@@ -331,13 +331,10 @@ class CudaGraphRunner:
             encoder_len_fill_value=self.encoder_len_fill_value,
             num_tokens_per_bs=self.num_tokens_per_bs,
             cache_loc_dtype=self._cache_loc_dtype(),
+            enable_over_encoding=self.model_runner.server_args.enable_over_encoding,
         )
 
         self.tbo_plugin = TboCudaGraphRunnerPlugin()
-        if self.model_runner.server_args.enable_over_encoding:
-            self.input_ids_gram2 = torch.zeros((self.max_num_token,), dtype=torch.int64)
-            self.input_ids_gram3 = torch.zeros((self.max_num_token,), dtype=torch.int64)
-            self.input_ids_gram4 = torch.zeros((self.max_num_token,), dtype=torch.int64)
 
         # Speculative_inference
         if model_runner.spec_algorithm.is_eagle3():
@@ -648,9 +645,9 @@ class CudaGraphRunner:
         )
         if self.model_runner.server_args.enable_over_encoding:
             forward_batch.n_gram_input_ids = NGramInputIds(
-                input_ids_gram2=self.input_ids_gram2[:num_tokens],
-                input_ids_gram3=self.input_ids_gram3[:num_tokens],
-                input_ids_gram4=self.input_ids_gram4[:num_tokens],
+                input_ids_gram2=buffers.input_ids_gram2[:num_tokens],
+                input_ids_gram3=buffers.input_ids_gram3[:num_tokens],
+                input_ids_gram4=buffers.input_ids_gram4[:num_tokens],
             )
         self.tbo_plugin.capture_one_batch_size(forward_batch, num_tokens=num_tokens)
 

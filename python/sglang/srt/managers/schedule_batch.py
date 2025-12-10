@@ -2008,6 +2008,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             dllm_config=self.dllm_config,
             reqs=self.reqs,
             has_grammar=self.has_grammar,
+            n_gram_input_ids=self.n_gram_input_ids,
         )
 
     def copy(self):

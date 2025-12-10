@@ -25,6 +25,9 @@ class GraphInputBuffers:
     global_num_tokens_for_logprob_gpu: torch.Tensor
     encoder_lens: Optional[torch.Tensor]
     pp_proxy_tensors: Optional[Dict[str, torch.Tensor]]
+    input_ids_gram2: Optional[torch.Tensor]
+    input_ids_gram3: Optional[torch.Tensor]
+    input_ids_gram4: Optional[torch.Tensor]
 
     @classmethod
     def create(
@@ -44,8 +47,17 @@ class GraphInputBuffers:
         encoder_len_fill_value: int,
         num_tokens_per_bs: int,
         cache_loc_dtype: torch.dtype,
+        enable_over_encoding: bool,
     ) -> "GraphInputBuffers":
         with torch.device(device):
+            if enable_over_encoding:
+                input_ids_gram2 = torch.zeros((max_num_token,), dtype=torch.int64)
+                input_ids_gram3 = torch.zeros((max_num_token,), dtype=torch.int64)
+                input_ids_gram4 = torch.zeros((max_num_token,), dtype=torch.int64)
+            else:
+                input_ids_gram2 = None
+                input_ids_gram3 = None
+                input_ids_gram4 = None
             input_ids = torch.zeros((max_num_token,), dtype=torch.int64)
             input_embeds = torch.zeros((max_num_token, hidden_size), dtype=dtype)
             req_pool_indices = torch.zeros((max_bs,), dtype=torch.int32)
@@ -111,6 +123,9 @@ class GraphInputBuffers:
             global_num_tokens_gpu=global_num_tokens_gpu,
             global_num_tokens_for_logprob_gpu=global_num_tokens_for_logprob_gpu,
             pp_proxy_tensors=pp_proxy_tensors,
+            input_ids_gram2=input_ids_gram2,
+            input_ids_gram3=input_ids_gram3,
+            input_ids_gram4=input_ids_gram4,
         )
 
     def populate_from_forward_batch(
