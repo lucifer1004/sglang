@@ -432,6 +432,12 @@ class RequestStage(str, enum.Enum):
     DECODE_QUICK_FINISH = "quick_finish"
 
 
+@dataclasses.dataclass
+class NGramInputIds:
+    input_ids_gram2: Optional[torch.Tensor] = None
+    input_ids_gram3: Optional[torch.Tensor] = None
+    input_ids_gram4: Optional[torch.Tensor] = None
+
 class Req:
     """The input and output status of a request."""
 
@@ -1170,6 +1176,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     # hicache pointer for synchronizing data loading from CPU to GPU
     hicache_consumer_index: int = -1
+    
+    n_gram_input_ids: Optional[NGramInputIds] = None
 
     # Diffusion LLM
     dllm_config: Optional[DllmConfig] = None
@@ -1300,6 +1308,15 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             len(self.out_cache_loc) == self.extend_num_tokens
         ), f"Expected {len(self.out_cache_loc)}, got {self.extend_num_tokens}"
 
+    def _get_token_ids_gram_n(self, req_input_ids, n):
+        seq_len = len(req_input_ids)
+        result_id = [0] * seq_len
+        if seq_len <= n:
+            return result_id
+        else:
+            result_id[n:] = req_input_ids[:-n]
+            return result_id
+
     def prepare_for_extend(self):
         self.forward_mode = ForwardMode.EXTEND
 
@@ -1328,6 +1345,28 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         input_ids_tensor = torch.tensor(
             list(chain.from_iterable(input_ids)), dtype=torch.int64
         ).to(self.device, non_blocking=True)
+        
+        input_ids_gram2 = []
+        input_ids_gram3 = []
+        input_ids_gram4 = []
+        for r in reqs:
+            prefix_len = len(r.prefix_indices)
+            input_ids_gram2.append(self._get_token_ids_gram_n(r.fill_ids, 1)[prefix_len:])
+            input_ids_gram3.append(self._get_token_ids_gram_n(r.fill_ids, 2)[prefix_len:])
+            input_ids_gram4.append(self._get_token_ids_gram_n(r.fill_ids, 3)[prefix_len:])
+        
+        self.n_gram_input_ids = NGramInputIds(
+            input_ids_gram2=torch.tensor(sum(input_ids_gram2, []), dtype=torch.int64).to(
+                self.device, non_blocking=True
+            ),
+            input_ids_gram3=torch.tensor(sum(input_ids_gram3, []), dtype=torch.int64).to(
+                self.device, non_blocking=True
+            ),
+            input_ids_gram4=torch.tensor(sum(input_ids_gram4, []), dtype=torch.int64).to(
+                self.device, non_blocking=True
+            ),
+        )
+        
         seq_lens_tensor = torch.tensor(seq_lens, dtype=torch.int64).to(
             self.device, non_blocking=True
         )
@@ -1736,6 +1775,21 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # Update fields
         self.input_ids = self.output_ids
         self.output_ids = None
+        
+        input_ids_gram2 = []
+        input_ids_gram3 = []
+        input_ids_gram4 = []
+        for r in self.reqs:
+            ids = r.origin_input_ids + r.output_ids
+            input_ids_gram2.append(ids[-2])
+            input_ids_gram3.append(ids[-3])
+            input_ids_gram4.append(ids[-4])
+
+        self.n_gram_input_ids = NGramInputIds(
+            input_ids_gram2=torch.tensor(input_ids_gram2, dtype=torch.int64).to(self.device, non_blocking=True),
+            input_ids_gram3=torch.tensor(input_ids_gram3, dtype=torch.int64).to(self.device, non_blocking=True),
+            input_ids_gram4=torch.tensor(input_ids_gram4, dtype=torch.int64).to(self.device, non_blocking=True),
+        )
 
         if self.model_config.is_encoder_decoder:
             self.prepare_encoder_info_decode()
@@ -2076,3 +2130,6 @@ class ModelWorkerBatch:
     # FIXME(lsyin): remove this after fully overlap grammar
     reqs: Optional[List[Req]] = None
     has_grammar: bool = False
+    
+    # Over Encoding
+    n_gram_input_ids: Optional[NGramInputIds] = None

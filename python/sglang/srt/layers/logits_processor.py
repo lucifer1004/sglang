@@ -143,6 +143,9 @@ class LogitsMetadata:
 
     # Whether this batch is prefill-only (no token generation needed)
     is_prefill_only: bool = False
+    
+    # For KV Mirror
+    enable_kv_mirror: bool = False
 
     @classmethod
     def from_forward_batch(cls, forward_batch: ForwardBatch):
@@ -194,6 +197,7 @@ class LogitsMetadata:
             global_num_tokens_for_logprob_cpu=forward_batch.global_num_tokens_for_logprob_cpu,
             global_num_tokens_for_logprob_gpu=forward_batch.global_num_tokens_for_logprob_gpu,
             dp_padding_mode=DpPaddingMode.SUM_LEN,
+            enable_kv_mirror=forward_batch.enable_kv_mirror,
         )
 
     def compute_dp_attention_metadata(self):
@@ -397,6 +401,7 @@ class LogitsProcessor(nn.Module):
             logits_metadata.forward_mode.is_decode_or_idle()
             or logits_metadata.forward_mode.is_target_verify()
             or logits_metadata.forward_mode.is_draft_extend_v2()
+            or logits_metadata.enable_kv_mirror
         ):
             pruned_states = hidden_states
             if aux_hidden_states is not None:

@@ -56,7 +56,7 @@ from sglang.srt.utils import get_compiler_backend, is_npu, support_triton
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
     from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-    from sglang.srt.managers.schedule_batch import ModelWorkerBatch, MultimodalInputs
+    from sglang.srt.managers.schedule_batch import ModelWorkerBatch, MultimodalInputs, NGramInputIds
     from sglang.srt.mem_cache.memory_pool import KVCache, ReqToTokenPool
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
@@ -353,6 +353,10 @@ class ForwardBatch:
 
     # Record the split metadata of the sequence number of NSA context parallels.
     nsa_cp_metadata: Optional[NSAContextParallelMetadata] = None
+    
+    # For Over Encoding
+    n_gram_input_ids: Optional[NGramInputIds] = None
+    enable_kv_mirror: bool = False
 
     @classmethod
     def init_new(
@@ -394,8 +398,10 @@ class ForwardBatch:
             token_type_ids=batch.token_type_ids,
             tbo_split_seq_index=batch.tbo_split_seq_index,
             dimensions=batch.dimensions,
+            n_gram_input_ids=batch.n_gram_input_ids,
         )
         device = model_runner.device
+        ret.enable_kv_mirror = model_runner.server_args.enable_kv_mirror
 
         if batch.extend_input_logprob_token_ids is not None:
             ret.extend_input_logprob_token_ids_gpu = (

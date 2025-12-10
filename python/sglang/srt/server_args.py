@@ -590,6 +590,11 @@ class ServerArgs:
 
     # For forward hooks
     forward_hooks: Optional[List[dict[str, Any]]] = None
+    
+
+    # For Over Encoding
+    enable_over_encoding: bool = False
+    enable_kv_mirror: bool = False
 
     def __post_init__(self):
         """
@@ -3912,6 +3917,20 @@ class ServerArgs:
             default=ServerArgs.forward_hooks,
             help="JSON-formatted forward hook specifications to attach to the model.",
         )
+
+        # For Over Encoding
+        parser.add_argument(
+            "--enable-over-encoding",
+            action="store_true",
+            help="Enable Over Encoding.",
+        )
+        
+        parser.add_argument(
+            "--enable-kv-mirror",
+            action="store_true",
+            help="Enable KV Mirror.",
+        )
+
 
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace):

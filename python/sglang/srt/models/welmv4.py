@@ -45,6 +45,7 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
+    ColumnParallelLinear,
     QKVParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
@@ -76,6 +77,34 @@ from sglang.srt.utils import add_prefix, make_layers
 
 logger = logging.getLogger(__name__)
 
+
+def hash_input_ids_vectorized(input_ids: torch.Tensor) -> torch.Tensor:
+    ids = input_ids.to(torch.int64)
+    result = ids * 2654435761
+    result = result & 0xFFFFFFFF
+    return result.to(input_ids.dtype)
+
+class KVMirrorManager:
+    '''
+    Manager for kv mirror algorithm
+    '''
+    activations_dict_hs = dict()
+    
+    @staticmethod
+    def set_hidden_states_activation(layer_number, kv_activation):
+        if layer_number not in KVMirrorManager.activations_dict_hs:
+            KVMirrorManager.activations_dict_hs[layer_number] = []
+        KVMirrorManager.activations_dict_hs[layer_number].append(kv_activation)
+
+    @staticmethod
+    def get_hidden_states_activation(layer_number, end_of_story=False):
+        assert layer_number in KVMirrorManager.activations_dict_hs
+        assert len(KVMirrorManager.activations_dict_hs[layer_number]) == 1
+        kv_activation = KVMirrorManager.activations_dict_hs[layer_number].pop()
+        if end_of_story:
+            for key in KVMirrorManager.activations_dict_hs.keys():
+                KVMirrorManager.activations_dict_hs[key].clear()
+        return kv_activation
 
 class Qwen2MoeMLP(nn.Module):
     def __init__(
@@ -122,14 +151,13 @@ class Qwen2MoeMLP(nn.Module):
         )
         return x
 
-
 def expert_bias_routing(
     hidden_states: torch.Tensor,
     gating_output: torch.Tensor,
     topk: int,
     expert_bias: torch.Tensor,
     renormalize: bool = False,
-    score_func: str = "sigmoid",
+    score_func: str = 'sigmoid',
 ):
     assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
     if score_func == "softmax":
@@ -158,7 +186,6 @@ def sigmoid_routing_function(
     _, indices = torch.topk(scores_for_routing, topk, dim=-1)
     topk_scores = torch.gather(scores, dim=1, index=indices).type_as(scores)
     return topk_scores, indices
-
 
 class Qwen2MoeSparseMoeBlock(nn.Module):
 
@@ -238,10 +265,12 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
 
         self.shared_expert_gate = None
         has_shared_expert_gate = getattr(
-            config, "has_shared_expert_gate", True
-        )  # default to true since qwen2_moe always has it
+            config, "has_shared_expert_gate",
+            True)  # default to true since qwen2_moe always has it
         if has_shared_expert_gate:
-            self.shared_expert_gate = torch.nn.Linear(config.hidden_size, 1, bias=False)
+            self.shared_expert_gate = torch.nn.Linear(config.hidden_size,
+                                                      1,
+                                                      bias=False)
 
     def forward(
         self,
@@ -256,8 +285,8 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             shared_output = self.shared_expert(hidden_states)
             if self.shared_expert_gate is not None:
                 shared_output = (
-                    F.sigmoid(self.shared_expert_gate(hidden_states)) * shared_output
-                )
+                    F.sigmoid(self.shared_expert_gate(hidden_states)) *
+                    shared_output)
 
         # router_logits: (num_tokens, n_experts)
         router_logits, _ = self.gate(hidden_states)
@@ -266,7 +295,8 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         if shared_output is not None:
             final_hidden_states = final_hidden_states + shared_output
         if self.tp_size > 1 and not use_reduce_scatter:
-            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+            final_hidden_states = tensor_model_parallel_all_reduce(
+                final_hidden_states)
 
         return final_hidden_states.view(num_tokens, hidden_dim)
 
@@ -471,6 +501,11 @@ class Qwen2MoeAttention(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         dual_chunk_attention_config: Optional[dict[str, Any]] = None,
         prefix: str = "",
+        kv_mirror_layers=[],
+        kv_mirror_imitated_layers=[],
+        layer_idx: Optional[int] = None,
+        o_norm=False,
+        total_layer_num: int = 1,
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
@@ -511,6 +546,19 @@ class Qwen2MoeAttention(nn.Module):
             else nn.Identity()
         )
 
+        self.kv_mirror_layers = kv_mirror_layers
+        self.kv_mirror_imitated_layers = kv_mirror_imitated_layers
+        self.layer_idx = layer_idx
+        print("self.layer_idx:{}".format(layer_idx), "self.kv_mirror_layers:", self.kv_mirror_layers, "self.kv_mirror_imitated_layers:", self.kv_mirror_imitated_layers, flush=True)
+        self.use_o_norm = o_norm
+        self.total_layer_num = total_layer_num
+
+        self.q_norm = RMSNorm(self.head_dim) if self.qk_norm else nn.Identity()
+        self.k_norm = RMSNorm(
+            self.head_dim
+        ) if self.qk_norm or self.only_k_norm else nn.Identity()
+        self.o_norm = RMSNorm(self.hidden_size) if self.use_o_norm else nn.Identity()
+
         self.qkv_proj = QKVParallelLinear(
             hidden_size,
             self.head_dim,
@@ -530,10 +578,9 @@ class Qwen2MoeAttention(nn.Module):
             quant_config=quant_config,
             tp_rank=attn_tp_rank,
             tp_size=attn_tp_size,
-            reduce_results=False,
+            reduce_results=True,
             prefix=add_prefix("o_proj", prefix),
         )
-
         if rope_scaling is None:
             rope_scaling = {"type": "linear", "factor": 1 / self.compress}
         else:
@@ -563,6 +610,14 @@ class Qwen2MoeAttention(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("attn", prefix),
         )
+        self.gated_self_attention_headwise = True
+        if self.gated_self_attention_headwise:
+            self.gate_proj = ColumnParallelLinear(
+                    hidden_size,
+                    self.total_num_heads,
+                    bias=False,
+            )
+        self.attn.is_kv_mirror = self.layer_idx in self.kv_mirror_layers
 
     def forward(
         self,
@@ -570,17 +625,41 @@ class Qwen2MoeAttention(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        qkv, _ = self.qkv_proj(hidden_states)
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        hidden_states_ori = hidden_states
+        #qkv, _ = self.qkv_proj(hidden_states)
+
+        if self.layer_idx in self.kv_mirror_imitated_layers:
+            qkv, _ = self.qkv_proj(hidden_states)
+            KVMirrorManager.set_hidden_states_activation(self.layer_idx, hidden_states_ori)
+            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        elif self.layer_idx in self.kv_mirror_layers:
+            mirror_layer_number = self.kv_mirror_imitated_layers[self.kv_mirror_layers.index(self.layer_idx)]
+            if self.layer_idx == self.total_layer_num - 1:
+                hidden_states_ori = KVMirrorManager.get_hidden_states_activation(mirror_layer_number, end_of_story=True)
+            else:
+                hidden_states_ori = KVMirrorManager.get_hidden_states_activation(mirror_layer_number, end_of_story=False)
+            if forward_batch.enable_kv_mirror and forward_batch.forward_mode.is_extend() and not hasattr(forward_batch, 'custom_last_index'):
+                forward_batch.custom_last_index = torch.cumsum(forward_batch.extend_seq_lens, dim=0) - 1
+                hidden_states = hidden_states[forward_batch.custom_last_index]
+            qkv, _ = self.qkv_proj(hidden_states)
+            qkv_shadow, _ = self.qkv_proj(hidden_states_ori)
+            q, _, _ = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+            _, k, v = qkv_shadow.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        else:
+            qkv, _ = self.qkv_proj(hidden_states)
+            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+
         q_shape = q.shape
         k_shape = k.shape
 
-        q_by_head = q.view(*q.shape[:-1], q.shape[-1] // self.head_dim, self.head_dim)
+        q_by_head = q.view(*q.shape[:-1], q.shape[-1] // self.head_dim,
+                           self.head_dim)
         if self.qk_norm:
             q_by_head = self.q_norm.forward_native(q_by_head)
         q = q_by_head.view(q.shape)
 
-        k_by_head = k.view(*k.shape[:-1], k.shape[-1] // self.head_dim, self.head_dim)
+        k_by_head = k.view(*k.shape[:-1], k.shape[-1] // self.head_dim,
+                           self.head_dim)
         if self.qk_norm or self.only_k_norm:
             k_by_head = self.k_norm.forward_native(k_by_head)
         k = k_by_head.view(k.shape)
@@ -588,26 +667,28 @@ class Qwen2MoeAttention(nn.Module):
         qk_nope_head_dim = self.head_dim - self.qk_rope_head_dim
         if qk_nope_head_dim > 0:
             q_nope, q_pe = q.view(q_by_head.shape).split(
-                [qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
-            )
+                [qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
             k_nope, k_pe = k.view(k_by_head.shape).split(
-                [qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
-            )
+                [qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
 
             q_pe = q_pe.reshape(
-                (*q_shape[:-1], q_shape[-1] // self.head_dim * self.qk_rope_head_dim)
-            )
+                (*q_shape[:-1],
+                 q_shape[-1] // self.head_dim * self.qk_rope_head_dim))
             k_pe = k_pe.reshape(
-                (*k_shape[:-1], k_shape[-1] // self.head_dim * self.qk_rope_head_dim)
-            )
-            q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
+                (*k_shape[:-1],
+                 k_shape[-1] // self.head_dim * self.qk_rope_head_dim))
+            if forward_batch.enable_kv_mirror and forward_batch.forward_mode.is_extend() and self.layer_idx in self.kv_mirror_layers:
+                q_pe_proxy = torch.empty((k_pe.shape[0],) + q_pe.shape[1:], dtype=q_pe.dtype, device=q_pe.device)
+                k_pe_proxy = torch.empty((q_pe.shape[0],) + k_pe.shape[1:], dtype=k_pe.dtype, device=k_pe.device)
+                _, k_pe = self.rotary_emb(positions, q_pe_proxy, k_pe)
+                q_pe, _ = self.rotary_emb(positions[forward_batch.custom_last_index], q_pe, k_pe_proxy)
+            else:
+                q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
 
             q_pe = q_pe.reshape(
-                (*q_shape[:-1], q_shape[-1] // self.head_dim, -1)
-            ).clone()
+                (*q_shape[:-1], q_shape[-1] // self.head_dim, -1)).clone()
             k_pe = k_pe.reshape(
-                (*k_shape[:-1], k_shape[-1] // self.head_dim, -1)
-            ).clone()
+                (*k_shape[:-1], k_shape[-1] // self.head_dim, -1)).clone()
 
             q = q.reshape(q_by_head.shape)
             k = k.reshape(k_by_head.shape)
@@ -620,7 +701,16 @@ class Qwen2MoeAttention(nn.Module):
         else:
             q, k = self.rotary_emb(positions, q, k)
         attn_output = self.attn(q, k, v, forward_batch)
+        if self.gated_self_attention_headwise:
+            attn_shape = attn_output.shape
+            gate = self.gate_proj(hidden_states)[0].unsqueeze(-1) # (bs * seq_len, num_heads, 1)
+            attn_output = attn_output.view(attn_shape[0], self.num_heads, -1)
+            attn_output = attn_output * torch.sigmoid(gate)
+            attn_output = attn_output.view(attn_shape)
+
         output, _ = self.o_proj(attn_output)
+        if self.use_o_norm:
+            output = self.o_norm(output)
         return output
 
 
@@ -652,10 +742,18 @@ class Qwen2MoeDecoderLayer(nn.Module):
         qk_norm = getattr(config, "qk_norm", False)
         k_norm = getattr(config, "k_norm", False)
         out_bias = getattr(config, "out_proj_bias", False)
-        head_dim = getattr(
-            config, "head_dim", self.hidden_size // config.num_attention_heads
-        )
+        head_dim = getattr(config, "head_dim",
+                           self.hidden_size // config.num_attention_heads)
         qk_rope_head_dim = getattr(config, "qk_rope_head_dim", head_dim)
+        
+        self.kv_mirror_layers = getattr(config, "kv_mirror_layers", [])
+        self.kv_mirror_imitated_layers = getattr(config, "kv_mirror_imitated_layers", [])
+        self.ppln = getattr(config, "ppln", False)
+        o_norm = getattr(config, "o_norm", False)
+        self.prenorm_layer_idx = getattr(config, "prenorm_layer_idx", [])
+        print("self.ppln:", self.ppln, "o_norm:", o_norm, "self.prenorm_layer_idx:", self.prenorm_layer_idx)
+        total_layer_num = config.num_hidden_layers
+        
         self.self_attn = Qwen2MoeAttention(
             hidden_size=self.hidden_size,
             num_heads=config.num_attention_heads,
@@ -664,19 +762,21 @@ class Qwen2MoeDecoderLayer(nn.Module):
             layer_id=layer_id,
             rope_theta=rope_theta,
             rope_scaling=rope_scaling,
-            compress=config.rotary_compress,
             max_position_embeddings=max_position_embeddings,
             qk_norm=qk_norm,
             k_norm=k_norm,
             qk_rope_head_dim=qk_rope_head_dim,
-            qk_norm_eps=config.rms_norm_eps,
             quant_config=quant_config,
             dual_chunk_attention_config=dual_chunk_attention_config,
             qkv_bias=qkv_bias,
             out_bias=out_bias,
             prefix=add_prefix("self_attn", prefix),
+            kv_mirror_layers=self.kv_mirror_layers,
+            kv_mirror_imitated_layers=self.kv_mirror_imitated_layers,
+            layer_idx=layer_id,
+            o_norm=o_norm and layer_id not in self.prenorm_layer_idx,
+            total_layer_num=total_layer_num,
         )
-
         self.layer_id = layer_id
 
         self.attn_tp_size = get_attention_tp_size()
@@ -726,11 +826,14 @@ class Qwen2MoeDecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-
-        hidden_states, residual = self.layer_communicator.prepare_attn(
-            hidden_states, residual, forward_batch
-        )
-
+        if residual is None:
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
+        else:
+            hidden_states, residual = self.input_layernorm(hidden_states, residual)
+        
+        if self.ppln and self.layer_id not in self.prenorm_layer_idx:
+            residual = hidden_states.clone().to(dtype=hidden_states.dtype, device=hidden_states.device)
         if hidden_states.shape[0] != 0:
             hidden_states = self.self_attn(
                 positions=positions,
@@ -738,21 +841,23 @@ class Qwen2MoeDecoderLayer(nn.Module):
                 forward_batch=forward_batch,
             )
 
-        hidden_states, residual = self.layer_communicator.prepare_mlp(
-            hidden_states, residual, forward_batch
-        )
+        # hidden_states, residual = self.layer_communicator.prepare_mlp(
+        #     hidden_states, residual, forward_batch
+        # )
+        if forward_batch.enable_kv_mirror and forward_batch.forward_mode.is_extend() and self.layer_id == self.kv_mirror_layers[-1]:
+            residual = residual[forward_batch.custom_last_index]
+        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
 
         # For DP with padding, reduce scatter can be used instead of all-reduce.
         use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
             forward_batch
         )
-
         hidden_states = self.mlp(hidden_states, forward_batch, use_reduce_scatter)
-
-        hidden_states, residual = self.layer_communicator.postprocess_layer(
-            hidden_states, residual, forward_batch
-        )
-
+        # hidden_states = hidden_states + residual
+    
+        # hidden_states, residual = self.layer_communicator.postprocess_layer(
+        #     hidden_states, residual, forward_batch
+        # )
         return hidden_states, residual
 
 
@@ -770,6 +875,19 @@ class Qwen2MoeModel(nn.Module):
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
         self.pp_group = get_pp_group()
+
+        self.oe_dim = config.oe_dim
+        self.oe_grams = config.oe_grams
+        self.oe_vocab_sizes = config.oe_vocab_sizes
+
+        if len(self.oe_vocab_sizes) > 0:
+            self.oe_embed = nn.ModuleList(
+                [VocabParallelEmbedding(self.oe_vocab_sizes[i],self.oe_dim,)
+                 for i in range(len(self.oe_vocab_sizes))]
+            )
+            self.oe_gate_up_proj = ReplicatedLinear(
+                self.oe_dim * len(self.oe_vocab_sizes), config.hidden_size, bias=False, quant_config=None
+            )
 
         if self.pp_group.is_first_rank:
             self.embed_tokens = VocabParallelEmbedding(
@@ -817,6 +935,23 @@ class Qwen2MoeModel(nn.Module):
                 hidden_states = self.embed_tokens(input_ids)
             else:
                 hidden_states = input_embeds
+            
+            if len(self.oe_grams) > 0:
+                input_ids_ngram = []
+                input_ids_ngram_tmp = input_ids
+                input_ids_gram_n = [forward_batch.n_gram_input_ids.input_ids_gram2, forward_batch.n_gram_input_ids.input_ids_gram3, forward_batch.n_gram_input_ids.input_ids_gram4]
+                for g in range(1, max(self.oe_grams)):
+                    input_ids_ngram_tmp = input_ids_ngram_tmp + input_ids_gram_n[g-1] * (self.vocab_size ** g)
+                    input_ids_ngram.append(hash_input_ids_vectorized(input_ids_ngram_tmp))
+
+                emb_ngram = []
+                for i, vs in enumerate(self.oe_vocab_sizes):
+                    input_ids_ngram_hashed_tmp = input_ids_ngram[self.oe_grams[i] - 2] % vs
+                    emb_ngram_tmp = self.oe_embed[i](input_ids_ngram_hashed_tmp)
+                    emb_ngram.append(emb_ngram_tmp) 
+                emb_new, _ = self.oe_gate_up_proj(torch.cat(emb_ngram, dim=-1))
+                hidden_states = (hidden_states + emb_new) / 2.0
+
             residual = None
         else:
             assert pp_proxy_tensors is not None
@@ -867,7 +1002,7 @@ class Qwen2MoeModel(nn.Module):
         return hidden_states, aux_hidden_states
 
 
-class Qwen2MoeForCausalLM(nn.Module):
+class WeLMV4MoeForCausalLM(nn.Module):
     fall_back_to_pt_during_load = False
 
     def __init__(
@@ -880,9 +1015,9 @@ class Qwen2MoeForCausalLM(nn.Module):
         self.pp_group = get_pp_group()
         self.config = config
         self.quant_config = quant_config
-        self.model = Qwen2MoeModel(
-            config, quant_config, prefix=add_prefix("model", prefix)
-        )
+        self.model = Qwen2MoeModel(config,
+                                   quant_config,
+                                   prefix=add_prefix("model", prefix))
         self.lm_head = ParallelLMHead(
             config.vocab_size,
             config.hidden_size,
@@ -925,9 +1060,9 @@ class Qwen2MoeForCausalLM(nn.Module):
         if self.capture_aux_hidden_states:
             hidden_states, aux_hidden_states = hidden_states
         if self.pp_group.is_last_rank:
-            return self.logits_processor(
-                input_ids, hidden_states, self.lm_head, forward_batch, aux_hidden_states
-            )
+            return self.logits_processor(input_ids, hidden_states,
+                                         self.lm_head, forward_batch,
+                                         aux_hidden_states)
         else:
             return hidden_states
 
@@ -944,13 +1079,15 @@ class Qwen2MoeForCausalLM(nn.Module):
         # embed
         if start == 0:
             if input_embeds is None:
-                forward_batch.hidden_states = self.model.embed_tokens(input_ids)
+                forward_batch.hidden_states = self.model.embed_tokens(
+                    input_ids)
             else:
                 forward_batch.hidden_states = input_embeds
 
         # decoder layer
         for i in range(start, end):
-            with get_global_expert_distribution_recorder().with_current_layer(i):
+            with get_global_expert_distribution_recorder().with_current_layer(
+                    i):
                 layer = self.model.layers[i]
                 forward_batch.hidden_states, forward_batch.residual = layer(
                     positions,
@@ -961,14 +1098,13 @@ class Qwen2MoeForCausalLM(nn.Module):
 
         if end == self.model.config.num_hidden_layers:
             # norm
-            hidden_states, _ = self.model.norm(
-                forward_batch.hidden_states, forward_batch.residual
-            )
+            hidden_states, _ = self.model.norm(forward_batch.hidden_states,
+                                               forward_batch.residual)
             forward_batch.hidden_states = hidden_states
             # logits process
-            result = self.logits_processor(
-                input_ids, forward_batch.hidden_states, self.lm_head, forward_batch
-            )
+            result = self.logits_processor(input_ids,
+                                           forward_batch.hidden_states,
+                                           self.lm_head, forward_batch)
         else:
             result = None
 
@@ -982,19 +1118,19 @@ class Qwen2MoeForCausalLM(nn.Module):
     def end_layer(self):
         return self.model.end_layer
 
-    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]], is_nextn=False):
+    def load_weights(self,
+                     weights: Iterable[Tuple[str, torch.Tensor]],
+                     is_nextn=False):
         if is_nextn:
             if hasattr(self.config, "num_nextn_predict_layers"):
                 num_nextn_layers = self.config.num_nextn_predict_layers
                 assert num_nextn_layers == 1, "Only 1 nextn layer is supported"
                 # compatible with old design
-                nextn_layer_id = (
-                    0
-                    if self.config.num_hidden_layers == 1
-                    else self.config.num_hidden_layers
-                )
+                nextn_layer_id = (0 if self.config.num_hidden_layers == 1 else
+                                  self.config.num_hidden_layers)
             else:
-                raise ValueError("num_nextn_predict_layers is not in the config")
+                raise ValueError(
+                    "num_nextn_predict_layers is not in the config")
 
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
@@ -1025,12 +1161,11 @@ class Qwen2MoeForCausalLM(nn.Module):
             if not is_nextn:
                 if hasattr(self.config, "num_nextn_predict_layers"):
                     num_nextn_layers = self.config.num_nextn_predict_layers
-                    if num_nextn_layers > 0 and name.startswith("model.layers"):
+                    if num_nextn_layers > 0 and name.startswith(
+                            "model.layers"):
                         name_list = name.split(".")
-                        if (
-                            len(name_list) >= 3
-                            and int(name_list[2]) >= self.config.num_hidden_layers
-                        ):
+                        if (len(name_list) >= 3 and int(name_list[2])
+                                >= self.config.num_hidden_layers):
                             continue
             else:
                 if not name.startswith(nextn_layer_prefix):
@@ -1052,18 +1187,15 @@ class Qwen2MoeForCausalLM(nn.Module):
                     name = name.replace(nextn_layer_prefix, "model.decoder")
 
             layer_id = get_layer_id(name)
-            if (
-                layer_id is not None
-                and hasattr(self.model, "start_layer")
-                and (
-                    layer_id < self.model.start_layer
-                    or layer_id >= self.model.end_layer
-                )
-            ):
+            if (layer_id is not None and hasattr(self.model, "start_layer")
+                    and (layer_id < self.model.start_layer
+                         or layer_id >= self.model.end_layer)):
                 continue
             if "rotary_emb.inv_freq" in name:
                 continue
             for param_name, weight_name, shard_id in stacked_params_mapping:
+                if 'self_attn.gate_proj' in name:
+                    continue
                 # Skip non-stacked layers and experts (experts handled below).
                 if weight_name not in name:
                     continue
@@ -1080,6 +1212,8 @@ class Qwen2MoeForCausalLM(nn.Module):
                 if name.endswith(".bias") and name not in params_dict:
                     continue
                 if name not in params_dict:
+                    continue
+                if name == "model.oe_gate_up_proj.weight":
                     continue
 
                 param = params_dict[name]
@@ -1111,12 +1245,12 @@ class Qwen2MoeForCausalLM(nn.Module):
 
                     if name in params_dict.keys():
                         param = params_dict[name]
-                        weight_loader = getattr(
-                            param, "weight_loader", default_weight_loader
-                        )
+                        weight_loader = getattr(param, "weight_loader",
+                                                default_weight_loader)
                         weight_loader(param, loaded_weight)
                     else:
-                        logger.warning(f"Parameter {name} not found in params_dict")
+                        logger.warning(
+                            f"Parameter {name} not found in params_dict")
 
     @classmethod
     def get_model_config_for_expert_location(cls, config):
@@ -1126,7 +1260,8 @@ class Qwen2MoeForCausalLM(nn.Module):
             num_groups=None,
         )
 
-    def set_eagle3_layers_to_capture(self, layer_ids: Optional[List[int]] = None):
+    def set_eagle3_layers_to_capture(self,
+                                     layer_ids: Optional[List[int]] = None):
         if not self.pp_group.is_last_rank:
             return
 
@@ -1142,4 +1277,5 @@ class Qwen2MoeForCausalLM(nn.Module):
             self.model.layers_to_capture = [val + 1 for val in layer_ids]
 
 
-EntryClass = Qwen2MoeForCausalLM
+EntryClass = WeLMV4MoeForCausalLM
+

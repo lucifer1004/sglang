@@ -74,6 +74,7 @@ from sglang.srt.utils import (
 )
 from sglang.srt.utils.patch_torch import monkey_patch_torch_compile
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
+from sglang.srt.managers.schedule_batch import NGramInputIds
 
 try:
     from kt_kernel import KTMoEWrapper
@@ -333,6 +334,10 @@ class CudaGraphRunner:
         )
 
         self.tbo_plugin = TboCudaGraphRunnerPlugin()
+        if self.model_runner.server_args.enable_over_encoding:
+            self.input_ids_gram2 = torch.zeros((self.max_num_token,), dtype=torch.int64)
+            self.input_ids_gram3 = torch.zeros((self.max_num_token,), dtype=torch.int64)
+            self.input_ids_gram4 = torch.zeros((self.max_num_token,), dtype=torch.int64)
 
         # Speculative_inference
         if model_runner.spec_algorithm.is_eagle3():
@@ -641,6 +646,12 @@ class CudaGraphRunner:
             global_forward_mode=self.capture_forward_mode,
             lora_ids=lora_ids,
         )
+        if self.model_runner.server_args.enable_over_encoding:
+            forward_batch.n_gram_input_ids = NGramInputIds(
+                input_ids_gram2=self.input_ids_gram2[:num_tokens],
+                input_ids_gram3=self.input_ids_gram3[:num_tokens],
+                input_ids_gram4=self.input_ids_gram4[:num_tokens],
+            )
         self.tbo_plugin.capture_one_batch_size(forward_batch, num_tokens=num_tokens)
 
         if lora_ids is not None:
