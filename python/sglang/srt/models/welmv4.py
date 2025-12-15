@@ -209,12 +209,14 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         layer_id: int,
         config: PretrainedConfig,
         quant_config: Optional[QuantizationConfig] = None,
+        alt_stream: Optional[torch.cuda.Stream] = None,
         prefix: str = "",
     ):
         super().__init__()
         self.tp_size = get_tensor_model_parallel_world_size()
         self.expert_bias = torch.nn.Parameter(torch.zeros((config.num_experts)))
         self.layer_id = layer_id
+        self.alt_stream = alt_stream
         if self.tp_size > config.num_experts:
             raise ValueError(
                 f"Tensor parallel size {self.tp_size} is greater than "
@@ -813,6 +815,7 @@ class Qwen2MoeDecoderLayer(nn.Module):
                 layer_id=layer_id,
                 config=config,
                 quant_config=quant_config,
+                alt_stream=alt_stream,
                 prefix=add_prefix("mlp", prefix),
             )
         else:
@@ -937,6 +940,11 @@ class Qwen2MoeModel(nn.Module):
         # For EAGLE3 support
         self.layers_to_capture = []
 
+    def set_eagle3_layers_to_capture(self, layers_to_capture: List[int]):
+        self.layers_to_capture = layers_to_capture
+        for layer_id in self.layers_to_capture:
+            setattr(self.layers[layer_id], "_is_layer_to_capture", True)
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -1030,9 +1038,13 @@ class WeLMV4MoeForCausalLM(nn.Module):
         self.pp_group = get_pp_group()
         self.config = config
         self.quant_config = quant_config
-        self.model = Qwen2MoeModel(config,
-                                   quant_config,
-                                   prefix=add_prefix("model", prefix))
+        alt_stream = torch.cuda.Stream() if _is_cuda else None
+        self.model = Qwen2MoeModel(
+            config,
+            quant_config,
+            prefix=add_prefix("model", prefix),
+            alt_stream=alt_stream,
+        )
         self.lm_head = ParallelLMHead(
             config.vocab_size,
             config.hidden_size,
@@ -1043,17 +1055,6 @@ class WeLMV4MoeForCausalLM(nn.Module):
         self.logits_processor = LogitsProcessor(config)
         # For EAGLE3 support
         self.capture_aux_hidden_states = False
-
-    def get_embed_and_head(self):
-        return self.model.embed_tokens.weight, self.lm_head.weight
-
-    def set_embed_and_head(self, embed, head):
-        del self.model.embed_tokens.weight
-        del self.lm_head.weight
-        self.model.embed_tokens.weight = embed
-        self.lm_head.weight = head
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
 
     @torch.no_grad()
     def forward(
@@ -1283,7 +1284,7 @@ class WeLMV4MoeForCausalLM(nn.Module):
         self.capture_aux_hidden_states = True
         if layer_ids is None:
             num_layers = self.config.num_hidden_layers
-            self.model.layers_to_capture = [
+            self.model.set_eagle3_layers_to_capture = [
                 2,
                 num_layers // 2,
                 num_layers - 3,

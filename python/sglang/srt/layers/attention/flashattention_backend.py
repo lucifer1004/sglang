@@ -56,6 +56,10 @@ class FlashAttentionMetadata:
     encoder_lens_int32: torch.Tensor = None
     # Page table for the encoder
     encoder_page_table: torch.Tensor = None
+    
+    # For KV mirror Layer
+    mirror_cu_seqlens_q: torch.Tensor = None
+    mirror_max_seq_len_q: int = 1
 
     @dataclass
     class LocalAttentionMetadata:
@@ -595,6 +599,10 @@ class FlashAttentionBackend(AttentionBackend):
             metadata.page_table = forward_batch.req_to_token_pool.req_to_token[
                 forward_batch.req_pool_indices, : metadata.max_seq_len_k
             ]
+            if forward_batch.enable_kv_mirror:
+                metadata.mirror_cu_seqlens_q = torch.arange(
+                    0, batch_size + 1, dtype=torch.int32, device=device
+                )
 
             if any(
                 forward_batch.extend_prefix_lens_cpu
@@ -783,6 +791,12 @@ class FlashAttentionBackend(AttentionBackend):
             cache_seqlens = swa_spec_metadata.cache_seqlens_int32
             max_seqlen_q = swa_spec_metadata.max_seq_len_q
             cu_seqlens_k = swa_spec_metadata.cu_seqlens_k
+        elif hasattr(forward_batch, 'custom_last_index'):
+            page_table = metadata.page_table
+            cu_seqlens_q = metadata.mirror_cu_seqlens_q
+            cache_seqlens = metadata.cache_seqlens_int32
+            max_seqlen_q = metadata.mirror_max_seq_len_q
+            cu_seqlens_k = metadata.cu_seqlens_k
         else:
             page_table = metadata.page_table
             cu_seqlens_q = metadata.cu_seqlens_q
