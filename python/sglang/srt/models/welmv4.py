@@ -306,7 +306,10 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                     shared_output)
 
         # router_logits: (num_tokens, n_experts)
-        router_logits, _ = self.gate(hidden_states)
+        # router_logits, _ = self.gate(hidden_states)
+        router_logits = F.linear(
+            hidden_states.to(torch.float32), self.gate.weight.to(torch.float32)
+        )
         topk_output = self.topk(hidden_states, router_logits)
         final_hidden_states = self.experts(hidden_states, topk_output)
         if shared_output is not None:
