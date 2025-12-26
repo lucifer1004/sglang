@@ -214,7 +214,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
     ):
         super().__init__()
         self.tp_size = get_tensor_model_parallel_world_size()
-        self.expert_bias = torch.nn.Parameter(torch.zeros((config.num_experts)))
+        self.expert_bias = torch.nn.Parameter(torch.zeros((config.num_experts), dtype=torch.float32))
         self.layer_id = layer_id
         self.alt_stream = alt_stream
         if self.tp_size > config.num_experts:
