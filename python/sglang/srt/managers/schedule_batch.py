@@ -1781,9 +1781,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         input_ids_gram4 = []
         for r in self.reqs:
             ids = r.origin_input_ids + r.output_ids
-            input_ids_gram2.append(ids[-2])
-            input_ids_gram3.append(ids[-3])
-            input_ids_gram4.append(ids[-4])
+            input_ids_gram2.append(ids[-2] if len(ids) > 1 else 0)
+            input_ids_gram3.append(ids[-3] if len(ids) > 2 else 0)
+            input_ids_gram4.append(ids[-4] if len(ids) > 3 else 0)
 
         self.n_gram_input_ids = NGramInputIds(
             input_ids_gram2=torch.tensor(input_ids_gram2, dtype=torch.int64).to(self.device, non_blocking=True),
