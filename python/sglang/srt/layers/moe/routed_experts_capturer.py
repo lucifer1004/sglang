@@ -75,8 +75,9 @@ class _RoutedExpertsHostCache:
         assert hasattr(self, "buffer")
         return get_tensor_size_bytes(self.buffer)
 
-    def set_experts_buffer(self, layer_id: int, loc: torch.Tensor, top_k: torch.Tensor):
-        self.buffer[layer_id, loc, :] = top_k.cpu()
+    # NOTE: slime's patch seems to use wrong buffer index. But this function is not called actually.
+    # def set_experts_buffer(self, layer_id: int, loc: torch.Tensor, top_k: torch.Tensor):
+    #     self.buffer[layer_id, loc, :] = top_k.cpu()
 
     def _finalize_allocation_log(self):
         """Common logging and memory usage computation for captured experts buffers."""
