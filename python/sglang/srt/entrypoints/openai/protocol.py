@@ -232,6 +232,7 @@ class CompletionRequest(BaseModel):
     top_p: float = 1.0
     user: Optional[str] = None
     return_hidden_states: bool = False
+    return_token_ids: bool = False
 
     # Extra parameters for SRT backend only and will be ignored by OpenAI models.
     top_k: int = -1
@@ -284,6 +285,7 @@ class CompletionResponseChoice(BaseModel):
     finish_reason: Optional[Literal["stop", "length", "content_filter", "abort"]] = None
     matched_stop: Union[None, int, str] = None
     hidden_states: Optional[object] = None
+    prompt_token_ids: Optional[List[int]] = None
 
     @model_serializer(mode="wrap")
     def _serialize(self, handler):
@@ -310,6 +312,7 @@ class CompletionResponseStreamChoice(BaseModel):
     finish_reason: Optional[Literal["stop", "length", "content_filter", "abort"]] = None
     matched_stop: Union[None, int, str] = None
     hidden_states: Optional[object] = None
+    prompt_token_ids: Optional[List[int]] = None
 
     @model_serializer(mode="wrap")
     def _serialize(self, handler):
