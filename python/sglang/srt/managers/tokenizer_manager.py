@@ -1622,6 +1622,9 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             if getattr(recv_obj, "output_hidden_states", None):
                 meta_info["hidden_states"] = recv_obj.output_hidden_states[i]
 
+            if getattr(recv_obj, "output_routed_experts", None):
+                meta_info["routed_experts"] = recv_obj.output_routed_experts[i]
+
             if isinstance(recv_obj, BatchStrOutput):
                 state.text += recv_obj.output_strs[i]
                 if self.server_args.stream_output and state.obj.stream:

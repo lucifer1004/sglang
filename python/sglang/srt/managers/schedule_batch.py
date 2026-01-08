@@ -515,7 +515,6 @@ class Req:
         self.custom_logit_processor = custom_logit_processor
         self.return_hidden_states = return_hidden_states
         self.return_routed_experts = return_routed_experts
-        self.routed_experts = []
 
         # extra key for classifying the request (e.g. cache_salt)
         if lora_id is not None:
@@ -565,7 +564,6 @@ class Req:
         # Prefix info
         # The indices to kv cache for the shared prefix.
         self.prefix_indices: torch.Tensor = torch.empty((0,), dtype=torch.int64)
-        self.routed_experts = []
         # Number of tokens to run prefill.
         self.extend_input_len = 0
         # The relative logprob_start_len in an extend batch
@@ -642,6 +640,8 @@ class Req:
         self.hidden_states_tensor = None  # Note: use tensor instead of list to transfer hidden_states when PD + MTP
         self.output_topk_p = None
         self.output_topk_index = None
+
+        self.routed_experts: List[List[List[int]]] = []
 
         # Embedding (return values)
         self.embedding = None

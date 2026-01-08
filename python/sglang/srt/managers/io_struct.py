@@ -917,7 +917,7 @@ class BatchTokenIDOutput(
     output_hidden_states: List[List[float]]
 
     # Routed experts
-    output_routed_experts: List[List[int]]
+    output_routed_experts: List[List[List[List[int]]]]
 
     # The information of placeholder tokens (e.g., image token)
     # idx is the index of the token in the prompt after expansion.
@@ -999,7 +999,7 @@ class BatchStrOutput(
     output_hidden_states: List[List[float]]
 
     # Routed experts
-    output_routed_experts: List[List[int]]
+    output_routed_experts: List[List[List[List[int]]]]
 
     # The information of placeholder tokens (e.g., image token)
     # idx is the index of the token in the prompt after expansion.
