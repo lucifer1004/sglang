@@ -281,8 +281,6 @@ pub struct GenerateMetaInfo {
     pub input_token_logprobs: Option<Vec<Vec<Option<f64>>>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output_token_logprobs: Option<Vec<Vec<Option<f64>>>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub routed_experts: Option<Vec<Vec<Vec<u32>>>>,
     pub completion_tokens: u32,
     pub cached_tokens: u32,
     pub e2e_latency: f64,
