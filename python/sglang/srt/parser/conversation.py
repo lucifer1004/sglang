@@ -1006,7 +1006,7 @@ MODEL_TYPE_TO_TEMPLATE = {
 
 @register_conv_template_matching_function
 def match_points_v15_chat(model_path: str):
-    if re.search(r"points", model_path, re.IGNORECASE):
+    if re.search(r"\bpoints\b", model_path, re.IGNORECASE):
         return "points-v15-chat"
 
 
