@@ -889,6 +889,7 @@ class Qwen2MoeDecoderLayer(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         alt_stream: Optional[torch.cuda.Stream] = None,
+        is_nextn: bool = False,
     ) -> None:
         super().__init__()
         self.config = config
@@ -1140,6 +1141,12 @@ class Qwen2MoeModel(nn.Module):
                     forward_batch.n_gram_input_ids.input_ids_gram3,
                     forward_batch.n_gram_input_ids.input_ids_gram4,
                 ]
+                if torch.cuda.current_device() == 0:
+                    print('='*100)
+                    print('target model forward')
+                    print(input_ids)
+                    print(input_ids_gram_n)
+                    print('='*100)
                 for g in range(1, max(self.oe_grams)):
                     input_ids_ngram_tmp = input_ids_ngram_tmp + input_ids_gram_n[
                         g - 1
@@ -1457,17 +1464,25 @@ class WeLMV4MoeForCausalLM(nn.Module):
                         logger.warning(f"Parameter {name} not found in params_dict")
         self.post_init_after_load_weights()
 
-    def post_init_after_load_weights(self):
-        torch.cuda.empty_cache()
-        free_gpu_memory, _ = torch.cuda.mem_get_info(torch.cuda.current_device())
-        print(f"{torch.cuda.current_device()} free_gpu_memory: {free_gpu_memory}")
+    def get_embed_and_head(self):
+        return [self.model.embed_tokens, self.model.oe_embed, self.model.oe_gate_up_proj], self.lm_head
 
+    def set_embed_and_head(self, embed, head):
+        self.model.embed_tokens = embed[0]
+        self.model.oe_embed = embed[1]
+        self.model.oe_gate_up_proj = embed[2]
+        self.lm_head = head
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+
+    def post_init_after_load_weights(self):
+        if self.__class__.__name__ == "WeLMV4MoeForCausalLMNextN":
+            return
         kv_mirror_layers = getattr(self.model.config, "kv_mirror_layers", [])
         kv_mirror_imitated_layers = getattr(
             self.model.config, "kv_mirror_imitated_layers", []
         )
 
-        release_mem = 0
         for mirror_layer_id in kv_mirror_layers:
             if mirror_layer_id >= len(self.model.layers):
                 continue
@@ -1517,10 +1532,6 @@ class WeLMV4MoeForCausalLM(nn.Module):
             del imitated_qkv_proj_weight
 
         torch.cuda.empty_cache()
-        free_gpu_memory, _ = torch.cuda.mem_get_info(torch.cuda.current_device())
-        print(
-            f"{torch.cuda.current_device()} free_gpu_memory: {free_gpu_memory}, release_mem: {release_mem}"
-        )
 
     @classmethod
     def get_model_config_for_expert_location(cls, config):

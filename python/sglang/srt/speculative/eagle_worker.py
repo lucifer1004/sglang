@@ -50,6 +50,7 @@ from sglang.srt.speculative.spec_utils import (
     generate_token_bitmask,
     load_token_map,
     select_top_k_tokens,
+    select_top_k_tokens_ngram,
 )
 from sglang.srt.utils import (
     MultiprocessingSerializer,
@@ -613,12 +614,18 @@ class EAGLEWorker(TpModelWorker):
         # Forward multiple steps
         scores = None
         for i in range(self.speculative_num_steps):
+            if torch.cuda.current_device() == 0:
+                print('='*100)
+                print('step ', i, ':')
             input_ids, hidden_states, scores, tree_info = select_top_k_tokens(
                 i, topk_p, topk_index, hidden_states, scores, self.topk
             )
             score_list.append(tree_info[0])
             token_list.append(tree_info[1])
             parents_list.append(tree_info[2])
+            select_top_k_tokens_ngram(
+                i, forward_batch, topk_index, self.topk, token_list, parents_list
+            )
 
             # We don't need to run the last forward. we get 1 token from draft prefill and (#spec steps - 1) tokens here
             if i == self.speculative_num_steps - 1:

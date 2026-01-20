@@ -39,6 +39,7 @@ from sglang.srt.speculative.spec_utils import (
     get_target_cache_loc,
 )
 from sglang.srt.utils import is_cuda, is_npu, next_power_of_2
+from sglang.srt.utils.over_encoding_utils import assign_ngram_input_ids_draft_extend, assign_ngram_buffer
 
 _is_npu = is_npu()
 
@@ -648,6 +649,14 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
                 (input_ids[1:], self.verified_id[i].reshape(1))
             )
             pt += extend_len
+        
+        if hasattr(batch, 'n_gram_input_ids'):
+            assign_ngram_input_ids_draft_extend(batch.input_ids, batch.n_gram_input_ids.input_ids_gram2, batch.extend_lens, 2)
+            assign_ngram_input_ids_draft_extend(batch.input_ids, batch.n_gram_input_ids.input_ids_gram3, batch.extend_lens, 3)
+            assign_ngram_input_ids_draft_extend(batch.input_ids, batch.n_gram_input_ids.input_ids_gram4, batch.extend_lens, 4)
+            buffer = torch.empty(batch.batch_size() * batch.n_gram_input_ids.buffer_size, device=batch.input_ids.device, dtype=batch.input_ids.dtype)
+            assign_ngram_buffer(batch.input_ids, buffer, batch.seq_lens, batch.n_gram_input_ids.buffer_size)
+            batch.n_gram_input_ids.input_ids_buffer = buffer
 
     @classmethod
     def create_idle_input(

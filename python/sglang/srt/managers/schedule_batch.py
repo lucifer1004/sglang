@@ -437,6 +437,25 @@ class NGramInputIds:
     input_ids_gram2: Optional[torch.Tensor] = None
     input_ids_gram3: Optional[torch.Tensor] = None
     input_ids_gram4: Optional[torch.Tensor] = None
+    input_ids_buffer: Optional[torch.Tensor] = None
+    buffer_size: int = 3
+
+    @staticmethod
+    def get_token_ids_gram_n(req_input_ids: List[int], n: int):
+        seq_len = len(req_input_ids)
+        result_id = [0] * seq_len
+        if seq_len <= n:
+            return result_id
+        else:
+            result_id[n:] = req_input_ids[:-n]
+            return result_id
+
+    def get_token_ids_buffer(self, req_input_ids: List[int]):
+        seq_len = len(req_input_ids)
+        result_id = [0] * self.buffer_size
+        start_idx = min(seq_len, self.buffer_size)
+        result_id[-start_idx:] = req_input_ids[-start_idx:]
+        return result_id
 
 class Req:
     """The input and output status of a request."""
@@ -1308,14 +1327,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             len(self.out_cache_loc) == self.extend_num_tokens
         ), f"Expected {len(self.out_cache_loc)}, got {self.extend_num_tokens}"
 
-    def _get_token_ids_gram_n(self, req_input_ids, n):
-        seq_len = len(req_input_ids)
-        result_id = [0] * seq_len
-        if seq_len <= n:
-            return result_id
-        else:
-            result_id[n:] = req_input_ids[:-n]
-            return result_id
+    # def _get_token_ids_gram_n(self, req_input_ids, n):
+    #     seq_len = len(req_input_ids)
+    #     result_id = [0] * seq_len
+    #     if seq_len <= n:
+    #         return result_id
+    #     else:
+    #         result_id[n:] = req_input_ids[:-n]
+    #         return result_id
 
     def prepare_for_extend(self):
         self.forward_mode = ForwardMode.EXTEND
@@ -1351,9 +1370,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         input_ids_gram4 = []
         for r in reqs:
             prefix_len = len(r.prefix_indices)
-            input_ids_gram2.append(self._get_token_ids_gram_n(r.fill_ids, 1)[prefix_len:])
-            input_ids_gram3.append(self._get_token_ids_gram_n(r.fill_ids, 2)[prefix_len:])
-            input_ids_gram4.append(self._get_token_ids_gram_n(r.fill_ids, 3)[prefix_len:])
+            input_ids_gram2.append(NGramInputIds.get_token_ids_gram_n(r.fill_ids, 1)[prefix_len:])
+            input_ids_gram3.append(NGramInputIds.get_token_ids_gram_n(r.fill_ids, 2)[prefix_len:])
+            input_ids_gram4.append(NGramInputIds.get_token_ids_gram_n(r.fill_ids, 3)[prefix_len:])
         
         self.n_gram_input_ids = NGramInputIds(
             input_ids_gram2=torch.tensor(sum(input_ids_gram2, []), dtype=torch.int64).to(
