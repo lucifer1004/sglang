@@ -94,24 +94,7 @@ class KVMirrorManager:
     Manager for kv mirror algorithm
     """
 
-    activations_dict_hs = dict()
     activations_dict_kv = dict()
-
-    @staticmethod
-    def set_hidden_states_activation(layer_number, kv_activation):
-        if layer_number not in KVMirrorManager.activations_dict_hs:
-            KVMirrorManager.activations_dict_hs[layer_number] = []
-        KVMirrorManager.activations_dict_hs[layer_number].append(kv_activation)
-
-    @staticmethod
-    def get_hidden_states_activation(layer_number, end_of_story=False):
-        assert layer_number in KVMirrorManager.activations_dict_hs
-        assert len(KVMirrorManager.activations_dict_hs[layer_number]) == 1
-        kv_activation = KVMirrorManager.activations_dict_hs[layer_number].pop()
-        if end_of_story:
-            for key in KVMirrorManager.activations_dict_hs.keys():
-                KVMirrorManager.activations_dict_hs[key].clear()
-        return kv_activation
 
     @staticmethod
     def set_kv_activation(layer_number, kv_activation):
@@ -120,9 +103,13 @@ class KVMirrorManager:
         KVMirrorManager.activations_dict_kv[layer_number].append(kv_activation)
 
     @staticmethod
-    def get_kv_activation(layer_number):
-        assert layer_number in KVMirrorManager.activations_dict_kv
-        assert len(KVMirrorManager.activations_dict_kv[layer_number]) == 1
+    def get_kv_activation(layer_number, clear=False):
+        assert (
+            layer_number in KVMirrorManager.activations_dict_kv
+        ), f"layer {layer_number} not in activations_dict_kv, only layers {KVMirrorManager.activations_dict_kv.keys()} are existing"
+        assert (
+            len(KVMirrorManager.activations_dict_kv[layer_number]) == 1
+        ), f"len of activations_dict_kv for layer {layer_number} is {len(KVMirrorManager.activations_dict_kv[layer_number])}"
         kv_activation = KVMirrorManager.activations_dict_kv[layer_number].pop()
         return kv_activation
 
@@ -205,6 +192,74 @@ def remove_all_references(obj: Any, verbose: bool = False) -> int:
         print(f"删除后剩余引用数: {remaining_refs}")
 
     return removed_count
+
+
+class LayerManager:
+    decoder_layer = dict()
+    num_nextn_predict_layers: int = 0
+    num_nextn_predict_layer_idx: List[int] = []
+
+    @staticmethod
+    def set_decoder_layer(layer_idx, decoder_layer):
+        LayerManager.decoder_layer[layer_idx] = decoder_layer
+
+    @staticmethod
+    def post_init(kv_mirror_layers, kv_mirror_imitated_layers):
+        LayerManager.num_nextn_predict_layer_idx = kv_mirror_layers[
+            : LayerManager.num_nextn_predict_layers
+        ]
+        for mirror_layer_id in kv_mirror_layers:
+            if mirror_layer_id >= len(LayerManager.decoder_layer):
+                continue
+            imitated_layer_id = kv_mirror_imitated_layers[
+                kv_mirror_layers.index(mirror_layer_id)
+            ]
+            mirror_layer_attn = LayerManager.decoder_layer[mirror_layer_id].self_attn
+            imitated_layer_attn = LayerManager.decoder_layer[
+                imitated_layer_id
+            ].self_attn
+
+            mirror_qkv_proj_weight = mirror_layer_attn.qkv_proj.weight
+            mirror_qkv_proj_bias = getattr(mirror_layer_attn.qkv_proj, "bias", None)
+            imitated_qkv_proj_weight = imitated_layer_attn.qkv_proj.weight
+            imitated_qkv_proj_bias = getattr(imitated_layer_attn.qkv_proj, "bias", None)
+            assert (mirror_qkv_proj_bias is not None) == (
+                imitated_qkv_proj_bias is not None
+            )
+
+            mirror_layer_attn.qkv_proj_weight = mirror_qkv_proj_weight[
+                : mirror_layer_attn.q_size, :
+            ].clone()
+            imitated_layer_attn.qkv_proj_weight = torch.concat(
+                [
+                    imitated_qkv_proj_weight,
+                    mirror_qkv_proj_weight[mirror_layer_attn.q_size :, :],
+                ],
+                dim=0,
+            )
+            if mirror_qkv_proj_bias is not None:
+                mirror_layer_attn.qkv_proj_bias = mirror_qkv_proj_bias[
+                    : mirror_layer_attn.q_size
+                ].clone()
+                imitated_layer_attn.qkv_proj_bias = torch.concat(
+                    [
+                        imitated_qkv_proj_bias,
+                        mirror_qkv_proj_bias[mirror_layer_attn.q_size :],
+                    ],
+                    dim=0,
+                )
+            else:
+                imitated_layer_attn.qkv_proj_bias = None
+                mirror_layer_attn.qkv_proj_bias = None
+
+            # if mirror_layer_id not in LayerManager.num_nextn_predict_layer_idx:
+            #     remove_all_references(mirror_layer_attn.qkv_proj)
+            #     remove_all_references(mirror_qkv_proj_weight)
+            #     remove_all_references(mirror_qkv_proj_bias)
+            #     remove_all_references(imitated_layer_attn.qkv_proj)
+            #     remove_all_references(imitated_qkv_proj_weight)
+            #     remove_all_references(imitated_qkv_proj_bias)
+        torch.cuda.empty_cache()
 
 
 class Qwen2MoeMLP(nn.Module):
@@ -619,6 +674,7 @@ class Qwen2MoeAttention(nn.Module):
         layer_idx: Optional[int] = None,
         o_norm=False,
         total_layer_num: int = 1,
+        is_nextn: bool = False,
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
@@ -740,6 +796,11 @@ class Qwen2MoeAttention(nn.Module):
                 bias=False,
             )
         self.attn.is_kv_mirror = self.layer_idx in self.kv_mirror_layers
+        self.need_clear_kv_cache = self.layer_idx == len(LayerManager.decoder_layer)
+        self.kv_mirror_layer_idx = (
+            layer_idx if not is_nextn else layer_idx + len(LayerManager.decoder_layer)
+        )
+        self.is_nextn = is_nextn
 
     def forward(
         self,
@@ -750,7 +811,7 @@ class Qwen2MoeAttention(nn.Module):
         hidden_states_ori = hidden_states
         # qkv, _ = self.qkv_proj(hidden_states)
 
-        if self.layer_idx in self.kv_mirror_imitated_layers:
+        if self.kv_mirror_layer_idx in self.kv_mirror_imitated_layers:
             if hasattr(self, "qkv_proj_weight"):
                 qkv = F.linear(hidden_states, self.qkv_proj_weight, self.qkv_proj_bias)
                 q, k, v, mirror_k, mirror_v = qkv.split(
@@ -763,36 +824,36 @@ class Qwen2MoeAttention(nn.Module):
                     ],
                     dim=-1,
                 )
-                KVMirrorManager.set_kv_activation(self.layer_idx, (mirror_k, mirror_v))
+                KVMirrorManager.set_kv_activation(
+                    self.kv_mirror_layer_idx, (mirror_k, mirror_v)
+                )
             else:
                 qkv, _ = self.qkv_proj(hidden_states)
                 q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-            KVMirrorManager.set_hidden_states_activation(
-                self.layer_idx, hidden_states_ori
-            )
-        elif self.layer_idx in self.kv_mirror_layers:
-            mirror_layer_number = self.kv_mirror_imitated_layers[
-                self.kv_mirror_layers.index(self.layer_idx)
-            ]
-            if self.layer_idx == self.total_layer_num - 1:
-                hidden_states_ori = KVMirrorManager.get_hidden_states_activation(
-                    mirror_layer_number, end_of_story=True
-                )
-            else:
-                hidden_states_ori = KVMirrorManager.get_hidden_states_activation(
-                    mirror_layer_number, end_of_story=False
-                )
+        elif self.kv_mirror_layer_idx in self.kv_mirror_layers:
             if (
-                forward_batch.enable_kv_mirror
-                and forward_batch.forward_mode.is_extend()
-                and not hasattr(forward_batch, "custom_last_index")
+                self.kv_mirror_layer_idx in LayerManager.num_nextn_predict_layer_idx
+                and not forward_batch.forward_mode.is_extend_without_speculative()
             ):
-                forward_batch.custom_last_index = (
-                    torch.cumsum(forward_batch.extend_seq_lens, dim=0) - 1
+                qkv, _ = self.qkv_proj(hidden_states)
+                q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+            else:
+                mirror_layer_number = self.kv_mirror_imitated_layers[
+                    self.kv_mirror_layers.index(self.kv_mirror_layer_idx)
+                ]
+                if (
+                    forward_batch.enable_kv_mirror
+                    and forward_batch.forward_mode.is_extend_without_speculative()
+                    and not hasattr(forward_batch, "custom_last_index")
+                ):
+                    forward_batch.custom_last_index = (
+                        torch.cumsum(forward_batch.extend_seq_lens, dim=0) - 1
+                    )
+                    hidden_states = hidden_states[forward_batch.custom_last_index]
+                k, v = KVMirrorManager.get_kv_activation(
+                    mirror_layer_number, clear=self.need_clear_kv_cache
                 )
-                hidden_states = hidden_states[forward_batch.custom_last_index]
-            k, v = KVMirrorManager.get_kv_activation(mirror_layer_number)
-            q = F.linear(hidden_states, self.qkv_proj_weight, self.qkv_proj_bias)
+                q = F.linear(hidden_states, self.qkv_proj_weight, self.qkv_proj_bias)
         else:
             qkv, _ = self.qkv_proj(hidden_states)
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
@@ -827,8 +888,8 @@ class Qwen2MoeAttention(nn.Module):
             )
             if (
                 forward_batch.enable_kv_mirror
-                and forward_batch.forward_mode.is_extend()
-                and self.layer_idx in self.kv_mirror_layers
+                and forward_batch.forward_mode.is_extend_without_speculative()
+                and self.kv_mirror_layer_idx in self.kv_mirror_layers
             ):
                 q_pe_proxy = torch.empty(
                     (k_pe.shape[0],) + q_pe.shape[1:],
@@ -953,6 +1014,10 @@ class Qwen2MoeDecoderLayer(nn.Module):
             layer_idx=layer_id,
             o_norm=o_norm and layer_id not in self.prenorm_layer_idx,
             total_layer_num=total_layer_num,
+            is_nextn=is_nextn,
+        )
+        LayerManager.num_nextn_predict_layers = getattr(
+            config, "num_nextn_predict_layers", 0
         )
         self.layer_id = layer_id
 
@@ -996,6 +1061,7 @@ class Qwen2MoeDecoderLayer(nn.Module):
             post_attention_layernorm=self.post_attention_layernorm,
             allow_reduce_scatter=True,
         )
+        LayerManager.set_decoder_layer(self.self_attn.kv_mirror_layer_idx, self)
 
     def forward(
         self,
@@ -1026,7 +1092,7 @@ class Qwen2MoeDecoderLayer(nn.Module):
         # )
         if (
             forward_batch.enable_kv_mirror
-            and forward_batch.forward_mode.is_extend()
+            and forward_batch.forward_mode.is_extend_without_speculative()
             and self.layer_id == self.kv_mirror_layers[-1]
         ):
             residual = residual[forward_batch.custom_last_index]
@@ -1142,11 +1208,11 @@ class Qwen2MoeModel(nn.Module):
                     forward_batch.n_gram_input_ids.input_ids_gram4,
                 ]
                 if torch.cuda.current_device() == 0:
-                    print('='*100)
-                    print('target model forward')
+                    print("=" * 100)
+                    print("target model forward")
                     print(input_ids)
                     print(input_ids_gram_n)
-                    print('='*100)
+                    print("=" * 100)
                 for g in range(1, max(self.oe_grams)):
                     input_ids_ngram_tmp = input_ids_ngram_tmp + input_ids_gram_n[
                         g - 1
@@ -1329,11 +1395,7 @@ class WeLMV4MoeForCausalLM(nn.Module):
                 num_nextn_layers = self.config.num_nextn_predict_layers
                 assert num_nextn_layers == 1, "Only 1 nextn layer is supported"
                 # compatible with old design
-                nextn_layer_id = (
-                    0
-                    if self.config.num_hidden_layers == 1
-                    else self.config.num_hidden_layers
-                )
+                nextn_layer_id = 48  # hard code for welmv4, fix it later @kavioyu
             else:
                 raise ValueError("num_nextn_predict_layers is not in the config")
 
@@ -1376,7 +1438,6 @@ class WeLMV4MoeForCausalLM(nn.Module):
             else:
                 if not name.startswith(nextn_layer_prefix):
                     continue
-
                 # Use shared head and embed weights from target model
                 if "shared_head.head" in name or "embed_tokens" in name:
                     continue
@@ -1462,10 +1523,15 @@ class WeLMV4MoeForCausalLM(nn.Module):
                         weight_loader(param, loaded_weight)
                     else:
                         logger.warning(f"Parameter {name} not found in params_dict")
-        self.post_init_after_load_weights()
+        if is_nextn or get_global_server_args().speculative_algorithm is None:
+            self.post_init_after_load_weights()
 
     def get_embed_and_head(self):
-        return [self.model.embed_tokens, self.model.oe_embed, self.model.oe_gate_up_proj], self.lm_head
+        return [
+            self.model.embed_tokens,
+            self.model.oe_embed,
+            self.model.oe_gate_up_proj,
+        ], self.lm_head
 
     def set_embed_and_head(self, embed, head):
         self.model.embed_tokens = embed[0]
@@ -1476,62 +1542,11 @@ class WeLMV4MoeForCausalLM(nn.Module):
         torch.cuda.synchronize()
 
     def post_init_after_load_weights(self):
-        if self.__class__.__name__ == "WeLMV4MoeForCausalLMNextN":
-            return
         kv_mirror_layers = getattr(self.model.config, "kv_mirror_layers", [])
         kv_mirror_imitated_layers = getattr(
             self.model.config, "kv_mirror_imitated_layers", []
         )
-
-        for mirror_layer_id in kv_mirror_layers:
-            if mirror_layer_id >= len(self.model.layers):
-                continue
-            imitated_layer_id = kv_mirror_imitated_layers[
-                kv_mirror_layers.index(mirror_layer_id)
-            ]
-            mirror_layer_attn = self.model.layers[mirror_layer_id].self_attn
-            imitated_layer_attn = self.model.layers[imitated_layer_id].self_attn
-
-            mirror_qkv_proj_weight = mirror_layer_attn.qkv_proj.weight
-            mirror_qkv_proj_bias = mirror_layer_attn.qkv_proj.bias
-            imitated_qkv_proj_weight = imitated_layer_attn.qkv_proj.weight
-            imitated_qkv_proj_bias = imitated_layer_attn.qkv_proj.bias
-            assert (mirror_qkv_proj_bias is not None) == (
-                imitated_qkv_proj_bias is not None
-            )
-
-            mirror_layer_attn.qkv_proj_weight = mirror_qkv_proj_weight[
-                : mirror_layer_attn.q_size, :
-            ].clone()
-            imitated_layer_attn.qkv_proj_weight = torch.concat(
-                [
-                    imitated_qkv_proj_weight,
-                    mirror_qkv_proj_weight[mirror_layer_attn.q_size :, :],
-                ],
-                dim=0,
-            )
-            if mirror_qkv_proj_bias is not None:
-                mirror_layer_attn.qkv_proj_bias = mirror_qkv_proj_bias[
-                    : mirror_layer_attn.q_size
-                ].clone()
-                imitated_layer_attn.qkv_proj_bias = torch.concat(
-                    [
-                        imitated_qkv_proj_bias,
-                        mirror_qkv_proj_bias[mirror_layer_attn.q_size :],
-                    ],
-                    dim=0,
-                )
-            else:
-                imitated_layer_attn.qkv_proj_bias = None
-                mirror_layer_attn.qkv_proj_bias = None
-            remove_all_references(mirror_layer_attn.qkv_proj)
-            remove_all_references(imitated_layer_attn.qkv_proj)
-            remove_all_references(mirror_qkv_proj_weight)
-            remove_all_references(imitated_qkv_proj_weight)
-            del mirror_qkv_proj_weight
-            del imitated_qkv_proj_weight
-
-        torch.cuda.empty_cache()
+        LayerManager.post_init(kv_mirror_layers, kv_mirror_imitated_layers)
 
     @classmethod
     def get_model_config_for_expert_location(cls, config):

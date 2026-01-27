@@ -1,4 +1,5 @@
 """Inference-only WeLMV4 NextN Speculative Decoding."""
+
 import logging
 from typing import Iterable, Optional, Tuple
 
@@ -8,28 +9,19 @@ from transformers import PretrainedConfig
 
 from sglang.srt.distributed import get_pp_group, get_tensor_model_parallel_world_size
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
-
-from sglang.srt.layers.dp_attention import (
-    is_dp_attention_enabled,
-)
 from sglang.srt.layers.layernorm import RMSNorm
-from sglang.srt.layers.logits_processor import LogitsProcessor
-from sglang.srt.layers.quantization import Fp8Config
-from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.layers.vocab_parallel_embedding import (
-    ParallelLMHead,
-    VocabParallelEmbedding,
-)
 from sglang.srt.layers.linear import ReplicatedLinear
+from sglang.srt.layers.logits_processor import LogitsProcessor
+from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.models.welmv4 import (
     Qwen2MoeDecoderLayer,
     WeLMV4MoeForCausalLM,
-    KVMirrorManager,
-    hash_input_ids_vectorized
+    hash_input_ids_vectorized,
 )
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import BumpAllocator, add_prefix, is_cuda, is_npu
+from sglang.srt.utils import add_prefix, is_cuda, is_npu
 
 logger = logging.getLogger(__name__)
 
@@ -46,7 +38,7 @@ class WeLMV4ModelNextN(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
-        moe_quant_config = None
+        self.config = config
         self.vocab_size = config.vocab_size
 
         self.embed_tokens = None
@@ -89,7 +81,7 @@ class WeLMV4ModelNextN(nn.Module):
 
         self.decoder = Qwen2MoeDecoderLayer(
             config,
-            0,
+            0,  # hard encoding, should fixed later @kavioyu
             quant_config=quant_config,
             is_nextn=True,
             prefix=add_prefix(layer_name, prefix),
@@ -99,7 +91,6 @@ class WeLMV4ModelNextN(nn.Module):
         self.shared_head = nn.Module()
         self.shared_head.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
-
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -108,12 +99,11 @@ class WeLMV4ModelNextN(nn.Module):
         input_embeds: torch.Tensor = None,
     ) -> torch.Tensor:
 
-
         if input_embeds is None:
             hidden_states = self.embed_tokens(input_ids)
         else:
             hidden_states = input_embeds
-            
+
         if len(self.oe_grams) > 0:
             input_ids_ngram = []
             input_ids_ngram_tmp = input_ids
@@ -123,24 +113,20 @@ class WeLMV4ModelNextN(nn.Module):
                 forward_batch.n_gram_input_ids.input_ids_gram4,
             ]
             if torch.cuda.current_device() == 0:
-                print('='*50)
-                print('draft model forward run')
+                print("=" * 50)
+                print("draft model forward run")
                 print(input_ids)
                 print(input_ids_gram_n)
-                print('='*50)
+                print("=" * 50)
             for g in range(1, max(self.oe_grams)):
-                input_ids_ngram_tmp = input_ids_ngram_tmp + input_ids_gram_n[
-                    g - 1
-                ] * (self.vocab_size**g)
-                input_ids_ngram.append(
-                    hash_input_ids_vectorized(input_ids_ngram_tmp)
+                input_ids_ngram_tmp = input_ids_ngram_tmp + input_ids_gram_n[g - 1] * (
+                    self.vocab_size**g
                 )
+                input_ids_ngram.append(hash_input_ids_vectorized(input_ids_ngram_tmp))
 
             emb_ngram = []
             for i, vs in enumerate(self.oe_vocab_sizes):
-                input_ids_ngram_hashed_tmp = (
-                    input_ids_ngram[self.oe_grams[i] - 2] % vs
-                )
+                input_ids_ngram_hashed_tmp = input_ids_ngram[self.oe_grams[i] - 2] % vs
                 emb_ngram_tmp = self.oe_embed[i](input_ids_ngram_hashed_tmp)
                 emb_ngram.append(emb_ngram_tmp)
             emb_new, _ = self.oe_gate_up_proj(torch.cat(emb_ngram, dim=-1))
@@ -148,13 +134,13 @@ class WeLMV4ModelNextN(nn.Module):
 
         if (
             forward_batch.enable_kv_mirror
-            and forward_batch.forward_mode.is_extend()
+            and forward_batch.forward_mode.is_extend_without_speculative()
         ):
             forward_batch.custom_last_index = (
                 torch.cumsum(forward_batch.extend_seq_lens, dim=0) - 1
             )
             hidden_states = hidden_states[forward_batch.custom_last_index]
-            
+
         if hidden_states.shape[0] > 0:
             hidden_states = self.eh_proj(
                 torch.cat(
