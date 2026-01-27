@@ -505,7 +505,7 @@ class HunYuanModel(nn.Module):
             [
                 HunYuanDecoderLayer(
                     config=config,
-                    layer_id=layer_id,
+                    layer_id=self.layer_id,
                     quant_config=quant_config,
                     # prefix=prefix
                 )
