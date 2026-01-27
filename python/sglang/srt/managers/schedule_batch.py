@@ -438,6 +438,7 @@ class NGramInputIds:
     input_ids_gram3: Optional[torch.Tensor] = None
     input_ids_gram4: Optional[torch.Tensor] = None
 
+
 class Req:
     """The input and output status of a request."""
 
@@ -459,6 +460,7 @@ class Req:
         session_id: Optional[str] = None,
         custom_logit_processor: Optional[str] = None,
         return_hidden_states: bool = False,
+        return_routed_experts: bool = False,
         eos_token_ids: Optional[Set[int]] = None,
         bootstrap_host: Optional[str] = None,
         bootstrap_port: Optional[int] = None,
@@ -512,6 +514,7 @@ class Req:
         self.sampling_params = sampling_params
         self.custom_logit_processor = custom_logit_processor
         self.return_hidden_states = return_hidden_states
+        self.return_routed_experts = return_routed_experts
 
         # extra key for classifying the request (e.g. cache_salt)
         if lora_id is not None:
@@ -637,6 +640,8 @@ class Req:
         self.hidden_states_tensor = None  # Note: use tensor instead of list to transfer hidden_states when PD + MTP
         self.output_topk_p = None
         self.output_topk_index = None
+
+        self.routed_experts: List[List[List[int]]] = []
 
         # Embedding (return values)
         self.embedding = None
@@ -1171,12 +1176,15 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # Whether to return hidden states
     return_hidden_states: bool = False
 
+    # Whether to return routed experts
+    return_routed_experts: bool = False
+
     # Whether this batch is prefill-only (no token generation needed)
     is_prefill_only: bool = False
 
     # hicache pointer for synchronizing data loading from CPU to GPU
     hicache_consumer_index: int = -1
-    
+
     n_gram_input_ids: Optional[NGramInputIds] = None
 
     # Diffusion LLM
@@ -1220,6 +1228,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             device=req_to_token_pool.device,
             spec_algorithm=spec_algorithm,
             return_hidden_states=any(req.return_hidden_states for req in reqs),
+            return_routed_experts=any(req.return_routed_experts for req in reqs),
             is_prefill_only=all(req.is_prefill_only for req in reqs),
             chunked_req=chunked_req,
             dllm_config=dllm_config,
@@ -1345,28 +1354,34 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         input_ids_tensor = torch.tensor(
             list(chain.from_iterable(input_ids)), dtype=torch.int64
         ).to(self.device, non_blocking=True)
-        
+
         input_ids_gram2 = []
         input_ids_gram3 = []
         input_ids_gram4 = []
         for r in reqs:
             prefix_len = len(r.prefix_indices)
-            input_ids_gram2.append(self._get_token_ids_gram_n(r.fill_ids, 1)[prefix_len:])
-            input_ids_gram3.append(self._get_token_ids_gram_n(r.fill_ids, 2)[prefix_len:])
-            input_ids_gram4.append(self._get_token_ids_gram_n(r.fill_ids, 3)[prefix_len:])
-        
+            input_ids_gram2.append(
+                self._get_token_ids_gram_n(r.fill_ids, 1)[prefix_len:]
+            )
+            input_ids_gram3.append(
+                self._get_token_ids_gram_n(r.fill_ids, 2)[prefix_len:]
+            )
+            input_ids_gram4.append(
+                self._get_token_ids_gram_n(r.fill_ids, 3)[prefix_len:]
+            )
+
         self.n_gram_input_ids = NGramInputIds(
-            input_ids_gram2=torch.tensor(sum(input_ids_gram2, []), dtype=torch.int64).to(
-                self.device, non_blocking=True
-            ),
-            input_ids_gram3=torch.tensor(sum(input_ids_gram3, []), dtype=torch.int64).to(
-                self.device, non_blocking=True
-            ),
-            input_ids_gram4=torch.tensor(sum(input_ids_gram4, []), dtype=torch.int64).to(
-                self.device, non_blocking=True
-            ),
+            input_ids_gram2=torch.tensor(
+                sum(input_ids_gram2, []), dtype=torch.int64
+            ).to(self.device, non_blocking=True),
+            input_ids_gram3=torch.tensor(
+                sum(input_ids_gram3, []), dtype=torch.int64
+            ).to(self.device, non_blocking=True),
+            input_ids_gram4=torch.tensor(
+                sum(input_ids_gram4, []), dtype=torch.int64
+            ).to(self.device, non_blocking=True),
         )
-        
+
         seq_lens_tensor = torch.tensor(seq_lens, dtype=torch.int64).to(
             self.device, non_blocking=True
         )
@@ -1775,7 +1790,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # Update fields
         self.input_ids = self.output_ids
         self.output_ids = None
-        
+
         input_ids_gram2 = []
         input_ids_gram3 = []
         input_ids_gram4 = []
@@ -1786,9 +1801,15 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             input_ids_gram4.append(ids[-4] if len(ids) > 3 else 0)
 
         self.n_gram_input_ids = NGramInputIds(
-            input_ids_gram2=torch.tensor(input_ids_gram2, dtype=torch.int64).to(self.device, non_blocking=True),
-            input_ids_gram3=torch.tensor(input_ids_gram3, dtype=torch.int64).to(self.device, non_blocking=True),
-            input_ids_gram4=torch.tensor(input_ids_gram4, dtype=torch.int64).to(self.device, non_blocking=True),
+            input_ids_gram2=torch.tensor(input_ids_gram2, dtype=torch.int64).to(
+                self.device, non_blocking=True
+            ),
+            input_ids_gram3=torch.tensor(input_ids_gram3, dtype=torch.int64).to(
+                self.device, non_blocking=True
+            ),
+            input_ids_gram4=torch.tensor(input_ids_gram4, dtype=torch.int64).to(
+                self.device, non_blocking=True
+            ),
         )
 
         if self.model_config.is_encoder_decoder:
@@ -2044,7 +2065,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     def __str__(self):
         return (
             f"ScheduleBatch(forward_mode={self.forward_mode.name if self.forward_mode else 'None'}, "
-            f"#req={(len(self.reqs))})"
+            f"#req={(len(self.reqs))}), " + f"#out_cache_loc={self.out_cache_loc})"
         )
 
 
@@ -2131,6 +2152,6 @@ class ModelWorkerBatch:
     # FIXME(lsyin): remove this after fully overlap grammar
     reqs: Optional[List[Req]] = None
     has_grammar: bool = False
-    
+
     # Over Encoding
     n_gram_input_ids: Optional[NGramInputIds] = None

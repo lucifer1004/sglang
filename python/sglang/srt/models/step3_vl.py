@@ -127,6 +127,7 @@ class Step3TextMoEMLP(nn.Module):
 
         self.topk = TopK(
             top_k=config.moe_top_k,
+            layer_id=self.layer_id,
             renormalize=config.norm_expert_weight,
             use_grouped_topk=False,
         )

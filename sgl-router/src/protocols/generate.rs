@@ -62,6 +62,10 @@ pub struct GenerateRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub return_logprob: Option<bool>,
 
+    /// Whether to return routed experts
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub return_routed_experts: Option<bool>,
+
     /// If return logprobs, the start location in the prompt for returning logprobs.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub logprob_start_len: Option<i32>,
