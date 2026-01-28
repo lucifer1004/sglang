@@ -112,12 +112,6 @@ class WeLMV4ModelNextN(nn.Module):
                 forward_batch.n_gram_input_ids.input_ids_gram3,
                 forward_batch.n_gram_input_ids.input_ids_gram4,
             ]
-            if torch.cuda.current_device() == 0:
-                print("=" * 50)
-                print("draft model forward run")
-                print(input_ids)
-                print(input_ids_gram_n)
-                print("=" * 50)
             for g in range(1, max(self.oe_grams)):
                 input_ids_ngram_tmp = input_ids_ngram_tmp + input_ids_gram_n[g - 1] * (
                     self.vocab_size**g

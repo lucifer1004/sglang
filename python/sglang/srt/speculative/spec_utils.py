@@ -4,7 +4,7 @@ import logging
 import os
 import time
 from contextlib import contextmanager
-from typing import TYPE_CHECKING, List, Tuple
+from typing import TYPE_CHECKING, List
 
 import torch
 import triton
@@ -19,9 +19,12 @@ from sglang.srt.distributed.parallel_state import (
 from sglang.srt.environ import envs
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import Req
-from sglang.srt.utils import is_cuda, is_hip, is_npu, next_power_of_2
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.utils.over_encoding_utils import assign_ngram_input_ids_draft_decode_first_token, build_ngram_with_tree
+from sglang.srt.utils import is_cuda, is_hip, is_npu, next_power_of_2
+from sglang.srt.utils.over_encoding_utils import (
+    assign_ngram_input_ids_draft_decode_first_token,
+    build_ngram_with_tree,
+)
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
@@ -505,7 +508,7 @@ def select_top_k_tokens(
     return input_ids, hidden_states, scores, tree_info
 
 
-#@torch.compile(dynamic=True, disable=_is_npu)
+# @torch.compile(dynamic=True, disable=_is_npu)
 def select_top_k_tokens_ngram(
     i: int,
     forward_batch: ForwardBatch,
@@ -517,31 +520,73 @@ def select_top_k_tokens_ngram(
     n_gram_input_ids = forward_batch.n_gram_input_ids
     seq_lens = forward_batch.seq_lens
     bs = topk_index.numel()
-    if torch.cuda.current_device() == 0:
-        print('tree info:')
-        print(token_list)
-        print(parents_list)
-        print()
-        print('--------------------------------')
-    if i==0:
+    if i == 0:
         n_gram2 = torch.empty((bs), device=seq_lens.device, dtype=torch.int64)
         n_gram3 = torch.empty((bs), device=seq_lens.device, dtype=torch.int64)
         n_gram4 = torch.empty((bs), device=seq_lens.device, dtype=torch.int64)
-        assign_ngram_input_ids_draft_decode_first_token(n_gram_input_ids.input_ids_buffer, n_gram2, seq_lens, 2, topk, n_gram_input_ids.buffer_size)
-        assign_ngram_input_ids_draft_decode_first_token(n_gram_input_ids.input_ids_buffer, n_gram3, seq_lens, 3, topk, n_gram_input_ids.buffer_size)
-        assign_ngram_input_ids_draft_decode_first_token(n_gram_input_ids.input_ids_buffer, n_gram4, seq_lens, 4, topk, n_gram_input_ids.buffer_size)
+        assign_ngram_input_ids_draft_decode_first_token(
+            n_gram_input_ids.input_ids_buffer,
+            n_gram2,
+            seq_lens,
+            2,
+            topk,
+            n_gram_input_ids.buffer_size,
+        )
+        assign_ngram_input_ids_draft_decode_first_token(
+            n_gram_input_ids.input_ids_buffer,
+            n_gram3,
+            seq_lens,
+            3,
+            topk,
+            n_gram_input_ids.buffer_size,
+        )
+        assign_ngram_input_ids_draft_decode_first_token(
+            n_gram_input_ids.input_ids_buffer,
+            n_gram4,
+            seq_lens,
+            4,
+            topk,
+            n_gram_input_ids.buffer_size,
+        )
         forward_batch.n_gram_input_ids.input_ids_gram2 = n_gram2
         forward_batch.n_gram_input_ids.input_ids_gram3 = n_gram3
         forward_batch.n_gram_input_ids.input_ids_gram4 = n_gram4
     else:
         parent_tensor = torch.cat(parents_list, dim=1)
         token_tensor = torch.cat(token_list, dim=1)
-        build_ngram_with_tree(n_gram_input_ids.input_ids_gram2, parent_tensor, token_tensor, parents_list[-1],
-                              n_gram_input_ids.input_ids_buffer, n_gram_input_ids.buffer_size, 2, topk, i)
-        build_ngram_with_tree(n_gram_input_ids.input_ids_gram3, parent_tensor, token_tensor, parents_list[-1],
-                              n_gram_input_ids.input_ids_buffer, n_gram_input_ids.buffer_size, 3, topk, i)
-        build_ngram_with_tree(n_gram_input_ids.input_ids_gram4, parent_tensor, token_tensor, parents_list[-1],
-                              n_gram_input_ids.input_ids_buffer, n_gram_input_ids.buffer_size, 4, topk, i)
+        build_ngram_with_tree(
+            n_gram_input_ids.input_ids_gram2,
+            parent_tensor,
+            token_tensor,
+            parents_list[-1],
+            n_gram_input_ids.input_ids_buffer,
+            n_gram_input_ids.buffer_size,
+            2,
+            topk,
+            i,
+        )
+        build_ngram_with_tree(
+            n_gram_input_ids.input_ids_gram3,
+            parent_tensor,
+            token_tensor,
+            parents_list[-1],
+            n_gram_input_ids.input_ids_buffer,
+            n_gram_input_ids.buffer_size,
+            3,
+            topk,
+            i,
+        )
+        build_ngram_with_tree(
+            n_gram_input_ids.input_ids_gram4,
+            parent_tensor,
+            token_tensor,
+            parents_list[-1],
+            n_gram_input_ids.input_ids_buffer,
+            n_gram_input_ids.buffer_size,
+            4,
+            topk,
+            i,
+        )
 
 
 def generate_simulated_accept_index(

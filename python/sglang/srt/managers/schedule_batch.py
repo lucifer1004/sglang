@@ -85,6 +85,7 @@ from sglang.srt.server_args import ServerArgs, get_global_server_args
 from sglang.srt.utils import flatten_nested_list
 from sglang.srt.utils.common import is_npu
 from sglang.srt.utils.cuda_ipc_transport_utils import CudaIpcTensorTransportProxy
+from sglang.srt.utils.over_encoding_utils import filter_buffer
 
 _is_npu = is_npu()
 
@@ -1922,6 +1923,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 new_indices=keep_indices_device,
                 has_been_filtered=has_been_filtered,
             )
+        if self.n_gram_input_ids and self.n_gram_input_ids.input_ids_buffer is not None:
+            self.n_gram_input_ids.input_ids_buffer = filter_buffer(
+                self.n_gram_input_ids.input_ids_buffer,
+                keep_indices_device,
+                self.n_gram_input_ids.buffer_size,
+            )
 
     def merge_batch(self, other: "ScheduleBatch"):
         # NOTE: in v2 eagle mode, we do not need wait verify here because
@@ -1967,6 +1974,18 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         if self.spec_info:
             self.spec_info.merge_batch(other.spec_info)
+        if (
+            self.n_gram_input_ids
+            and other.n_gram_input_ids
+            and self.n_gram_input_ids.input_ids_buffer is not None
+            and other.n_gram_input_ids.input_ids_buffer is not None
+        ):
+            self.n_gram_input_ids.input_ids_buffer = torch.cat(
+                [
+                    self.n_gram_input_ids.input_ids_buffer,
+                    other.n_gram_input_ids.input_ids_buffer,
+                ]
+            )
 
     def get_model_worker_batch(
         self, seq_lens_cpu_cache: Optional[torch.Tensor] = None

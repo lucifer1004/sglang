@@ -98,19 +98,17 @@ class KVMirrorManager:
 
     @staticmethod
     def set_kv_activation(layer_number, kv_activation):
-        if layer_number not in KVMirrorManager.activations_dict_kv:
-            KVMirrorManager.activations_dict_kv[layer_number] = []
-        KVMirrorManager.activations_dict_kv[layer_number].append(kv_activation)
+        KVMirrorManager.activations_dict_kv[layer_number] = kv_activation
 
     @staticmethod
     def get_kv_activation(layer_number, clear=False):
         assert (
             layer_number in KVMirrorManager.activations_dict_kv
         ), f"layer {layer_number} not in activations_dict_kv, only layers {KVMirrorManager.activations_dict_kv.keys()} are existing"
-        assert (
-            len(KVMirrorManager.activations_dict_kv[layer_number]) == 1
-        ), f"len of activations_dict_kv for layer {layer_number} is {len(KVMirrorManager.activations_dict_kv[layer_number])}"
-        kv_activation = KVMirrorManager.activations_dict_kv[layer_number].pop()
+        kv_activation = KVMirrorManager.activations_dict_kv.pop(layer_number)
+        # have bug @kavioyu
+        # if clear:
+        #     KVMirrorManager.activations_dict_kv.clear()
         return kv_activation
 
 
@@ -1207,12 +1205,6 @@ class Qwen2MoeModel(nn.Module):
                     forward_batch.n_gram_input_ids.input_ids_gram3,
                     forward_batch.n_gram_input_ids.input_ids_gram4,
                 ]
-                if torch.cuda.current_device() == 0:
-                    print("=" * 100)
-                    print("target model forward")
-                    print(input_ids)
-                    print(input_ids_gram_n)
-                    print("=" * 100)
                 for g in range(1, max(self.oe_grams)):
                     input_ids_ngram_tmp = input_ids_ngram_tmp + input_ids_gram_n[
                         g - 1

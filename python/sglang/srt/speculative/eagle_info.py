@@ -768,8 +768,6 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
         self.accept_length.add_(1)
         self.positions = torch.empty_like(batch.input_ids, dtype=torch.long)
         self.verified_id = torch.empty_like(self.accept_length, dtype=torch.int32)
-        if torch.cuda.current_device() == 0:
-            print("accept length: ", self.accept_length)
 
         create_extend_after_decode_spec_info[(len(batch.seq_lens),)](
             batch.input_ids,

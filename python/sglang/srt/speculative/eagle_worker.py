@@ -614,9 +614,6 @@ class EAGLEWorker(TpModelWorker):
         # Forward multiple steps
         scores = None
         for i in range(self.speculative_num_steps):
-            if torch.cuda.current_device() == 0:
-                print('='*100)
-                print('step ', i, ':')
             input_ids, hidden_states, scores, tree_info = select_top_k_tokens(
                 i, topk_p, topk_index, hidden_states, scores, self.topk
             )

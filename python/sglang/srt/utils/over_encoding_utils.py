@@ -313,6 +313,7 @@ def build_ngram_with_target_verify(
     )
 
 
+# will also update the buffer if update_buffer is True
 def assign_ngram_input_ids_draft_extend_after_decode(
     input_ids: torch.Tensor,
     buffer: torch.Tensor,
@@ -335,3 +336,36 @@ def assign_ngram_input_ids_draft_extend_after_decode(
         grid=(bs, 1, 1),
         block=(32, 1, 1),
     )
+
+
+@triton.jit
+def assign_buffer_kernel(
+    buffer: torch.Tensor,
+    new_buffer: torch.Tensor,
+    keep_indices: torch.Tensor,
+    buffer_size: tl.constexpr,
+    buffer_block: tl.constexpr,
+):
+    bid = tl.program_id(0)
+    offset = tl.load(keep_indices + bid)
+    buffer_offset = tl.arange(0, buffer_block)
+    data = tl.load(
+        buffer + offset * buffer_size + buffer_offset, buffer_offset < buffer_size
+    )
+    tl.store(
+        new_buffer + bid * buffer_size + buffer_offset,
+        data,
+        buffer_offset < buffer_size,
+    )
+
+
+def filter_buffer(buffer: torch.Tensor, keep_indices: torch.Tensor, buffer_size: int):
+    size = keep_indices.numel()
+    new_buffer = torch.empty(
+        (size * buffer_size), device=buffer.device, dtype=buffer.dtype
+    )
+    buffer_block = triton.next_power_of_2(buffer_size)
+    assign_buffer_kernel[(size,)](
+        buffer, new_buffer, keep_indices, buffer_size, buffer_block
+    )
+    return new_buffer
