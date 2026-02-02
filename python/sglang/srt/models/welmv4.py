@@ -106,9 +106,8 @@ class KVMirrorManager:
             layer_number in KVMirrorManager.activations_dict_kv
         ), f"layer {layer_number} not in activations_dict_kv, only layers {KVMirrorManager.activations_dict_kv.keys()} are existing"
         kv_activation = KVMirrorManager.activations_dict_kv.pop(layer_number)
-        # have bug @kavioyu
-        # if clear:
-        #     KVMirrorManager.activations_dict_kv.clear()
+        if clear:
+            KVMirrorManager.activations_dict_kv.clear()
         return kv_activation
 
 
@@ -195,6 +194,7 @@ def remove_all_references(obj: Any, verbose: bool = False) -> int:
 class LayerManager:
     decoder_layer = dict()
     num_nextn_predict_layers: int = 0
+    num_target_layers: int = 0
     num_nextn_predict_layer_idx: List[int] = []
 
     @staticmethod
@@ -202,10 +202,10 @@ class LayerManager:
         LayerManager.decoder_layer[layer_idx] = decoder_layer
 
     @staticmethod
-    def post_init(kv_mirror_layers, kv_mirror_imitated_layers):
-        LayerManager.num_nextn_predict_layer_idx = kv_mirror_layers[
-            : LayerManager.num_nextn_predict_layers
-        ]
+    def post_init(kv_mirror_layers, kv_mirror_imitated_layers, is_nextn=False):
+
+        if is_nextn:
+            LayerManager.num_nextn_predict_layer_idx = kv_mirror_layers
         for mirror_layer_id in kv_mirror_layers:
             if mirror_layer_id >= len(LayerManager.decoder_layer):
                 continue
@@ -794,10 +794,17 @@ class Qwen2MoeAttention(nn.Module):
                 bias=False,
             )
         self.attn.is_kv_mirror = self.layer_idx in self.kv_mirror_layers
-        self.need_clear_kv_cache = self.layer_idx == len(LayerManager.decoder_layer)
         self.kv_mirror_layer_idx = (
             layer_idx if not is_nextn else layer_idx + len(LayerManager.decoder_layer)
         )
+        if get_global_server_args().speculative_algorithm is not None:
+            self.need_clear_kv_cache = (
+                self.layer_idx == LayerManager.num_nextn_predict_layers - 1
+            )
+        else:
+            self.need_clear_kv_cache = (
+                self.layer_idx == LayerManager.num_target_layers - 1
+            )
         self.is_nextn = is_nextn
 
     def forward(
@@ -806,9 +813,6 @@ class Qwen2MoeAttention(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        hidden_states_ori = hidden_states
-        # qkv, _ = self.qkv_proj(hidden_states)
-
         if self.kv_mirror_layer_idx in self.kv_mirror_imitated_layers:
             if hasattr(self, "qkv_proj_weight"):
                 qkv = F.linear(hidden_states, self.qkv_proj_weight, self.qkv_proj_bias)
@@ -1157,6 +1161,7 @@ class Qwen2MoeModel(nn.Module):
 
         # Use the provided decoder layer type or default to Qwen2MoeDecoderLayer
         decoder_layer_type = decoder_layer_type or Qwen2MoeDecoderLayer
+        LayerManager.num_target_layers = config.num_hidden_layers
         self.layers, self.start_layer, self.end_layer = make_layers(
             config.num_hidden_layers,
             lambda idx, prefix: decoder_layer_type(
@@ -1515,8 +1520,7 @@ class WeLMV4MoeForCausalLM(nn.Module):
                         weight_loader(param, loaded_weight)
                     else:
                         logger.warning(f"Parameter {name} not found in params_dict")
-        if is_nextn or get_global_server_args().speculative_algorithm is None:
-            self.post_init_after_load_weights()
+        self.post_init_after_load_weights(is_nextn=is_nextn)
 
     def get_embed_and_head(self):
         return [
@@ -1533,12 +1537,32 @@ class WeLMV4MoeForCausalLM(nn.Module):
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
 
-    def post_init_after_load_weights(self):
-        kv_mirror_layers = getattr(self.model.config, "kv_mirror_layers", [])
-        kv_mirror_imitated_layers = getattr(
+    def post_init_after_load_weights(self, is_nextn=False):
+        total_kv_mirror_layers = getattr(self.model.config, "kv_mirror_layers", [])
+        total_kv_mirror_imitated_layers = getattr(
             self.model.config, "kv_mirror_imitated_layers", []
         )
-        LayerManager.post_init(kv_mirror_layers, kv_mirror_imitated_layers)
+        if is_nextn:
+            kv_mirror_layer_ids = [self.model.decoder.self_attn.kv_mirror_layer_idx]
+            kv_mirror_imitated_layers = total_kv_mirror_imitated_layers[
+                : len(kv_mirror_layer_ids)
+            ]
+        else:
+            kv_mirror_layer_ids = [
+                decoder_layer.self_attn.kv_mirror_layer_idx
+                for decoder_layer in self.model.layers
+            ]
+            kv_mirror_layer_ids = [
+                layer_id
+                for layer_id in total_kv_mirror_layers
+                if layer_id in kv_mirror_layer_ids
+            ]  # keep the order of total_kv_mirror_layers
+            kv_mirror_imitated_layers = total_kv_mirror_imitated_layers[
+                -len(kv_mirror_layer_ids) :
+            ]
+        LayerManager.post_init(
+            kv_mirror_layer_ids, kv_mirror_imitated_layers, is_nextn=is_nextn
+        )
 
     @classmethod
     def get_model_config_for_expert_location(cls, config):

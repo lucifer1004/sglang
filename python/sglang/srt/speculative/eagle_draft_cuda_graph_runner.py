@@ -33,6 +33,8 @@ from sglang.srt.utils import (
 if TYPE_CHECKING:
     from sglang.srt.speculative.eagle_worker import EAGLEWorker
 
+from sglang.srt.managers.schedule_batch import NGramInputIds
+
 
 class EAGLEDraftCudaGraphRunner:
     def __init__(self, eagle_worker: EAGLEWorker):
@@ -104,7 +106,23 @@ class EAGLEDraftCudaGraphRunner:
                 (self.max_bs, self.model_runner.model_config.hidden_size),
                 dtype=self.model_runner.dtype,
             )
-
+            if self.model_runner.server_args.enable_over_encoding:
+                self.ngram_input_ids = NGramInputIds(
+                    input_ids_gram2=torch.zeros(
+                        (self.max_num_token,), dtype=torch.int64
+                    ),
+                    input_ids_gram3=torch.zeros(
+                        (self.max_num_token,), dtype=torch.int64
+                    ),
+                    input_ids_gram4=torch.zeros(
+                        (self.max_num_token,), dtype=torch.int64
+                    ),
+                    input_ids_buffer=torch.zeros(
+                        (self.max_bs * NGramInputIds.buffer_size), dtype=torch.int64
+                    ),
+                )
+            else:
+                self.ngram_input_ids = None
             if self.require_gathered_buffer:
                 if self.require_mlp_tp_gather:
                     self.global_num_tokens_gpu = torch.zeros(
@@ -192,6 +210,21 @@ class EAGLEDraftCudaGraphRunner:
         hidden_states = self.hidden_states[:num_seqs]
         topk_p = self.topk_p[:num_seqs]
         topk_index = self.topk_index[:num_seqs]
+        if self.ngram_input_ids is not None:
+            buffer = self.ngram_input_ids.input_ids_buffer[
+                : num_seqs * self.ngram_input_ids.buffer_size
+            ]
+            gram2 = self.ngram_input_ids.input_ids_gram2[:num_tokens]
+            gram3 = self.ngram_input_ids.input_ids_gram3[:num_tokens]
+            gram4 = self.ngram_input_ids.input_ids_gram4[:num_tokens]
+            current_ngram_input_ids = NGramInputIds(
+                input_ids_gram2=gram2,
+                input_ids_gram3=gram3,
+                input_ids_gram4=gram4,
+                input_ids_buffer=buffer,
+            )
+        else:
+            current_ngram_input_ids = None
 
         if self.require_mlp_tp_gather:
             self.global_num_tokens_gpu.copy_(
@@ -267,6 +300,7 @@ class EAGLEDraftCudaGraphRunner:
             capture_hidden_mode=(
                 spec_info.capture_hidden_mode if spec_info else CaptureHiddenMode.NULL
             ),
+            n_gram_input_ids=current_ngram_input_ids,
         )
 
         # Attention backend
@@ -348,6 +382,19 @@ class EAGLEDraftCudaGraphRunner:
         self.topk_index[:raw_bs].copy_(forward_batch.spec_info.topk_index)
         self.hidden_states[:raw_bs].copy_(forward_batch.spec_info.hidden_states)
         self.req_pool_indices[:raw_bs].copy_(forward_batch.req_pool_indices)
+        if self.ngram_input_ids is not None:
+            self.ngram_input_ids.input_ids_buffer[
+                : raw_bs * NGramInputIds.buffer_size
+            ].copy_(forward_batch.n_gram_input_ids.input_ids_buffer)
+            self.ngram_input_ids.input_ids_gram2[:raw_num_token].copy_(
+                forward_batch.n_gram_input_ids.input_ids_gram2
+            )
+            self.ngram_input_ids.input_ids_gram3[:raw_num_token].copy_(
+                forward_batch.n_gram_input_ids.input_ids_gram3
+            )
+            self.ngram_input_ids.input_ids_gram4[:raw_num_token].copy_(
+                forward_batch.n_gram_input_ids.input_ids_gram4
+            )
 
         # TODO(ch-wan): support num_token_non_padded
         if self.require_gathered_buffer:

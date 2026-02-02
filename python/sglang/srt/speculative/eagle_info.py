@@ -3,6 +3,7 @@ from copy import copy
 from dataclasses import dataclass
 from typing import ClassVar, List, Optional, Tuple
 
+import prc_custom_ops
 import torch
 import torch.nn.functional as F
 
@@ -42,8 +43,7 @@ from sglang.srt.utils import is_cuda, is_npu, next_power_of_2
 from sglang.srt.utils.over_encoding_utils import (
     assign_ngram_buffer,
     assign_ngram_input_ids_draft_extend,
-    assign_ngram_input_ids_draft_extend_after_decode,
-    build_ngram_with_target_verify,
+    filter_buffer,
 )
 
 _is_npu = is_npu()
@@ -157,7 +157,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             gram2 = torch.empty_like(self.draft_token)
             gram3 = torch.empty_like(self.draft_token)
             gram4 = torch.empty_like(self.draft_token)
-            build_ngram_with_target_verify(
+            prc_custom_ops.build_ngram_with_target_verify(
                 gram2,
                 batch.n_gram_input_ids.input_ids_buffer,
                 self.draft_token,
@@ -168,7 +168,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 self.draft_token_num,
                 batch.n_gram_input_ids.buffer_size,
             )
-            build_ngram_with_target_verify(
+            prc_custom_ops.build_ngram_with_target_verify(
                 gram3,
                 batch.n_gram_input_ids.input_ids_buffer,
                 self.draft_token,
@@ -179,7 +179,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 self.draft_token_num,
                 batch.n_gram_input_ids.buffer_size,
             )
-            build_ngram_with_target_verify(
+            prc_custom_ops.build_ngram_with_target_verify(
                 gram4,
                 batch.n_gram_input_ids.input_ids_buffer,
                 self.draft_token,
@@ -444,7 +444,6 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             req.spec_accepted_tokens += (
                 sum(1 for idx in accept_index_row if idx != -1) - 1
             )
-
         if has_finished:
             accept_length = (accept_index != -1).sum(dim=1) - 1
 
@@ -600,6 +599,15 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                         accept_length_filter,
                         next_power_of_2(bs),
                         next_power_of_2(self.draft_token_num),
+                    )
+                if (
+                    batch.n_gram_input_ids is not None
+                    and batch.n_gram_input_ids.input_ids_buffer is not None
+                ):
+                    batch.n_gram_input_ids.input_ids_buffer = filter_buffer(
+                        batch.n_gram_input_ids.input_ids_buffer,
+                        unfinished_index_device,
+                        batch.n_gram_input_ids.buffer_size,
                     )
 
                 draft_input = EagleDraftInput(
@@ -784,14 +792,15 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
         n_gram2 = torch.empty_like(batch.input_ids, dtype=torch.int64)
         n_gram3 = torch.empty_like(batch.input_ids, dtype=torch.int64)
         n_gram4 = torch.empty_like(batch.input_ids, dtype=torch.int64)
-        assign_ngram_input_ids_draft_extend_after_decode(
-            batch.input_ids, buffer, n_gram2, self.accept_length, 2, buffer_size, False
+        accept_length = self.accept_length.to(torch.int32)
+        prc_custom_ops.assign_ngram_input_ids_draft_extend_after_decode(
+            batch.input_ids, buffer, n_gram2, accept_length, 2, buffer_size, False
         )
-        assign_ngram_input_ids_draft_extend_after_decode(
-            batch.input_ids, buffer, n_gram3, self.accept_length, 3, buffer_size, False
+        prc_custom_ops.assign_ngram_input_ids_draft_extend_after_decode(
+            batch.input_ids, buffer, n_gram3, accept_length, 3, buffer_size, False
         )
-        assign_ngram_input_ids_draft_extend_after_decode(
-            batch.input_ids, buffer, n_gram4, self.accept_length, 4, buffer_size, True
+        prc_custom_ops.assign_ngram_input_ids_draft_extend_after_decode(
+            batch.input_ids, buffer, n_gram4, accept_length, 4, buffer_size, True
         )
         batch.n_gram_input_ids.input_ids_gram2 = n_gram2
         batch.n_gram_input_ids.input_ids_gram3 = n_gram3

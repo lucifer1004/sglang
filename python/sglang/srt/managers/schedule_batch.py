@@ -85,7 +85,6 @@ from sglang.srt.server_args import ServerArgs, get_global_server_args
 from sglang.srt.utils import flatten_nested_list
 from sglang.srt.utils.common import is_npu
 from sglang.srt.utils.cuda_ipc_transport_utils import CudaIpcTensorTransportProxy
-from sglang.srt.utils.over_encoding_utils import filter_buffer
 
 _is_npu = is_npu()
 
@@ -1922,12 +1921,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.spec_info.filter_batch(
                 new_indices=keep_indices_device,
                 has_been_filtered=has_been_filtered,
-            )
-        if self.n_gram_input_ids and self.n_gram_input_ids.input_ids_buffer is not None:
-            self.n_gram_input_ids.input_ids_buffer = filter_buffer(
-                self.n_gram_input_ids.input_ids_buffer,
-                keep_indices_device,
-                self.n_gram_input_ids.buffer_size,
             )
 
     def merge_batch(self, other: "ScheduleBatch"):

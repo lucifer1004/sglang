@@ -6,6 +6,7 @@ import time
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, List
 
+import prc_custom_ops
 import torch
 import triton
 import triton.language as tl
@@ -23,7 +24,6 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.utils import is_cuda, is_hip, is_npu, next_power_of_2
 from sglang.srt.utils.over_encoding_utils import (
     assign_ngram_input_ids_draft_decode_first_token,
-    build_ngram_with_tree,
 )
 
 _is_cuda = is_cuda()
@@ -519,14 +519,10 @@ def select_top_k_tokens_ngram(
 ):
     n_gram_input_ids = forward_batch.n_gram_input_ids
     seq_lens = forward_batch.seq_lens
-    bs = topk_index.numel()
     if i == 0:
-        n_gram2 = torch.empty((bs), device=seq_lens.device, dtype=torch.int64)
-        n_gram3 = torch.empty((bs), device=seq_lens.device, dtype=torch.int64)
-        n_gram4 = torch.empty((bs), device=seq_lens.device, dtype=torch.int64)
         assign_ngram_input_ids_draft_decode_first_token(
             n_gram_input_ids.input_ids_buffer,
-            n_gram2,
+            n_gram_input_ids.input_ids_gram2,
             seq_lens,
             2,
             topk,
@@ -534,7 +530,7 @@ def select_top_k_tokens_ngram(
         )
         assign_ngram_input_ids_draft_decode_first_token(
             n_gram_input_ids.input_ids_buffer,
-            n_gram3,
+            n_gram_input_ids.input_ids_gram3,
             seq_lens,
             3,
             topk,
@@ -542,19 +538,16 @@ def select_top_k_tokens_ngram(
         )
         assign_ngram_input_ids_draft_decode_first_token(
             n_gram_input_ids.input_ids_buffer,
-            n_gram4,
+            n_gram_input_ids.input_ids_gram4,
             seq_lens,
             4,
             topk,
             n_gram_input_ids.buffer_size,
         )
-        forward_batch.n_gram_input_ids.input_ids_gram2 = n_gram2
-        forward_batch.n_gram_input_ids.input_ids_gram3 = n_gram3
-        forward_batch.n_gram_input_ids.input_ids_gram4 = n_gram4
     else:
         parent_tensor = torch.cat(parents_list, dim=1)
         token_tensor = torch.cat(token_list, dim=1)
-        build_ngram_with_tree(
+        prc_custom_ops.build_ngram_with_tree(
             n_gram_input_ids.input_ids_gram2,
             parent_tensor,
             token_tensor,
@@ -565,7 +558,7 @@ def select_top_k_tokens_ngram(
             topk,
             i,
         )
-        build_ngram_with_tree(
+        prc_custom_ops.build_ngram_with_tree(
             n_gram_input_ids.input_ids_gram3,
             parent_tensor,
             token_tensor,
@@ -576,7 +569,7 @@ def select_top_k_tokens_ngram(
             topk,
             i,
         )
-        build_ngram_with_tree(
+        prc_custom_ops.build_ngram_with_tree(
             n_gram_input_ids.input_ids_gram4,
             parent_tensor,
             token_tensor,
