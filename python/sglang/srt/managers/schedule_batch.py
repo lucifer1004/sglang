@@ -85,6 +85,7 @@ from sglang.srt.server_args import ServerArgs, get_global_server_args
 from sglang.srt.utils import flatten_nested_list
 from sglang.srt.utils.common import is_npu
 from sglang.srt.utils.cuda_ipc_transport_utils import CudaIpcTensorTransportProxy
+from sglang.srt.utils.over_encoding_utils import filter_buffer
 
 _is_npu = is_npu()
 
@@ -439,6 +440,7 @@ class NGramInputIds:
     input_ids_gram4: Optional[torch.Tensor] = None
     input_ids_buffer: Optional[torch.Tensor] = None
     buffer_size: int = 4
+    filtered: bool = False
 
     @staticmethod
     def get_token_ids_gram_n(req_input_ids: List[int], n: int):
@@ -456,6 +458,16 @@ class NGramInputIds:
         start_idx = min(seq_len, self.buffer_size)
         result_id[-start_idx:] = req_input_ids[-start_idx:]
         return result_id
+
+    def filter_buffer(self, unfinished_index_device: torch.Tensor):
+        if self.input_ids_buffer is not None and not self.filtered:
+            self.input_ids_buffer = filter_buffer(
+                self.input_ids_buffer, unfinished_index_device, self.buffer_size
+            )
+            self.filtered = True
+
+    def start_new_step(self):
+        self.filtered = False
 
 
 class Req:
@@ -1922,6 +1934,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 new_indices=keep_indices_device,
                 has_been_filtered=has_been_filtered,
             )
+        if self.n_gram_input_ids:
+            self.n_gram_input_ids.filter_buffer(keep_indices_device)
 
     def merge_batch(self, other: "ScheduleBatch"):
         # NOTE: in v2 eagle mode, we do not need wait verify here because

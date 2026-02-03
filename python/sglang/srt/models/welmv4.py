@@ -1390,9 +1390,7 @@ class WeLMV4MoeForCausalLM(nn.Module):
         if is_nextn:
             if hasattr(self.config, "num_nextn_predict_layers"):
                 num_nextn_layers = self.config.num_nextn_predict_layers
-                assert num_nextn_layers == 1, "Only 1 nextn layer is supported"
-                # compatible with old design
-                nextn_layer_id = 48  # hard code for welmv4, fix it later @kavioyu
+                num_target_layers = LayerManager.num_target_layers
             else:
                 raise ValueError("num_nextn_predict_layers is not in the config")
 
@@ -1414,13 +1412,17 @@ class WeLMV4MoeForCausalLM(nn.Module):
 
         params_dict = dict(self.named_parameters())
         if is_nextn:
-            nextn_layer_prefix = f"model.layers.{nextn_layer_id}"
+            # nextn_layer_prefix = f"model.layers.{nextn_layer_id}"
+            next_layer_prefixes = [
+                f"model.layers.{i+num_target_layers}" for i in range(num_nextn_layers)
+            ]
             nextn_spec_weight_names = [
                 "shared_head.norm",
                 "eh_proj",
                 "enorm",
                 "hnorm",
             ]
+
         for name, loaded_weight in weights:
             if not is_nextn:
                 if hasattr(self.config, "num_nextn_predict_layers"):
@@ -1433,8 +1435,17 @@ class WeLMV4MoeForCausalLM(nn.Module):
                         ):
                             continue
             else:
-                if not name.startswith(nextn_layer_prefix):
+                flag = False
+                matched_prefix = None
+                for next_layer_prefix in next_layer_prefixes:
+                    if name.startswith(next_layer_prefix):
+                        flag = True
+                        matched_prefix = next_layer_prefix
+                        break
+                if not flag:
                     continue
+                # if not name.startswith(nextn_layer_prefix):
+                #     continue
                 # Use shared head and embed weights from target model
                 if "shared_head.head" in name or "embed_tokens" in name:
                     continue
@@ -1443,13 +1454,16 @@ class WeLMV4MoeForCausalLM(nn.Module):
                 # For nextn specific weights
                 for weight_name in nextn_spec_weight_names:
                     if weight_name in name:
-                        name = name.replace(nextn_layer_prefix, "model")
+                        name = name.replace(matched_prefix, "model")
                         is_decoder = False
                         break
                 # For decoder layer weights
                 if is_decoder:
-                    name = name.replace(nextn_layer_prefix, "model.decoder")
-
+                    weight_suffix = int(next_layer_prefix.split(".")[-1])
+                    name = name.replace(
+                        matched_prefix,
+                        f"model.decoder_layers.{weight_suffix-num_target_layers}",
+                    )
             layer_id = get_layer_id(name)
             if (
                 layer_id is not None
@@ -1543,7 +1557,10 @@ class WeLMV4MoeForCausalLM(nn.Module):
             self.model.config, "kv_mirror_imitated_layers", []
         )
         if is_nextn:
-            kv_mirror_layer_ids = [self.model.decoder.self_attn.kv_mirror_layer_idx]
+            kv_mirror_layer_ids = [
+                decoder.self_attn.kv_mirror_layer_idx
+                for decoder in self.model.decoder_layers
+            ]
             kv_mirror_imitated_layers = total_kv_mirror_imitated_layers[
                 : len(kv_mirror_layer_ids)
             ]

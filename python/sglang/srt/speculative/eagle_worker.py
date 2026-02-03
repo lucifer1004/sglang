@@ -269,6 +269,8 @@ class EAGLEWorker(TpModelWorker):
             A tuple of the final logit output of the target model, next tokens accepted,
             the batch id (used for overlap schedule), and number of accepted tokens.
         """
+        if batch.n_gram_input_ids:
+            batch.n_gram_input_ids.start_new_step()
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
             logits_output, next_token_ids, seq_lens_cpu = self.forward_target_extend(
                 batch
@@ -293,7 +295,6 @@ class EAGLEWorker(TpModelWorker):
             logits_output, verify_output, model_worker_batch, can_run_cuda_graph = (
                 self.verify(batch, spec_info)
             )
-
             with self.draft_tp_context(
                 self.draft_model_runner.tp_group
             ), speculative_moe_backend_context():
@@ -305,7 +306,6 @@ class EAGLEWorker(TpModelWorker):
                 ):
                     # decode is not finished
                     self.forward_draft_extend_after_decode(batch)
-            print(verify_output.accept_length_per_req_cpu, flush=True)
 
             return GenerationBatchResult(
                 logits_output=logits_output,
@@ -740,7 +740,6 @@ class EAGLEWorker(TpModelWorker):
             self.page_size,
             vocab_mask,
         )
-
         # Post process based on verified outputs.
         # Pick indices that we care (accepted)
         logits_output.next_token_logits = logits_output.next_token_logits[

@@ -43,7 +43,6 @@ from sglang.srt.utils import is_cuda, is_npu, next_power_of_2
 from sglang.srt.utils.over_encoding_utils import (
     assign_ngram_buffer,
     assign_ngram_input_ids_draft_extend,
-    filter_buffer,
 )
 
 _is_npu = is_npu()
@@ -600,15 +599,8 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                         next_power_of_2(bs),
                         next_power_of_2(self.draft_token_num),
                     )
-                if (
-                    batch.n_gram_input_ids is not None
-                    and batch.n_gram_input_ids.input_ids_buffer is not None
-                ):
-                    batch.n_gram_input_ids.input_ids_buffer = filter_buffer(
-                        batch.n_gram_input_ids.input_ids_buffer,
-                        unfinished_index_device,
-                        batch.n_gram_input_ids.buffer_size,
-                    )
+                if batch.n_gram_input_ids:
+                    batch.n_gram_input_ids.filter_buffer(unfinished_index_device)
 
                 draft_input = EagleDraftInput(
                     hidden_states=batch.spec_info.hidden_states[

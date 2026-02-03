@@ -79,13 +79,18 @@ class WeLMV4ModelNextN(nn.Module):
         ):
             layer_name = "layers." + str(config.num_hidden_layers)
 
-        self.decoder = Qwen2MoeDecoderLayer(
-            config,
-            0,  # hard encoding, should fixed later @kavioyu
-            quant_config=quant_config,
-            is_nextn=True,
-            prefix=add_prefix(layer_name, prefix),
-            alt_stream=self.alt_stream,
+        self.decoder_layers = nn.ModuleList(
+            [
+                Qwen2MoeDecoderLayer(
+                    config,
+                    i,
+                    quant_config=quant_config,
+                    is_nextn=True,
+                    prefix=add_prefix(layer_name, prefix),
+                    alt_stream=self.alt_stream,
+                )
+                for i in range(config.num_nextn_predict_layers)
+            ]
         )
 
         self.shared_head = nn.Module()
@@ -148,12 +153,13 @@ class WeLMV4ModelNextN(nn.Module):
 
         residual = None
         with get_global_expert_distribution_recorder().disable_this_region():
-            hidden_states, residual = self.decoder(
-                positions,
-                hidden_states,
-                forward_batch,
-                residual,
-            )
+            for layer in self.decoder_layers:
+                hidden_states, residual = layer(
+                    positions,
+                    hidden_states,
+                    forward_batch,
+                    residual,
+                )
 
         if not forward_batch.forward_mode.is_idle():
             if residual is not None:
