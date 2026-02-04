@@ -633,9 +633,10 @@ class EAGLEWorker(TpModelWorker):
             score_list.append(tree_info[0])
             token_list.append(tree_info[1])
             parents_list.append(tree_info[2])
-            select_top_k_tokens_ngram(
-                i, forward_batch, topk_index, self.topk, token_list, parents_list
-            )
+            if forward_batch.n_gram_input_ids is not None:
+                select_top_k_tokens_ngram(
+                    i, forward_batch, topk_index, self.topk, token_list, parents_list
+                )
 
             # We don't need to run the last forward. we get 1 token from draft prefill and (#spec steps - 1) tokens here
             if i == self.speculative_num_steps - 1:

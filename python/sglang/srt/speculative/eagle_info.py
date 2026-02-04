@@ -779,24 +779,25 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
         )
 
         batch.input_ids = batch.input_ids.to(torch.int64)
-        buffer = batch.n_gram_input_ids.input_ids_buffer
-        buffer_size = batch.n_gram_input_ids.buffer_size
-        n_gram2 = torch.empty_like(batch.input_ids, dtype=torch.int64)
-        n_gram3 = torch.empty_like(batch.input_ids, dtype=torch.int64)
-        n_gram4 = torch.empty_like(batch.input_ids, dtype=torch.int64)
-        accept_length = self.accept_length.to(torch.int32)
-        prc_custom_ops.assign_ngram_input_ids_draft_extend_after_decode(
-            batch.input_ids, buffer, n_gram2, accept_length, 2, buffer_size, False
-        )
-        prc_custom_ops.assign_ngram_input_ids_draft_extend_after_decode(
-            batch.input_ids, buffer, n_gram3, accept_length, 3, buffer_size, False
-        )
-        prc_custom_ops.assign_ngram_input_ids_draft_extend_after_decode(
-            batch.input_ids, buffer, n_gram4, accept_length, 4, buffer_size, True
-        )
-        batch.n_gram_input_ids.input_ids_gram2 = n_gram2
-        batch.n_gram_input_ids.input_ids_gram3 = n_gram3
-        batch.n_gram_input_ids.input_ids_gram4 = n_gram4
+        if batch.n_gram_input_ids is not None:
+            buffer = batch.n_gram_input_ids.input_ids_buffer
+            buffer_size = batch.n_gram_input_ids.buffer_size
+            n_gram2 = torch.empty_like(batch.input_ids, dtype=torch.int64)
+            n_gram3 = torch.empty_like(batch.input_ids, dtype=torch.int64)
+            n_gram4 = torch.empty_like(batch.input_ids, dtype=torch.int64)
+            accept_length = self.accept_length.to(torch.int32)
+            prc_custom_ops.assign_ngram_input_ids_draft_extend_after_decode(
+                batch.input_ids, buffer, n_gram2, accept_length, 2, buffer_size, False
+            )
+            prc_custom_ops.assign_ngram_input_ids_draft_extend_after_decode(
+                batch.input_ids, buffer, n_gram3, accept_length, 3, buffer_size, False
+            )
+            prc_custom_ops.assign_ngram_input_ids_draft_extend_after_decode(
+                batch.input_ids, buffer, n_gram4, accept_length, 4, buffer_size, True
+            )
+            batch.n_gram_input_ids.input_ids_gram2 = n_gram2
+            batch.n_gram_input_ids.input_ids_gram3 = n_gram3
+            batch.n_gram_input_ids.input_ids_gram4 = n_gram4
 
     def generate_attn_arg_prefill(
         self,

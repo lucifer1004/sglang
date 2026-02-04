@@ -188,13 +188,6 @@ class WeLMV4MoeForCausalLMNextN(WeLMV4MoeForCausalLM):
             config, quant_config, prefix=add_prefix("model", prefix)
         )
         self.lm_head = None
-        # self.lm_head = ParallelLMHead(
-        #     config.vocab_size,
-        #     config.hidden_size,
-        #     quant_config=quant_config,
-        #     prefix=add_prefix("model.shared_head.head", prefix),
-        #     use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
-        # )
         self.logits_processor = LogitsProcessor(config)
 
     @torch.no_grad()
