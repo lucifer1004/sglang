@@ -616,6 +616,10 @@ def get_rope(
         elif scaling_type == "yarn":
             scaling_factor = rope_scaling["factor"]
             original_max_position = rope_scaling["original_max_position_embeddings"]
+            if max_position != int(original_max_position * scaling_factor):
+                raise ValueError(
+                    f"max_position ({max_position}) != original_max_position ({original_max_position}) * scaling_factor ({scaling_factor})"
+                )
             extra_kwargs = {
                 k: v
                 for k, v in rope_scaling.items()
@@ -671,6 +675,8 @@ class Qwen2MoeAttention(nn.Module):
         prefix: str = "",
         kv_mirror_layers=[],
         kv_mirror_imitated_layers=[],
+        sliding_window_size_layerwise=[],
+        enable_attn_sink_layerwise=[],
         layer_idx: Optional[int] = None,
         o_norm=False,
         total_layer_num: int = 1,
@@ -726,6 +732,32 @@ class Qwen2MoeAttention(nn.Module):
             self.kv_mirror_imitated_layers,
             flush=True,
         )
+        if len(sliding_window_size_layerwise) > layer_idx:
+            self.sliding_window_size = sliding_window_size_layerwise[layer_idx]
+        else:
+            self.sliding_window_size = -1
+        print(
+            "self.layer_idx:{}".format(layer_idx),
+            "self.sliding_window_size:",
+            self.sliding_window_size,
+            flush=True,
+        )
+        if len(enable_attn_sink_layerwise) > layer_idx:
+            self.enable_attention_sink = enable_attn_sink_layerwise[layer_idx]
+        else:
+            self.enable_attention_sink = False
+        print(
+            "self.layer_idx:{}".format(layer_idx),
+            "self.enable_attention_sink:",
+            self.enable_attention_sink,
+            flush=True,
+        )
+        if self.enable_attention_sink == True:
+            self.attn_sink = nn.Parameter(
+                torch.empty(self.num_heads), requires_grad=False
+            )
+        else:
+            self.attn_sink = None
         self.use_o_norm = o_norm
         self.total_layer_num = total_layer_num
 
@@ -787,6 +819,7 @@ class Qwen2MoeAttention(nn.Module):
             layer_id=layer_id,
             quant_config=quant_config,
             prefix=add_prefix("attn", prefix),
+            sliding_window_size=self.sliding_window_size,
         )
         self.gated_self_attention_headwise = True
         if self.gated_self_attention_headwise:
@@ -929,7 +962,7 @@ class Qwen2MoeAttention(nn.Module):
             k = k.view(k_shape)
         else:
             q, k = self.rotary_emb(positions, q, k)
-        attn_output = self.attn(q, k, v, forward_batch)
+        attn_output = self.attn(q, k, v, forward_batch, sinks=self.attn_sink)
         if self.gated_self_attention_headwise:
             attn_shape = attn_output.shape
             gate = self.gate_proj(hidden_states)[0].unsqueeze(
@@ -983,6 +1016,12 @@ class Qwen2MoeDecoderLayer(nn.Module):
         self.kv_mirror_imitated_layers = getattr(
             config, "kv_mirror_imitated_layers", []
         )
+        self.sliding_window_size_layerwise = getattr(
+            config, "sliding_window_size_layerwise", []
+        )
+        self.enable_attn_sink_layerwise = getattr(
+            config, "enable_attn_sink_layerwise", []
+        )
         self.ppln = getattr(config, "ppln", False)
         o_norm = getattr(config, "o_norm", False)
         self.prenorm_layer_idx = getattr(config, "prenorm_layer_idx", [])
@@ -1015,6 +1054,8 @@ class Qwen2MoeDecoderLayer(nn.Module):
             prefix=add_prefix("self_attn", prefix),
             kv_mirror_layers=self.kv_mirror_layers,
             kv_mirror_imitated_layers=self.kv_mirror_imitated_layers,
+            sliding_window_size_layerwise=self.sliding_window_size_layerwise,
+            enable_attn_sink_layerwise=self.enable_attn_sink_layerwise,
             layer_idx=layer_id,
             o_norm=o_norm and layer_id not in self.prenorm_layer_idx,
             total_layer_num=total_layer_num,
@@ -1530,10 +1571,16 @@ class WeLMV4MoeForCausalLM(nn.Module):
 
                     if name in params_dict.keys():
                         param = params_dict[name]
-                        weight_loader = getattr(
-                            param, "weight_loader", default_weight_loader
-                        )
-                        weight_loader(param, loaded_weight)
+                        if "attn_sink" in name:
+                            start = get_attention_tp_rank() * param.numel()
+                            param.data.copy_(
+                                loaded_weight[start : start + param.numel()]
+                            )
+                        else:
+                            weight_loader = getattr(
+                                param, "weight_loader", default_weight_loader
+                            )
+                            weight_loader(param, loaded_weight)
                     else:
                         logger.warning(f"Parameter {name} not found in params_dict")
         self.post_init_after_load_weights(is_nextn=is_nextn)
