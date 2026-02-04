@@ -12,7 +12,7 @@ def assign_ngram_input_ids_kernel(
     gram_n: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     GRAM_BLOCK_SIZE: tl.constexpr,
-    extend_len,
+    extend_len: torch.Tensor,
 ):
     data_offset = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     gram_offset = gram_n - 1
@@ -128,48 +128,6 @@ def assign_ngram_buffer(
     assign_ngram_buffer_kernel[(bs,)](
         input_ids, buffer, seq_lens, buffer_size, bs_block, buffer_size_block
     )
-
-
-# def build_ngram_with_tree(
-#     ngram_input_ids: torch.Tensor,
-#     parent_list: torch.Tensor,
-#     token_list: torch.Tensor,
-#     current_parrent_list: torch.Tensor,
-#     buffer: torch.Tensor,
-#     buffer_size: int,
-#     gram_n: int,
-#     topk: int,
-#     i: int,
-# ):
-#     prc_custom_ops.build_ngram_with_tree(ngram_input_ids, parent_list, token_list, current_parrent_list, buffer, buffer_size, gram_n, topk, i)
-
-# def build_ngram_with_target_verify(
-#     n_gram_input_ids: torch.Tensor,
-#     buffer: torch.Tensor,
-#     draft_token_ids: torch.Tensor,
-#     tree_mask: torch.Tensor,
-#     positions: torch.Tensor,
-#     seq_lens: torch.Tensor,
-#     gram_n: int,
-#     draft_token_num: int,
-#     buffer_size: int,
-# ):
-#     bs = seq_lens.numel()
-#     prc_custom_ops.build_ngram_with_target_verify(n_gram_input_ids, buffer, draft_token_ids, tree_mask, positions, seq_lens, gram_n, draft_token_num, buffer_size)
-
-
-# will also update the buffer if update_buffer is True
-# def assign_ngram_input_ids_draft_extend_after_decode(
-#     input_ids: torch.Tensor,
-#     buffer: torch.Tensor,
-#     input_ids_gram: torch.Tensor,
-#     accept_length: torch.Tensor,
-#     gram_n: int,
-#     buffer_size: int,
-#     update_buffer: bool = False,
-# ):
-#     accept_length = accept_length.to(torch.int32)
-#     prc_custom_ops.assign_ngram_input_ids_draft_extend_after_decode(input_ids, buffer, input_ids_gram, accept_length, gram_n, buffer_size, update_buffer)
 
 
 @triton.jit
