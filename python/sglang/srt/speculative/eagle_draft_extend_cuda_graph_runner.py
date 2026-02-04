@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Callable
 import torch
 
 from sglang.srt.layers.dp_attention import DpPaddingMode, set_dp_buffer_len
+from sglang.srt.managers.schedule_batch import NGramInputIds
 from sglang.srt.model_executor.cuda_graph_runner import (
     CUDA_GRAPH_CAPTURE_FAILED_MSG,
     CudaGraphRunner,
@@ -170,6 +171,23 @@ class EAGLEDraftExtendCudaGraphRunner:
                 ),
                 dtype=torch.float,
             )
+            if self.model_runner.server_args.enable_over_encoding:
+                self.ngram_input_ids = NGramInputIds(
+                    input_ids_gram2=torch.zeros(
+                        (self.max_num_token,), dtype=torch.int64
+                    ),
+                    input_ids_gram3=torch.zeros(
+                        (self.max_num_token,), dtype=torch.int64
+                    ),
+                    input_ids_gram4=torch.zeros(
+                        (self.max_num_token,), dtype=torch.int64
+                    ),
+                    input_ids_buffer=torch.zeros(
+                        (self.max_bs * NGramInputIds.buffer_size), dtype=torch.int64
+                    ),
+                )
+            else:
+                self.ngram_input_ids = None
 
         # Capture
         try:
@@ -285,6 +303,22 @@ class EAGLEDraftExtendCudaGraphRunner:
 
         self.deepep_adapter.capture(is_extend_in_batch=True)
 
+        if self.ngram_input_ids is not None:
+            buffer = self.ngram_input_ids.input_ids_buffer[
+                : bs * self.ngram_input_ids.buffer_size
+            ]
+            gram2 = self.ngram_input_ids.input_ids_gram2[:num_tokens]
+            gram3 = self.ngram_input_ids.input_ids_gram3[:num_tokens]
+            gram4 = self.ngram_input_ids.input_ids_gram4[:num_tokens]
+            current_ngram_input_ids = NGramInputIds(
+                input_ids_gram2=gram2,
+                input_ids_gram3=gram3,
+                input_ids_gram4=gram4,
+                input_ids_buffer=buffer,
+            )
+        else:
+            current_ngram_input_ids = None
+
         # Forward batch
         forward_batch = ForwardBatch(
             forward_mode=self.forward_mode,
@@ -312,6 +346,7 @@ class EAGLEDraftExtendCudaGraphRunner:
             capture_hidden_mode=CaptureHiddenMode.LAST,
             attn_backend=self.eagle_worker.draft_extend_attn_backend,
             padded_static_len=self.padded_static_len,
+            n_gram_input_ids=current_ngram_input_ids,
         )
 
         self.eagle_worker.draft_extend_attn_backend.init_forward_metadata_capture_cuda_graph(
@@ -419,6 +454,20 @@ class EAGLEDraftExtendCudaGraphRunner:
         if bs != raw_bs:
             forward_batch.spec_info.positions = self.positions[:num_tokens]
             forward_batch.spec_info.accept_length = self.accept_length[:bs]
+
+        if self.ngram_input_ids is not None:
+            self.ngram_input_ids.input_ids_buffer[
+                : raw_bs * NGramInputIds.buffer_size
+            ].copy_(forward_batch.n_gram_input_ids.input_ids_buffer)
+            self.ngram_input_ids.input_ids_gram2[:num_tokens].copy_(
+                forward_batch.n_gram_input_ids.input_ids_gram2
+            )
+            self.ngram_input_ids.input_ids_gram3[:num_tokens].copy_(
+                forward_batch.n_gram_input_ids.input_ids_gram3
+            )
+            self.ngram_input_ids.input_ids_gram4[:num_tokens].copy_(
+                forward_batch.n_gram_input_ids.input_ids_gram4
+            )
 
         self.eagle_worker.draft_extend_attn_backend.init_forward_metadata_replay_cuda_graph(
             bs=bs,

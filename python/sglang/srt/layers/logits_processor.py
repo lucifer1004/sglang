@@ -143,7 +143,7 @@ class LogitsMetadata:
 
     # Whether this batch is prefill-only (no token generation needed)
     is_prefill_only: bool = False
-    
+
     # For KV Mirror
     enable_kv_mirror: bool = False
 
@@ -401,7 +401,10 @@ class LogitsProcessor(nn.Module):
             logits_metadata.forward_mode.is_decode_or_idle()
             or logits_metadata.forward_mode.is_target_verify()
             or logits_metadata.forward_mode.is_draft_extend_v2()
-            or logits_metadata.enable_kv_mirror
+            or (
+                logits_metadata.enable_kv_mirror
+                and logits_metadata.forward_mode.is_extend_without_speculative()
+            )
         ):
             pruned_states = hidden_states
             if aux_hidden_states is not None:

@@ -85,6 +85,7 @@ from sglang.srt.server_args import ServerArgs, get_global_server_args
 from sglang.srt.utils import flatten_nested_list
 from sglang.srt.utils.common import is_npu
 from sglang.srt.utils.cuda_ipc_transport_utils import CudaIpcTensorTransportProxy
+from sglang.srt.utils.over_encoding_utils import filter_buffer
 
 _is_npu = is_npu()
 
@@ -437,6 +438,36 @@ class NGramInputIds:
     input_ids_gram2: Optional[torch.Tensor] = None
     input_ids_gram3: Optional[torch.Tensor] = None
     input_ids_gram4: Optional[torch.Tensor] = None
+    input_ids_buffer: Optional[torch.Tensor] = None
+    buffer_size: int = 4
+    filtered: bool = False
+
+    @staticmethod
+    def get_token_ids_gram_n(req_input_ids: List[int], n: int):
+        seq_len = len(req_input_ids)
+        result_id = [0] * seq_len
+        if seq_len <= n:
+            return result_id
+        else:
+            result_id[n:] = req_input_ids[:-n]
+            return result_id
+
+    def get_token_ids_buffer(self, req_input_ids: List[int]):
+        seq_len = len(req_input_ids)
+        result_id = [0] * self.buffer_size
+        start_idx = min(seq_len, self.buffer_size)
+        result_id[-start_idx:] = req_input_ids[-start_idx:]
+        return result_id
+
+    def filter_buffer(self, unfinished_index_device: torch.Tensor):
+        if self.input_ids_buffer is not None and not self.filtered:
+            self.input_ids_buffer = filter_buffer(
+                self.input_ids_buffer, unfinished_index_device, self.buffer_size
+            )
+            self.filtered = True
+
+    def start_new_step(self):
+        self.filtered = False
 
 
 class Req:
@@ -1317,14 +1348,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             len(self.out_cache_loc) == self.extend_num_tokens
         ), f"Expected {len(self.out_cache_loc)}, got {self.extend_num_tokens}"
 
-    def _get_token_ids_gram_n(self, req_input_ids, n):
-        seq_len = len(req_input_ids)
-        result_id = [0] * seq_len
-        if seq_len <= n:
-            return result_id
-        else:
-            result_id[n:] = req_input_ids[:-n]
-            return result_id
+    # def _get_token_ids_gram_n(self, req_input_ids, n):
+    #     seq_len = len(req_input_ids)
+    #     result_id = [0] * seq_len
+    #     if seq_len <= n:
+    #         return result_id
+    #     else:
+    #         result_id[n:] = req_input_ids[:-n]
+    #         return result_id
 
     def prepare_for_extend(self):
         self.forward_mode = ForwardMode.EXTEND
@@ -1361,13 +1392,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         for r in reqs:
             prefix_len = len(r.prefix_indices)
             input_ids_gram2.append(
-                self._get_token_ids_gram_n(r.fill_ids, 1)[prefix_len:]
+                NGramInputIds.get_token_ids_gram_n(r.fill_ids, 1)[prefix_len:]
             )
             input_ids_gram3.append(
-                self._get_token_ids_gram_n(r.fill_ids, 2)[prefix_len:]
+                NGramInputIds.get_token_ids_gram_n(r.fill_ids, 2)[prefix_len:]
             )
             input_ids_gram4.append(
-                self._get_token_ids_gram_n(r.fill_ids, 3)[prefix_len:]
+                NGramInputIds.get_token_ids_gram_n(r.fill_ids, 3)[prefix_len:]
             )
 
         self.n_gram_input_ids = NGramInputIds(
@@ -1911,6 +1942,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 new_indices=keep_indices_device,
                 has_been_filtered=has_been_filtered,
             )
+        if self.n_gram_input_ids:
+            self.n_gram_input_ids.filter_buffer(keep_indices_device)
 
     def merge_batch(self, other: "ScheduleBatch"):
         # NOTE: in v2 eagle mode, we do not need wait verify here because
@@ -1956,6 +1989,18 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         if self.spec_info:
             self.spec_info.merge_batch(other.spec_info)
+        if (
+            self.n_gram_input_ids
+            and other.n_gram_input_ids
+            and self.n_gram_input_ids.input_ids_buffer is not None
+            and other.n_gram_input_ids.input_ids_buffer is not None
+        ):
+            self.n_gram_input_ids.input_ids_buffer = torch.cat(
+                [
+                    self.n_gram_input_ids.input_ids_buffer,
+                    other.n_gram_input_ids.input_ids_buffer,
+                ]
+            )
 
     def get_model_worker_batch(
         self, seq_lens_cpu_cache: Optional[torch.Tensor] = None

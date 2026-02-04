@@ -6,6 +6,7 @@ import time
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, List
 
+import prc_custom_ops
 import torch
 import triton
 import triton.language as tl
@@ -19,7 +20,11 @@ from sglang.srt.distributed.parallel_state import (
 from sglang.srt.environ import envs
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.utils import is_cuda, is_hip, is_npu, next_power_of_2
+from sglang.srt.utils.over_encoding_utils import (
+    assign_ngram_input_ids_draft_decode_first_token,
+)
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
@@ -501,6 +506,80 @@ def select_top_k_tokens(
         )
 
     return input_ids, hidden_states, scores, tree_info
+
+
+# @torch.compile(dynamic=True, disable=_is_npu)
+def select_top_k_tokens_ngram(
+    i: int,
+    forward_batch: ForwardBatch,
+    topk_index: torch.Tensor,
+    topk: int,
+    token_list: List[torch.Tensor],
+    parents_list: List[torch.Tensor],
+):
+    n_gram_input_ids = forward_batch.n_gram_input_ids
+    seq_lens = forward_batch.seq_lens
+    if i == 0:
+        assign_ngram_input_ids_draft_decode_first_token(
+            n_gram_input_ids.input_ids_buffer,
+            n_gram_input_ids.input_ids_gram2,
+            seq_lens,
+            2,
+            topk,
+            n_gram_input_ids.buffer_size,
+        )
+        assign_ngram_input_ids_draft_decode_first_token(
+            n_gram_input_ids.input_ids_buffer,
+            n_gram_input_ids.input_ids_gram3,
+            seq_lens,
+            3,
+            topk,
+            n_gram_input_ids.buffer_size,
+        )
+        assign_ngram_input_ids_draft_decode_first_token(
+            n_gram_input_ids.input_ids_buffer,
+            n_gram_input_ids.input_ids_gram4,
+            seq_lens,
+            4,
+            topk,
+            n_gram_input_ids.buffer_size,
+        )
+    else:
+        parent_tensor = torch.cat(parents_list, dim=1)
+        token_tensor = torch.cat(token_list, dim=1)
+        prc_custom_ops.build_ngram_with_tree(
+            n_gram_input_ids.input_ids_gram2,
+            parent_tensor,
+            token_tensor,
+            parents_list[-1],
+            n_gram_input_ids.input_ids_buffer,
+            n_gram_input_ids.buffer_size,
+            2,
+            topk,
+            i,
+        )
+        prc_custom_ops.build_ngram_with_tree(
+            n_gram_input_ids.input_ids_gram3,
+            parent_tensor,
+            token_tensor,
+            parents_list[-1],
+            n_gram_input_ids.input_ids_buffer,
+            n_gram_input_ids.buffer_size,
+            3,
+            topk,
+            i,
+        )
+        prc_custom_ops.build_ngram_with_tree(
+            n_gram_input_ids.input_ids_gram4,
+            parent_tensor,
+            token_tensor,
+            parents_list[-1],
+            n_gram_input_ids.input_ids_buffer,
+            n_gram_input_ids.buffer_size,
+            4,
+            topk,
+            i,
+        )
 
 
 def generate_simulated_accept_index(

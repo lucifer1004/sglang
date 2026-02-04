@@ -50,6 +50,7 @@ from sglang.srt.speculative.spec_utils import (
     generate_token_bitmask,
     load_token_map,
     select_top_k_tokens,
+    select_top_k_tokens_ngram,
 )
 from sglang.srt.utils import (
     MultiprocessingSerializer,
@@ -268,6 +269,8 @@ class EAGLEWorker(TpModelWorker):
             A tuple of the final logit output of the target model, next tokens accepted,
             the batch id (used for overlap schedule), and number of accepted tokens.
         """
+        if batch.n_gram_input_ids:
+            batch.n_gram_input_ids.start_new_step()
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
             logits_output, next_token_ids, seq_lens_cpu = self.forward_target_extend(
                 batch
@@ -292,7 +295,6 @@ class EAGLEWorker(TpModelWorker):
             logits_output, verify_output, model_worker_batch, can_run_cuda_graph = (
                 self.verify(batch, spec_info)
             )
-
             with self.draft_tp_context(
                 self.draft_model_runner.tp_group
             ), speculative_moe_backend_context():
@@ -526,6 +528,18 @@ class EAGLEWorker(TpModelWorker):
         can_cuda_graph = self.cuda_graph_runner and self.cuda_graph_runner.can_run(
             forward_batch
         )
+        n_gram2 = torch.empty(
+            (spec_info.topk_index.numel()), dtype=torch.int64, device=self.device
+        )
+        n_gram3 = torch.empty(
+            (spec_info.topk_index.numel()), dtype=torch.int64, device=self.device
+        )
+        n_gram4 = torch.empty(
+            (spec_info.topk_index.numel()), dtype=torch.int64, device=self.device
+        )
+        forward_batch.n_gram_input_ids.input_ids_gram2 = n_gram2
+        forward_batch.n_gram_input_ids.input_ids_gram3 = n_gram3
+        forward_batch.n_gram_input_ids.input_ids_gram4 = n_gram4
         if can_cuda_graph:
             parent_list, top_scores_index, draft_tokens = self.cuda_graph_runner.replay(
                 forward_batch
@@ -619,6 +633,10 @@ class EAGLEWorker(TpModelWorker):
             score_list.append(tree_info[0])
             token_list.append(tree_info[1])
             parents_list.append(tree_info[2])
+            if forward_batch.n_gram_input_ids is not None:
+                select_top_k_tokens_ngram(
+                    i, forward_batch, topk_index, self.topk, token_list, parents_list
+                )
 
             # We don't need to run the last forward. we get 1 token from draft prefill and (#spec steps - 1) tokens here
             if i == self.speculative_num_steps - 1:
@@ -723,7 +741,6 @@ class EAGLEWorker(TpModelWorker):
             self.page_size,
             vocab_mask,
         )
-
         # Post process based on verified outputs.
         # Pick indices that we care (accepted)
         logits_output.next_token_logits = logits_output.next_token_logits[
