@@ -491,6 +491,7 @@ class Req:
         session_id: Optional[str] = None,
         custom_logit_processor: Optional[str] = None,
         return_hidden_states: bool = False,
+        return_routed_experts: bool = False,
         eos_token_ids: Optional[Set[int]] = None,
         bootstrap_host: Optional[str] = None,
         bootstrap_port: Optional[int] = None,
@@ -544,6 +545,7 @@ class Req:
         self.sampling_params = sampling_params
         self.custom_logit_processor = custom_logit_processor
         self.return_hidden_states = return_hidden_states
+        self.return_routed_experts = return_routed_experts
 
         # extra key for classifying the request (e.g. cache_salt)
         if lora_id is not None:
@@ -669,6 +671,8 @@ class Req:
         self.hidden_states_tensor = None  # Note: use tensor instead of list to transfer hidden_states when PD + MTP
         self.output_topk_p = None
         self.output_topk_index = None
+
+        self.routed_experts: List[List[List[int]]] = []
 
         # Embedding (return values)
         self.embedding = None
@@ -1203,6 +1207,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # Whether to return hidden states
     return_hidden_states: bool = False
 
+    # Whether to return routed experts
+    return_routed_experts: bool = False
+
     # Whether this batch is prefill-only (no token generation needed)
     is_prefill_only: bool = False
 
@@ -1252,6 +1259,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             device=req_to_token_pool.device,
             spec_algorithm=spec_algorithm,
             return_hidden_states=any(req.return_hidden_states for req in reqs),
+            return_routed_experts=any(req.return_routed_experts for req in reqs),
             is_prefill_only=all(req.is_prefill_only for req in reqs),
             chunked_req=chunked_req,
             dllm_config=dllm_config,
@@ -2102,7 +2110,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     def __str__(self):
         return (
             f"ScheduleBatch(forward_mode={self.forward_mode.name if self.forward_mode else 'None'}, "
-            f"#req={(len(self.reqs))})"
+            f"#req={(len(self.reqs))}), " + f"#out_cache_loc={self.out_cache_loc})"
         )
 
 

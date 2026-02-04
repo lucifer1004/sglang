@@ -150,6 +150,7 @@ class HunYuanSparseMoeBlock(nn.Module):
 
         self.topk = TopK(
             top_k=top_k,
+            layer_id=self.layer_id,
             renormalize=True if top_k > 1 else False,
         )
 
@@ -504,7 +505,7 @@ class HunYuanModel(nn.Module):
             [
                 HunYuanDecoderLayer(
                     config=config,
-                    layer_id=layer_id,
+                    layer_id=self.layer_id,
                     quant_config=quant_config,
                     # prefix=prefix
                 )

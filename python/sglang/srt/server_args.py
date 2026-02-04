@@ -530,6 +530,7 @@ class ServerArgs:
     disable_fast_image_processor: bool = False
     keep_mm_feature_on_device: bool = False
     enable_return_hidden_states: bool = False
+    enable_return_routed_experts: bool = False
     scheduler_recv_interval: int = 1
     numa_node: Optional[List[int]] = None
     enable_deterministic_inference: bool = False
@@ -590,7 +591,6 @@ class ServerArgs:
 
     # For forward hooks
     forward_hooks: Optional[List[dict[str, Any]]] = None
-    
 
     # For Over Encoding
     enable_over_encoding: bool = False
@@ -3669,6 +3669,11 @@ class ServerArgs:
             help="Enable returning hidden states with responses.",
         )
         parser.add_argument(
+            "--enable-return-routed-experts",
+            action="store_true",
+            help="Enable returning routed experts of each layer with responses.",
+        )
+        parser.add_argument(
             "--scheduler-recv-interval",
             type=int,
             default=ServerArgs.scheduler_recv_interval,
@@ -3925,13 +3930,12 @@ class ServerArgs:
             action="store_true",
             help="Enable Over Encoding.",
         )
-        
+
         parser.add_argument(
             "--enable-kv-mirror",
             action="store_true",
             help="Enable KV Mirror.",
         )
-
 
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace):

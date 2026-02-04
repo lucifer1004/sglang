@@ -342,6 +342,7 @@ def sigmoid_routing_function(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     # if softmax, then use qwen3 moe's routing function
     scores = torch.sigmoid(gating_output).type_as(gating_output)
+    scores_for_routing = scores
     if correction_bias is not None:
         scores += correction_bias
     _, indices = torch.topk(scores, topk, dim=-1)
@@ -396,6 +397,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
 
         self.topk = TopK(
             top_k=config.num_experts_per_tok,
+            layer_id=self.layer_id,
             renormalize=config.norm_topk_prob,
             custom_routing_function=self.custom_routing_function,
         )

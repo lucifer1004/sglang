@@ -242,6 +242,7 @@ class LongcatFlashMoE(nn.Module):
 
         self.topk = TopK(
             top_k=self.top_k,
+            layer_id=self.layer_id,
             renormalize=False,
             use_grouped_topk=False,
             correction_bias=self.router.e_score_correction_bias.data,

@@ -17,7 +17,6 @@
 """Inference-only Qwen2MoE model compatible with HuggingFace weights."""
 
 import logging
-from contextlib import nullcontext
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
@@ -27,14 +26,12 @@ from transformers import PretrainedConfig
 
 from sglang.srt.batch_overlap.two_batch_overlap import model_forward_maybe_tbo
 from sglang.srt.distributed import (
-    get_moe_expert_parallel_world_size,
     get_pp_group,
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
-from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
@@ -54,17 +51,14 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
-from sglang.srt.layers.moe import get_moe_a2a_backend
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
-from sglang.srt.layers.moe.utils import RoutingMethodType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import (
     LinearScalingRotaryEmbedding,
     RotaryEmbedding,
-    _apply_rotary_emb,
     _yarn_find_correction_range,
     _yarn_linear_ramp_mask,
     yarn_get_mscale,
@@ -74,11 +68,11 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.server_args import get_global_server_args
-#from sglang.srt.two_batch_overlap import model_forward_maybe_tbo
+
+# from sglang.srt.two_batch_overlap import model_forward_maybe_tbo
 from sglang.srt.utils import add_prefix, is_cuda, make_layers
 
 logger = logging.getLogger(__name__)
@@ -168,8 +162,9 @@ def sigmoid_routing_function(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     # if softmax, then use qwen3 moe's routing function
     scores = torch.sigmoid(gating_output).type_as(gating_output)
+    scores_for_routing = scores
     if correction_bias is not None:
-        scores_for_routing += correction_bias
+        scores_for_routing = scores + correction_bias
     _, indices = torch.topk(scores_for_routing, topk, dim=-1)
     topk_scores = torch.gather(scores, dim=1, index=indices).type_as(scores)
     return topk_scores, indices
@@ -220,6 +215,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
 
         self.topk = TopK(
             top_k=config.num_experts_per_tok,
+            layer_id=self.layer_id,
             renormalize=config.norm_topk_prob,
             custom_routing_function=self.custom_routing_function,
         )
