@@ -47,10 +47,10 @@ class GraphInputBuffers:
         encoder_len_fill_value: int,
         num_tokens_per_bs: int,
         cache_loc_dtype: torch.dtype,
-        enable_over_encoding: bool,
+        prepare_n_gram_inputs: bool,
     ) -> "GraphInputBuffers":
         with torch.device(device):
-            if enable_over_encoding:
+            if prepare_n_gram_inputs:
                 input_ids_gram2 = torch.zeros((max_num_token,), dtype=torch.int64)
                 input_ids_gram3 = torch.zeros((max_num_token,), dtype=torch.int64)
                 input_ids_gram4 = torch.zeros((max_num_token,), dtype=torch.int64)
@@ -154,11 +154,19 @@ class GraphInputBuffers:
         self.seq_lens[:raw_bs].copy_(forward_batch.seq_lens)
         self.out_cache_loc[:raw_num_token].copy_(forward_batch.out_cache_loc)
         self.positions[:raw_num_token].copy_(forward_batch.positions)
-        if forward_batch.n_gram_input_ids is not None and self.input_ids_gram2 is not None:
-            self.input_ids_gram2[:raw_num_token].copy_(forward_batch.n_gram_input_ids.input_ids_gram2)
-            self.input_ids_gram3[:raw_num_token].copy_(forward_batch.n_gram_input_ids.input_ids_gram3)
-            self.input_ids_gram4[:raw_num_token].copy_(forward_batch.n_gram_input_ids.input_ids_gram4)
-        
+        if (
+            forward_batch.n_gram_input_ids is not None
+            and self.input_ids_gram2 is not None
+        ):
+            self.input_ids_gram2[:raw_num_token].copy_(
+                forward_batch.n_gram_input_ids.input_ids_gram2
+            )
+            self.input_ids_gram3[:raw_num_token].copy_(
+                forward_batch.n_gram_input_ids.input_ids_gram3
+            )
+            self.input_ids_gram4[:raw_num_token].copy_(
+                forward_batch.n_gram_input_ids.input_ids_gram4
+            )
 
         seq_lens_cpu: Optional[torch.Tensor] = None
         if forward_batch.seq_lens_cpu is not None:

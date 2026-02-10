@@ -27,6 +27,7 @@ from sglang.srt.layers.quantization.base_config import (
     method_has_implemented_embedding,
 )
 from sglang.srt.layers.quantization.unquant import UnquantizedEmbeddingMethod
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_compiler_backend,
@@ -304,7 +305,11 @@ class VocabParallelEmbedding(torch.nn.Module):
             self.num_embeddings_padded,
             params_dtype=params_dtype,
             weight_loader=self.weight_loader,
-            host_tensor = True if self.__class__ is VocabParallelEmbedding else False,
+            host_tensor=(
+                get_global_server_args().enable_over_encoding
+                if self.__class__ is VocabParallelEmbedding
+                else False
+            ),
         )
 
     @classmethod

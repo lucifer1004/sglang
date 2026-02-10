@@ -106,7 +106,7 @@ class EAGLEDraftCudaGraphRunner:
                 (self.max_bs, self.model_runner.model_config.hidden_size),
                 dtype=self.model_runner.dtype,
             )
-            if self.model_runner.server_args.enable_over_encoding:
+            if self.model_runner.server_args.prepare_n_gram_inputs:
                 self.ngram_input_ids = NGramInputIds(
                     input_ids_gram2=torch.zeros(
                         (self.max_num_token,), dtype=torch.int64
