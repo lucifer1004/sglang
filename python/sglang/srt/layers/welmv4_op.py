@@ -40,7 +40,7 @@ def rms_norm_kernel(  # pylint: disable=too-many-arguments,too-many-locals
     gamma_shm = tl.load(gamma_ptr + cols_off, mask=mask, other=0.0)
 
     original_dtype = hidden_states_ptr.dtype.element_ty
-    for row_id in tl.range(row_start, rows, NUM_SMS, num_stages=2):
+    for row_id in tl.range(row_start, rows, NUM_SMS, num_stages=4):
         h_offs = (row_id * hidden_states_row_stride + cols_off).to(tl.int64)
         r_offs = (row_id * residual_row_stride + cols_off).to(tl.int64)
         h = tl.load(hidden_states_ptr + h_offs, mask=mask, other=0.0).to(tl.float32)
@@ -75,7 +75,7 @@ class WelmV4FusedRMSNorm(CustomOp):
         self.hidden_size = hidden_size
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(hidden_size, dtype=weight_dtype))
-        self.num_sms = 100
+        self.num_sms = 78 * 8
 
     def forward_cuda(
         self,
@@ -139,7 +139,7 @@ def sigmoid_mul_kernel(
     row_start = tl.program_id(0)
     col_off = tl.arange(0, BLOCK_SIZE)
     mask = col_off < cols
-    for row_id in tl.range(row_start, rows, NUM_SMS, num_stages=2):
+    for row_id in tl.range(row_start, rows, NUM_SMS, num_stages=4):
         y_off = row_id * y_row_stride + col_off
         y_data = tl.load(y + y_off, mask=mask, other=0.0)
         x_data = tl.load(x + row_id).to(tl.float32)
@@ -149,33 +149,11 @@ def sigmoid_mul_kernel(
 
 # return sigmoid(x) * y
 def inplace_sigmoid_mul(x: torch.Tensor, y: torch.Tensor):
-    num_sms = 100
+    num_sms = 78 * 8
     cols = y.shape[-1]
     rows = y.numel() // cols
     block_size = triton.next_power_of_2(cols)
     sigmoid_mul_kernel[(num_sms,)](x, y, rows, cols, y.stride(-2), block_size, num_sms)
-
-
-def _apply_rotary_emb(
-    x: torch.Tensor,
-    cos: torch.Tensor,
-    sin: torch.Tensor,
-    is_neox_style: bool,
-) -> torch.Tensor:
-    """
-    Args:
-        x: [num_tokens, num_heads, head_size]
-        cos: [num_tokens, head_size // 2]
-        sin: [num_tokens, head_size // 2]
-        is_neox_style: Whether to use the Neox-style or GPT-J-style rotary
-            positional embeddings.
-    """
-    cos = cos.unsqueeze(-2).to(x.dtype)
-    sin = sin.unsqueeze(-2).to(x.dtype)
-    x1, x2 = torch.chunk(x, 2, dim=-1)
-    o1 = x1 * cos - x2 * sin
-    o2 = x2 * cos + x1 * sin
-    return torch.cat((o1, o2), dim=-1)
 
 
 @triton.jit
@@ -291,7 +269,7 @@ class WelmV4InplaceRotaryEmbedding(RotaryEmbedding):
         super().__init__(
             head_size, rotary_dim, max_position_embeddings, base, is_neox_style, dtype
         )
-        self.num_sms = 100
+        self.num_sms = 78 * 8
 
     def forward_cuda(
         self,
@@ -306,7 +284,7 @@ class WelmV4InplaceRotaryEmbedding(RotaryEmbedding):
         key = key.view(key.shape[0], -1, self.head_size)
         N = positions.shape[0]
         num_sms = min(N, self.num_sms)
-        num_stages = 2
+        num_stages = 4
         BS = last_index.numel() if last_index is not None else 0
         _welmv4_inplace_rope_kernel[(num_sms,)](
             query,

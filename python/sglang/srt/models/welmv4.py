@@ -966,9 +966,7 @@ class Qwen2MoeAttention(nn.Module):
             )  # (bs * seq_len, num_heads, 1)
             # fuse: implement a fused sigmoid mul, maybe could use torch.compile
             attn_output = attn_output.view(attn_shape[0], self.num_heads, -1)
-            # attn_output = attn_output * torch.sigmoid(gate)
             inplace_sigmoid_mul(gate, attn_output)
-
             attn_output = attn_output.view(attn_shape)
 
         output, _ = self.o_proj(attn_output)
