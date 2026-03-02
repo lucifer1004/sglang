@@ -70,6 +70,11 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from sglang.srt.layers.welmv4_op import (
+    WelmV4FusedRMSNorm,
+    WelmV4InplaceRotaryEmbedding,
+    inplace_sigmoid_mul,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.server_args import get_global_server_args
@@ -80,6 +85,11 @@ from sglang.srt.utils import add_prefix, is_cuda, make_layers
 logger = logging.getLogger(__name__)
 
 _is_cuda = is_cuda()
+
+
+def log(*args):
+    if torch.cuda.current_device() == 0:
+        print(*args)
 
 
 def hash_input_ids_vectorized(input_ids: torch.Tensor) -> torch.Tensor:
@@ -419,6 +429,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             quant_config=None,
             prefix=add_prefix("gate", prefix),
         )
+        self.gate.weight.data = self.gate.weight.to(torch.float32)
         if config.shared_expert_intermediate_size > 0:
             self.shared_expert = Qwen2MoeMLP(
                 hidden_size=config.hidden_size,
@@ -441,6 +452,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
+        hidden_states_fp32: torch.Tensor,
         forward_batch: Optional[ForwardBatch] = None,
         use_reduce_scatter: bool = False,
     ) -> torch.Tensor:
@@ -453,12 +465,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 shared_output = (
                     F.sigmoid(self.shared_expert_gate(hidden_states)) * shared_output
                 )
-
-        # router_logits: (num_tokens, n_experts)
-        # router_logits, _ = self.gate(hidden_states)
-        router_logits = F.linear(
-            hidden_states.to(torch.float32), self.gate.weight.to(torch.float32)
-        )
+        router_logits = F.linear(hidden_states_fp32, self.gate.weight)
         topk_output = self.topk(hidden_states, router_logits)
         final_hidden_states = self.experts(hidden_states, topk_output)
         if shared_output is not None:
@@ -469,7 +476,8 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         return final_hidden_states.view(num_tokens, hidden_dim)
 
 
-class Qwen2MoeYarnScalingRotaryEmbedding(RotaryEmbedding):
+# WelmV4InplaceRotaryEmbedding
+class Qwen2MoeYarnScalingRotaryEmbedding(WelmV4InplaceRotaryEmbedding):
     def __init__(
         self,
         head_size: int,
@@ -600,6 +608,7 @@ def get_rope(
         raise ValueError(f"Please set RoPE scaling")
     else:
         scaling_type = rope_scaling["type"]
+        assert scaling_type == "yarn", "Only yarn scaling is supported for WelmV4"
 
         if scaling_type == "linear":
             scaling_factor = rope_scaling["factor"]
@@ -711,12 +720,17 @@ class Qwen2MoeAttention(nn.Module):
         self.qk_rope_head_dim = qk_rope_head_dim
         self.qk_norm = qk_norm
         self.only_k_norm = k_norm
+        self.use_o_norm = o_norm
+        self.total_layer_num = total_layer_num
+        self.o_norm = RMSNorm(self.hidden_size) if self.use_o_norm else nn.Identity()
 
         self.q_norm = (
-            RMSNorm(self.head_dim, eps=qk_norm_eps) if self.qk_norm else nn.Identity()
+            WelmV4FusedRMSNorm(self.head_dim, eps=qk_norm_eps)
+            if self.qk_norm
+            else nn.Identity()
         )
         self.k_norm = (
-            RMSNorm(self.head_dim, eps=qk_norm_eps)
+            WelmV4FusedRMSNorm(self.head_dim, eps=qk_norm_eps)
             if self.qk_norm or self.only_k_norm
             else nn.Identity()
         )
@@ -758,16 +772,6 @@ class Qwen2MoeAttention(nn.Module):
             )
         else:
             self.attn_sink = None
-        self.use_o_norm = o_norm
-        self.total_layer_num = total_layer_num
-
-        self.q_norm = RMSNorm(self.head_dim) if self.qk_norm else nn.Identity()
-        self.k_norm = (
-            RMSNorm(self.head_dim)
-            if self.qk_norm or self.only_k_norm
-            else nn.Identity()
-        )
-        self.o_norm = RMSNorm(self.hidden_size) if self.use_o_norm else nn.Identity()
 
         self.qkv_proj = QKVParallelLinear(
             hidden_size,
@@ -804,13 +808,25 @@ class Qwen2MoeAttention(nn.Module):
                     self.scaling = self.scaling * mscale * mscale
 
         self.rotary_emb = get_rope(
-            self.qk_rope_head_dim,
+            # self.qk_rope_head_dim,
+            self.head_dim,
             rotary_dim=self.qk_rope_head_dim,
             max_position=max_position_embeddings,
             base=rope_theta,
             compress=self.compress,
             rope_scaling=rope_scaling,
         )
+
+        self.rotary_emb_orig = get_rope(
+            self.qk_rope_head_dim,
+            # self.head_dim,
+            rotary_dim=self.qk_rope_head_dim,
+            max_position=max_position_embeddings,
+            base=rope_theta,
+            compress=self.compress,
+            rope_scaling=rope_scaling,
+        )
+
         self.attn = RadixAttention(
             self.num_heads,
             self.head_dim,
@@ -900,76 +916,57 @@ class Qwen2MoeAttention(nn.Module):
 
         q_by_head = q.view(*q.shape[:-1], q.shape[-1] // self.head_dim, self.head_dim)
         if self.qk_norm:
-            q_by_head = self.q_norm.forward_native(q_by_head)
+            q_by_head, _ = self.q_norm(q_by_head)
         q = q_by_head.view(q.shape)
 
         k_by_head = k.view(*k.shape[:-1], k.shape[-1] // self.head_dim, self.head_dim)
+        # for welmv4, qk_norm is false and only_k_norm is true
+        # fuse: implement a high precision and fused k_norm
         if self.qk_norm or self.only_k_norm:
-            k_by_head = self.k_norm.forward_native(k_by_head)
+            k_by_head, _ = self.k_norm(k_by_head)
         k = k_by_head.view(k.shape)
 
         qk_nope_head_dim = self.head_dim - self.qk_rope_head_dim
         if qk_nope_head_dim > 0:
-            q_nope, q_pe = q.view(q_by_head.shape).split(
-                [qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
-            )
-            k_nope, k_pe = k.view(k_by_head.shape).split(
-                [qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
-            )
-
-            q_pe = q_pe.reshape(
-                (*q_shape[:-1], q_shape[-1] // self.head_dim * self.qk_rope_head_dim)
-            )
-            k_pe = k_pe.reshape(
-                (*k_shape[:-1], k_shape[-1] // self.head_dim * self.qk_rope_head_dim)
-            )
             if (
                 forward_batch.enable_kv_mirror
                 and forward_batch.forward_mode.is_extend_without_speculative()
                 and self.kv_mirror_layer_idx in self.kv_mirror_layers
             ):
-                q_pe_proxy = torch.empty(
-                    (k_pe.shape[0],) + q_pe.shape[1:],
-                    dtype=q_pe.dtype,
-                    device=q_pe.device,
-                )
-                k_pe_proxy = torch.empty(
-                    (q_pe.shape[0],) + k_pe.shape[1:],
-                    dtype=k_pe.dtype,
-                    device=k_pe.device,
-                )
-                _, k_pe = self.rotary_emb(positions, q_pe_proxy, k_pe)
-                q_pe, _ = self.rotary_emb(
-                    positions[forward_batch.custom_last_index], q_pe, k_pe_proxy
+                # optim: mirror rope embedding optim @kavioyu
+                # q_pe_proxy = torch.empty(
+                #     (k_pe.shape[0],) + q_pe.shape[1:],
+                #     dtype=q_pe.dtype,
+                #     device=q_pe.device,
+                # )
+                # k_pe_proxy = torch.empty(
+                #     (q_pe.shape[0],) + k_pe.shape[1:],
+                #     dtype=k_pe.dtype,
+                #     device=k_pe.device,
+                # )
+                # _, k_pe = self.rotary_emb(positions, q_pe_proxy, k_pe)
+                # q_pe, _ = self.rotary_emb(
+                #     positions[forward_batch.custom_last_index], q_pe, k_pe_proxy
+                # )
+                self.rotary_emb.forward_cuda(
+                    positions, q, k, last_index=forward_batch.custom_last_index
                 )
             else:
-                q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
-
-            q_pe = q_pe.reshape(
-                (*q_shape[:-1], q_shape[-1] // self.head_dim, -1)
-            ).clone()
-            k_pe = k_pe.reshape(
-                (*k_shape[:-1], k_shape[-1] // self.head_dim, -1)
-            ).clone()
-
-            q = q.reshape(q_by_head.shape)
-            k = k.reshape(k_by_head.shape)
-
-            q[..., qk_nope_head_dim:] = q_pe
-            k[..., qk_nope_head_dim:] = k_pe
-
+                self.rotary_emb.forward_cuda(positions, q, k)
             q = q.view(q_shape)
             k = k.view(k_shape)
         else:
             q, k = self.rotary_emb(positions, q, k)
+
         attn_output = self.attn(q, k, v, forward_batch, sinks=self.attn_sink)
         if self.gated_self_attention_headwise:
             attn_shape = attn_output.shape
             gate = self.gate_proj(hidden_states)[0].unsqueeze(
                 -1
             )  # (bs * seq_len, num_heads, 1)
+            # fuse: implement a fused sigmoid mul, maybe could use torch.compile
             attn_output = attn_output.view(attn_shape[0], self.num_heads, -1)
-            attn_output = attn_output * torch.sigmoid(gate)
+            inplace_sigmoid_mul(gate, attn_output)
             attn_output = attn_output.view(attn_shape)
 
         output, _ = self.o_proj(attn_output)
@@ -1096,10 +1093,17 @@ class Qwen2MoeDecoderLayer(nn.Module):
                 quant_config=quant_config,
                 prefix=add_prefix("mlp", prefix),
             )
-        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = RMSNorm(
+        # self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        # self.post_attention_layernorm = RMSNorm(
+        #     config.hidden_size, eps=config.rms_norm_eps
+        # )
+        self.input_layernorm = WelmV4FusedRMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
+        self.post_attention_layernorm = WelmV4FusedRMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps
+        )
+
         self.layer_communicator = LayerCommunicator(
             layer_scatter_modes=self.layer_scatter_modes,
             input_layernorm=self.input_layernorm,
@@ -1115,11 +1119,19 @@ class Qwen2MoeDecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        if residual is None:
-            residual = hidden_states
-            hidden_states = self.input_layernorm(hidden_states)
-        else:
-            hidden_states, residual = self.input_layernorm(hidden_states, residual)
+        # mtp 这里需要prenorm这里处理的对吗？需要确认一下@kavioyu
+        # fuse: input layer norm and copy residual
+        residual_after_layernorm = (
+            self.ppln and self.layer_id not in self.prenorm_layer_idx
+        )
+        hidden_states, residual = self.input_layernorm(
+            hidden_states, residual, residual_after_layernorm=residual_after_layernorm
+        )
+        # if residual is None:
+        #     residual = hidden_states
+        #     hidden_states = self.input_layernorm(hidden_states)
+        # else:
+        #     hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
         if self.ppln and self.layer_id not in self.prenorm_layer_idx:
             residual = hidden_states.clone().to(
@@ -1131,28 +1143,24 @@ class Qwen2MoeDecoderLayer(nn.Module):
                 hidden_states=hidden_states,
                 forward_batch=forward_batch,
             )
-
-        # hidden_states, residual = self.layer_communicator.prepare_mlp(
-        #     hidden_states, residual, forward_batch
-        # )
         if (
             forward_batch.enable_kv_mirror
             and forward_batch.forward_mode.is_extend_without_speculative()
             and self.layer_id == self.kv_mirror_layers[-1]
         ):
             residual = residual[forward_batch.custom_last_index]
-        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
-
+        # fuse: implement a post_attention_layernorm with cast to float32 to avoid cast before moe router
+        # hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        hidden_states, residual, hidden_states_fp32 = self.post_attention_layernorm(
+            hidden_states, residual, clone_fp32_out=True
+        )
         # For DP with padding, reduce scatter can be used instead of all-reduce.
         use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
             forward_batch
         )
-        hidden_states = self.mlp(hidden_states, forward_batch, use_reduce_scatter)
-        # hidden_states = hidden_states + residual
-
-        # hidden_states, residual = self.layer_communicator.postprocess_layer(
-        #     hidden_states, residual, forward_batch
-        # )
+        hidden_states = self.mlp(
+            hidden_states, hidden_states_fp32, forward_batch, use_reduce_scatter
+        )
         return hidden_states, residual
 
 
@@ -1334,7 +1342,7 @@ class WeLMV4MoeForCausalLM(nn.Module):
         self.pp_group = get_pp_group()
         self.config = config
         self.quant_config = quant_config
-        alt_stream = torch.cuda.Stream() if _is_cuda else None
+        alt_stream = torch.cuda.Stream(device=torch.cuda.current_device())
         self.model = Qwen2MoeModel(
             config,
             quant_config,
