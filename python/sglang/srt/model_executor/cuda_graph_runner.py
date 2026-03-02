@@ -52,6 +52,7 @@ from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.moe.token_dispatcher.deepep import DeepEPBuffer
 from sglang.srt.layers.moe.utils import get_deepep_mode, get_moe_a2a_backend
 from sglang.srt.layers.torchao_utils import save_gemlite_cache
+from sglang.srt.managers.schedule_batch import NGramInputIds
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
@@ -74,7 +75,6 @@ from sglang.srt.utils import (
 )
 from sglang.srt.utils.patch_torch import monkey_patch_torch_compile
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
-from sglang.srt.managers.schedule_batch import NGramInputIds
 
 try:
     from kt_kernel import KTMoEWrapper
@@ -331,7 +331,7 @@ class CudaGraphRunner:
             encoder_len_fill_value=self.encoder_len_fill_value,
             num_tokens_per_bs=self.num_tokens_per_bs,
             cache_loc_dtype=self._cache_loc_dtype(),
-            enable_over_encoding=self.model_runner.server_args.enable_over_encoding,
+            prepare_n_gram_inputs=self.model_runner.server_args.prepare_n_gram_inputs,
         )
 
         self.tbo_plugin = TboCudaGraphRunnerPlugin()
@@ -643,7 +643,7 @@ class CudaGraphRunner:
             global_forward_mode=self.capture_forward_mode,
             lora_ids=lora_ids,
         )
-        if self.model_runner.server_args.enable_over_encoding:
+        if self.model_runner.server_args.prepare_n_gram_inputs:
             forward_batch.n_gram_input_ids = NGramInputIds(
                 input_ids_gram2=buffers.input_ids_gram2[:num_tokens],
                 input_ids_gram3=buffers.input_ids_gram3[:num_tokens],
