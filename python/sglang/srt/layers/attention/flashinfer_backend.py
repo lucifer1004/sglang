@@ -810,6 +810,7 @@ class FlashInferAttnBackend(AttentionBackend):
         layer: RadixAttention,
         forward_batch: ForwardBatch,
         save_kv_cache=True,
+        **kwargs,
     ):
         decode_wrapper = self.forward_metadata.decode_wrappers[
             self._get_wrapper_idx(layer)
