@@ -15,9 +15,7 @@
 # Adapted from
 # https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/models/qwen2_moe.py
 """Inference-only Qwen2MoE model compatible with HuggingFace weights."""
-import gc
 import logging
-import sys
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
@@ -59,7 +57,6 @@ from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import (
-    LinearScalingRotaryEmbedding,
     RotaryEmbedding,
     _yarn_find_correction_range,
     _yarn_linear_ramp_mask,
@@ -85,11 +82,6 @@ from sglang.srt.utils import add_prefix, is_cuda, make_layers
 logger = logging.getLogger(__name__)
 
 _is_cuda = is_cuda()
-
-
-def log(*args):
-    if torch.cuda.current_device() == 0:
-        print(*args)
 
 
 def hash_input_ids_vectorized(input_ids: torch.Tensor) -> torch.Tensor:
@@ -119,86 +111,6 @@ class KVMirrorManager:
         if clear:
             KVMirrorManager.activations_dict_kv.clear()
         return kv_activation
-
-
-def remove_all_references(obj: Any, verbose: bool = False) -> int:
-    removed_count = 0
-    referrers = gc.get_referrers(obj)
-
-    if verbose:
-        print(f"找到 {len(referrers)} 个引用者")
-
-    for ref in referrers:
-        try:
-            # 跳过 gc.get_referrers 返回的列表本身
-            if ref is referrers:
-                continue
-
-            # 1. 如果是字典，查找并删除键值对
-            if isinstance(ref, dict):
-                keys_to_delete = []
-                for key, value in ref.items():
-                    if value is obj:
-                        keys_to_delete.append(key)
-
-                for key in keys_to_delete:
-                    try:
-                        del ref[key]
-                        removed_count += 1
-                        if verbose:
-                            print(f"  从字典中删除键: {key}")
-                    except (TypeError, KeyError):
-                        pass  # 可能是只读字典
-
-            # 2. 如果是列表，尝试替换或删除元素
-            elif isinstance(ref, list):
-                try:
-                    indices = [i for i, item in enumerate(ref) if item is obj]
-                    # 从后往前删除，避免索引变化
-                    for i in reversed(indices):
-                        ref.pop(i)
-                        removed_count += 1
-                        if verbose:
-                            print(f"  从列表中删除索引: {i}")
-                except (TypeError, AttributeError):
-                    pass  # 可能是只读列表
-
-            # 3. 如果是对象，尝试删除属性
-            elif hasattr(ref, "__dict__"):
-                attrs_to_delete = []
-                for attr_name, attr_value in ref.__dict__.items():
-                    if attr_value is obj:
-                        attrs_to_delete.append(attr_name)
-
-                for attr_name in attrs_to_delete:
-                    try:
-                        delattr(ref, attr_name)
-                        removed_count += 1
-                        if verbose:
-                            print(
-                                f"  从对象 {type(ref).__name__} 中删除属性: {attr_name}"
-                            )
-                    except (AttributeError, TypeError):
-                        pass
-
-            # 4. 如果是元组或不可变类型，无法删除
-            elif isinstance(ref, (tuple, frozenset)):
-                if verbose:
-                    print(f"  跳过不可变类型: {type(ref).__name__}")
-
-        except Exception as e:
-            if verbose:
-                print(f"  处理引用时出错: {type(ref).__name__} - {e}")
-            continue
-
-    # 强制垃圾回收
-    gc.collect()
-
-    if verbose:
-        remaining_refs = sys.getrefcount(obj) - 1
-        print(f"删除后剩余引用数: {remaining_refs}")
-
-    return removed_count
 
 
 class LayerManager:
@@ -260,13 +172,6 @@ class LayerManager:
                 imitated_layer_attn.qkv_proj_bias = None
                 mirror_layer_attn.qkv_proj_bias = None
 
-            # if mirror_layer_id not in LayerManager.num_nextn_predict_layer_idx:
-            #     remove_all_references(mirror_layer_attn.qkv_proj)
-            #     remove_all_references(mirror_qkv_proj_weight)
-            #     remove_all_references(mirror_qkv_proj_bias)
-            #     remove_all_references(imitated_layer_attn.qkv_proj)
-            #     remove_all_references(imitated_qkv_proj_weight)
-            #     remove_all_references(imitated_qkv_proj_bias)
         torch.cuda.empty_cache()
 
 
@@ -476,6 +381,65 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         return final_hidden_states.view(num_tokens, hidden_dim)
 
 
+class LinearScalingRotaryEmbedding(WelmV4InplaceRotaryEmbedding):
+    def __init__(
+        self,
+        head_size: int,
+        rotary_dim: int,
+        max_position_embeddings: int,
+        base: int,
+        is_neox_style: bool,
+        scaling_factors: Union[List[float], float],
+        dtype: torch.dtype,
+    ) -> None:
+        if isinstance(scaling_factors, float):
+            scaling_factors = [scaling_factors]
+        self.scaling_factors: List[float] = scaling_factors  # noqa
+        super().__init__(
+            head_size, rotary_dim, max_position_embeddings, base, is_neox_style, dtype
+        )
+        # Lazy initialized.
+        self._scaling_factor_to_offset: Dict[float, int]
+
+    def _compute_cos_sin_cache(self) -> torch.Tensor:
+        inv_freq = self._compute_inv_freq(self.base)
+        cache_list: List[torch.Tensor] = []
+        # offsets to the next cache in a tensor.
+        # Each offset corresponds to the same index in scaling_factors.
+        offsets: List[int] = []
+        for scaling_factor in self.scaling_factors:
+            # NOTE(woosuk): self.max_position_embeddings is the original
+            # maximum length before applying the rope scaling.
+            # Thus, the maximum length after applying the rope scaling is
+            # self.max_position_embeddings * self.scaling_factor.
+            max_len = self.max_position_embeddings * scaling_factor
+            t = torch.arange(max_len, dtype=torch.float)
+            t = t / scaling_factor
+
+            freqs = torch.einsum("i,j -> ij", t, inv_freq)
+            cos = freqs.cos()
+            sin = freqs.sin()
+            cache = torch.cat((cos, sin), dim=-1)
+            if not cache_list:
+                offset = 0
+            else:
+                last_offset = offsets[-1]
+                next_max_len = cache_list[-1].shape[0]
+                offset = last_offset + next_max_len
+            offsets.append(offset)
+            cache_list.append(cache)
+        self._scaling_factor_to_offset = {
+            float(scaling_factor): offsets[i]
+            for i, scaling_factor in enumerate(self.scaling_factors)
+        }
+        assert len(self.scaling_factors) == len(offsets)
+        return torch.cat(cache_list, dim=0)
+
+    @property
+    def scaling_factor_to_offset(self) -> Dict[float, int]:
+        return self._scaling_factor_to_offset
+
+
 # WelmV4InplaceRotaryEmbedding
 class Qwen2MoeYarnScalingRotaryEmbedding(WelmV4InplaceRotaryEmbedding):
     def __init__(
@@ -608,7 +572,6 @@ def get_rope(
         raise ValueError(f"Please set RoPE scaling")
     else:
         scaling_type = rope_scaling["type"]
-        assert scaling_type == "yarn", "Only yarn scaling is supported for WelmV4"
 
         if scaling_type == "linear":
             scaling_factor = rope_scaling["factor"]
@@ -933,21 +896,6 @@ class Qwen2MoeAttention(nn.Module):
                 and forward_batch.forward_mode.is_extend_without_speculative()
                 and self.kv_mirror_layer_idx in self.kv_mirror_layers
             ):
-                # optim: mirror rope embedding optim @kavioyu
-                # q_pe_proxy = torch.empty(
-                #     (k_pe.shape[0],) + q_pe.shape[1:],
-                #     dtype=q_pe.dtype,
-                #     device=q_pe.device,
-                # )
-                # k_pe_proxy = torch.empty(
-                #     (q_pe.shape[0],) + k_pe.shape[1:],
-                #     dtype=k_pe.dtype,
-                #     device=k_pe.device,
-                # )
-                # _, k_pe = self.rotary_emb(positions, q_pe_proxy, k_pe)
-                # q_pe, _ = self.rotary_emb(
-                #     positions[forward_batch.custom_last_index], q_pe, k_pe_proxy
-                # )
                 self.rotary_emb.forward_cuda(
                     positions, q, k, last_index=forward_batch.custom_last_index
                 )
@@ -964,7 +912,6 @@ class Qwen2MoeAttention(nn.Module):
             gate = self.gate_proj(hidden_states)[0].unsqueeze(
                 -1
             )  # (bs * seq_len, num_heads, 1)
-            # fuse: implement a fused sigmoid mul, maybe could use torch.compile
             attn_output = attn_output.view(attn_shape[0], self.num_heads, -1)
             inplace_sigmoid_mul(gate, attn_output)
             attn_output = attn_output.view(attn_shape)
@@ -1093,10 +1040,6 @@ class Qwen2MoeDecoderLayer(nn.Module):
                 quant_config=quant_config,
                 prefix=add_prefix("mlp", prefix),
             )
-        # self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        # self.post_attention_layernorm = RMSNorm(
-        #     config.hidden_size, eps=config.rms_norm_eps
-        # )
         self.input_layernorm = WelmV4FusedRMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
@@ -1119,19 +1062,12 @@ class Qwen2MoeDecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        # mtp 这里需要prenorm这里处理的对吗？需要确认一下@kavioyu
-        # fuse: input layer norm and copy residual
         residual_after_layernorm = (
             self.ppln and self.layer_id not in self.prenorm_layer_idx
         )
         hidden_states, residual = self.input_layernorm(
             hidden_states, residual, residual_after_layernorm=residual_after_layernorm
         )
-        # if residual is None:
-        #     residual = hidden_states
-        #     hidden_states = self.input_layernorm(hidden_states)
-        # else:
-        #     hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
         if self.ppln and self.layer_id not in self.prenorm_layer_idx:
             residual = hidden_states.clone().to(
@@ -1149,8 +1085,6 @@ class Qwen2MoeDecoderLayer(nn.Module):
             and self.layer_id == self.kv_mirror_layers[-1]
         ):
             residual = residual[forward_batch.custom_last_index]
-        # fuse: implement a post_attention_layernorm with cast to float32 to avoid cast before moe router
-        # hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         hidden_states, residual, hidden_states_fp32 = self.post_attention_layernorm(
             hidden_states, residual, clone_fp32_out=True
         )
