@@ -227,6 +227,7 @@ def _welmv4_inplace_rope_kernel(
         if last_index_ptr is not None:
             if token_id < BS:
                 position_id = tl.load(last_index_ptr + token_id)
+                position_id = tl.load(position_ptr + position_id)
                 cos_sin_cache = tl.load(
                     cos_sin_cache_ptr + position_id * rope_dim + cos_off
                 )
