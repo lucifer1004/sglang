@@ -1461,6 +1461,14 @@ class ServerArgs:
         if not user_set_prefill and not user_set_decode and is_hip():
             self.nsa_prefill_backend = "tilelang"
             self.nsa_decode_backend = "tilelang"
+        elif major >= 12:
+            # SM120 (Blackwell RTX): trtllm-gen FMHA and FlashMLA cubins are
+            # not compiled for SM120.  Use triton_sparse (dequant + cuBLAS bmm)
+            # which works on all architectures.
+            if not user_set_prefill:
+                self.nsa_prefill_backend = "triton_sparse"
+            if not user_set_decode:
+                self.nsa_decode_backend = "triton_sparse"
         elif kv_cache_dtype == "fp8_e4m3":
             if major >= 10:
                 self.nsa_prefill_backend = "trtllm"

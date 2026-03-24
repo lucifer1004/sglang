@@ -277,7 +277,7 @@ class NSAIndexerMetadata(BaseIndexerMetadata):
 
 
 _NSA_IMPL_T: TypeAlias = Literal[
-    "flashmla_sparse", "flashmla_kv", "fa3", "tilelang", "trtllm"
+    "flashmla_sparse", "flashmla_kv", "fa3", "tilelang", "trtllm", "triton_sparse"
 ]
 
 
@@ -372,6 +372,30 @@ class NativeSparseAttnBackend(
                 next_pow_of_2, device=self.device, dtype=torch.int32
             )
         return self._arange_buf[:l]
+
+    def _get_paged_mqa_schedule_metadata(
+        self, seqlens_32: torch.Tensor
+    ) -> Optional[torch.Tensor]:
+        """Get schedule metadata for paged MQA logits (NSA indexer Stage 1).
+
+        Uses FlashInfer Triton path on SM120+ where DeepGEMM is unsupported,
+        falls back to DeepGEMM on SM90/SM100.
+        """
+        try:
+            if self.device_sm_major >= 12:
+                from flashinfer.fp8_paged_mqa_logits import (
+                    get_paged_mqa_logits_metadata,
+                )
+                return get_paged_mqa_logits_metadata(
+                    seqlens_32, 64, 84  # block_size=64, num_sms=84 (SM120)
+                )
+            else:
+                import deep_gemm
+                return deep_gemm.get_paged_mqa_logits_metadata(
+                    seqlens_32, 64, deep_gemm.get_num_sms()
+                )
+        except (ImportError, ModuleNotFoundError, RuntimeError):
+            return None
 
     def _transform_table_1_to_real(self, page_table: torch.Tensor) -> torch.Tensor:
         page_size = self.real_page_size
@@ -609,23 +633,17 @@ class NativeSparseAttnBackend(
             or forward_batch.forward_mode.is_target_verify()
             or forward_batch.forward_mode.is_draft_extend()
         ):
-            try:
-                import deep_gemm
-
-                # NOTE: DeepGEMM paged path uses block_size=64.
-                seqlens_32 = (
-                    seqlens_expanded
-                    if (
-                        forward_batch.forward_mode.is_target_verify()
-                        or forward_batch.forward_mode.is_draft_extend()
-                    )
-                    else cache_seqlens_int32
+            seqlens_32 = (
+                seqlens_expanded
+                if (
+                    forward_batch.forward_mode.is_target_verify()
+                    or forward_batch.forward_mode.is_draft_extend()
                 )
-                paged_mqa_schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
-                    seqlens_32, 64, deep_gemm.get_num_sms()
-                )
-            except (ImportError, ModuleNotFoundError):
-                paged_mqa_schedule_metadata = None
+                else cache_seqlens_int32
+            )
+            paged_mqa_schedule_metadata = self._get_paged_mqa_schedule_metadata(
+                seqlens_32
+            )
 
         metadata = NSAMetadata(
             page_size=self.real_page_size,
@@ -895,22 +913,17 @@ class NativeSparseAttnBackend(
             or forward_mode.is_target_verify()
             or forward_mode.is_draft_extend()
         ):
-            try:
-                import deep_gemm
-
-                seqlens_32 = (
-                    seqlens_expanded
-                    if (
-                        forward_mode.is_target_verify()
-                        or forward_mode.is_draft_extend()
-                    )
-                    else cache_seqlens_int32
+            seqlens_32 = (
+                seqlens_expanded
+                if (
+                    forward_mode.is_target_verify()
+                    or forward_mode.is_draft_extend()
                 )
-                paged_mqa_schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
-                    seqlens_32, 64, deep_gemm.get_num_sms()
-                )
-            except (ImportError, ModuleNotFoundError):
-                paged_mqa_schedule_metadata = None
+                else cache_seqlens_int32
+            )
+            paged_mqa_schedule_metadata = self._get_paged_mqa_schedule_metadata(
+                seqlens_32
+            )
 
         metadata = NSAMetadata(
             page_size=self.real_page_size,
@@ -1044,26 +1057,17 @@ class NativeSparseAttnBackend(
             or forward_mode.is_target_verify()
             or forward_mode.is_draft_extend()
         ):
-            try:
-                import deep_gemm
-
-                seqlens_32 = (
-                    seqlens_expanded
-                    if (
-                        forward_mode.is_target_verify()
-                        or forward_mode.is_draft_extend()
-                    )
-                    else metadata.cache_seqlens_int32
+            seqlens_32 = (
+                seqlens_expanded
+                if (
+                    forward_mode.is_target_verify()
+                    or forward_mode.is_draft_extend()
                 )
-                new_schedule = deep_gemm.get_paged_mqa_logits_metadata(
-                    seqlens_32, 64, deep_gemm.get_num_sms()
-                )
-                if metadata.paged_mqa_schedule_metadata is None:
-                    metadata.paged_mqa_schedule_metadata = new_schedule
-                else:
-                    metadata.paged_mqa_schedule_metadata.copy_(new_schedule)
-            except (ImportError, ModuleNotFoundError):
-                metadata.paged_mqa_schedule_metadata = None
+                else metadata.cache_seqlens_int32
+            )
+            new_schedule = self._get_paged_mqa_schedule_metadata(seqlens_32)
+            if new_schedule is not None and metadata.paged_mqa_schedule_metadata is not None:
+                metadata.paged_mqa_schedule_metadata.copy_(new_schedule)
         seqlens_expanded_size = seqlens_expanded.shape[0]
         assert (
             metadata.nsa_cache_seqlens_int32 is not None
@@ -1457,6 +1461,16 @@ class NativeSparseAttnBackend(
                 page_table_1=page_table_1,
                 layer=layer,
             )
+        elif nsa_impl == "triton_sparse":
+            if q_rope is not None:
+                q_all = concat_mla_absorb_q_general(q_nope, q_rope)
+            return self._forward_triton_sparse(
+                q_all=q_all,
+                kv_cache=kv_cache,
+                page_table_1=page_table_1,
+                sm_scale=layer.scaling,
+                v_head_dim=layer.v_head_dim,
+            )
         else:
             raise ValueError(
                 f"Unsupported {nsa_impl = } for forward_extend. Consider using an other attention backend."
@@ -1606,9 +1620,88 @@ class NativeSparseAttnBackend(
                 metadata=metadata,
                 bs=forward_batch.batch_size,
             )
+        elif self.nsa_decode_impl == "triton_sparse":
+            if q_rope is not None:
+                q_all = concat_mla_absorb_q_general(q_nope, q_rope)
+            return self._forward_triton_sparse(
+                q_all=q_all,
+                kv_cache=kv_cache,
+                page_table_1=page_table_1,
+                sm_scale=layer.scaling,
+                v_head_dim=layer.v_head_dim,
+            )
 
         else:
             assert False, f"Unsupported {self.nsa_decode_impl = }"
+
+    def _forward_triton_sparse(
+        self,
+        q_all: torch.Tensor,
+        kv_cache: torch.Tensor,
+        page_table_1: torch.Tensor,
+        sm_scale: float,
+        v_head_dim: int,
+    ) -> torch.Tensor:
+        """Sparse MLA attention on SM120 via fused FP8 or dequant+bmm fallback.
+
+        Decode path: fused FP8 Triton kernel (reads FP8 directly, no intermediate).
+        Prefill path: chunked dequant + cuBLAS bmm (handles large Q token counts).
+        """
+        num_tokens, num_heads, head_dim = q_all.shape
+        top_k = page_table_1.shape[1]
+        kv_cache_2d = kv_cache.view(-1, kv_cache.shape[-1]) if kv_cache.ndim > 2 else kv_cache
+
+        # Use fused FP8 kernel: reads FP8 directly, no intermediate BF16 buffer
+        if (
+            self.nsa_kv_cache_store_fp8
+            and num_heads >= 16
+            and kv_cache_2d.dtype == torch.float8_e4m3fn
+        ):
+            from flashinfer.fused_sparse_mla_decode import fused_sparse_mla_decode
+            # Decode (small batch): auto-tune split-K for GPU occupancy
+            # Prefill (many Q tokens): no split-K needed, enough parallelism
+            k_splits = None if num_tokens <= 64 else 1
+            return fused_sparse_mla_decode(
+                q_all, kv_cache_2d, page_table_1, sm_scale,
+                kv_lora_rank=v_head_dim,
+                qk_rope_head_dim=head_dim - v_head_dim,
+                k_splits=k_splits,
+            )
+
+        # Fallback: chunked dequant + cuBLAS bmm (for non-FP8 KV cache)
+        bytes_per_q = top_k * head_dim * 2 + top_k * num_heads * 4 * 2
+        max_chunk = max(1, (512 * 1024**2) // bytes_per_q)
+        chunk_size = min(num_tokens, max_chunk)
+
+        output = torch.empty(
+            num_tokens, num_heads, v_head_dim,
+            dtype=q_all.dtype, device=q_all.device,
+        )
+
+        for start in range(0, num_tokens, chunk_size):
+            end = min(start + chunk_size, num_tokens)
+            q_chunk = q_all[start:end]
+            pt_chunk = page_table_1[start:end]
+            cs = end - start
+
+            if self.nsa_kv_cache_store_fp8:
+                flat_idx = pt_chunk.clamp(min=0).reshape(-1).to(torch.int32)
+                kv_bf16 = dequantize_k_cache_paged(
+                    kv_cache_2d.unsqueeze(1) if kv_cache_2d.ndim == 2 else kv_cache_2d,
+                    flat_idx,
+                ).squeeze(1).view(cs, top_k, -1)
+            else:
+                flat_idx = pt_chunk.clamp(min=0).reshape(-1).long()
+                kv_bf16 = kv_cache_2d[flat_idx].view(cs, top_k, -1)
+
+            valid = (pt_chunk >= 0).unsqueeze(1)
+            scores = torch.bmm(q_chunk, kv_bf16.transpose(1, 2))
+            scores = scores.float() * sm_scale
+            scores = scores.masked_fill(~valid, float("-inf"))
+            attn = torch.softmax(scores, dim=-1).to(q_all.dtype)
+            output[start:end] = torch.bmm(attn, kv_bf16[:, :, :v_head_dim])
+
+        return output
 
     def _forward_fa3(
         self,

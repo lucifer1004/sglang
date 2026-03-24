@@ -29,6 +29,24 @@ if _is_cuda:
     except ImportError as e:
         deep_gemm = e
 
+# Use FlashInfer's Triton-based MQA logits on SM120+ where DeepGEMM lacks support,
+# or as fallback when DeepGEMM import fails.
+_use_flashinfer_mqa_logits = False
+if _is_cuda:
+    _sm_major = torch.cuda.get_device_capability()[0]
+    if _sm_major >= 12 or isinstance(deep_gemm, Exception):
+        try:
+            from flashinfer.fp8_paged_mqa_logits import (
+                fp8_paged_mqa_logits as _flashinfer_fp8_paged_mqa_logits,
+                get_paged_mqa_logits_metadata as _flashinfer_get_paged_mqa_logits_metadata,
+            )
+            from flashinfer.fp8_ragged_mqa_logits import (
+                fp8_ragged_mqa_logits as _flashinfer_fp8_ragged_mqa_logits,
+            )
+            _use_flashinfer_mqa_logits = True
+        except ImportError:
+            pass
+
 if is_npu():
     import torch_npu
     from sglang.srt.hardware_backend.npu.utils import get_indexer_weight_stream
@@ -420,9 +438,14 @@ class Indexer(MultiPlatformOp):
         schedule_metadata = getattr(metadata, "paged_mqa_schedule_metadata", None)
         if _is_cuda:
             if schedule_metadata is None:
-                schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
-                    seqlens_32, blocksize, self.sm_count
-                )
+                if _use_flashinfer_mqa_logits:
+                    schedule_metadata = _flashinfer_get_paged_mqa_logits_metadata(
+                        seqlens_32, blocksize, self.sm_count
+                    )
+                else:
+                    schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
+                        seqlens_32, blocksize, self.sm_count
+                    )
 
         assert len(q_fp8.shape) == 3
         q_fp8 = q_fp8.unsqueeze(1)  # the next_n dim is 1 now
@@ -467,6 +490,17 @@ class Indexer(MultiPlatformOp):
                 ChunkK=128,
                 TotalCuCount=256,
                 WavePerEU=5,
+            )
+        elif _use_flashinfer_mqa_logits:
+            logits = _flashinfer_fp8_paged_mqa_logits(
+                q_fp8[:q_offset],
+                kv_cache_fp8,
+                weights[:q_offset],
+                seqlens_32,
+                block_tables,
+                schedule_metadata,
+                max_seq_len,
+                clean_logits=False,
             )
         else:
             logits = deep_gemm.fp8_paged_mqa_logits(
@@ -597,6 +631,15 @@ class Indexer(MultiPlatformOp):
                     logits = fp8_mqa_logits(
                         q_fp8[:q_offset], kv, scale, weights[:q_offset], ks, ke
                     )
+                elif _use_flashinfer_mqa_logits:
+                    logits = _flashinfer_fp8_ragged_mqa_logits(
+                        q_fp8[:q_offset],
+                        kv_fp8,
+                        weights[:q_offset],
+                        ks,
+                        ke,
+                        clean_logits=False,
+                    )
                 else:
                     logits = deep_gemm.fp8_mqa_logits(
                         q_fp8[:q_offset],
@@ -646,6 +689,15 @@ class Indexer(MultiPlatformOp):
                         weights[start:end],
                         ks[start:end],
                         ke[start:end],
+                    )
+                elif _use_flashinfer_mqa_logits:
+                    logits_chunk = _flashinfer_fp8_ragged_mqa_logits(
+                        q_fp8[start:end],
+                        kv_fp8,
+                        weights[start:end],
+                        ks[start:end],
+                        ke[start:end],
+                        clean_logits=False,
                     )
                 else:
                     logits_chunk = deep_gemm.fp8_mqa_logits(
