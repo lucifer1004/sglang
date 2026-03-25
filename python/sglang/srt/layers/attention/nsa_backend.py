@@ -1657,16 +1657,22 @@ class NativeSparseAttnBackend(
             and num_heads >= 16
             and kv_cache_2d.dtype == torch.float8_e4m3fn
         ):
-            from flashinfer.fused_sparse_mla_decode import fused_sparse_mla_decode
-            # Decode (small batch): auto-tune split-K for GPU occupancy
-            # Prefill (many Q tokens): no split-K needed, enough parallelism
-            k_splits = None if num_tokens <= 64 else 1
-            return fused_sparse_mla_decode(
-                q_all, kv_cache_2d, page_table_1, sm_scale,
-                kv_lora_rank=v_head_dim,
-                qk_rope_head_dim=head_dim - v_head_dim,
-                k_splits=k_splits,
-            )
+            if num_tokens > 64:
+                # Prefill: head-tiled kernel (7× faster than decode kernel at large num_q)
+                from flashinfer.sparse_mla_prefill import sparse_mla_prefill
+                return sparse_mla_prefill(
+                    q_all, kv_cache_2d, page_table_1, sm_scale,
+                    kv_lora_rank=v_head_dim,
+                    qk_rope_head_dim=head_dim - v_head_dim,
+                )
+            else:
+                # Decode: split-K kernel (better for small batch with GPU underutilization)
+                from flashinfer.fused_sparse_mla_decode import fused_sparse_mla_decode
+                return fused_sparse_mla_decode(
+                    q_all, kv_cache_2d, page_table_1, sm_scale,
+                    kv_lora_rank=v_head_dim,
+                    qk_rope_head_dim=head_dim - v_head_dim,
+                )
 
         # Fallback: chunked dequant + cuBLAS bmm (for non-FP8 KV cache)
         bytes_per_q = top_k * head_dim * 2 + top_k * num_heads * 4 * 2
