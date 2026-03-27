@@ -173,15 +173,10 @@ class EAGLEDraftExtendCudaGraphRunner:
             )
             if self.model_runner.server_args.prepare_n_gram_inputs:
                 self.ngram_input_ids = NGramInputIds(
-                    input_ids_gram2=torch.zeros(
-                        (self.max_num_token,), dtype=torch.int64
-                    ),
-                    input_ids_gram3=torch.zeros(
-                        (self.max_num_token,), dtype=torch.int64
-                    ),
-                    input_ids_gram4=torch.zeros(
-                        (self.max_num_token,), dtype=torch.int64
-                    ),
+                    input_ids_grams=[
+                        torch.zeros((self.max_num_token,), dtype=torch.int64)
+                        for _ in range(3)
+                    ],
                     input_ids_buffer=torch.zeros(
                         (self.max_bs * NGramInputIds.buffer_size), dtype=torch.int64
                     ),
@@ -307,13 +302,10 @@ class EAGLEDraftExtendCudaGraphRunner:
             buffer = self.ngram_input_ids.input_ids_buffer[
                 : bs * self.ngram_input_ids.buffer_size
             ]
-            gram2 = self.ngram_input_ids.input_ids_gram2[:num_tokens]
-            gram3 = self.ngram_input_ids.input_ids_gram3[:num_tokens]
-            gram4 = self.ngram_input_ids.input_ids_gram4[:num_tokens]
             current_ngram_input_ids = NGramInputIds(
-                input_ids_gram2=gram2,
-                input_ids_gram3=gram3,
-                input_ids_gram4=gram4,
+                input_ids_grams=[
+                    gram[:num_tokens] for gram in self.ngram_input_ids.input_ids_grams
+                ],
                 input_ids_buffer=buffer,
             )
         else:
@@ -459,15 +451,11 @@ class EAGLEDraftExtendCudaGraphRunner:
             self.ngram_input_ids.input_ids_buffer[
                 : raw_bs * NGramInputIds.buffer_size
             ].copy_(forward_batch.n_gram_input_ids.input_ids_buffer)
-            self.ngram_input_ids.input_ids_gram2[:num_tokens].copy_(
-                forward_batch.n_gram_input_ids.input_ids_gram2
-            )
-            self.ngram_input_ids.input_ids_gram3[:num_tokens].copy_(
-                forward_batch.n_gram_input_ids.input_ids_gram3
-            )
-            self.ngram_input_ids.input_ids_gram4[:num_tokens].copy_(
-                forward_batch.n_gram_input_ids.input_ids_gram4
-            )
+            for buf_gram, src_gram in zip(
+                self.ngram_input_ids.input_ids_grams,
+                forward_batch.n_gram_input_ids.input_ids_grams,
+            ):
+                buf_gram[:num_tokens].copy_(src_gram)
 
         self.eagle_worker.draft_extend_attn_backend.init_forward_metadata_replay_cuda_graph(
             bs=bs,

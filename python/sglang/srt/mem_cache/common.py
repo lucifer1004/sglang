@@ -338,10 +338,14 @@ def alloc_for_extend(
 
     bs = len(batch.reqs)
     prefix_tensors = [r.prefix_indices for r in batch.reqs]
+    prefix_lens = [s * batch.scale_seq_factor for s in batch.prefix_lens]
+    extend_lens = [s * batch.scale_seq_factor for s in batch.extend_lens]
+    prefix_lens_cpu = torch.tensor(prefix_lens, dtype=torch.int64)
+    extend_lens_cpu = torch.tensor(extend_lens, dtype=torch.int64)
 
     # Create tensors for allocation
-    prefix_lens_cpu = torch.tensor(batch.prefix_lens, dtype=torch.int64)
-    extend_lens_cpu = torch.tensor(batch.extend_lens, dtype=torch.int64)
+    # prefix_lens_cpu = torch.tensor(batch.prefix_lens, dtype=torch.int64)
+    # extend_lens_cpu = torch.tensor(batch.extend_lens, dtype=torch.int64)
     prefix_lens_device = prefix_lens_cpu.to(batch.device, non_blocking=True)
     extend_lens_device = extend_lens_cpu.to(batch.device, non_blocking=True)
 
@@ -456,9 +460,23 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
     else:
         locs = batch.seq_lens.clone()
 
-    batch.req_to_token_pool.write(
-        (batch.req_pool_indices, locs), out_cache_loc.to(torch.int32)
-    )
+    # batch.req_to_token_pool.write(
+    #     (batch.req_pool_indices, locs), out_cache_loc.to(torch.int32)
+    # )
+    if token_per_req > 1:
+        expanded_req_pool_indices = batch.req_pool_indices.repeat_interleave(
+            token_per_req
+        )
+        offsets = torch.arange(token_per_req, device=batch.device, dtype=locs.dtype)
+        expanded_locs = (locs.unsqueeze(1) + offsets).reshape(-1)
+        batch.req_to_token_pool.write(
+            (expanded_req_pool_indices, expanded_locs),
+            out_cache_loc.to(torch.int32),
+        )
+    else:
+        batch.req_to_token_pool.write(
+            (batch.req_pool_indices, locs), out_cache_loc.to(torch.int32)
+        )
 
     return out_cache_loc
 

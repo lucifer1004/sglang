@@ -285,6 +285,12 @@ class CudaGraphRunner:
                 self.num_tokens_per_bs = (
                     self.model_runner.server_args.speculative_num_draft_tokens
                 )
+        self.scale_seq_factor = (
+            getattr(model_runner.model_config.hf_config, "scale_seq_times", 0) + 1
+        )
+        if self.scale_seq_factor > 1 and self.num_tokens_per_bs == 1:
+            self.num_tokens_per_bs = self.scale_seq_factor
+            self.capture_forward_mode = ForwardMode.TARGET_VERIFY
 
         # If returning hidden states is enabled, set initial capture hidden mode to full to avoid double-capture on startup
         if model_runner.server_args.enable_return_hidden_states:
@@ -332,6 +338,7 @@ class CudaGraphRunner:
             num_tokens_per_bs=self.num_tokens_per_bs,
             cache_loc_dtype=self._cache_loc_dtype(),
             prepare_n_gram_inputs=self.model_runner.server_args.prepare_n_gram_inputs,
+            scale_seq_factor=self.scale_seq_factor,
         )
 
         self.tbo_plugin = TboCudaGraphRunnerPlugin()
@@ -540,7 +547,10 @@ class CudaGraphRunner:
         num_tokens = bs * self.num_tokens_per_bs
 
         # Graph inputs
-        input_ids = buffers.input_ids[:num_tokens]
+        is_scale_seq = self.scale_seq_factor > 1
+        model_input_len = bs if is_scale_seq else num_tokens
+        input_ids = buffers.input_ids[:model_input_len]
+
         req_pool_indices = buffers.req_pool_indices[:bs]
         seq_lens = buffers.seq_lens[:bs]
         seq_lens_cpu = buffers.seq_lens_cpu[:bs]
@@ -551,7 +561,7 @@ class CudaGraphRunner:
         else:
             encoder_lens = None
         mrope_positions = buffers.mrope_positions[:, :num_tokens]
-        next_token_logits_buffer = buffers.next_token_logits_buffer[:num_tokens]
+        next_token_logits_buffer = buffers.next_token_logits_buffer[:model_input_len]
         buffers.num_token_non_padded[...] = num_tokens
 
         # pipeline parallelism
@@ -645,9 +655,9 @@ class CudaGraphRunner:
         )
         if self.model_runner.server_args.prepare_n_gram_inputs:
             forward_batch.n_gram_input_ids = NGramInputIds(
-                input_ids_gram2=buffers.input_ids_gram2[:num_tokens],
-                input_ids_gram3=buffers.input_ids_gram3[:num_tokens],
-                input_ids_gram4=buffers.input_ids_gram4[:num_tokens],
+                input_ids_grams=[
+                    gram[:model_input_len] for gram in buffers.input_ids_grams
+                ],
             )
         self.tbo_plugin.capture_one_batch_size(forward_batch, num_tokens=num_tokens)
 
@@ -820,7 +830,6 @@ class CudaGraphRunner:
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
         self.deepep_adapter.replay()
-
         if not skip_attn_backend_init:
             self.replay_prepare(forward_batch, pp_proxy_tensors)
         else:
@@ -834,12 +843,14 @@ class CudaGraphRunner:
         else:
             graph_key = self.bs
         self.graphs[graph_key].replay()
+
+        output_len = self.raw_bs if self.scale_seq_factor > 1 else self.raw_num_token
         output = self.output_buffers[graph_key]
         if isinstance(output, LogitsProcessorOutput):
             return LogitsProcessorOutput(
-                next_token_logits=output.next_token_logits[: self.raw_num_token],
+                next_token_logits=output.next_token_logits[:output_len],
                 hidden_states=(
-                    output.hidden_states[: self.raw_num_token]
+                    output.hidden_states[:output_len]
                     if output.hidden_states is not None
                     else None
                 ),

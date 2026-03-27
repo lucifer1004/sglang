@@ -588,9 +588,11 @@ def get_rope(
         elif scaling_type == "yarn":
             scaling_factor = rope_scaling["factor"]
             original_max_position = rope_scaling["original_max_position_embeddings"]
-            if max_position != int(original_max_position * scaling_factor):
+            base_max_position = int(original_max_position * scaling_factor)
+            if max_position < base_max_position:
                 raise ValueError(
-                    f"max_position ({max_position}) != original_max_position ({original_max_position}) * scaling_factor ({scaling_factor})"
+                    f"max_position ({max_position}) < original_max_position "
+                    f"({original_max_position}) * scaling_factor ({scaling_factor})"
                 )
             extra_kwargs = {
                 k: v
@@ -939,6 +941,10 @@ class Qwen2MoeDecoderLayer(nn.Module):
         rope_theta = getattr(config, "rope_theta", 10000)
         rope_scaling = getattr(config, "rope_scaling", None)
         max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
+
+        scale_seq_times = getattr(config, "scale_seq_times", 0)
+        if scale_seq_times > 0:
+            max_position_embeddings = max_position_embeddings * (scale_seq_times + 1)
         if getattr(config, "qkv_bias", None) is not None:
             qkv_bias = getattr(config, "qkv_bias")
         elif getattr(config, "qkv_proj_bias", None) is not None:
@@ -1116,6 +1122,7 @@ class Qwen2MoeModel(nn.Module):
         self.oe_dim = config.oe_dim
         self.oe_grams = config.oe_grams
         self.oe_vocab_sizes = config.oe_vocab_sizes
+        self.scale_seq_times = getattr(config, "scale_seq_times", 0)
 
         if len(self.oe_vocab_sizes) > 0:
             self.oe_embed = nn.ModuleList(
@@ -1133,6 +1140,44 @@ class Qwen2MoeModel(nn.Module):
                 bias=False,
                 quant_config=None,
             )
+
+        # Scale sequence length embeddings: N additional embedding groups
+        if self.scale_seq_times > 0:
+            self.scale_seq_embed_tokens_list = nn.ModuleList(
+                [
+                    VocabParallelEmbedding(
+                        config.vocab_size,
+                        config.hidden_size,
+                        enable_tp=not is_dp_attention_enabled(),
+                    )
+                    for _ in range(self.scale_seq_times)
+                ]
+            )
+            if len(self.oe_vocab_sizes) > 0:
+                self.scale_seq_oe_embed_list = nn.ModuleList(
+                    [
+                        nn.ModuleList(
+                            [
+                                VocabParallelEmbedding(
+                                    self.oe_vocab_sizes[j], self.oe_dim
+                                )
+                                for j in range(len(self.oe_vocab_sizes))
+                            ]
+                        )
+                        for _ in range(self.scale_seq_times)
+                    ]
+                )
+                self.scale_seq_oe_up_proj_list = nn.ModuleList(
+                    [
+                        ReplicatedLinear(
+                            self.oe_dim * len(self.oe_vocab_sizes),
+                            config.hidden_size,
+                            bias=False,
+                            quant_config=None,
+                        )
+                        for _ in range(self.scale_seq_times)
+                    ]
+                )
 
         if self.pp_group.is_first_rank:
             self.embed_tokens = VocabParallelEmbedding(
@@ -1173,6 +1218,72 @@ class Qwen2MoeModel(nn.Module):
         for layer_id in self.layers_to_capture:
             setattr(self.layers[layer_id], "_is_layer_to_capture", True)
 
+    def _compute_oe_embedding(
+        self,
+        input_ids,
+        forward_batch,
+        base_hidden_states,
+        oe_embed_modules=None,
+        oe_up_proj_module=None,
+    ):
+        """Compute over-encoding embedding and combine with base hidden states.
+        If oe_embed_modules/oe_up_proj_module are None, use the main OE modules."""
+        if oe_embed_modules is None:
+            oe_embed_modules = self.oe_embed
+        if oe_up_proj_module is None:
+            oe_up_proj_module = self.oe_gate_up_proj
+
+        input_ids_ngram = []
+        input_ids_ngram_tmp = input_ids
+        for g in range(1, max(self.oe_grams)):
+            gram_tensor = forward_batch.n_gram_input_ids.get_gram(g + 1)
+            if gram_tensor is not None:
+                input_ids_ngram_tmp = input_ids_ngram_tmp + gram_tensor * (
+                    self.vocab_size**g
+                )
+            input_ids_ngram.append(hash_input_ids_vectorized(input_ids_ngram_tmp))
+
+        emb_ngram = []
+        for i, vs in enumerate(self.oe_vocab_sizes):
+            input_ids_ngram_hashed_tmp = input_ids_ngram[self.oe_grams[i] - 2] % vs
+            emb_ngram_tmp = oe_embed_modules[i](input_ids_ngram_hashed_tmp)
+            emb_ngram.append(emb_ngram_tmp)
+        emb_new, _ = oe_up_proj_module(torch.cat(emb_ngram, dim=-1))
+        return (base_hidden_states + emb_new) / 2.0
+
+    def _expand_scale_seq(self, input_ids, forward_batch, hidden_states):
+        """Expand hidden_states from (T, D) to (T * scale, D) by interleaving
+        main embedding with scale_seq embeddings.
+
+        Layout per original token i:
+          [main_emb_i, scale_seq_1_emb_i, ..., scale_seq_N_emb_i]
+        """
+        scale = self.scale_seq_times + 1
+        T = hidden_states.shape[0]
+        D = hidden_states.shape[1]
+
+        # (T, D) -> (T, 1, D)
+        hidden_states = hidden_states.unsqueeze(1)
+        hidden_states_list = [hidden_states]
+
+        for s in range(self.scale_seq_times):
+            hs_s = self.scale_seq_embed_tokens_list[s](input_ids)  # (T, D)
+            if len(self.oe_grams) > 0:
+                hs_s = self._compute_oe_embedding(
+                    input_ids,
+                    forward_batch,
+                    hs_s,
+                    oe_embed_modules=self.scale_seq_oe_embed_list[s],
+                    oe_up_proj_module=self.scale_seq_oe_up_proj_list[s],
+                )
+            hs_s = hs_s.unsqueeze(1)  # (T, 1, D)
+            hidden_states_list.append(hs_s)
+
+        # (T, scale, D) -> (T * scale, D)
+        hidden_states = torch.cat(hidden_states_list, dim=1)
+        hidden_states = hidden_states.reshape(T * scale, D).contiguous()
+        return hidden_states
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -1188,31 +1299,14 @@ class Qwen2MoeModel(nn.Module):
                 hidden_states = input_embeds
 
             if len(self.oe_grams) > 0:
-                input_ids_ngram = []
-                input_ids_ngram_tmp = input_ids
-                input_ids_gram_n = [
-                    forward_batch.n_gram_input_ids.input_ids_gram2,
-                    forward_batch.n_gram_input_ids.input_ids_gram3,
-                    forward_batch.n_gram_input_ids.input_ids_gram4,
-                ]
-                for g in range(1, max(self.oe_grams)):
-                    input_ids_ngram_tmp = input_ids_ngram_tmp + input_ids_gram_n[
-                        g - 1
-                    ] * (self.vocab_size**g)
-                    input_ids_ngram.append(
-                        hash_input_ids_vectorized(input_ids_ngram_tmp)
-                    )
+                hidden_states = self._compute_oe_embedding(
+                    input_ids, forward_batch, hidden_states
+                )
 
-                emb_ngram = []
-                for i, vs in enumerate(self.oe_vocab_sizes):
-                    input_ids_ngram_hashed_tmp = (
-                        input_ids_ngram[self.oe_grams[i] - 2] % vs
-                    )
-                    emb_ngram_tmp = self.oe_embed[i](input_ids_ngram_hashed_tmp)
-                    emb_ngram.append(emb_ngram_tmp)
-                emb_new, _ = self.oe_gate_up_proj(torch.cat(emb_ngram, dim=-1))
-                hidden_states = (hidden_states + emb_new) / 2.0
-
+            if self.scale_seq_times > 0:
+                hidden_states = self._expand_scale_seq(
+                    input_ids, forward_batch, hidden_states
+                )
             residual = None
         else:
             assert pp_proxy_tensors is not None
@@ -1314,6 +1408,40 @@ class WeLMV4MoeForCausalLM(nn.Module):
         if self.capture_aux_hidden_states:
             hidden_states, aux_hidden_states = hidden_states
         if self.pp_group.is_last_rank:
+            # Contract expanded hidden_states back to logical size for logits.
+            # Transformer layers have already processed all T*scale states and
+            # written KV cache.  For logits we only need the last state in each
+            # scale group (matches MMQ's [:, -1, :] semantic).
+            if self.model.scale_seq_times > 0:
+                scale = self.model.scale_seq_times + 1
+                # Select every scale-th element (last of each group)
+                kv_mirror_contracted = (
+                    forward_batch.enable_kv_mirror
+                    and forward_batch.forward_mode.is_extend_without_speculative()
+                )
+                if not kv_mirror_contracted:
+                    indices = torch.arange(
+                        scale - 1,
+                        hidden_states.shape[0],
+                        scale,
+                        device=hidden_states.device,
+                    )
+                    hidden_states = hidden_states[indices]
+
+                # Restore forward_batch metadata to logical space so that
+                # LogitsProcessor sees the un-expanded lengths.
+                if forward_batch.extend_seq_lens is not None:
+                    forward_batch.extend_seq_lens = (
+                        forward_batch.extend_seq_lens // scale
+                    )
+                    if forward_batch.extend_seq_lens_cpu is not None:
+                        forward_batch.extend_seq_lens_cpu = [
+                            x // scale for x in forward_batch.extend_seq_lens_cpu
+                        ]
+                    forward_batch.extend_num_tokens = (
+                        forward_batch.extend_num_tokens // scale
+                    )
+
             return self.logits_processor(
                 input_ids, hidden_states, self.lm_head, forward_batch, aux_hidden_states
             )
@@ -1337,6 +1465,16 @@ class WeLMV4MoeForCausalLM(nn.Module):
             else:
                 forward_batch.hidden_states = input_embeds
 
+            if len(self.model.oe_grams) > 0:
+                forward_batch.hidden_states = self.model._compute_oe_embedding(
+                    input_ids, forward_batch, forward_batch.hidden_states
+                )
+
+            if self.model.scale_seq_times > 0:
+                forward_batch.hidden_states = self.model._expand_scale_seq(
+                    input_ids, forward_batch, forward_batch.hidden_states
+                )
+
         # decoder layer
         for i in range(start, end):
             with get_global_expert_distribution_recorder().with_current_layer(i):
@@ -1354,6 +1492,36 @@ class WeLMV4MoeForCausalLM(nn.Module):
                 forward_batch.hidden_states, forward_batch.residual
             )
             forward_batch.hidden_states = hidden_states
+
+            # Contract expanded hidden_states back to logical size
+            if self.model.scale_seq_times > 0:
+                scale = self.model.scale_seq_times + 1
+                kv_mirror_contracted = (
+                    forward_batch.enable_kv_mirror
+                    and forward_batch.forward_mode.is_extend_without_speculative()
+                )
+                if not kv_mirror_contracted:
+                    indices = torch.arange(
+                        scale - 1,
+                        hidden_states.shape[0],
+                        scale,
+                        device=hidden_states.device,
+                    )
+                    forward_batch.hidden_states = hidden_states[indices]
+                else:
+                    forward_batch.hidden_states = hidden_states
+                if forward_batch.extend_seq_lens is not None:
+                    forward_batch.extend_seq_lens = (
+                        forward_batch.extend_seq_lens // scale
+                    )
+                    if forward_batch.extend_seq_lens_cpu is not None:
+                        forward_batch.extend_seq_lens_cpu = [
+                            x // scale for x in forward_batch.extend_seq_lens_cpu
+                        ]
+                    forward_batch.extend_num_tokens = (
+                        forward_batch.extend_num_tokens // scale
+                    )
+
             # logits process
             result = self.logits_processor(
                 input_ids, forward_batch.hidden_states, self.lm_head, forward_batch
@@ -1466,6 +1634,9 @@ class WeLMV4MoeForCausalLM(nn.Module):
                     continue
                 # Skip non-stacked layers and experts (experts handled below).
                 if weight_name not in name:
+                    continue
+
+                if weight_name == "up_proj" and "scale_seq_oe_up_proj" in name:
                     continue
                 # We have mlp.experts[0].gate_proj in the checkpoint.
                 # Since we handle the experts below in expert_params_mapping,

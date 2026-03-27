@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Dict, Optional
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional
 
 import torch
 
@@ -25,9 +25,8 @@ class GraphInputBuffers:
     global_num_tokens_for_logprob_gpu: torch.Tensor
     encoder_lens: Optional[torch.Tensor]
     pp_proxy_tensors: Optional[Dict[str, torch.Tensor]]
-    input_ids_gram2: Optional[torch.Tensor]
-    input_ids_gram3: Optional[torch.Tensor]
-    input_ids_gram4: Optional[torch.Tensor]
+    input_ids_grams: List[torch.Tensor] = field(default_factory=list)
+    scale_seq_factor: int = 1
 
     @classmethod
     def create(
@@ -48,16 +47,15 @@ class GraphInputBuffers:
         num_tokens_per_bs: int,
         cache_loc_dtype: torch.dtype,
         prepare_n_gram_inputs: bool,
+        scale_seq_factor: int,
     ) -> "GraphInputBuffers":
         with torch.device(device):
             if prepare_n_gram_inputs:
-                input_ids_gram2 = torch.zeros((max_num_token,), dtype=torch.int64)
-                input_ids_gram3 = torch.zeros((max_num_token,), dtype=torch.int64)
-                input_ids_gram4 = torch.zeros((max_num_token,), dtype=torch.int64)
+                input_ids_grams = [
+                    torch.zeros((max_num_token,), dtype=torch.int64) for _ in range(3)
+                ]
             else:
-                input_ids_gram2 = None
-                input_ids_gram3 = None
-                input_ids_gram4 = None
+                input_ids_grams = []
             input_ids = torch.zeros((max_num_token,), dtype=torch.int64)
             input_embeds = torch.zeros((max_num_token, hidden_size), dtype=dtype)
             req_pool_indices = torch.zeros((max_bs,), dtype=torch.int32)
@@ -123,9 +121,8 @@ class GraphInputBuffers:
             global_num_tokens_gpu=global_num_tokens_gpu,
             global_num_tokens_for_logprob_gpu=global_num_tokens_for_logprob_gpu,
             pp_proxy_tensors=pp_proxy_tensors,
-            input_ids_gram2=input_ids_gram2,
-            input_ids_gram3=input_ids_gram3,
-            input_ids_gram4=input_ids_gram4,
+            input_ids_grams=input_ids_grams,
+            scale_seq_factor=scale_seq_factor,
         )
 
     def populate_from_forward_batch(
@@ -149,24 +146,19 @@ class GraphInputBuffers:
             self.out_cache_loc.zero_()
 
         # Common inputs
-        self.input_ids[:raw_num_token].copy_(forward_batch.input_ids)
+        is_scale_seq = self.scale_seq_factor > 1
+        raw_model_input = raw_bs if is_scale_seq else raw_num_token
+        self.input_ids[:raw_model_input].copy_(forward_batch.input_ids)
         self.req_pool_indices[:raw_bs].copy_(forward_batch.req_pool_indices)
         self.seq_lens[:raw_bs].copy_(forward_batch.seq_lens)
         self.out_cache_loc[:raw_num_token].copy_(forward_batch.out_cache_loc)
         self.positions[:raw_num_token].copy_(forward_batch.positions)
-        if (
-            forward_batch.n_gram_input_ids is not None
-            and self.input_ids_gram2 is not None
-        ):
-            self.input_ids_gram2[:raw_num_token].copy_(
-                forward_batch.n_gram_input_ids.input_ids_gram2
-            )
-            self.input_ids_gram3[:raw_num_token].copy_(
-                forward_batch.n_gram_input_ids.input_ids_gram3
-            )
-            self.input_ids_gram4[:raw_num_token].copy_(
-                forward_batch.n_gram_input_ids.input_ids_gram4
-            )
+        if forward_batch.n_gram_input_ids is not None and len(self.input_ids_grams) > 0:
+            for buf_gram, src_gram in zip(
+                self.input_ids_grams,
+                forward_batch.n_gram_input_ids.input_ids_grams,
+            ):
+                buf_gram[:raw_model_input].copy_(src_gram)
 
         seq_lens_cpu: Optional[torch.Tensor] = None
         if forward_batch.seq_lens_cpu is not None:

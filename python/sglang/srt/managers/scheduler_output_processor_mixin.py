@@ -113,7 +113,6 @@ class SchedulerOutputProcessorMixin:
                     continue
 
                 if req.is_chunked <= 0:
-                    # req output_ids are set here
                     req.output_ids.append(next_token_id)
                     req.check_finished()
 
@@ -359,9 +358,6 @@ class SchedulerOutputProcessorMixin:
             req: Req
 
             if self.enable_overlap and (req.finished() or req.is_retracted):
-                # NOTE: This (req.finished() or req.is_retracted) should only happen when overlap scheduling is enabled.
-                # (currently not, e.g. Eagle V1 still check finish during forward)
-                # And all the over-allocated tokens will be freed in `release_kv_cache`.
                 continue
 
             new_accepted_len = 1

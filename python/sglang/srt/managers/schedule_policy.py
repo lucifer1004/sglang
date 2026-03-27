@@ -378,49 +378,35 @@ class PrefillAdder:
             * self.new_token_ratio
         )
 
-    @property
-    def rem_total_tokens(self):
+    def _available_and_evictable(self):
+        """Return available + evictable KV slots in logical token units."""
         if self.is_hybrid_swa:
-            available_and_evictable = min(
+            physical = min(
                 self.token_to_kv_pool_allocator.full_available_size()
                 + self.tree_cache.full_evictable_size(),
                 self.token_to_kv_pool_allocator.swa_available_size()
                 + self.tree_cache.swa_evictable_size(),
             )
         elif self.is_hybrid_gdn_cache:
-            available_and_evictable = (
+            physical = (
                 self.token_to_kv_pool_allocator.available_size()
                 + self.tree_cache.full_evictable_size()
             )
         else:
-            available_and_evictable = (
+            physical = (
                 self.token_to_kv_pool_allocator.available_size()
                 + self.tree_cache.evictable_size()
             )
+        # Convert physical KV slots to logical token count
+        return physical // self.tree_cache.scale_seq_factor
 
-        return available_and_evictable - self.rem_total_token_offset
+    @property
+    def rem_total_tokens(self):
+        return self._available_and_evictable() - self.rem_total_token_offset
 
     @property
     def cur_rem_tokens(self):
-        if self.is_hybrid_swa:
-            available_and_evictable = min(
-                self.token_to_kv_pool_allocator.full_available_size()
-                + self.tree_cache.full_evictable_size(),
-                self.token_to_kv_pool_allocator.swa_available_size()
-                + self.tree_cache.swa_evictable_size(),
-            )
-        elif self.is_hybrid_gdn_cache:
-            available_and_evictable = (
-                self.token_to_kv_pool_allocator.available_size()
-                + self.tree_cache.full_evictable_size()
-            )
-        else:
-            available_and_evictable = (
-                self.token_to_kv_pool_allocator.available_size()
-                + self.tree_cache.evictable_size()
-            )
-
-        return available_and_evictable - self.cur_rem_token_offset
+        return self._available_and_evictable() - self.cur_rem_token_offset
 
     def ceil_paged_tokens(self, tokens: int) -> int:
         return -(-tokens // self.page_size) * self.page_size
@@ -455,7 +441,9 @@ class PrefillAdder:
         _rem_tokens = min(self.rem_chunk_tokens, int(self.rem_total_tokens))
         truncated = req.extend_input_len > _rem_tokens
         req.extend_input_len = min(req.extend_input_len, _rem_tokens)
-        req.fill_ids = req.fill_ids[: len(req.prefix_indices) + req.extend_input_len]
+        scale = req._scale_seq_factor
+        logical_prefix_len = len(req.prefix_indices) // scale
+        req.fill_ids = req.fill_ids[: logical_prefix_len + req.extend_input_len]
         self.can_run_list.append(req)
         self._update_prefill_budget(
             0,
@@ -604,7 +592,10 @@ class PrefillAdder:
                     req.last_host_node, req.host_hit_length
                 )
                 req.prefix_indices = torch.cat([req.prefix_indices, new_indices])
-                req.extend_input_len = len(req.fill_ids) - len(req.prefix_indices)
+                scale = req._scale_seq_factor
+                req.extend_input_len = (
+                    len(req.fill_ids) - len(req.prefix_indices) // scale
+                )
                 prefix_len = len(req.prefix_indices)
                 req.cache_protected_len = prefix_len
 
@@ -648,7 +639,10 @@ class PrefillAdder:
 
                 # Chunked prefill
                 req.extend_input_len = trunc_len
-                req.fill_ids = req.fill_ids[: len(req.prefix_indices) + trunc_len]
+                scale = req._scale_seq_factor
+                req.fill_ids = req.fill_ids[
+                    : len(req.prefix_indices) // scale + trunc_len
+                ]
 
                 self.can_run_list.append(req)
                 self.new_chunked_req = req

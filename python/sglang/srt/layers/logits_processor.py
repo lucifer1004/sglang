@@ -403,7 +403,10 @@ class LogitsProcessor(nn.Module):
             or logits_metadata.forward_mode.is_draft_extend_v2()
             or (
                 logits_metadata.enable_kv_mirror
-                and logits_metadata.forward_mode.is_extend_without_speculative()
+                and (
+                    logits_metadata.forward_mode.is_extend_without_speculative()
+                    or logits_metadata.scale_seq_factor > 1
+                )
             )
         ):
             pruned_states = hidden_states

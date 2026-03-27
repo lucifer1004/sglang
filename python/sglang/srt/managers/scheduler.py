@@ -795,6 +795,9 @@ class Scheduler(
         else:
             self.decode_offload_manager = None
 
+        # Propagate scale_seq_factor to tree_cache for correct KV cache freeing
+        scale_seq_times = getattr(self.model_config.hf_config, "scale_seq_times", 0)
+        self.tree_cache.scale_seq_factor = scale_seq_times + 1
         self.decode_mem_cache_buf_multiplier = (
             1
             if self.spec_algorithm.is_none()
