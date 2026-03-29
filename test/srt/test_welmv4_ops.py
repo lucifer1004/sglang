@@ -25,13 +25,14 @@ from sglang.srt.layers.welmv4_op import (
 )
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.test.test_utils import CustomTestCase
-torch.random.manual_seed(0)
+
+torch.random.manual_seed(1)
 
 # bf16 has ~0.0078 per-ULP precision.
 # Triton's tree-reduction for sum vs PyTorch's sequential accumulation can cause
 # up to ~0.5 ULP difference in the final bf16 result, so we use 5e-3 (< 1 ULP).
-ATOL = 4e-3
-RTOL = 4e-3
+ATOL = 1e-3
+RTOL = 1e-3
 DEVICE = "cuda"
 DTYPE = torch.bfloat16
 
@@ -44,6 +45,7 @@ QK_ROPE_HEAD_DIM = 64
 RMS_NORM_EPS = 1e-5
 
 num_tokens_list = [127]
+
 
 def setUpModule():
     """Set global server args required by RotaryEmbedding init."""
@@ -166,9 +168,7 @@ class TestWelmV4FusedRMSNorm(CustomTestCase):
                 )
                 # fp32_out vs pre-fusion pattern (bf16 output cast to fp32)
                 ref_fp32 = ref_out.to(torch.float32)
-                torch.testing.assert_close(
-                    fused_fp32, ref_fp32, atol=2e-2, rtol=2e-2
-                )
+                torch.testing.assert_close(fused_fp32, ref_fp32, atol=2e-2, rtol=2e-2)
 
     # --- Case (e): per-head k_norm (head_dim=256, k_norm=True, qk_norm=False) ---
     # Before: k_by_head = self.k_norm.forward_native(k_by_head)
@@ -366,9 +366,7 @@ class TestWelmV4InplaceRotaryEmbedding(CustomTestCase):
         ref, fused = self._make_ref_and_fused()
         num_tokens = 64
         bs = 4
-        last_index = torch.tensor(
-            [15, 31, 47, 63], device=DEVICE, dtype=torch.int64
-        )
+        last_index = torch.tensor([15, 31, 47, 63], device=DEVICE, dtype=torch.int64)
         positions = torch.randint(
             0, 4096, (num_tokens,), device=DEVICE, dtype=torch.int64
         )
@@ -384,7 +382,9 @@ class TestWelmV4InplaceRotaryEmbedding(CustomTestCase):
         q_ref_heads = q.clone().view(num_tokens, NUM_Q_HEADS, HEAD_DIM)
         q_pe_bs = q_ref_heads[:bs, :, nope_dim:].contiguous()
         q_pe_bs_flat = q_pe_bs.reshape(bs, NUM_Q_HEADS * QK_ROPE_HEAD_DIM)
-        dummy = torch.zeros(bs, NUM_K_HEADS * QK_ROPE_HEAD_DIM, device=DEVICE, dtype=DTYPE)
+        dummy = torch.zeros(
+            bs, NUM_K_HEADS * QK_ROPE_HEAD_DIM, device=DEVICE, dtype=DTYPE
+        )
         q_pe_out, _ = ref.forward_cuda(positions[last_index], q_pe_bs_flat, dummy)
         q_pe_out = q_pe_out.reshape(bs, NUM_Q_HEADS, QK_ROPE_HEAD_DIM)
         q_ref_heads[:bs, :, nope_dim:] = q_pe_out

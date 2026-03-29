@@ -143,8 +143,8 @@ def sigmoid_mul_kernel(
         y_off = row_id * y_row_stride + col_off
         y_data = tl.load(y + y_off, mask=mask, other=0.0)
         x_data = tl.load(x + row_id).to(tl.float32)
-        out_data = tl.sigmoid(x_data) * y_data
-        tl.store(y + y_off, out_data.to(y.dtype.element_ty), mask=mask)
+        out_data = tl.sigmoid(x_data).to(y.dtype.element_ty) * y_data
+        tl.store(y + y_off, out_data, mask=mask)
 
 
 # return sigmoid(x) * y
