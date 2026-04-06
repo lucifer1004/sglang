@@ -6,6 +6,7 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.nsa.dequant_k_cache import dequantize_k_cache_paged
+from sglang.srt.layers.attention.nsa_backend import NativeSparseAttnBackend
 from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
 from sglang.srt.layers.attention.utils import concat_and_cast_mha_k_triton
 from sglang.srt.layers.communicator import get_attn_tp_context
@@ -223,6 +224,12 @@ class DeepseekMHAForwardMixin:
             if (
                 self.use_nsa
                 and self.kv_cache_dtype == "fp8_e4m3"
+                and isinstance(
+                    forward_batch.attn_backend.primary
+                    if isinstance(forward_batch.attn_backend, TboAttnBackend)
+                    else forward_batch.attn_backend,
+                    NativeSparseAttnBackend,
+                )
                 and (
                     not get_global_server_args().nsa_decode_backend == "trtllm"
                     or not get_global_server_args().nsa_prefill_backend == "trtllm"
