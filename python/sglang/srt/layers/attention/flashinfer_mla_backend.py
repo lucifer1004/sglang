@@ -18,6 +18,7 @@ import torch
 from sglang.srt.compilation.piecewise_context_manager import is_in_piecewise_cuda_graph
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.layers.attention.nsa.dequant_k_cache import dequantize_k_cache
 from sglang.srt.layers.attention.flashinfer_backend import (
     create_flashinfer_kv_indices_triton,
 )
@@ -572,9 +573,11 @@ class FlashInferMLAAttnBackend(AttentionBackend):
             )
         else:
             # mla paged prefill
-            k_buf = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id).to(
-                q.dtype
-            )
+            k_raw = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
+            if getattr(forward_batch.token_to_kv_pool, "nsa_kv_cache_store_fp8", False):
+                k_buf = dequantize_k_cache(k_raw)
+            else:
+                k_buf = k_raw.to(q.dtype)
             if q_rope is None:
                 qall = q.view(-1, layer.tp_q_head_num, layer.head_dim)
                 q, q_rope = (
@@ -636,9 +639,11 @@ class FlashInferMLAAttnBackend(AttentionBackend):
             q_nope = reshaped_q[:, :, : layer.v_head_dim]
             q_rope = reshaped_q[:, :, layer.v_head_dim :]
 
-        k_buffer = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id).to(
-            q.dtype
-        )
+        k_raw = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        if getattr(forward_batch.token_to_kv_pool, "nsa_kv_cache_store_fp8", False):
+            k_buffer = dequantize_k_cache(k_raw)
+        else:
+            k_buffer = k_raw.to(q.dtype)
 
         o = q_nope.new_empty(q_nope.shape)
         # Direct call to run without the wrapper
