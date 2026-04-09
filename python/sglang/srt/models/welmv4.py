@@ -186,6 +186,7 @@ class Qwen2MoeMLP(nn.Module):
         prefix: str = "",
         tp_rank: Optional[int] = None,
         tp_size: Optional[int] = None,
+        swiglu_clamp_limit: Optional[float] = None,
     ) -> None:
         super().__init__()
         self.gate_up_proj = MergedColumnParallelLinear(
@@ -212,6 +213,7 @@ class Qwen2MoeMLP(nn.Module):
                 f"Unsupported activation: {hidden_act}. Only silu is supported for now."
             )
         self.act_fn = SiluAndMul()
+        self.swiglu_clamp_limit = swiglu_clamp_limit
 
     def forward(
         self,
@@ -220,7 +222,13 @@ class Qwen2MoeMLP(nn.Module):
         use_reduce_scatter: bool = False,
     ):
         gate_up, _ = self.gate_up_proj(x)
-        x = self.act_fn(gate_up)
+        if self.swiglu_clamp_limit is not None and self.swiglu_clamp_limit > 0:
+            d = gate_up.shape[-1] // 2
+            gate = F.silu(gate_up[..., :d]).clamp_(max=self.swiglu_clamp_limit)
+            up = gate_up[..., d:].clamp(min=-self.swiglu_clamp_limit, max=self.swiglu_clamp_limit)
+            x = gate * up
+        else:
+            x = self.act_fn(gate_up)
         x, _ = self.down_proj(
             x, skip_all_reduce=should_allreduce_fusion or use_reduce_scatter
         )
@@ -288,6 +296,19 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 f"the number of experts {config.num_experts}."
             )
 
+        moe_clamp_limits = getattr(config, "moe_expert_swiglu_clamp_limit_layerwise", [])
+        moe_clamp_limit = (
+            moe_clamp_limits[layer_id]
+            if layer_id < len(moe_clamp_limits) and moe_clamp_limits[layer_id] > 0
+            else None
+        )
+        shared_clamp_limits = getattr(config, "shared_expert_swiglu_clamp_limit_layerwise", [])
+        shared_clamp_limit = (
+            shared_clamp_limits[layer_id]
+            if layer_id < len(shared_clamp_limits) and shared_clamp_limits[layer_id] > 0
+            else None
+        )
+
         self.router_score_func = (
             config.router_score_func
             if hasattr(config, "router_score_func")
@@ -325,6 +346,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             intermediate_size=config.moe_intermediate_size,
             quant_config=quant_config,
             prefix=add_prefix("experts", prefix),
+            swiglu_clamp_limit=moe_clamp_limit,
         )
 
         self.gate = ReplicatedLinear(
@@ -343,6 +365,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 quant_config=quant_config,
                 reduce_results=False,
                 prefix=add_prefix("shared_expert", prefix),
+                swiglu_clamp_limit=shared_clamp_limit,
             )
         else:
             self.shared_expert = None

@@ -85,6 +85,7 @@ def inplace_fused_experts(
     gemm1_alpha: Optional[float] = None,
     gemm1_limit: Optional[float] = None,
     filter_expert: bool = True,
+    swiglu_clamp_limit: Optional[float] = None,
 ) -> None:
     fused_experts_impl(
         hidden_states,
@@ -115,6 +116,7 @@ def inplace_fused_experts(
         gemm1_alpha,
         gemm1_limit,
         filter_expert,
+        swiglu_clamp_limit=swiglu_clamp_limit,
     )
 
 
@@ -145,6 +147,7 @@ def inplace_fused_experts_fake(
     gemm1_alpha: Optional[float] = None,
     gemm1_limit: Optional[float] = None,
     filter_expert: bool = True,
+    swiglu_clamp_limit: Optional[float] = None,
 ) -> None:
     pass
 
@@ -185,6 +188,7 @@ def outplace_fused_experts(
     gemm1_alpha: Optional[float] = None,
     gemm1_limit: Optional[float] = None,
     filter_expert: bool = True,
+    swiglu_clamp_limit: Optional[float] = None,
 ) -> torch.Tensor:
     return fused_experts_impl(
         hidden_states,
@@ -215,6 +219,7 @@ def outplace_fused_experts(
         gemm1_alpha=gemm1_alpha,
         gemm1_limit=gemm1_limit,
         filter_expert=filter_expert,
+        swiglu_clamp_limit=swiglu_clamp_limit,
     )
 
 
@@ -246,6 +251,7 @@ def outplace_fused_experts_fake(
     gemm1_alpha: Optional[float] = None,
     gemm1_limit: Optional[float] = None,
     filter_expert: bool = True,
+    swiglu_clamp_limit: Optional[float] = None,
 ) -> torch.Tensor:
     return torch.empty_like(hidden_states)
 
@@ -313,6 +319,7 @@ def fused_experts(
             moe_runner_config.gemm1_alpha,
             moe_runner_config.gemm1_clamp_limit,
             filter_expert,
+            moe_runner_config.swiglu_clamp_limit,
         )
         return hidden_states
     else:
@@ -343,6 +350,7 @@ def fused_experts(
             routed_scaling_factor=moe_runner_config.routed_scaling_factor,
             gemm1_alpha=moe_runner_config.gemm1_alpha,
             gemm1_limit=moe_runner_config.gemm1_clamp_limit,
+            swiglu_clamp_limit=moe_runner_config.swiglu_clamp_limit,
             filter_expert=filter_expert,
         )
 
@@ -395,6 +403,7 @@ def fused_experts_impl(
     gemm1_alpha: Optional[float] = None,
     gemm1_limit: Optional[float] = None,
     filter_expert: bool = True,
+    swiglu_clamp_limit: Optional[float] = None,
 ):
     padded_size = padding_size
     if not (use_fp8_w8a8 or use_int8_w8a8) or block_shape is not None or _use_aiter:
@@ -546,7 +555,12 @@ def fused_experts_impl(
         )
         # Activation function with multiplication
         if activation == "silu" and is_gated:
-            if gemm1_alpha is not None:
+            if swiglu_clamp_limit is not None and swiglu_clamp_limit > 0:
+                cache_view = intermediate_cache1.view(-1, N)
+                gate = F.silu(cache_view[:, :N // 2]).clamp_(max=swiglu_clamp_limit)
+                up = cache_view[:, N // 2:].clamp(min=-swiglu_clamp_limit, max=swiglu_clamp_limit)
+                intermediate_cache2 = gate * up
+            elif gemm1_alpha is not None:
                 assert gemm1_limit is not None
                 intermediate_cache2 = swiglu_with_alpha_and_limit(
                     intermediate_cache1.view(-1, N),

@@ -122,6 +122,7 @@ class TritonKernelsRunnerCore(MoeRunnerCore):
                 b2=quant_info.w2_bias,
                 gemm1_alpha=self.config.gemm1_alpha,
                 gemm1_clamp_limit=self.config.gemm1_clamp_limit,
+                swiglu_clamp_limit=self.config.swiglu_clamp_limit,
                 **common_kwargs,
             )
         else:
@@ -129,6 +130,7 @@ class TritonKernelsRunnerCore(MoeRunnerCore):
                 hidden_states=hidden_states,
                 w1=quant_info.w13_weight,
                 w2=quant_info.w2_weight,
+                swiglu_clamp_limit=self.config.swiglu_clamp_limit,
                 **common_kwargs,
             )
 

@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, Optional
 
 import torch
+import torch.nn.functional as F
 import triton.language as tl
 
 from sglang.srt.layers.moe.moe_runner.base import (
@@ -150,6 +151,7 @@ class TritonRunnerCore(MoeRunnerCore):
         inplace = self.config.inplace
         gemm1_alpha = self.config.gemm1_alpha
         gemm1_limit = self.config.gemm1_clamp_limit
+        swiglu_clamp_limit = self.config.swiglu_clamp_limit
         routed_scaling_factor = self.config.routed_scaling_factor
         apply_router_weight_on_input = self.config.apply_router_weight_on_input
 
@@ -199,7 +201,12 @@ class TritonRunnerCore(MoeRunnerCore):
         )
 
         if activation == "silu":
-            if gemm1_alpha is not None:
+            if swiglu_clamp_limit is not None and swiglu_clamp_limit > 0:
+                cache_view = intermediate_cache1.view(-1, N)
+                gate = F.silu(cache_view[:, :N // 2]).clamp_(max=swiglu_clamp_limit)
+                up = cache_view[:, N // 2:].clamp(min=-swiglu_clamp_limit, max=swiglu_clamp_limit)
+                intermediate_cache2 = gate * up
+            elif gemm1_alpha is not None:
                 assert gemm1_limit is not None
                 intermediate_cache2 = swiglu_with_alpha_and_limit(
                     intermediate_cache1.view(-1, N),
