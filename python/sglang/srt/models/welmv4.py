@@ -1433,7 +1433,7 @@ class WeLMV4MoeForCausalLM(nn.Module):
         self.logits_processor = LogitsProcessor(config)
         # For EAGLE3 support
         self.capture_aux_hidden_states = False
-        self.post_init_after_load_weights(is_nextn=is_nextn)
+        self.post_init_after_load_weights(is_nextn=False)
 
     @torch.no_grad()
     def forward(
