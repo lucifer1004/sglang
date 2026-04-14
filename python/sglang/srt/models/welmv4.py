@@ -883,7 +883,7 @@ class Qwen2MoeAttention(nn.Module):
                     self.kv_mirror_layers.index(self.kv_mirror_layer_idx)
                 ]
                 if (
-                    forward_batch.enable_kv_mirror
+                    forward_batch.enable_welm_kv_mirror_opt
                     and forward_batch.forward_mode.is_extend_without_speculative()
                     and not hasattr(forward_batch, "custom_last_index")
                 ):
@@ -917,7 +917,7 @@ class Qwen2MoeAttention(nn.Module):
         qk_nope_head_dim = self.head_dim - self.qk_rope_head_dim
         if qk_nope_head_dim > 0:
             if (
-                forward_batch.enable_kv_mirror
+                forward_batch.enable_welm_kv_mirror_opt
                 and forward_batch.forward_mode.is_extend_without_speculative()
                 and self.kv_mirror_layer_idx in self.kv_mirror_layers
             ):
@@ -1109,7 +1109,7 @@ class Qwen2MoeDecoderLayer(nn.Module):
                 forward_batch=forward_batch,
             )
         if (
-            forward_batch.enable_kv_mirror
+            forward_batch.enable_welm_kv_mirror_opt
             and forward_batch.forward_mode.is_extend_without_speculative()
             and self.layer_id == self.kv_mirror_layers[-1]
         ):
@@ -1439,7 +1439,7 @@ class WeLMV4MoeForCausalLM(nn.Module):
                 scale = self.model.scale_seq_times + 1
                 # Select every scale-th element (last of each group)
                 kv_mirror_contracted = (
-                    forward_batch.enable_kv_mirror
+                    forward_batch.enable_welm_kv_mirror_opt
                     and forward_batch.forward_mode.is_extend_without_speculative()
                 )
                 if not kv_mirror_contracted:
@@ -1520,7 +1520,7 @@ class WeLMV4MoeForCausalLM(nn.Module):
             if self.model.scale_seq_times > 0:
                 scale = self.model.scale_seq_times + 1
                 kv_mirror_contracted = (
-                    forward_batch.enable_kv_mirror
+                    forward_batch.enable_welm_kv_mirror_opt
                     and forward_batch.forward_mode.is_extend_without_speculative()
                 )
                 if not kv_mirror_contracted:

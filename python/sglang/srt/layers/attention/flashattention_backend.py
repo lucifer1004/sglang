@@ -610,7 +610,7 @@ class FlashAttentionBackend(AttentionBackend):
             metadata.page_table = forward_batch.req_to_token_pool.req_to_token[
                 forward_batch.req_pool_indices, : metadata.max_seq_len_k
             ]
-            if forward_batch.enable_kv_mirror:
+            if forward_batch.enable_welm_kv_mirror_opt:
                 metadata.mirror_cu_seqlens_q = torch.arange(
                     0, batch_size + 1, dtype=torch.int32, device=device
                 )

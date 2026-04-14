@@ -145,7 +145,7 @@ class LogitsMetadata:
     is_prefill_only: bool = False
 
     # For KV Mirror
-    enable_kv_mirror: bool = False
+    enable_welm_kv_mirror_opt: bool = False
 
     @classmethod
     def from_forward_batch(cls, forward_batch: ForwardBatch):
@@ -197,7 +197,7 @@ class LogitsMetadata:
             global_num_tokens_for_logprob_cpu=forward_batch.global_num_tokens_for_logprob_cpu,
             global_num_tokens_for_logprob_gpu=forward_batch.global_num_tokens_for_logprob_gpu,
             dp_padding_mode=DpPaddingMode.SUM_LEN,
-            enable_kv_mirror=forward_batch.enable_kv_mirror,
+            enable_welm_kv_mirror_opt=forward_batch.enable_welm_kv_mirror_opt,
         )
 
     def compute_dp_attention_metadata(self):
@@ -402,7 +402,7 @@ class LogitsProcessor(nn.Module):
             or logits_metadata.forward_mode.is_target_verify()
             or logits_metadata.forward_mode.is_draft_extend_v2()
             or (
-                logits_metadata.enable_kv_mirror
+                logits_metadata.enable_welm_kv_mirror_opt
                 and (
                     logits_metadata.forward_mode.is_extend_without_speculative()
                     or logits_metadata.scale_seq_factor > 1
@@ -546,7 +546,16 @@ class LogitsProcessor(nn.Module):
 
         del hidden_states
 
-        if not logits_metadata.extend_return_logprob:
+        # When kv_mirror is active in extend mode, hidden_states have been
+        # subsampled to only the last token per request.  There are no
+        # intermediate-token logits available, so input logprobs cannot be
+        # computed.  Treat this the same as "no return_logprob".
+        kv_mirror_extend = logits_metadata.enable_welm_kv_mirror_opt and (
+            logits_metadata.forward_mode.is_extend_without_speculative()
+            or logits_metadata.scale_seq_factor > 1
+        )
+
+        if not logits_metadata.extend_return_logprob or kv_mirror_extend:
             # Compute logits for both input and sampled tokens.
             logits = self._get_logits(pruned_states, lm_head, logits_metadata)
             sampled_logits = (

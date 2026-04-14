@@ -138,7 +138,7 @@ class WeLMV4ModelNextN(nn.Module):
             hidden_states = (hidden_states + emb_new) / 2.0
 
         if (
-            forward_batch.enable_kv_mirror
+            forward_batch.enable_welm_kv_mirror_opt
             and forward_batch.forward_mode.is_extend_without_speculative()
         ):
             forward_batch.custom_last_index = (

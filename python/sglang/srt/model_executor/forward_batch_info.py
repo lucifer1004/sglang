@@ -360,7 +360,7 @@ class ForwardBatch:
 
     # For Over Encoding
     n_gram_input_ids: Optional[NGramInputIds] = None
-    enable_kv_mirror: bool = False
+    enable_welm_kv_mirror_opt: bool = False
     scale_seq_factor: int = 1
 
     @classmethod
@@ -407,7 +407,7 @@ class ForwardBatch:
             scale_seq_factor=batch.scale_seq_factor,
         )
         device = model_runner.device
-        ret.enable_kv_mirror = model_runner.server_args.enable_kv_mirror
+        ret.enable_welm_kv_mirror_opt = model_runner.server_args.enable_welm_kv_mirror_opt
 
         if batch.extend_input_logprob_token_ids is not None:
             ret.extend_input_logprob_token_ids_gpu = (

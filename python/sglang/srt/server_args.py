@@ -594,7 +594,7 @@ class ServerArgs:
 
     # For Over Encoding
     enable_over_encoding: bool = False
-    enable_kv_mirror: bool = False
+    enable_welm_kv_mirror_opt: bool = False
     prepare_n_gram_inputs: bool = False
 
     def __post_init__(self):
@@ -691,6 +691,16 @@ class ServerArgs:
                 f"The tool_call_parser '{self.tool_call_parser}' is deprecated. Please use '{deprecated_tool_call_parsers[self.tool_call_parser]}' instead."
             )
             self.tool_call_parser = deprecated_tool_call_parsers[self.tool_call_parser]
+
+        # Warn if using deprecated --enable-kv-mirror
+        if self.enable_welm_kv_mirror_opt:
+            import sys
+
+            if "--enable-kv-mirror" in sys.argv and "--enable-welm-kv-mirror-opt" not in sys.argv:
+                logger.warning(
+                    "--enable-kv-mirror is deprecated and will be removed in a future release. "
+                    "Please use --enable-welm-kv-mirror-opt instead."
+                )
 
     def _handle_missing_default_values(self):
         if self.tokenizer_path is None:
@@ -3935,9 +3945,18 @@ class ServerArgs:
         )
 
         parser.add_argument(
+            "--enable-welm-kv-mirror-opt",
+            action="store_true",
+            dest="enable_welm_kv_mirror_opt",
+            help="Enable WeLM KV mirror optimization. "
+            "Mirror layers reuse KV activations from imitated layers, "
+            "reducing computation at the cost of not producing input logprobs in prefill.",
+        )
+        parser.add_argument(
             "--enable-kv-mirror",
             action="store_true",
-            help="Enable KV Mirror.",
+            dest="enable_welm_kv_mirror_opt",
+            help="Deprecated: use --enable-welm-kv-mirror-opt instead.",
         )
 
         parser.add_argument(
