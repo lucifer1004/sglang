@@ -68,7 +68,7 @@ class UnquantizedEmbeddingMethod(QuantizeMethodBase):
     ):
         """Create weights for embedding layer."""
         if extra_weight_attrs.get("host_tensor", False):
-            from prc_custom_ops_kernel import custom_empty
+            from sglang.jit_kernel.memory_allocator import custom_empty
             weight = Parameter(
                 custom_empty(
                     (sum(output_partition_sizes), input_size_per_partition),

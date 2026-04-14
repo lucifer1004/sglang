@@ -3,7 +3,10 @@ from copy import copy
 from dataclasses import dataclass
 from typing import ClassVar, List, Optional, Tuple
 
-import prc_custom_ops
+from sglang.jit_kernel.ngram_ops import (
+    assign_ngram_input_ids_draft_extend_after_decode,
+    build_ngram_with_target_verify,
+)
 import torch
 import torch.nn.functional as F
 
@@ -159,7 +162,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             ]
             for idx, gram_tensor in enumerate(n_gram_tensors):
                 n = idx + 2
-                prc_custom_ops.build_ngram_with_target_verify(
+                build_ngram_with_target_verify(
                     gram_tensor,
                     batch.n_gram_input_ids.input_ids_buffer,
                     self.draft_token,
@@ -757,7 +760,7 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
                 n = idx + 2
                 n_gram = torch.empty_like(batch.input_ids, dtype=torch.int64)
                 update_buffer = idx == num_grams - 1
-                prc_custom_ops.assign_ngram_input_ids_draft_extend_after_decode(
+                assign_ngram_input_ids_draft_extend_after_decode(
                     batch.input_ids,
                     buffer,
                     n_gram,

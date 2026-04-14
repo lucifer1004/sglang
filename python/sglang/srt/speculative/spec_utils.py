@@ -6,7 +6,7 @@ import time
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, List
 
-import prc_custom_ops
+from sglang.jit_kernel.ngram_ops import build_ngram_with_tree
 import torch
 import triton
 import triton.language as tl
@@ -539,7 +539,7 @@ def select_top_k_tokens_ngram(
         token_tensor = torch.cat(token_list, dim=1)
         for idx, gram_tensor in enumerate(n_gram_tensors):
             n = idx + 2
-            prc_custom_ops.build_ngram_with_tree(
+            build_ngram_with_tree(
                 gram_tensor,
                 parent_tensor,
                 token_tensor,
