@@ -582,9 +582,6 @@ class OverEncodingContext:
         result_id[n:] = req_input_ids[:-n]
         return result_id
 
-    # Public alias kept for external callers.
-    get_token_ids_gram_n = _shift_ids
-
     def get_token_ids_buffer(self, req_input_ids: List[int]):
         seq_len = len(req_input_ids)
         result_id = [0] * self.buffer_size
