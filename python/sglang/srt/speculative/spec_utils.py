@@ -517,22 +517,22 @@ def select_top_k_tokens_ngram(
     token_list: List[torch.Tensor],
     parents_list: List[torch.Tensor],
 ):
-    n_gram_input_ids = forward_batch.n_gram_input_ids
-    if n_gram_input_ids is None:
+    oe_context = forward_batch.oe_context
+    if oe_context is None:
         return
 
     seq_lens = forward_batch.seq_lens
-    n_gram_tensors = n_gram_input_ids.input_ids_grams
+    n_gram_tensors = oe_context.input_ids_grams
     if i == 0:
         for idx, gram_tensor in enumerate(n_gram_tensors):
             n = idx + 2
             assign_ngram_input_ids_draft_decode_first_token(
-                n_gram_input_ids.input_ids_buffer,
+                oe_context.input_ids_buffer,
                 gram_tensor,
                 seq_lens,
                 n,
                 topk,
-                n_gram_input_ids.buffer_size,
+                oe_context.buffer_size,
             )
     else:
         parent_tensor = torch.cat(parents_list, dim=1)
@@ -544,8 +544,8 @@ def select_top_k_tokens_ngram(
                 parent_tensor,
                 token_tensor,
                 parents_list[-1],
-                n_gram_input_ids.input_ids_buffer,
-                n_gram_input_ids.buffer_size,
+                oe_context.input_ids_buffer,
+                oe_context.buffer_size,
                 n,
                 topk,
                 i,

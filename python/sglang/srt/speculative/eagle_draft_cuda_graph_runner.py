@@ -292,7 +292,7 @@ class EAGLEDraftCudaGraphRunner:
             capture_hidden_mode=(
                 spec_info.capture_hidden_mode if spec_info else CaptureHiddenMode.NULL
             ),
-            n_gram_input_ids=current_ngram_input_ids,
+            oe_context=current_ngram_input_ids,
         )
 
         # Attention backend
@@ -377,10 +377,10 @@ class EAGLEDraftCudaGraphRunner:
         if self.ngram_input_ids is not None:
             self.ngram_input_ids.input_ids_buffer[
                 : raw_bs * OverEncodingContext.buffer_size
-            ].copy_(forward_batch.n_gram_input_ids.input_ids_buffer)
+            ].copy_(forward_batch.oe_context.input_ids_buffer)
             for buf_gram, src_gram in zip(
                 self.ngram_input_ids.input_ids_grams,
-                forward_batch.n_gram_input_ids.input_ids_grams,
+                forward_batch.oe_context.input_ids_grams,
             ):
                 buf_gram[:raw_num_token].copy_(src_gram)
 

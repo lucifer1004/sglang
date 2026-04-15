@@ -359,7 +359,7 @@ class ForwardBatch:
     nsa_cp_metadata: Optional[NSAContextParallelMetadata] = None
 
     # For Over Encoding
-    n_gram_input_ids: Optional["OverEncodingContext"] = None
+    oe_context: Optional["OverEncodingContext"] = None
     enable_welm_kv_mirror_opt: bool = False
     scale_seq_factor: int = 1
 
@@ -403,7 +403,7 @@ class ForwardBatch:
             token_type_ids=batch.token_type_ids,
             tbo_split_seq_index=batch.tbo_split_seq_index,
             dimensions=batch.dimensions,
-            n_gram_input_ids=batch.n_gram_input_ids,
+            oe_context=batch.oe_context,
             scale_seq_factor=batch.scale_seq_factor,
         )
         device = model_runner.device

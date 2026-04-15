@@ -1259,7 +1259,7 @@ class Qwen2MoeModel(nn.Module):
         input_ids_ngram = []
         input_ids_ngram_tmp = input_ids
         for g in range(1, max(self.oe_grams)):
-            gram_tensor = forward_batch.n_gram_input_ids.get_gram(g + 1)
+            gram_tensor = forward_batch.oe_context.get_gram(g + 1)
             if gram_tensor is not None:
                 input_ids_ngram_tmp = input_ids_ngram_tmp + gram_tensor * (
                     self.vocab_size**g

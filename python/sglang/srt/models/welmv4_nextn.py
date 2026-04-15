@@ -113,10 +113,10 @@ class WeLMV4ModelNextN(nn.Module):
             input_ids_ngram = []
             input_ids_ngram_tmp = input_ids
             max_n = max(self.oe_grams)
-            if getattr(forward_batch, "n_gram_input_ids", None) is not None:
+            if getattr(forward_batch, "oe_context", None) is not None:
                 input_ids_gram_n = []
                 for n in range(2, max_n + 1):
-                    gram = forward_batch.n_gram_input_ids.get_gram(n)
+                    gram = forward_batch.oe_context.get_gram(n)
                     input_ids_gram_n.append(
                         gram if gram is not None else torch.zeros_like(input_ids)
                     )

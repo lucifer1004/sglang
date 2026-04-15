@@ -269,8 +269,8 @@ class EAGLEWorker(TpModelWorker):
             A tuple of the final logit output of the target model, next tokens accepted,
             the batch id (used for overlap schedule), and number of accepted tokens.
         """
-        if batch.n_gram_input_ids:
-            batch.n_gram_input_ids.start_new_step()
+        if batch.oe_context:
+            batch.oe_context.start_new_step()
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
             logits_output, next_token_ids, seq_lens_cpu = self.forward_target_extend(
                 batch
@@ -528,15 +528,15 @@ class EAGLEWorker(TpModelWorker):
         can_cuda_graph = self.cuda_graph_runner and self.cuda_graph_runner.can_run(
             forward_batch
         )
-        if forward_batch.n_gram_input_ids is not None:
-            for idx in range(len(forward_batch.n_gram_input_ids.input_ids_grams)):
+        if forward_batch.oe_context is not None:
+            for idx in range(len(forward_batch.oe_context.input_ids_grams)):
                 n = idx + 2
                 n_gram = torch.empty(
                     (spec_info.topk_index.numel()),
                     dtype=torch.int64,
                     device=self.device,
                 )
-                forward_batch.n_gram_input_ids.set_gram(n, n_gram)
+                forward_batch.oe_context.set_gram(n, n_gram)
         if can_cuda_graph:
             parent_list, top_scores_index, draft_tokens = self.cuda_graph_runner.replay(
                 forward_batch
@@ -630,7 +630,7 @@ class EAGLEWorker(TpModelWorker):
             score_list.append(tree_info[0])
             token_list.append(tree_info[1])
             parents_list.append(tree_info[2])
-            if forward_batch.n_gram_input_ids is not None:
+            if forward_batch.oe_context is not None:
                 select_top_k_tokens_ngram(
                     i, forward_batch, topk_index, self.topk, token_list, parents_list
                 )

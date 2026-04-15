@@ -654,7 +654,7 @@ class CudaGraphRunner:
             lora_ids=lora_ids,
         )
         if self.model_runner.server_args.prepare_n_gram_inputs:
-            forward_batch.n_gram_input_ids = OverEncodingContext(
+            forward_batch.oe_context = OverEncodingContext(
                 input_ids_grams=[
                     gram[:model_input_len] for gram in buffers.input_ids_grams
                 ],

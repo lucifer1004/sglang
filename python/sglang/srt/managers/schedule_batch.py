@@ -1366,7 +1366,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # hicache pointer for synchronizing data loading from CPU to GPU
     hicache_consumer_index: int = -1
 
-    n_gram_input_ids: Optional[OverEncodingContext] = None
+    oe_context: Optional[OverEncodingContext] = None
 
     # Diffusion LLM
     dllm_config: Optional[DllmConfig] = None
@@ -1538,7 +1538,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             list(chain.from_iterable(input_ids)), dtype=torch.int64
         ).to(self.device, non_blocking=True)
 
-        self.n_gram_input_ids = OverEncodingContext.from_extend(
+        self.oe_context = OverEncodingContext.from_extend(
             reqs, logical_prefix_lens, self.device
         )
 
@@ -1971,7 +1971,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.input_ids = self.output_ids
         self.output_ids = None
 
-        self.n_gram_input_ids = OverEncodingContext.from_decode(
+        self.oe_context = OverEncodingContext.from_decode(
             self.reqs, self.enable_overlap, self.device
         )
 
@@ -2082,8 +2082,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 new_indices=keep_indices_device,
                 has_been_filtered=has_been_filtered,
             )
-        if self.n_gram_input_ids:
-            self.n_gram_input_ids.filter_buffer(keep_indices_device)
+        if self.oe_context:
+            self.oe_context.filter_buffer(keep_indices_device)
 
     def merge_batch(self, other: "ScheduleBatch"):
         # NOTE: in v2 eagle mode, we do not need wait verify here because
@@ -2129,8 +2129,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         if self.spec_info:
             self.spec_info.merge_batch(other.spec_info)
-        if self.n_gram_input_ids and other.n_gram_input_ids:
-            self.n_gram_input_ids.merge_buffer(other.n_gram_input_ids)
+        if self.oe_context and other.oe_context:
+            self.oe_context.merge_buffer(other.oe_context)
 
     def get_model_worker_batch(
         self, seq_lens_cpu_cache: Optional[torch.Tensor] = None
@@ -2207,7 +2207,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             dllm_config=self.dllm_config,
             reqs=self.reqs,
             has_grammar=self.has_grammar,
-            n_gram_input_ids=self.n_gram_input_ids,
+            oe_context=self.oe_context,
             scale_seq_factor=scale,
         )
 
@@ -2333,5 +2333,5 @@ class ModelWorkerBatch:
     has_grammar: bool = False
 
     # Over Encoding
-    n_gram_input_ids: Optional[OverEncodingContext] = None
+    oe_context: Optional[OverEncodingContext] = None
     scale_seq_factor: int = 1

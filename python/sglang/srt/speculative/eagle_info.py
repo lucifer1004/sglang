@@ -155,25 +155,25 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             batch.out_cache_loc,
             bs,
         )
-        if getattr(batch, "n_gram_input_ids", None) is not None:
+        if getattr(batch, "oe_context", None) is not None:
             n_gram_tensors = [
                 torch.empty_like(self.draft_token)
-                for _ in batch.n_gram_input_ids.input_ids_grams
+                for _ in batch.oe_context.input_ids_grams
             ]
             for idx, gram_tensor in enumerate(n_gram_tensors):
                 n = idx + 2
                 build_ngram_with_target_verify(
                     gram_tensor,
-                    batch.n_gram_input_ids.input_ids_buffer,
+                    batch.oe_context.input_ids_buffer,
                     self.draft_token,
                     self.custom_mask,
                     self.positions,
                     batch.seq_lens,
                     n,
                     self.draft_token_num,
-                    batch.n_gram_input_ids.buffer_size,
+                    batch.oe_context.buffer_size,
                 )
-                batch.n_gram_input_ids.set_gram(n, gram_tensor)
+                batch.oe_context.set_gram(n, gram_tensor)
 
     def generate_attn_arg_prefill(
         self,
@@ -581,8 +581,8 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                         next_power_of_2(bs),
                         next_power_of_2(self.draft_token_num),
                     )
-                if batch.n_gram_input_ids:
-                    batch.n_gram_input_ids.filter_buffer(unfinished_index_device)
+                if batch.oe_context:
+                    batch.oe_context.filter_buffer(unfinished_index_device)
 
                 draft_input = EagleDraftInput(
                     hidden_states=batch.spec_info.hidden_states[
@@ -676,8 +676,8 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
             )
             pt += extend_len
 
-        if hasattr(batch, "n_gram_input_ids") and batch.n_gram_input_ids is not None:
-            for idx, gram_tensor in enumerate(batch.n_gram_input_ids.input_ids_grams):
+        if hasattr(batch, "oe_context") and batch.oe_context is not None:
+            for idx, gram_tensor in enumerate(batch.oe_context.input_ids_grams):
                 n = idx + 2
                 assign_ngram_input_ids_draft_extend(
                     batch.input_ids,
@@ -686,7 +686,7 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
                     n,
                 )
             buffer = torch.empty(
-                batch.batch_size() * batch.n_gram_input_ids.buffer_size,
+                batch.batch_size() * batch.oe_context.buffer_size,
                 device=batch.input_ids.device,
                 dtype=batch.input_ids.dtype,
             )
@@ -694,9 +694,9 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
                 batch.input_ids,
                 buffer,
                 batch.seq_lens,
-                batch.n_gram_input_ids.buffer_size,
+                batch.oe_context.buffer_size,
             )
-            batch.n_gram_input_ids.input_ids_buffer = buffer
+            batch.oe_context.input_ids_buffer = buffer
 
     @classmethod
     def create_idle_input(
@@ -751,11 +751,11 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
         )
 
         batch.input_ids = batch.input_ids.to(torch.int64)
-        if batch.n_gram_input_ids is not None:
-            buffer = batch.n_gram_input_ids.input_ids_buffer
-            buffer_size = batch.n_gram_input_ids.buffer_size
+        if batch.oe_context is not None:
+            buffer = batch.oe_context.input_ids_buffer
+            buffer_size = batch.oe_context.buffer_size
             accept_length = self.accept_length.to(torch.int32)
-            num_grams = len(batch.n_gram_input_ids.input_ids_grams)
+            num_grams = len(batch.oe_context.input_ids_grams)
             for idx in range(num_grams):
                 n = idx + 2
                 n_gram = torch.empty_like(batch.input_ids, dtype=torch.int64)
@@ -769,7 +769,7 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
                     buffer_size,
                     update_buffer,
                 )
-                batch.n_gram_input_ids.set_gram(n, n_gram)
+                batch.oe_context.set_gram(n, n_gram)
 
     def generate_attn_arg_prefill(
         self,

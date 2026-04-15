@@ -338,7 +338,7 @@ class EAGLEDraftExtendCudaGraphRunner:
             capture_hidden_mode=CaptureHiddenMode.LAST,
             attn_backend=self.eagle_worker.draft_extend_attn_backend,
             padded_static_len=self.padded_static_len,
-            n_gram_input_ids=current_ngram_input_ids,
+            oe_context=current_ngram_input_ids,
         )
 
         self.eagle_worker.draft_extend_attn_backend.init_forward_metadata_capture_cuda_graph(
@@ -450,10 +450,10 @@ class EAGLEDraftExtendCudaGraphRunner:
         if self.ngram_input_ids is not None:
             self.ngram_input_ids.input_ids_buffer[
                 : raw_bs * OverEncodingContext.buffer_size
-            ].copy_(forward_batch.n_gram_input_ids.input_ids_buffer)
+            ].copy_(forward_batch.oe_context.input_ids_buffer)
             for buf_gram, src_gram in zip(
                 self.ngram_input_ids.input_ids_grams,
-                forward_batch.n_gram_input_ids.input_ids_grams,
+                forward_batch.oe_context.input_ids_grams,
             ):
                 buf_gram[:num_tokens].copy_(src_gram)
 
