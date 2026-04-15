@@ -702,14 +702,6 @@ class ServerArgs:
                     "Please use --enable-welm-kv-mirror-opt instead."
                 )
 
-        # Warn about unimplemented --num-continuous-decode-steps
-        if self.num_continuous_decode_steps != 1:
-            logger.warning(
-                f"--num-continuous-decode-steps={self.num_continuous_decode_steps} "
-                "is not yet implemented and will be ignored. "
-                "The scheduler always runs 1 decode step per loop."
-            )
-
     def _handle_missing_default_values(self):
         if self.tokenizer_path is None:
             self.tokenizer_path = self.model_path
