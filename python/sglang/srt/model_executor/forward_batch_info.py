@@ -60,6 +60,7 @@ if TYPE_CHECKING:
         ModelWorkerBatch,
         MultimodalInputs,
         NGramInputIds,
+        OverEncodingContext,
     )
     from sglang.srt.mem_cache.memory_pool import KVCache, ReqToTokenPool
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -359,7 +360,7 @@ class ForwardBatch:
     nsa_cp_metadata: Optional[NSAContextParallelMetadata] = None
 
     # For Over Encoding
-    n_gram_input_ids: Optional[NGramInputIds] = None
+    n_gram_input_ids: Optional["OverEncodingContext"] = None
     enable_welm_kv_mirror_opt: bool = False
     scale_seq_factor: int = 1
 
