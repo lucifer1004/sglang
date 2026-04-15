@@ -59,7 +59,6 @@ if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import (
         ModelWorkerBatch,
         MultimodalInputs,
-        NGramInputIds,
         OverEncodingContext,
     )
     from sglang.srt.mem_cache.memory_pool import KVCache, ReqToTokenPool

@@ -609,8 +609,6 @@ class OverEncodingContext:
         object.__setattr__(self, name, value)
 
 
-# Backward compatibility alias so external code importing NGramInputIds still works.
-NGramInputIds = OverEncodingContext
 
 
 class Req:
@@ -1367,7 +1365,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # hicache pointer for synchronizing data loading from CPU to GPU
     hicache_consumer_index: int = -1
 
-    n_gram_input_ids: Optional[NGramInputIds] = None
+    n_gram_input_ids: Optional[OverEncodingContext] = None
 
     # Diffusion LLM
     dllm_config: Optional[DllmConfig] = None
@@ -2334,5 +2332,5 @@ class ModelWorkerBatch:
     has_grammar: bool = False
 
     # Over Encoding
-    n_gram_input_ids: Optional[NGramInputIds] = None
+    n_gram_input_ids: Optional[OverEncodingContext] = None
     scale_seq_factor: int = 1
