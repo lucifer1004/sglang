@@ -492,11 +492,9 @@ class OverEncodingContext:
     def from_decode(cls, reqs, enable_overlap, device) -> "OverEncodingContext":
         """Build context for a decode batch.
 
-        Each request contributes one token per gram level.  All data is packed
-        into a single tensor for one H2D copy.
+        Each request contributes one token per gram level.
         """
-        bs = len(reqs)
-        gram_flat = []
+        gram_lists = [[] for _ in range(cls.NUM_GRAMS)]
         for r in reqs:
             ids = r.origin_input_ids + r.output_ids
             if enable_overlap:
@@ -507,17 +505,15 @@ class OverEncodingContext:
                 offset = 1
             for gi in range(cls.NUM_GRAMS):
                 shift = gi + 1 + offset
-                gram_flat.append(ids[-shift] if len(ids) >= shift else 0)
+                gram_lists[gi].append(ids[-shift] if len(ids) >= shift else 0)
 
-        gram_tensor = (
-            torch.tensor(gram_flat, dtype=torch.int64)
-            .to(device, non_blocking=True)
-            .reshape(bs, cls.NUM_GRAMS)
-            .t()
-            .contiguous()
-        )
         return cls(
-            input_ids_grams=[gram_tensor[i] for i in range(cls.NUM_GRAMS)]
+            input_ids_grams=[
+                torch.tensor(gram_lists[gi], dtype=torch.int64).to(
+                    device, non_blocking=True
+                )
+                for gi in range(cls.NUM_GRAMS)
+            ]
         )
 
     # ------------------------------------------------------------------
