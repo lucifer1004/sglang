@@ -68,7 +68,7 @@ class WeLMV4ModelNextN(nn.Module):
         self.enorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.hnorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
-        self.eh_proj = nn.Linear(2 * config.hidden_size, config.hidden_size, bias=False)
+        self.eh_proj = nn.Linear(2 * config.hidden_size, config.hidden_size, bias=True)
 
         self.alt_stream = torch.cuda.Stream() if _is_cuda else None
 
