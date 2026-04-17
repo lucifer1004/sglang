@@ -195,6 +195,7 @@ class WeLMV4MoeForCausalLMNextN(WeLMV4MoeForCausalLM):
         )
         self.lm_head = None
         self.logits_processor = LogitsProcessor(config)
+        super().post_init_after_load_weights(is_nextn=True)
 
     @torch.no_grad()
     def forward(

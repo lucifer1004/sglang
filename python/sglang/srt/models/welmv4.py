@@ -147,27 +147,50 @@ class LayerManager:
                 imitated_qkv_proj_bias is not None
             )
 
-            mirror_layer_attn.qkv_proj_weight = mirror_qkv_proj_weight[
+            mirror_weight_data = mirror_qkv_proj_weight[
                 : mirror_layer_attn.q_size, :
-            ].clone()
-            imitated_layer_attn.qkv_proj_weight = torch.concat(
+            ]
+            imitated_weight_data = torch.concat(
                 [
                     imitated_qkv_proj_weight,
                     mirror_qkv_proj_weight[mirror_layer_attn.q_size :, :],
                 ],
                 dim=0,
             )
+
+            # Use in-place copy to preserve tensor addresses for CUDA graph
+            # compatibility. Creating new tensors would invalidate captured
+            # CUDA graphs that reference the old memory addresses.
+            if hasattr(mirror_layer_attn, "qkv_proj_weight"):
+                mirror_layer_attn.qkv_proj_weight.copy_(mirror_weight_data)
+            else:
+                mirror_layer_attn.qkv_proj_weight = mirror_weight_data.clone()
+
+            if hasattr(imitated_layer_attn, "qkv_proj_weight"):
+                imitated_layer_attn.qkv_proj_weight.copy_(imitated_weight_data)
+            else:
+                imitated_layer_attn.qkv_proj_weight = imitated_weight_data.clone()
+
             if mirror_qkv_proj_bias is not None:
-                mirror_layer_attn.qkv_proj_bias = mirror_qkv_proj_bias[
+                mirror_bias_data = mirror_qkv_proj_bias[
                     : mirror_layer_attn.q_size
-                ].clone()
-                imitated_layer_attn.qkv_proj_bias = torch.concat(
+                ]
+                imitated_bias_data = torch.concat(
                     [
                         imitated_qkv_proj_bias,
                         mirror_qkv_proj_bias[mirror_layer_attn.q_size :],
                     ],
                     dim=0,
                 )
+                if hasattr(mirror_layer_attn, "qkv_proj_bias") and mirror_layer_attn.qkv_proj_bias is not None:
+                    mirror_layer_attn.qkv_proj_bias.copy_(mirror_bias_data)
+                else:
+                    mirror_layer_attn.qkv_proj_bias = mirror_bias_data.clone()
+
+                if hasattr(imitated_layer_attn, "qkv_proj_bias") and imitated_layer_attn.qkv_proj_bias is not None:
+                    imitated_layer_attn.qkv_proj_bias.copy_(imitated_bias_data)
+                else:
+                    imitated_layer_attn.qkv_proj_bias = imitated_bias_data.clone()
             else:
                 imitated_layer_attn.qkv_proj_bias = None
                 mirror_layer_attn.qkv_proj_bias = None
@@ -1410,6 +1433,7 @@ class WeLMV4MoeForCausalLM(nn.Module):
         self.logits_processor = LogitsProcessor(config)
         # For EAGLE3 support
         self.capture_aux_hidden_states = False
+        self.post_init_after_load_weights(is_nextn=False)
 
     @torch.no_grad()
     def forward(
