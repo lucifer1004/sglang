@@ -153,10 +153,10 @@ class GraphInputBuffers:
         self.seq_lens[:raw_bs].copy_(forward_batch.seq_lens)
         self.out_cache_loc[:raw_num_token].copy_(forward_batch.out_cache_loc)
         self.positions[:raw_num_token].copy_(forward_batch.positions)
-        if forward_batch.n_gram_input_ids is not None and len(self.input_ids_grams) > 0:
+        if forward_batch.oe_context is not None and len(self.input_ids_grams) > 0:
             for buf_gram, src_gram in zip(
                 self.input_ids_grams,
-                forward_batch.n_gram_input_ids.input_ids_grams,
+                forward_batch.oe_context.input_ids_grams,
             ):
                 buf_gram[:raw_model_input].copy_(src_gram)
 

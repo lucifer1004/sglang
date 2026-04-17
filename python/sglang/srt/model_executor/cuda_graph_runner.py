@@ -52,7 +52,7 @@ from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.moe.token_dispatcher.deepep import DeepEPBuffer
 from sglang.srt.layers.moe.utils import get_deepep_mode, get_moe_a2a_backend
 from sglang.srt.layers.torchao_utils import save_gemlite_cache
-from sglang.srt.managers.schedule_batch import NGramInputIds
+from sglang.srt.managers.schedule_batch import OverEncodingContext
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
@@ -654,7 +654,7 @@ class CudaGraphRunner:
             lora_ids=lora_ids,
         )
         if self.model_runner.server_args.prepare_n_gram_inputs:
-            forward_batch.n_gram_input_ids = NGramInputIds(
+            forward_batch.oe_context = OverEncodingContext(
                 input_ids_grams=[
                     gram[:model_input_len] for gram in buffers.input_ids_grams
                 ],

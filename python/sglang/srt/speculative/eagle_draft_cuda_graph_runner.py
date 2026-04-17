@@ -33,7 +33,7 @@ from sglang.srt.utils import (
 if TYPE_CHECKING:
     from sglang.srt.speculative.eagle_worker import EAGLEWorker
 
-from sglang.srt.managers.schedule_batch import NGramInputIds
+from sglang.srt.managers.schedule_batch import OverEncodingContext
 
 
 class EAGLEDraftCudaGraphRunner:
@@ -107,13 +107,13 @@ class EAGLEDraftCudaGraphRunner:
                 dtype=self.model_runner.dtype,
             )
             if self.model_runner.server_args.prepare_n_gram_inputs:
-                self.ngram_input_ids = NGramInputIds(
+                self.ngram_input_ids = OverEncodingContext(
                     input_ids_grams=[
                         torch.zeros((self.max_num_token,), dtype=torch.int64)
                         for _ in range(3)
                     ],
                     input_ids_buffer=torch.zeros(
-                        (self.max_bs * NGramInputIds.buffer_size), dtype=torch.int64
+                        (self.max_bs * OverEncodingContext.buffer_size), dtype=torch.int64
                     ),
                 )
             else:
@@ -209,7 +209,7 @@ class EAGLEDraftCudaGraphRunner:
             buffer = self.ngram_input_ids.input_ids_buffer[
                 : num_seqs * self.ngram_input_ids.buffer_size
             ]
-            current_ngram_input_ids = NGramInputIds(
+            current_ngram_input_ids = OverEncodingContext(
                 input_ids_grams=[
                     gram[:num_tokens] for gram in self.ngram_input_ids.input_ids_grams
                 ],
@@ -292,7 +292,7 @@ class EAGLEDraftCudaGraphRunner:
             capture_hidden_mode=(
                 spec_info.capture_hidden_mode if spec_info else CaptureHiddenMode.NULL
             ),
-            n_gram_input_ids=current_ngram_input_ids,
+            oe_context=current_ngram_input_ids,
         )
 
         # Attention backend
@@ -376,11 +376,11 @@ class EAGLEDraftCudaGraphRunner:
         self.req_pool_indices[:raw_bs].copy_(forward_batch.req_pool_indices)
         if self.ngram_input_ids is not None:
             self.ngram_input_ids.input_ids_buffer[
-                : raw_bs * NGramInputIds.buffer_size
-            ].copy_(forward_batch.n_gram_input_ids.input_ids_buffer)
+                : raw_bs * OverEncodingContext.buffer_size
+            ].copy_(forward_batch.oe_context.input_ids_buffer)
             for buf_gram, src_gram in zip(
                 self.ngram_input_ids.input_ids_grams,
-                forward_batch.n_gram_input_ids.input_ids_grams,
+                forward_batch.oe_context.input_ids_grams,
             ):
                 buf_gram[:raw_num_token].copy_(src_gram)
 
