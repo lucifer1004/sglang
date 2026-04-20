@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import logging
 import os
-from pathlib import Path
 from typing import Sequence, Tuple
 
 import torch
@@ -18,7 +17,6 @@ logger = logging.getLogger(__name__)
 
 WELM_OE_IMPL_ENV = "SGLANG_WELM_OE_IMPL"
 WELM_OE_TRITON_PREPROCESS_ENV = "SGLANG_WELM_OE_TRITON_PREPROCESS"
-WELM_OE_DUMP_DIR_ENV = "SGLANG_WELM_OE_DUMP_DIR"
 WELM_OE_IMPL_LEGACY = "legacy"
 WELM_OE_IMPL_TP_FUSED = "tp_fused"
 SPECIALIZED_WELM_OE_GRAMS = (2, 2, 3, 3)
@@ -26,42 +24,6 @@ SPECIALIZED_WELM_OE_BRANCHES = 4
 SPECIALIZED_WELM_OE_DIM = 512
 DEFAULT_SPECIALIZED_WELM_OE_EMBED_BLOCK_D = 512
 DEFAULT_SPECIALIZED_WELM_OE_EMBED_NUM_WARPS = 1
-_welm_oe_dump_max_tokens = 0
-
-
-def _maybe_dump_welm_oe_runtime_inputs(
-    input_ids: torch.Tensor,
-    oe_context,
-    oe_vocab_sizes: Sequence[int],
-    vocab_size: int,
-) -> None:
-    dump_dir = os.getenv(WELM_OE_DUMP_DIR_ENV)
-    if not dump_dir:
-        return
-    if torch.cuda.is_current_stream_capturing():
-        return
-
-    global _welm_oe_dump_max_tokens
-    num_tokens = int(input_ids.numel())
-    if num_tokens <= _welm_oe_dump_max_tokens:
-        return
-    _welm_oe_dump_max_tokens = num_tokens
-
-    dump_path = Path(dump_dir)
-    dump_path.mkdir(parents=True, exist_ok=True)
-    gram2 = oe_context.get_gram(2)
-    gram3 = oe_context.get_gram(3)
-    payload = {
-        "input_ids": input_ids.detach().cpu(),
-        "gram2": None if gram2 is None else gram2.detach().cpu(),
-        "gram3": None if gram3 is None else gram3.detach().cpu(),
-        "vocab_size": int(vocab_size),
-        "oe_vocab_sizes": list(oe_vocab_sizes),
-        "num_tokens": num_tokens,
-    }
-    file_path = dump_path / f"welm_oe_inputs_rank{torch.cuda.current_device()}_{num_tokens}.pt"
-    torch.save(payload, file_path)
-    logger.info("[welm_oe_dump] saved runtime input dump to %s", file_path)
 
 
 @triton.jit
@@ -369,12 +331,6 @@ def compute_welm_oe_concat_local_partials(
     if not oe_grams:
         return input_ids.new_zeros((input_ids.shape[0], 0), dtype=torch.float32)
 
-    _maybe_dump_welm_oe_runtime_inputs(
-        input_ids,
-        forward_batch.oe_context,
-        oe_vocab_sizes,
-        vocab_size,
-    )
     if _can_use_specialized_welm_oe_lookup_concat(
         input_ids,
         oe_grams,
