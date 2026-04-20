@@ -359,6 +359,62 @@ class TestWelmV4OEEmbedding(unittest.TestCase):
         torch.testing.assert_close(local_tri.cpu(), local_ref.cpu())
         torch.testing.assert_close(mask_tri.cpu(), mask_ref.cpu())
 
+    def test_concat_local_partials_supports_repeated_oe_grams(self):
+        oe_grams = [2, 2, 4]
+        oe_vocab_sizes = [11, 7, 13]
+        embed_modules = [
+            FakeShardedEmbedding(
+                local_weight=self.full_weight_0,
+                vocab_start=0,
+                vocab_end=11,
+                padded_end=11,
+                tp_size=1,
+            ),
+            FakeShardedEmbedding(
+                local_weight=torch.arange(21, dtype=torch.float32).reshape(7, 3) / 5.0,
+                vocab_start=0,
+                vocab_end=7,
+                padded_end=7,
+                tp_size=1,
+            ),
+            FakeShardedEmbedding(
+                local_weight=self.full_weight_1,
+                vocab_start=0,
+                vocab_end=13,
+                padded_end=13,
+                tp_size=1,
+            ),
+        ]
+
+        actual = compute_welm_oe_concat_local_partials(
+            input_ids=self.input_ids,
+            forward_batch=self.forward_batch,
+            oe_grams=oe_grams,
+            oe_vocab_sizes=oe_vocab_sizes,
+            vocab_size=self.vocab_size,
+            oe_embed_modules=embed_modules,
+            use_triton_preprocess=False,
+        )
+
+        ngram2 = hash_input_ids_vectorized(
+            self.input_ids + self.forward_batch.oe_context.get_gram(2) * self.vocab_size
+        )
+        ngram4 = hash_input_ids_vectorized(
+            self.input_ids
+            + self.forward_batch.oe_context.get_gram(2) * self.vocab_size
+            + self.forward_batch.oe_context.get_gram(3) * (self.vocab_size**2)
+            + self.forward_batch.oe_context.get_gram(4) * (self.vocab_size**3)
+        )
+        expected = torch.cat(
+            [
+                F.embedding((ngram2 % oe_vocab_sizes[0]).long(), embed_modules[0].weight),
+                F.embedding((ngram2 % oe_vocab_sizes[1]).long(), embed_modules[1].weight),
+                F.embedding((ngram4 % oe_vocab_sizes[2]).long(), embed_modules[2].weight),
+            ],
+            dim=-1,
+        )
+        torch.testing.assert_close(actual, expected)
+
     def test_env_var_selects_legacy_and_tp_fused_paths(self):
         rank0_modules = [
             FakeShardedEmbedding(

@@ -58,20 +58,44 @@ def hash_input_ids_vectorized(input_ids: torch.Tensor) -> torch.Tensor:
     return result.to(input_ids.dtype)
 
 
-def _resolve_oe_gram_inputs(
+def _compute_welm_oe_hashed_inputs_fused(
+    *,
     input_ids: torch.Tensor,
     oe_context,
+    oe_grams: Sequence[int],
+    oe_vocab_sizes: Sequence[int],
     vocab_size: int,
-    max_oe_gram: int,
+    oe_embed_modules: Sequence,
+    use_triton_preprocess: bool,
 ) -> list[torch.Tensor]:
-    ngram_inputs = []
+    """Build n-grams and hash/localize them in a single pass over gram depth."""
+    if not oe_grams:
+        return []
+
+    gram_to_branch_indices: dict[int, list[int]] = {}
+    for branch_idx, gram in enumerate(oe_grams):
+        gram_to_branch_indices.setdefault(gram, []).append(branch_idx)
+
+    hashed_inputs: list[torch.Tensor | None] = [None] * len(oe_grams)
     running_ids = input_ids
-    for g in range(1, max_oe_gram):
+    for g in range(1, max(oe_grams)):
         gram_tensor = oe_context.get_gram(g + 1)
         if gram_tensor is not None:
             running_ids = running_ids + gram_tensor * (vocab_size**g)
-        ngram_inputs.append(running_ids)
-    return ngram_inputs
+
+        for branch_idx in gram_to_branch_indices.get(g + 1, []):
+            module = oe_embed_modules[branch_idx]
+            hashed_ids, _, _ = hash_and_localize_welm_oe_input_ids(
+                running_ids,
+                oe_vocab_sizes[branch_idx],
+                module.shard_indices.org_vocab_start_index,
+                module.shard_indices.org_vocab_end_index,
+                use_triton=use_triton_preprocess,
+            )
+            hashed_inputs[branch_idx] = hashed_ids
+
+    assert all(hashed_input is not None for hashed_input in hashed_inputs)
+    return [hashed_input for hashed_input in hashed_inputs]
 
 
 def hash_and_localize_welm_oe_input_ids(
@@ -162,30 +186,25 @@ def compute_welm_oe_concat_local_partials(
     if not oe_grams:
         return input_ids.new_zeros((input_ids.shape[0], 0), dtype=torch.float32)
 
-    ngram_inputs = _resolve_oe_gram_inputs(
-        input_ids,
-        forward_batch.oe_context,
-        vocab_size,
-        max(oe_grams),
+    hashed_inputs = _compute_welm_oe_hashed_inputs_fused(
+        input_ids=input_ids,
+        oe_context=forward_batch.oe_context,
+        oe_grams=oe_grams,
+        oe_vocab_sizes=oe_vocab_sizes,
+        vocab_size=vocab_size,
+        oe_embed_modules=oe_embed_modules,
+        use_triton_preprocess=use_triton_preprocess,
     )
 
     local_embeddings = []
-    for i, vocab_size_i in enumerate(oe_vocab_sizes):
+    for i, _ in enumerate(oe_vocab_sizes):
         module = oe_embed_modules[i]
         if not _supports_tp_fused_lookup(module):
             raise TypeError(
                 "OE TP fused lookup requires embedding modules with weight/tp_size/shard_indices"
             )
 
-        ngram_input = ngram_inputs[oe_grams[i] - 2]
-        hashed_ids, _, _ = hash_and_localize_welm_oe_input_ids(
-            ngram_input,
-            vocab_size_i,
-            module.shard_indices.org_vocab_start_index,
-            module.shard_indices.org_vocab_end_index,
-            use_triton=use_triton_preprocess,
-        )
-        local_embeddings.append(_lookup_local_embedding(module, hashed_ids))
+        local_embeddings.append(_lookup_local_embedding(module, hashed_inputs[i]))
 
     return torch.cat(local_embeddings, dim=-1)
 
