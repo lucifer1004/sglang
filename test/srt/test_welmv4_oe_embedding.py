@@ -473,29 +473,24 @@ class TestWelmV4OEEmbedding(unittest.TestCase):
         )
         torch.testing.assert_close(actual, expected)
 
-    def test_hash_and_localize_triton_matches_reference(self):
-        if not torch.cuda.is_available():
-            self.skipTest("CUDA is required to validate the Triton preprocess path")
-
-        input_ids = torch.tensor([1, 17, 33, 49, 65], device="cuda", dtype=torch.int64)
-        hashed_ref, local_ref, mask_ref = hash_and_localize_welm_oe_input_ids(
+    def test_hash_and_localize_matches_reference_formula(self):
+        input_ids = torch.tensor([1, 17, 33, 49, 65], dtype=torch.int64)
+        hashed, local_idx, valid_mask = hash_and_localize_welm_oe_input_ids(
             input_ids,
             vocab_size=13,
             shard_start=5,
             shard_end=10,
-            use_triton=False,
-        )
-        hashed_tri, local_tri, mask_tri = hash_and_localize_welm_oe_input_ids(
-            input_ids,
-            vocab_size=13,
-            shard_start=5,
-            shard_end=10,
-            use_triton=True,
         )
 
-        torch.testing.assert_close(hashed_tri.cpu(), hashed_ref.cpu())
-        torch.testing.assert_close(local_tri.cpu(), local_ref.cpu())
-        torch.testing.assert_close(mask_tri.cpu(), mask_ref.cpu())
+        expected_hashed = hash_input_ids_vectorized(input_ids.to(torch.int64)) % 13
+        expected_mask = (expected_hashed >= 5) & (expected_hashed < 10)
+        expected_local = torch.where(
+            expected_mask, expected_hashed - 5, torch.zeros_like(expected_hashed)
+        )
+
+        torch.testing.assert_close(hashed, expected_hashed.to(torch.int64))
+        torch.testing.assert_close(local_idx, expected_local.to(torch.int64))
+        torch.testing.assert_close(valid_mask, expected_mask)
 
     def test_specialized_lookup_concat_2233_matches_generic_concat(self):
         if not torch.cuda.is_available():

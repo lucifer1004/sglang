@@ -156,36 +156,6 @@ def _maybe_dump_welm_oe_runtime_inputs(
 
 
 @triton.jit
-def _hash_mod_localize_kernel(
-    input_ptr,
-    hashed_ptr,
-    local_idx_ptr,
-    valid_mask_ptr,
-    numel,
-    vocab_size,
-    shard_start,
-    shard_end,
-    BLOCK_SIZE: tl.constexpr,
-):
-    pid = tl.program_id(0)
-    offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    mask = offs < numel
-
-    input_ids = tl.load(input_ptr + offs, mask=mask, other=0).to(tl.uint64)
-    vocab_size = vocab_size.to(tl.uint64)
-    shard_start = shard_start.to(tl.uint64)
-    shard_end = shard_end.to(tl.uint64)
-    hashed = (input_ids * 2654435761) & 0xFFFFFFFF
-    hashed = hashed % vocab_size
-    valid = (hashed >= shard_start) & (hashed < shard_end)
-    local_idx = tl.where(valid, hashed - shard_start, 0)
-
-    tl.store(hashed_ptr + offs, hashed.to(tl.int64), mask=mask)
-    tl.store(local_idx_ptr + offs, local_idx.to(tl.int64), mask=mask)
-    tl.store(valid_mask_ptr + offs, valid.to(tl.int8), mask=mask)
-
-
-@triton.jit
 def _welm_oe_lookup_concat_2233_kernel(
     input_ptr,
     gram2_ptr,
@@ -323,7 +293,6 @@ def _compute_welm_oe_hashed_inputs_fused(
             vocab_size_branch,
             module.shard_indices.org_vocab_start_index,
             module.shard_indices.org_vocab_end_index,
-            use_triton=use_triton_preprocess,
         )
         hashed_inputs.append(hashed_ids)
     return hashed_inputs
@@ -432,31 +401,11 @@ def hash_and_localize_welm_oe_input_ids(
     vocab_size: int,
     shard_start: int,
     shard_end: int,
-    *,
-    use_triton: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Hash OE token ids, apply vocab modulo, and map valid ids into local TP indices."""
     if input_ids.numel() == 0:
         empty = torch.empty_like(input_ids, dtype=torch.int64)
         return empty, empty, torch.empty_like(input_ids, dtype=torch.bool)
-
-    if use_triton and input_ids.is_cuda:
-        hashed = torch.empty_like(input_ids, dtype=torch.int64)
-        local_idx = torch.empty_like(input_ids, dtype=torch.int64)
-        valid_mask = torch.empty_like(input_ids, dtype=torch.int8)
-        grid = (triton.cdiv(input_ids.numel(), 256),)
-        _hash_mod_localize_kernel[grid](
-            input_ids,
-            hashed,
-            local_idx,
-            valid_mask,
-            input_ids.numel(),
-            vocab_size,
-            shard_start,
-            shard_end,
-            BLOCK_SIZE=256,
-        )
-        return hashed, local_idx, valid_mask.to(torch.bool)
 
     hashed = hash_input_ids_vectorized(input_ids.to(torch.int64)) % vocab_size
     valid_mask = (hashed >= shard_start) & (hashed < shard_end)
