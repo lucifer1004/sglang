@@ -200,9 +200,12 @@ specialized path 只在以下条件同时满足时启用：
 
 这样做的原因是：
 
-1. 收益已经由主路径拿到
-2. 继续保留多个实验性 specialized 分支，会增加维护成本
-3. 对未来新 shape，generic fallback 仍然可用
+1. **只有固定 shape 才能做足够充分的 fuse**。
+   `2233` 把 gram 组合、hash/mod、shard check、4 路 embedding gather、concat write 都压进了同一条明确的执行路径里，kernel 足够“厚”，速度收益才稳定。
+2. generic shape 很难做到同样程度的 fuse。
+   branch/gram 组合一旦变成动态，控制流、地址计算和 launch 组织都会变复杂，kernel 更容易变碎，收益也更不稳定。
+3. 收益已经由线上主路径拿到，继续保留多个实验性 specialized 分支只会增加维护成本。
+4. 对未来新 shape，generic fallback 仍然可用。
 
 ## Current Status
 
