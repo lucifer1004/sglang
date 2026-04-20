@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+from collections import defaultdict, deque
 import logging
 import os
+from pathlib import Path
 from typing import Sequence, Tuple
 
 import torch
@@ -17,10 +19,143 @@ logger = logging.getLogger(__name__)
 
 WELM_OE_IMPL_ENV = "SGLANG_WELM_OE_IMPL"
 WELM_OE_TRITON_PREPROCESS_ENV = "SGLANG_WELM_OE_TRITON_PREPROCESS"
+WELM_OE_TRITON_LOOKUP_FUSION_ENV = "SGLANG_WELM_OE_TRITON_LOOKUP_FUSION"
+WELM_OE_CUDA_EVENT_PROFILE_ENV = "SGLANG_WELM_OE_CUDA_EVENT_PROFILE"
+WELM_OE_CUDA_EVENT_PROFILE_INTERVAL_ENV = "SGLANG_WELM_OE_CUDA_EVENT_PROFILE_INTERVAL"
+WELM_OE_DUMP_DIR_ENV = "SGLANG_WELM_OE_DUMP_DIR"
 WELM_OE_IMPL_LEGACY = "legacy"
 WELM_OE_IMPL_TP_FUSED = "tp_fused"
 SPECIALIZED_WELM_OE_GRAMS = (2, 2, 3, 3)
 SPECIALIZED_WELM_OE_BRANCHES = 4
+SPECIALIZED_WELM_OE_DIM = 512
+DEFAULT_WELM_OE_CUDA_EVENT_PROFILE_INTERVAL = 100
+DEFAULT_SPECIALIZED_WELM_OE_BLOCK_SIZE = 1024
+DEFAULT_SPECIALIZED_WELM_OE_NUM_WARPS = 8
+DEFAULT_SPECIALIZED_WELM_OE_EMBED_BLOCK_D = 128
+DEFAULT_SPECIALIZED_WELM_OE_EMBED_NUM_WARPS = 4
+
+
+class _WelmOeCudaEventMetric:
+    def __init__(self):
+        self.pending = deque()
+        self.total_ms = 0.0
+        self.total_items = 0
+        self.total_tokens = 0
+
+
+_welm_oe_cuda_event_metrics = defaultdict(_WelmOeCudaEventMetric)
+_welm_oe_dump_max_tokens = 0
+
+
+def _welm_oe_cuda_event_profile_enabled(tensor: torch.Tensor) -> bool:
+    return tensor.is_cuda and os.getenv(WELM_OE_CUDA_EVENT_PROFILE_ENV, "0").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _welm_oe_cuda_event_profile_interval() -> int:
+    try:
+        return max(
+            1,
+            int(
+                os.getenv(
+                    WELM_OE_CUDA_EVENT_PROFILE_INTERVAL_ENV,
+                    str(DEFAULT_WELM_OE_CUDA_EVENT_PROFILE_INTERVAL),
+                )
+            ),
+        )
+    except ValueError:
+        return DEFAULT_WELM_OE_CUDA_EVENT_PROFILE_INTERVAL
+
+
+def _drain_welm_oe_cuda_event_metric(name: str) -> None:
+    metric = _welm_oe_cuda_event_metrics[name]
+    interval = _welm_oe_cuda_event_profile_interval()
+    while metric.pending and metric.pending[0][1].query():
+        start_event, end_event, num_tokens = metric.pending.popleft()
+        elapsed_ms = start_event.elapsed_time(end_event)
+        metric.total_ms += elapsed_ms
+        metric.total_items += 1
+        metric.total_tokens += num_tokens
+        if metric.total_items % interval == 0:
+            avg_ms = metric.total_ms / metric.total_items
+            throughput = (
+                metric.total_tokens / (metric.total_ms / 1000.0)
+                if metric.total_ms > 0
+                else 0.0
+            )
+            logger.info(
+                "[welm_oe_profile] %s count=%d avg_ms=%.4f throughput=%.2f tok/s",
+                name,
+                metric.total_items,
+                avg_ms,
+                throughput,
+            )
+
+
+def _start_welm_oe_cuda_event_region(
+    name: str,
+    tensor: torch.Tensor,
+    num_tokens: int,
+):
+    if not _welm_oe_cuda_event_profile_enabled(tensor):
+        return None
+    if torch.cuda.is_current_stream_capturing():
+        return None
+    _drain_welm_oe_cuda_event_metric(name)
+    start_event = torch.cuda.Event(enable_timing=True)
+    end_event = torch.cuda.Event(enable_timing=True)
+    start_event.record()
+    return name, start_event, end_event, num_tokens
+
+
+def _end_welm_oe_cuda_event_region(region) -> None:
+    if region is None:
+        return
+    name, start_event, end_event, num_tokens = region
+    end_event.record()
+    _welm_oe_cuda_event_metrics[name].pending.append(
+        (start_event, end_event, num_tokens)
+    )
+    _drain_welm_oe_cuda_event_metric(name)
+
+
+def _maybe_dump_welm_oe_runtime_inputs(
+    input_ids: torch.Tensor,
+    oe_context,
+    oe_vocab_sizes: Sequence[int],
+    vocab_size: int,
+) -> None:
+    dump_dir = os.getenv(WELM_OE_DUMP_DIR_ENV)
+    if not dump_dir:
+        return
+    if torch.cuda.is_current_stream_capturing():
+        return
+
+    global _welm_oe_dump_max_tokens
+    num_tokens = int(input_ids.numel())
+    if num_tokens <= _welm_oe_dump_max_tokens:
+        return
+    _welm_oe_dump_max_tokens = num_tokens
+
+    dump_path = Path(dump_dir)
+    dump_path.mkdir(parents=True, exist_ok=True)
+    gram2 = oe_context.get_gram(2)
+    gram3 = oe_context.get_gram(3)
+    payload = {
+        "input_ids": input_ids.detach().cpu(),
+        "gram2": None if gram2 is None else gram2.detach().cpu(),
+        "gram3": None if gram3 is None else gram3.detach().cpu(),
+        "vocab_size": int(vocab_size),
+        "oe_vocab_sizes": list(oe_vocab_sizes),
+        "num_tokens": num_tokens,
+    }
+    file_path = dump_path / f"welm_oe_inputs_rank{torch.cuda.current_device()}_{num_tokens}.pt"
+    torch.save(payload, file_path)
+    logger.info("[welm_oe_dump] saved runtime input dump to %s", file_path)
 
 
 @triton.jit
@@ -75,38 +210,140 @@ def _welm_oe_hash_prepare_2233_kernel(
     offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = offs < numel
 
-    input_ids = tl.load(input_ptr + offs, mask=mask, other=0).to(tl.uint64)
-    gram2 = tl.load(gram2_ptr + offs, mask=mask, other=0).to(tl.uint64)
-    gram3 = tl.load(gram3_ptr + offs, mask=mask, other=0).to(tl.uint64)
+    input_ids = tl.load(input_ptr + offs, mask=mask, other=0).to(tl.uint32)
+    gram2 = tl.load(gram2_ptr + offs, mask=mask, other=0).to(tl.uint32)
+    gram3 = tl.load(gram3_ptr + offs, mask=mask, other=0).to(tl.uint32)
 
-    vocab_size = vocab_size.to(tl.uint64)
-    vocab_size_sq = vocab_size_sq.to(tl.uint64)
+    vocab_size = vocab_size.to(tl.uint32)
+    vocab_size_sq = vocab_size_sq.to(tl.uint32)
 
     running_ids_2 = input_ids + gram2 * vocab_size
     running_ids_3 = running_ids_2 + gram3 * vocab_size_sq
 
-    hashed_2 = (running_ids_2 * 2654435761) & 0xFFFFFFFF
-    hashed_3 = (running_ids_3 * 2654435761) & 0xFFFFFFFF
+    hashed_2 = running_ids_2 * 2654435761
+    hashed_3 = running_ids_3 * 2654435761
 
     tl.store(
         out0_ptr + offs,
-        (hashed_2 % oe_vocab_size_0.to(tl.uint64)).to(tl.int64),
+        (hashed_2 % oe_vocab_size_0.to(tl.uint32)).to(tl.int32),
         mask=mask,
     )
     tl.store(
         out1_ptr + offs,
-        (hashed_2 % oe_vocab_size_1.to(tl.uint64)).to(tl.int64),
+        (hashed_2 % oe_vocab_size_1.to(tl.uint32)).to(tl.int32),
         mask=mask,
     )
     tl.store(
         out2_ptr + offs,
-        (hashed_3 % oe_vocab_size_2.to(tl.uint64)).to(tl.int64),
+        (hashed_3 % oe_vocab_size_2.to(tl.uint32)).to(tl.int32),
         mask=mask,
     )
     tl.store(
         out3_ptr + offs,
-        (hashed_3 % oe_vocab_size_3.to(tl.uint64)).to(tl.int64),
+        (hashed_3 % oe_vocab_size_3.to(tl.uint32)).to(tl.int32),
         mask=mask,
+    )
+
+
+@triton.jit
+def _welm_oe_lookup_concat_2233_kernel(
+    input_ptr,
+    gram2_ptr,
+    gram3_ptr,
+    weight0_ptr,
+    weight1_ptr,
+    weight2_ptr,
+    weight3_ptr,
+    out_ptr,
+    num_tokens,
+    vocab_size,
+    vocab_size_sq,
+    oe_vocab_size_0,
+    oe_vocab_size_1,
+    oe_vocab_size_2,
+    oe_vocab_size_3,
+    shard_start_0,
+    shard_start_1,
+    shard_start_2,
+    shard_start_3,
+    shard_end_0,
+    shard_end_1,
+    shard_end_2,
+    shard_end_3,
+    weight0_row_stride,
+    weight1_row_stride,
+    weight2_row_stride,
+    weight3_row_stride,
+    out_row_stride,
+    BLOCK_D: tl.constexpr,
+    EMBED_DIM: tl.constexpr,
+):
+    token_idx = tl.program_id(0)
+    dim_block_idx = tl.program_id(1)
+    offs_d = dim_block_idx * BLOCK_D + tl.arange(0, BLOCK_D)
+    token_mask = token_idx < num_tokens
+    dim_mask = offs_d < EMBED_DIM
+
+    input_ids = tl.load(input_ptr + token_idx, mask=token_mask, other=0).to(tl.uint32)
+    gram2 = tl.load(gram2_ptr + token_idx, mask=token_mask, other=0).to(tl.uint32)
+    gram3 = tl.load(gram3_ptr + token_idx, mask=token_mask, other=0).to(tl.uint32)
+
+    vocab_size = vocab_size.to(tl.uint32)
+    vocab_size_sq = vocab_size_sq.to(tl.uint32)
+    running_ids_2 = input_ids + gram2 * vocab_size
+    running_ids_3 = running_ids_2 + gram3 * vocab_size_sq
+    hashed_2 = running_ids_2 * 2654435761
+    hashed_3 = running_ids_3 * 2654435761
+
+    bucket0 = hashed_2 % oe_vocab_size_0.to(tl.uint32)
+    bucket1 = hashed_2 % oe_vocab_size_1.to(tl.uint32)
+    bucket2 = hashed_3 % oe_vocab_size_2.to(tl.uint32)
+    bucket3 = hashed_3 % oe_vocab_size_3.to(tl.uint32)
+
+    valid0 = token_mask & (bucket0 >= shard_start_0.to(tl.uint32)) & (
+        bucket0 < shard_end_0.to(tl.uint32)
+    )
+    valid1 = token_mask & (bucket1 >= shard_start_1.to(tl.uint32)) & (
+        bucket1 < shard_end_1.to(tl.uint32)
+    )
+    valid2 = token_mask & (bucket2 >= shard_start_2.to(tl.uint32)) & (
+        bucket2 < shard_end_2.to(tl.uint32)
+    )
+    valid3 = token_mask & (bucket3 >= shard_start_3.to(tl.uint32)) & (
+        bucket3 < shard_end_3.to(tl.uint32)
+    )
+
+    row0 = (bucket0 - shard_start_0.to(tl.uint32)).to(tl.int64)
+    row1 = (bucket1 - shard_start_1.to(tl.uint32)).to(tl.int64)
+    row2 = (bucket2 - shard_start_2.to(tl.uint32)).to(tl.int64)
+    row3 = (bucket3 - shard_start_3.to(tl.uint32)).to(tl.int64)
+
+    mask0 = valid0 & dim_mask
+    mask1 = valid1 & dim_mask
+    mask2 = valid2 & dim_mask
+    mask3 = valid3 & dim_mask
+
+    emb0 = tl.load(weight0_ptr + row0 * weight0_row_stride + offs_d, mask=mask0, other=0.0)
+    emb1 = tl.load(weight1_ptr + row1 * weight1_row_stride + offs_d, mask=mask1, other=0.0)
+    emb2 = tl.load(weight2_ptr + row2 * weight2_row_stride + offs_d, mask=mask2, other=0.0)
+    emb3 = tl.load(weight3_ptr + row3 * weight3_row_stride + offs_d, mask=mask3, other=0.0)
+
+    out_token_base = token_idx * out_row_stride
+    tl.store(out_ptr + out_token_base + offs_d, emb0, mask=token_mask & dim_mask)
+    tl.store(
+        out_ptr + out_token_base + EMBED_DIM + offs_d,
+        emb1,
+        mask=token_mask & dim_mask,
+    )
+    tl.store(
+        out_ptr + out_token_base + 2 * EMBED_DIM + offs_d,
+        emb2,
+        mask=token_mask & dim_mask,
+    )
+    tl.store(
+        out_ptr + out_token_base + 3 * EMBED_DIM + offs_d,
+        emb3,
+        mask=token_mask & dim_mask,
     )
 
 
@@ -183,7 +420,7 @@ def _compute_welm_oe_hashed_inputs_specialized_2233(
     """Specialized Triton preprocess for the deployed [2,2,3,3] Welm OE shape."""
     if input_ids.numel() == 0:
         return [
-            torch.empty_like(input_ids, dtype=torch.int64)
+            torch.empty_like(input_ids, dtype=torch.int32)
             for _ in range(SPECIALIZED_WELM_OE_BRANCHES)
         ]
 
@@ -195,7 +432,7 @@ def _compute_welm_oe_hashed_inputs_specialized_2233(
         gram3 = torch.zeros_like(input_ids)
 
     outputs = [
-        torch.empty_like(input_ids, dtype=torch.int64)
+        torch.empty_like(input_ids, dtype=torch.int32)
         for _ in range(SPECIALIZED_WELM_OE_BRANCHES)
     ]
     grid = (triton.cdiv(input_ids.numel(), 256),)
@@ -214,9 +451,112 @@ def _compute_welm_oe_hashed_inputs_specialized_2233(
         oe_vocab_sizes[1],
         oe_vocab_sizes[2],
         oe_vocab_sizes[3],
-        BLOCK_SIZE=256,
+        BLOCK_SIZE=DEFAULT_SPECIALIZED_WELM_OE_BLOCK_SIZE,
+        num_warps=DEFAULT_SPECIALIZED_WELM_OE_NUM_WARPS,
     )
     return outputs
+
+
+def _can_use_specialized_welm_oe_lookup_concat(
+    input_ids: torch.Tensor,
+    oe_grams: Sequence[int],
+    oe_vocab_sizes: Sequence[int],
+    oe_embed_modules: Sequence,
+    use_triton_preprocess: bool,
+) -> bool:
+    if not _can_use_specialized_welm_oe_hash_prepare(
+        input_ids, oe_grams, oe_vocab_sizes, oe_embed_modules, use_triton_preprocess
+    ):
+        return False
+    if os.getenv(WELM_OE_TRITON_LOOKUP_FUSION_ENV, "0").strip().lower() not in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }:
+        return False
+    return all(
+        hasattr(module, "weight")
+        and (
+            not hasattr(module, "quant_method")
+            or module.quant_method.__class__.__name__ == "UnquantizedEmbeddingMethod"
+        )
+        and module.weight.is_cuda
+        and module.weight.dim() == 2
+        and module.weight.shape[1] == SPECIALIZED_WELM_OE_DIM
+        and module.weight.stride(1) == 1
+        and module.weight.dtype == oe_embed_modules[0].weight.dtype
+        and module.shard_indices.num_org_vocab_padding == 0
+        and module.shard_indices.num_added_elements_padded == 0
+        for module in oe_embed_modules
+    )
+
+
+def _compute_welm_oe_concat_local_partials_specialized_2233(
+    *,
+    input_ids: torch.Tensor,
+    oe_context,
+    oe_vocab_sizes: Sequence[int],
+    vocab_size: int,
+    oe_embed_modules: Sequence,
+) -> torch.Tensor:
+    if input_ids.numel() == 0:
+        return torch.empty(
+            (0, SPECIALIZED_WELM_OE_BRANCHES * SPECIALIZED_WELM_OE_DIM),
+            device=input_ids.device,
+            dtype=oe_embed_modules[0].weight.dtype,
+        )
+
+    gram2 = oe_context.get_gram(2)
+    gram3 = oe_context.get_gram(3)
+    if gram2 is None:
+        gram2 = torch.zeros_like(input_ids)
+    if gram3 is None:
+        gram3 = torch.zeros_like(input_ids)
+
+    output = torch.empty(
+        (input_ids.numel(), SPECIALIZED_WELM_OE_BRANCHES * SPECIALIZED_WELM_OE_DIM),
+        device=input_ids.device,
+        dtype=oe_embed_modules[0].weight.dtype,
+    )
+    grid = (
+        input_ids.numel(),
+        triton.cdiv(SPECIALIZED_WELM_OE_DIM, DEFAULT_SPECIALIZED_WELM_OE_EMBED_BLOCK_D),
+    )
+    _welm_oe_lookup_concat_2233_kernel[grid](
+        input_ids,
+        gram2,
+        gram3,
+        oe_embed_modules[0].weight,
+        oe_embed_modules[1].weight,
+        oe_embed_modules[2].weight,
+        oe_embed_modules[3].weight,
+        output,
+        input_ids.numel(),
+        vocab_size,
+        vocab_size * vocab_size,
+        oe_vocab_sizes[0],
+        oe_vocab_sizes[1],
+        oe_vocab_sizes[2],
+        oe_vocab_sizes[3],
+        oe_embed_modules[0].shard_indices.org_vocab_start_index,
+        oe_embed_modules[1].shard_indices.org_vocab_start_index,
+        oe_embed_modules[2].shard_indices.org_vocab_start_index,
+        oe_embed_modules[3].shard_indices.org_vocab_start_index,
+        oe_embed_modules[0].shard_indices.org_vocab_end_index,
+        oe_embed_modules[1].shard_indices.org_vocab_end_index,
+        oe_embed_modules[2].shard_indices.org_vocab_end_index,
+        oe_embed_modules[3].shard_indices.org_vocab_end_index,
+        oe_embed_modules[0].weight.stride(0),
+        oe_embed_modules[1].weight.stride(0),
+        oe_embed_modules[2].weight.stride(0),
+        oe_embed_modules[3].weight.stride(0),
+        output.stride(0),
+        BLOCK_D=DEFAULT_SPECIALIZED_WELM_OE_EMBED_BLOCK_D,
+        EMBED_DIM=SPECIALIZED_WELM_OE_DIM,
+        num_warps=DEFAULT_SPECIALIZED_WELM_OE_EMBED_NUM_WARPS,
+    )
+    return output
 
 
 def hash_and_localize_welm_oe_input_ids(
@@ -271,10 +611,6 @@ def _supports_tp_fused_lookup(module) -> bool:
     return all(hasattr(module, attr) for attr in required_attrs)
 
 
-def _get_oe_proj_bias(oe_proj_module) -> torch.Tensor | None:
-    return getattr(oe_proj_module, "bias", None) if hasattr(oe_proj_module, "weight") else None
-
-
 def _lookup_local_embedding(module, token_ids: torch.Tensor) -> torch.Tensor:
     shard_indices = module.shard_indices
     masked_input, input_mask = get_masked_input_and_mask(
@@ -307,20 +643,46 @@ def compute_welm_oe_concat_local_partials(
     if not oe_grams:
         return input_ids.new_zeros((input_ids.shape[0], 0), dtype=torch.float32)
 
-    if _can_use_specialized_welm_oe_hash_prepare(
+    _maybe_dump_welm_oe_runtime_inputs(
+        input_ids,
+        forward_batch.oe_context,
+        oe_vocab_sizes,
+        vocab_size,
+    )
+
+    total_region = _start_welm_oe_cuda_event_region(
+        "welm_oe.concat_local_partials.total",
+        input_ids,
+        input_ids.numel(),
+    )
+    if _can_use_specialized_welm_oe_lookup_concat(
         input_ids,
         oe_grams,
         oe_vocab_sizes,
         oe_embed_modules,
         use_triton_preprocess,
     ):
-        hashed_inputs = _compute_welm_oe_hashed_inputs_specialized_2233(
+        specialized_region = _start_welm_oe_cuda_event_region(
+            "welm_oe.concat_local_partials.specialized_lookup_and_concat",
+            input_ids,
+            input_ids.numel(),
+        )
+        result = _compute_welm_oe_concat_local_partials_specialized_2233(
             input_ids=input_ids,
             oe_context=forward_batch.oe_context,
             oe_vocab_sizes=oe_vocab_sizes,
             vocab_size=vocab_size,
+            oe_embed_modules=oe_embed_modules,
         )
+        _end_welm_oe_cuda_event_region(specialized_region)
+        _end_welm_oe_cuda_event_region(total_region)
+        return result
     else:
+        preprocess_region = _start_welm_oe_cuda_event_region(
+            "welm_oe.concat_local_partials.preprocess.generic",
+            input_ids,
+            input_ids.numel(),
+        )
         hashed_inputs = _compute_welm_oe_hashed_inputs_fused(
             input_ids=input_ids,
             oe_context=forward_batch.oe_context,
@@ -330,7 +692,13 @@ def compute_welm_oe_concat_local_partials(
             oe_embed_modules=oe_embed_modules,
             use_triton_preprocess=use_triton_preprocess,
         )
+        _end_welm_oe_cuda_event_region(preprocess_region)
 
+    lookup_region = _start_welm_oe_cuda_event_region(
+        "welm_oe.concat_local_partials.lookup_and_concat",
+        input_ids,
+        input_ids.numel(),
+    )
     local_embeddings = []
     for i, _ in enumerate(oe_vocab_sizes):
         module = oe_embed_modules[i]
@@ -341,7 +709,10 @@ def compute_welm_oe_concat_local_partials(
 
         local_embeddings.append(_lookup_local_embedding(module, hashed_inputs[i]))
 
-    return torch.cat(local_embeddings, dim=-1)
+    result = torch.cat(local_embeddings, dim=-1)
+    _end_welm_oe_cuda_event_region(lookup_region)
+    _end_welm_oe_cuda_event_region(total_region)
+    return result
 
 
 def _compute_welm_oe_proj_reference(

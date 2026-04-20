@@ -10,8 +10,10 @@ from torch import nn
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbeddingShardIndices
 from sglang.srt.models.welm_perf_opt import (
     _can_use_specialized_welm_oe_hash_prepare,
+    _can_use_specialized_welm_oe_lookup_concat,
     _compute_welm_oe_proj_reference,
     _compute_welm_oe_hashed_inputs_fused,
+    _compute_welm_oe_concat_local_partials_specialized_2233,
     _compute_welm_oe_hashed_inputs_specialized_2233,
     compute_welm_oe_concat_local_partials,
     compute_welm_oe_embedding,
@@ -21,6 +23,7 @@ from sglang.srt.models.welm_perf_opt import (
     hash_input_ids_vectorized,
     WELM_OE_IMPL_ENV,
     WELM_OE_TRITON_PREPROCESS_ENV,
+    WELM_OE_TRITON_LOOKUP_FUSION_ENV,
 )
 from sglang.srt.models.welmv4 import Qwen2MoeModel
 
@@ -85,6 +88,16 @@ class FakeShardedEmbedding(nn.Module):
             added_vocab_start_index=vocab_end,
             added_vocab_end_index=vocab_end,
         )
+
+
+class ForwardableShardedEmbedding(FakeShardedEmbedding):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.last_ids = None
+
+    def forward(self, ids: torch.Tensor) -> torch.Tensor:
+        self.last_ids = ids.clone()
+        return F.embedding(ids.long(), self.weight)
 
 
 def manual_oe_reference(
@@ -433,7 +446,7 @@ class TestWelmV4OEEmbedding(unittest.TestCase):
         )
 
         for got, expected in zip(specialized, generic):
-            torch.testing.assert_close(got.cpu(), expected.cpu())
+            torch.testing.assert_close(got.cpu().to(expected.dtype), expected.cpu())
 
     def test_specialized_hash_prepare_handles_missing_grams_like_generic(self):
         if not torch.cuda.is_available():
@@ -470,7 +483,314 @@ class TestWelmV4OEEmbedding(unittest.TestCase):
         )
 
         for got, expected in zip(specialized, generic):
-            torch.testing.assert_close(got.cpu(), expected.cpu())
+            torch.testing.assert_close(got.cpu().to(expected.dtype), expected.cpu())
+
+    def test_specialized_hash_prepare_matches_generic_for_large_vocab_size(self):
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA is required to validate specialized Triton dispatch")
+
+        vocab_size = 200000
+        input_ids = torch.tensor([12345, 54321, 100001, 199999], device="cuda", dtype=torch.int64)
+        oe_context = DummyOEContext(
+            {
+                2: torch.tensor([111, 222, 333, 444], device="cuda", dtype=torch.int64),
+                3: torch.tensor([555, 666, 777, 888], device="cuda", dtype=torch.int64),
+            }
+        )
+        oe_vocab_sizes = [16000008, 16000016, 16000024, 16000032]
+        modules = [
+            FakeShardedEmbedding(
+                local_weight=torch.randn(min(vs, 4096), 512, device="cuda", dtype=torch.bfloat16),
+                vocab_start=0,
+                vocab_end=min(vs, 4096),
+                padded_end=min(vs, 4096),
+                tp_size=1,
+            )
+            for vs in oe_vocab_sizes
+        ]
+
+        generic = _compute_welm_oe_hashed_inputs_fused(
+            input_ids=input_ids,
+            oe_context=oe_context,
+            oe_grams=[2, 2, 3, 3],
+            oe_vocab_sizes=oe_vocab_sizes,
+            vocab_size=vocab_size,
+            oe_embed_modules=modules,
+            use_triton_preprocess=False,
+        )
+        specialized = _compute_welm_oe_hashed_inputs_specialized_2233(
+            input_ids=input_ids,
+            oe_context=oe_context,
+            oe_vocab_sizes=oe_vocab_sizes,
+            vocab_size=vocab_size,
+        )
+
+        for got, expected in zip(specialized, generic):
+            torch.testing.assert_close(got.cpu().to(expected.dtype), expected.cpu())
+
+    def test_specialized_lookup_concat_2233_matches_generic_concat(self):
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA is required to validate specialized Triton dispatch")
+
+        input_ids = self.input_ids.cuda()
+        oe_context = DummyOEContext(
+            {
+                2: self.forward_batch.oe_context.get_gram(2).cuda(),
+                3: self.forward_batch.oe_context.get_gram(3).cuda(),
+            }
+        )
+        oe_vocab_sizes = [11, 7, 13, 17]
+        modules = [
+            FakeShardedEmbedding(
+                local_weight=torch.randn(vs, 512, device="cuda", dtype=torch.bfloat16),
+                vocab_start=0,
+                vocab_end=vs,
+                padded_end=vs,
+                tp_size=1,
+            )
+            for vs in oe_vocab_sizes
+        ]
+
+        with patch.dict(
+            os.environ, {WELM_OE_TRITON_LOOKUP_FUSION_ENV: "1"}, clear=False
+        ):
+            self.assertTrue(
+                _can_use_specialized_welm_oe_lookup_concat(
+                    input_ids,
+                    [2, 2, 3, 3],
+                    oe_vocab_sizes,
+                    modules,
+                    use_triton_preprocess=True,
+                )
+            )
+
+            generic = compute_welm_oe_concat_local_partials(
+                input_ids=input_ids,
+                forward_batch=SimpleNamespace(oe_context=oe_context),
+                oe_grams=[2, 2, 3, 3],
+                oe_vocab_sizes=oe_vocab_sizes,
+                vocab_size=self.vocab_size,
+                oe_embed_modules=modules,
+                use_triton_preprocess=False,
+            )
+            specialized = _compute_welm_oe_concat_local_partials_specialized_2233(
+                input_ids=input_ids,
+                oe_context=oe_context,
+                oe_vocab_sizes=oe_vocab_sizes,
+                vocab_size=self.vocab_size,
+                oe_embed_modules=modules,
+            )
+        torch.testing.assert_close(specialized, generic)
+
+    def test_specialized_lookup_concat_2233_handles_missing_gram3_like_generic(self):
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA is required to validate specialized Triton dispatch")
+
+        input_ids = self.input_ids.cuda()
+        oe_context = DummyOEContext({2: self.forward_batch.oe_context.get_gram(2).cuda()})
+        oe_vocab_sizes = [11, 7, 13, 17]
+        modules = [
+            FakeShardedEmbedding(
+                local_weight=torch.randn(vs, 512, device="cuda", dtype=torch.bfloat16),
+                vocab_start=0,
+                vocab_end=vs,
+                padded_end=vs,
+                tp_size=1,
+            )
+            for vs in oe_vocab_sizes
+        ]
+
+        with patch.dict(
+            os.environ, {WELM_OE_TRITON_LOOKUP_FUSION_ENV: "1"}, clear=False
+        ):
+            generic = compute_welm_oe_concat_local_partials(
+                input_ids=input_ids,
+                forward_batch=SimpleNamespace(oe_context=oe_context),
+                oe_grams=[2, 2, 3, 3],
+                oe_vocab_sizes=oe_vocab_sizes,
+                vocab_size=self.vocab_size,
+                oe_embed_modules=modules,
+                use_triton_preprocess=False,
+            )
+            specialized = _compute_welm_oe_concat_local_partials_specialized_2233(
+                input_ids=input_ids,
+                oe_context=oe_context,
+                oe_vocab_sizes=oe_vocab_sizes,
+                vocab_size=self.vocab_size,
+                oe_embed_modules=modules,
+            )
+        torch.testing.assert_close(specialized, generic)
+
+    def test_specialized_tp_fused_2233_matches_legacy_end_to_end(self):
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA is required to validate specialized Triton dispatch")
+
+        input_ids = self.input_ids.cuda()
+        base_hidden_states = torch.randn(
+            input_ids.shape[0], 6, device="cuda", dtype=torch.float32
+        )
+        oe_context = DummyOEContext(
+            {
+                2: self.forward_batch.oe_context.get_gram(2).cuda(),
+                3: self.forward_batch.oe_context.get_gram(3).cuda(),
+            }
+        )
+        oe_vocab_sizes = [11, 7, 13, 17]
+        modules = [
+            ForwardableShardedEmbedding(
+                local_weight=torch.randn(vs, 512, device="cuda", dtype=torch.float32),
+                vocab_start=0,
+                vocab_end=vs,
+                padded_end=vs,
+                tp_size=1,
+            )
+            for vs in oe_vocab_sizes
+        ]
+        proj_weight = torch.randn(6, 2048, device="cuda", dtype=torch.float32)
+        proj_bias = torch.randn(6, device="cuda", dtype=torch.float32)
+        proj_module = FakeProjModule(proj_weight, proj_bias)
+
+        legacy = compute_welm_oe_embedding(
+            input_ids=input_ids,
+            forward_batch=SimpleNamespace(oe_context=oe_context),
+            base_hidden_states=base_hidden_states,
+            oe_grams=[2, 2, 3, 3],
+            oe_vocab_sizes=oe_vocab_sizes,
+            vocab_size=self.vocab_size,
+            oe_embed_modules=modules,
+            oe_proj_module=proj_module,
+            implementation="legacy",
+            use_triton_preprocess=False,
+        )
+        with patch.dict(
+            os.environ, {WELM_OE_TRITON_LOOKUP_FUSION_ENV: "1"}, clear=False
+        ):
+            fused = compute_welm_oe_embedding(
+                input_ids=input_ids,
+                forward_batch=SimpleNamespace(oe_context=oe_context),
+                base_hidden_states=base_hidden_states,
+                oe_grams=[2, 2, 3, 3],
+                oe_vocab_sizes=oe_vocab_sizes,
+                vocab_size=self.vocab_size,
+                oe_embed_modules=modules,
+                oe_proj_module=proj_module,
+                implementation="tp_fused",
+                use_triton_preprocess=True,
+            )
+        torch.testing.assert_close(fused, legacy, atol=1e-3, rtol=1e-3)
+
+    def test_specialized_tp_fused_2233_sharded_sum_matches_legacy(self):
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA is required to validate specialized Triton dispatch")
+
+        input_ids = self.input_ids.cuda()
+        base_hidden_states = torch.randn(
+            input_ids.shape[0], 6, device="cuda", dtype=torch.float32
+        )
+        oe_context = DummyOEContext(
+            {
+                2: self.forward_batch.oe_context.get_gram(2).cuda(),
+                3: self.forward_batch.oe_context.get_gram(3).cuda(),
+            }
+        )
+        oe_vocab_sizes = [11, 7, 13, 17]
+        full_modules = [
+            ForwardableShardedEmbedding(
+                local_weight=torch.randn(vs, 512, device="cuda", dtype=torch.float32),
+                vocab_start=0,
+                vocab_end=vs,
+                padded_end=vs,
+                tp_size=1,
+            )
+            for vs in oe_vocab_sizes
+        ]
+        rank0_modules = [
+            ForwardableShardedEmbedding(
+                local_weight=module.weight[: (module.weight.shape[0] + 1) // 2],
+                vocab_start=0,
+                vocab_end=(module.weight.shape[0] + 1) // 2,
+                padded_end=(module.weight.shape[0] + 1) // 2,
+                tp_size=2,
+            )
+            for module in full_modules
+        ]
+        rank1_modules = [
+            ForwardableShardedEmbedding(
+                local_weight=module.weight[(module.weight.shape[0] + 1) // 2 :],
+                vocab_start=(module.weight.shape[0] + 1) // 2,
+                vocab_end=module.weight.shape[0],
+                padded_end=module.weight.shape[0],
+                tp_size=2,
+            )
+            for module in full_modules
+        ]
+        proj_weight = torch.randn(6, 2048, device="cuda", dtype=torch.float32)
+        proj_bias = torch.randn(6, device="cuda", dtype=torch.float32)
+        proj_module = FakeProjModule(proj_weight, proj_bias)
+
+        legacy = compute_welm_oe_embedding(
+            input_ids=input_ids,
+            forward_batch=SimpleNamespace(oe_context=oe_context),
+            base_hidden_states=base_hidden_states,
+            oe_grams=[2, 2, 3, 3],
+            oe_vocab_sizes=oe_vocab_sizes,
+            vocab_size=self.vocab_size,
+            oe_embed_modules=full_modules,
+            oe_proj_module=proj_module,
+            implementation="legacy",
+            use_triton_preprocess=False,
+        )
+
+        with patch.dict(
+            os.environ, {WELM_OE_TRITON_LOOKUP_FUSION_ENV: "1"}, clear=False
+        ):
+            rank0_concat = compute_welm_oe_concat_local_partials(
+                input_ids=input_ids,
+                forward_batch=SimpleNamespace(oe_context=oe_context),
+                oe_grams=[2, 2, 3, 3],
+                oe_vocab_sizes=oe_vocab_sizes,
+                vocab_size=self.vocab_size,
+                oe_embed_modules=rank0_modules,
+                use_triton_preprocess=True,
+            )
+            rank1_concat = compute_welm_oe_concat_local_partials(
+                input_ids=input_ids,
+                forward_batch=SimpleNamespace(oe_context=oe_context),
+                oe_grams=[2, 2, 3, 3],
+                oe_vocab_sizes=oe_vocab_sizes,
+                vocab_size=self.vocab_size,
+                oe_embed_modules=rank1_modules,
+                use_triton_preprocess=True,
+            )
+            fused = compute_welm_oe_embedding(
+                input_ids=input_ids,
+                forward_batch=SimpleNamespace(oe_context=oe_context),
+                base_hidden_states=base_hidden_states,
+                oe_grams=[2, 2, 3, 3],
+                oe_vocab_sizes=oe_vocab_sizes,
+                vocab_size=self.vocab_size,
+                oe_embed_modules=rank0_modules,
+                oe_proj_module=proj_module,
+                implementation="tp_fused",
+                use_triton_preprocess=True,
+                all_reduce_fn=lambda x: x + rank1_concat,
+            )
+
+        torch.testing.assert_close(
+            rank0_concat + rank1_concat,
+            compute_welm_oe_concat_local_partials(
+                input_ids=input_ids,
+                forward_batch=SimpleNamespace(oe_context=oe_context),
+                oe_grams=[2, 2, 3, 3],
+                oe_vocab_sizes=oe_vocab_sizes,
+                vocab_size=self.vocab_size,
+                oe_embed_modules=full_modules,
+                use_triton_preprocess=False,
+            ),
+            atol=1e-3,
+            rtol=1e-3,
+        )
+        torch.testing.assert_close(fused, legacy, atol=1e-3, rtol=1e-3)
 
     def test_concat_local_partials_supports_repeated_oe_grams(self):
         oe_grams = [2, 2, 4]
