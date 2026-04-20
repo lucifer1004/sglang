@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from collections import defaultdict, deque
 import logging
 import os
 from pathlib import Path
@@ -19,105 +18,15 @@ logger = logging.getLogger(__name__)
 
 WELM_OE_IMPL_ENV = "SGLANG_WELM_OE_IMPL"
 WELM_OE_TRITON_PREPROCESS_ENV = "SGLANG_WELM_OE_TRITON_PREPROCESS"
-WELM_OE_CUDA_EVENT_PROFILE_ENV = "SGLANG_WELM_OE_CUDA_EVENT_PROFILE"
-WELM_OE_CUDA_EVENT_PROFILE_INTERVAL_ENV = "SGLANG_WELM_OE_CUDA_EVENT_PROFILE_INTERVAL"
 WELM_OE_DUMP_DIR_ENV = "SGLANG_WELM_OE_DUMP_DIR"
 WELM_OE_IMPL_LEGACY = "legacy"
 WELM_OE_IMPL_TP_FUSED = "tp_fused"
 SPECIALIZED_WELM_OE_GRAMS = (2, 2, 3, 3)
 SPECIALIZED_WELM_OE_BRANCHES = 4
 SPECIALIZED_WELM_OE_DIM = 512
-DEFAULT_WELM_OE_CUDA_EVENT_PROFILE_INTERVAL = 100
 DEFAULT_SPECIALIZED_WELM_OE_EMBED_BLOCK_D = 512
 DEFAULT_SPECIALIZED_WELM_OE_EMBED_NUM_WARPS = 1
-
-
-class _WelmOeCudaEventMetric:
-    def __init__(self):
-        self.pending = deque()
-        self.total_ms = 0.0
-        self.total_items = 0
-        self.total_tokens = 0
-
-
-_welm_oe_cuda_event_metrics = defaultdict(_WelmOeCudaEventMetric)
 _welm_oe_dump_max_tokens = 0
-
-
-def _welm_oe_cuda_event_profile_enabled(tensor: torch.Tensor) -> bool:
-    return tensor.is_cuda and os.getenv(WELM_OE_CUDA_EVENT_PROFILE_ENV, "0").strip().lower() in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }
-
-
-def _welm_oe_cuda_event_profile_interval() -> int:
-    try:
-        return max(
-            1,
-            int(
-                os.getenv(
-                    WELM_OE_CUDA_EVENT_PROFILE_INTERVAL_ENV,
-                    str(DEFAULT_WELM_OE_CUDA_EVENT_PROFILE_INTERVAL),
-                )
-            ),
-        )
-    except ValueError:
-        return DEFAULT_WELM_OE_CUDA_EVENT_PROFILE_INTERVAL
-
-
-def _drain_welm_oe_cuda_event_metric(name: str) -> None:
-    metric = _welm_oe_cuda_event_metrics[name]
-    interval = _welm_oe_cuda_event_profile_interval()
-    while metric.pending and metric.pending[0][1].query():
-        start_event, end_event, num_tokens = metric.pending.popleft()
-        elapsed_ms = start_event.elapsed_time(end_event)
-        metric.total_ms += elapsed_ms
-        metric.total_items += 1
-        metric.total_tokens += num_tokens
-        if metric.total_items % interval == 0:
-            avg_ms = metric.total_ms / metric.total_items
-            throughput = (
-                metric.total_tokens / (metric.total_ms / 1000.0)
-                if metric.total_ms > 0
-                else 0.0
-            )
-            logger.info(
-                "[welm_oe_profile] %s count=%d avg_ms=%.4f throughput=%.2f tok/s",
-                name,
-                metric.total_items,
-                avg_ms,
-                throughput,
-            )
-
-
-def _start_welm_oe_cuda_event_region(
-    name: str,
-    tensor: torch.Tensor,
-    num_tokens: int,
-):
-    if not _welm_oe_cuda_event_profile_enabled(tensor):
-        return None
-    if torch.cuda.is_current_stream_capturing():
-        return None
-    _drain_welm_oe_cuda_event_metric(name)
-    start_event = torch.cuda.Event(enable_timing=True)
-    end_event = torch.cuda.Event(enable_timing=True)
-    start_event.record()
-    return name, start_event, end_event, num_tokens
-
-
-def _end_welm_oe_cuda_event_region(region) -> None:
-    if region is None:
-        return
-    name, start_event, end_event, num_tokens = region
-    end_event.record()
-    _welm_oe_cuda_event_metrics[name].pending.append(
-        (start_event, end_event, num_tokens)
-    )
-    _drain_welm_oe_cuda_event_metric(name)
 
 
 def _maybe_dump_welm_oe_runtime_inputs(
@@ -466,12 +375,6 @@ def compute_welm_oe_concat_local_partials(
         oe_vocab_sizes,
         vocab_size,
     )
-
-    total_region = _start_welm_oe_cuda_event_region(
-        "welm_oe.concat_local_partials.total",
-        input_ids,
-        input_ids.numel(),
-    )
     if _can_use_specialized_welm_oe_lookup_concat(
         input_ids,
         oe_grams,
@@ -479,42 +382,22 @@ def compute_welm_oe_concat_local_partials(
         oe_embed_modules,
         use_triton_preprocess,
     ):
-        specialized_region = _start_welm_oe_cuda_event_region(
-            "welm_oe.concat_local_partials.specialized_lookup_and_concat",
-            input_ids,
-            input_ids.numel(),
-        )
-        result = _compute_welm_oe_concat_local_partials_specialized_2233(
+        return _compute_welm_oe_concat_local_partials_specialized_2233(
             input_ids=input_ids,
             oe_context=forward_batch.oe_context,
             oe_vocab_sizes=oe_vocab_sizes,
             vocab_size=vocab_size,
             oe_embed_modules=oe_embed_modules,
         )
-        _end_welm_oe_cuda_event_region(specialized_region)
-        _end_welm_oe_cuda_event_region(total_region)
-        return result
-    else:
-        preprocess_region = _start_welm_oe_cuda_event_region(
-            "welm_oe.concat_local_partials.preprocess.generic",
-            input_ids,
-            input_ids.numel(),
-        )
-        hashed_inputs = _compute_welm_oe_hashed_inputs_fused(
-            input_ids=input_ids,
-            oe_context=forward_batch.oe_context,
-            oe_grams=oe_grams,
-            oe_vocab_sizes=oe_vocab_sizes,
-            vocab_size=vocab_size,
-            oe_embed_modules=oe_embed_modules,
-            use_triton_preprocess=use_triton_preprocess,
-        )
-        _end_welm_oe_cuda_event_region(preprocess_region)
 
-    lookup_region = _start_welm_oe_cuda_event_region(
-        "welm_oe.concat_local_partials.lookup_and_concat",
-        input_ids,
-        input_ids.numel(),
+    hashed_inputs = _compute_welm_oe_hashed_inputs_fused(
+        input_ids=input_ids,
+        oe_context=forward_batch.oe_context,
+        oe_grams=oe_grams,
+        oe_vocab_sizes=oe_vocab_sizes,
+        vocab_size=vocab_size,
+        oe_embed_modules=oe_embed_modules,
+        use_triton_preprocess=use_triton_preprocess,
     )
     local_embeddings = []
     for i, _ in enumerate(oe_vocab_sizes):
@@ -526,10 +409,7 @@ def compute_welm_oe_concat_local_partials(
 
         local_embeddings.append(_lookup_local_embedding(module, hashed_inputs[i]))
 
-    result = torch.cat(local_embeddings, dim=-1)
-    _end_welm_oe_cuda_event_region(lookup_region)
-    _end_welm_oe_cuda_event_region(total_region)
-    return result
+    return torch.cat(local_embeddings, dim=-1)
 
 
 def _compute_welm_oe_proj_reference(
