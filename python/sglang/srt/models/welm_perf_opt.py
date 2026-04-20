@@ -303,34 +303,30 @@ def _compute_welm_oe_hashed_inputs_fused(
     oe_embed_modules: Sequence,
     use_triton_preprocess: bool,
 ) -> list[torch.Tensor]:
-    """Build n-grams and hash/localize them in a single pass over gram depth."""
+    """Build n-grams first, then hash/localize the selected gram per branch."""
     if not oe_grams:
         return []
 
-    gram_to_branch_indices: dict[int, list[int]] = {}
-    for branch_idx, gram in enumerate(oe_grams):
-        gram_to_branch_indices.setdefault(gram, []).append(branch_idx)
-
-    hashed_inputs: list[torch.Tensor | None] = [None] * len(oe_grams)
+    ngram_inputs: list[torch.Tensor] = []
     running_ids = input_ids
     for g in range(1, max(oe_grams)):
         gram_tensor = oe_context.get_gram(g + 1)
         if gram_tensor is not None:
             running_ids = running_ids + gram_tensor * (vocab_size**g)
+        ngram_inputs.append(running_ids)
 
-        for branch_idx in gram_to_branch_indices.get(g + 1, []):
-            module = oe_embed_modules[branch_idx]
-            hashed_ids, _, _ = hash_and_localize_welm_oe_input_ids(
-                running_ids,
-                oe_vocab_sizes[branch_idx],
-                module.shard_indices.org_vocab_start_index,
-                module.shard_indices.org_vocab_end_index,
-                use_triton=use_triton_preprocess,
-            )
-            hashed_inputs[branch_idx] = hashed_ids
-
-    assert all(hashed_input is not None for hashed_input in hashed_inputs)
-    return [hashed_input for hashed_input in hashed_inputs]
+    hashed_inputs = []
+    for branch_idx, vocab_size_branch in enumerate(oe_vocab_sizes):
+        module = oe_embed_modules[branch_idx]
+        hashed_ids, _, _ = hash_and_localize_welm_oe_input_ids(
+            ngram_inputs[oe_grams[branch_idx] - 2],
+            vocab_size_branch,
+            module.shard_indices.org_vocab_start_index,
+            module.shard_indices.org_vocab_end_index,
+            use_triton=use_triton_preprocess,
+        )
+        hashed_inputs.append(hashed_ids)
+    return hashed_inputs
 
 def _can_use_specialized_welm_oe_lookup_concat(
     input_ids: torch.Tensor,
