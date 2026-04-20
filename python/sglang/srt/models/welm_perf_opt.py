@@ -19,6 +19,8 @@ WELM_OE_IMPL_ENV = "SGLANG_WELM_OE_IMPL"
 WELM_OE_TRITON_PREPROCESS_ENV = "SGLANG_WELM_OE_TRITON_PREPROCESS"
 WELM_OE_IMPL_LEGACY = "legacy"
 WELM_OE_IMPL_TP_FUSED = "tp_fused"
+SPECIALIZED_WELM_OE_GRAMS = (2, 2, 3, 3)
+SPECIALIZED_WELM_OE_BRANCHES = 4
 
 
 @triton.jit
@@ -49,6 +51,63 @@ def _hash_mod_localize_kernel(
     tl.store(hashed_ptr + offs, hashed.to(tl.int64), mask=mask)
     tl.store(local_idx_ptr + offs, local_idx.to(tl.int64), mask=mask)
     tl.store(valid_mask_ptr + offs, valid.to(tl.int8), mask=mask)
+
+
+@triton.jit
+def _welm_oe_hash_prepare_2233_kernel(
+    input_ptr,
+    gram2_ptr,
+    gram3_ptr,
+    out0_ptr,
+    out1_ptr,
+    out2_ptr,
+    out3_ptr,
+    numel,
+    vocab_size,
+    vocab_size_sq,
+    oe_vocab_size_0,
+    oe_vocab_size_1,
+    oe_vocab_size_2,
+    oe_vocab_size_3,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offs < numel
+
+    input_ids = tl.load(input_ptr + offs, mask=mask, other=0).to(tl.uint64)
+    gram2 = tl.load(gram2_ptr + offs, mask=mask, other=0).to(tl.uint64)
+    gram3 = tl.load(gram3_ptr + offs, mask=mask, other=0).to(tl.uint64)
+
+    vocab_size = vocab_size.to(tl.uint64)
+    vocab_size_sq = vocab_size_sq.to(tl.uint64)
+
+    running_ids_2 = input_ids + gram2 * vocab_size
+    running_ids_3 = running_ids_2 + gram3 * vocab_size_sq
+
+    hashed_2 = (running_ids_2 * 2654435761) & 0xFFFFFFFF
+    hashed_3 = (running_ids_3 * 2654435761) & 0xFFFFFFFF
+
+    tl.store(
+        out0_ptr + offs,
+        (hashed_2 % oe_vocab_size_0.to(tl.uint64)).to(tl.int64),
+        mask=mask,
+    )
+    tl.store(
+        out1_ptr + offs,
+        (hashed_2 % oe_vocab_size_1.to(tl.uint64)).to(tl.int64),
+        mask=mask,
+    )
+    tl.store(
+        out2_ptr + offs,
+        (hashed_3 % oe_vocab_size_2.to(tl.uint64)).to(tl.int64),
+        mask=mask,
+    )
+    tl.store(
+        out3_ptr + offs,
+        (hashed_3 % oe_vocab_size_3.to(tl.uint64)).to(tl.int64),
+        mask=mask,
+    )
 
 
 def hash_input_ids_vectorized(input_ids: torch.Tensor) -> torch.Tensor:
@@ -96,6 +155,68 @@ def _compute_welm_oe_hashed_inputs_fused(
 
     assert all(hashed_input is not None for hashed_input in hashed_inputs)
     return [hashed_input for hashed_input in hashed_inputs]
+
+
+def _can_use_specialized_welm_oe_hash_prepare(
+    input_ids: torch.Tensor,
+    oe_grams: Sequence[int],
+    oe_vocab_sizes: Sequence[int],
+    oe_embed_modules: Sequence,
+    use_triton_preprocess: bool,
+) -> bool:
+    return (
+        use_triton_preprocess
+        and input_ids.is_cuda
+        and tuple(oe_grams) == SPECIALIZED_WELM_OE_GRAMS
+        and len(oe_vocab_sizes) == SPECIALIZED_WELM_OE_BRANCHES
+        and len(oe_embed_modules) == SPECIALIZED_WELM_OE_BRANCHES
+    )
+
+
+def _compute_welm_oe_hashed_inputs_specialized_2233(
+    *,
+    input_ids: torch.Tensor,
+    oe_context,
+    oe_vocab_sizes: Sequence[int],
+    vocab_size: int,
+) -> list[torch.Tensor]:
+    """Specialized Triton preprocess for the deployed [2,2,3,3] Welm OE shape."""
+    if input_ids.numel() == 0:
+        return [
+            torch.empty_like(input_ids, dtype=torch.int64)
+            for _ in range(SPECIALIZED_WELM_OE_BRANCHES)
+        ]
+
+    gram2 = oe_context.get_gram(2)
+    gram3 = oe_context.get_gram(3)
+    if gram2 is None:
+        gram2 = torch.zeros_like(input_ids)
+    if gram3 is None:
+        gram3 = torch.zeros_like(input_ids)
+
+    outputs = [
+        torch.empty_like(input_ids, dtype=torch.int64)
+        for _ in range(SPECIALIZED_WELM_OE_BRANCHES)
+    ]
+    grid = (triton.cdiv(input_ids.numel(), 256),)
+    _welm_oe_hash_prepare_2233_kernel[grid](
+        input_ids,
+        gram2,
+        gram3,
+        outputs[0],
+        outputs[1],
+        outputs[2],
+        outputs[3],
+        input_ids.numel(),
+        vocab_size,
+        vocab_size * vocab_size,
+        oe_vocab_sizes[0],
+        oe_vocab_sizes[1],
+        oe_vocab_sizes[2],
+        oe_vocab_sizes[3],
+        BLOCK_SIZE=256,
+    )
+    return outputs
 
 
 def hash_and_localize_welm_oe_input_ids(
@@ -186,15 +307,29 @@ def compute_welm_oe_concat_local_partials(
     if not oe_grams:
         return input_ids.new_zeros((input_ids.shape[0], 0), dtype=torch.float32)
 
-    hashed_inputs = _compute_welm_oe_hashed_inputs_fused(
-        input_ids=input_ids,
-        oe_context=forward_batch.oe_context,
-        oe_grams=oe_grams,
-        oe_vocab_sizes=oe_vocab_sizes,
-        vocab_size=vocab_size,
-        oe_embed_modules=oe_embed_modules,
-        use_triton_preprocess=use_triton_preprocess,
-    )
+    if _can_use_specialized_welm_oe_hash_prepare(
+        input_ids,
+        oe_grams,
+        oe_vocab_sizes,
+        oe_embed_modules,
+        use_triton_preprocess,
+    ):
+        hashed_inputs = _compute_welm_oe_hashed_inputs_specialized_2233(
+            input_ids=input_ids,
+            oe_context=forward_batch.oe_context,
+            oe_vocab_sizes=oe_vocab_sizes,
+            vocab_size=vocab_size,
+        )
+    else:
+        hashed_inputs = _compute_welm_oe_hashed_inputs_fused(
+            input_ids=input_ids,
+            oe_context=forward_batch.oe_context,
+            oe_grams=oe_grams,
+            oe_vocab_sizes=oe_vocab_sizes,
+            vocab_size=vocab_size,
+            oe_embed_modules=oe_embed_modules,
+            use_triton_preprocess=use_triton_preprocess,
+        )
 
     local_embeddings = []
     for i, _ in enumerate(oe_vocab_sizes):

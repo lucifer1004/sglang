@@ -9,7 +9,10 @@ from torch import nn
 
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbeddingShardIndices
 from sglang.srt.models.welm_perf_opt import (
+    _can_use_specialized_welm_oe_hash_prepare,
     _compute_welm_oe_proj_reference,
+    _compute_welm_oe_hashed_inputs_fused,
+    _compute_welm_oe_hashed_inputs_specialized_2233,
     compute_welm_oe_concat_local_partials,
     compute_welm_oe_embedding,
     get_welm_oe_implementation,
@@ -358,6 +361,116 @@ class TestWelmV4OEEmbedding(unittest.TestCase):
         torch.testing.assert_close(hashed_tri.cpu(), hashed_ref.cpu())
         torch.testing.assert_close(local_tri.cpu(), local_ref.cpu())
         torch.testing.assert_close(mask_tri.cpu(), mask_ref.cpu())
+
+    def test_specialized_hash_prepare_dispatch_for_2233_shape(self):
+        rank0_modules = [
+            FakeShardedEmbedding(
+                local_weight=self.full_weight_0,
+                vocab_start=0,
+                vocab_end=11,
+                padded_end=11,
+                tp_size=1,
+            )
+            for _ in range(4)
+        ]
+
+        self.assertFalse(
+            _can_use_specialized_welm_oe_hash_prepare(
+                self.input_ids,
+                [2, 2, 3, 3],
+                [11, 13, 17, 19],
+                rank0_modules,
+                use_triton_preprocess=True,
+            )
+        )
+
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA is required to validate specialized Triton dispatch")
+
+        input_ids = self.input_ids.cuda()
+        oe_context = DummyOEContext(
+            {
+                2: self.forward_batch.oe_context.get_gram(2).cuda(),
+                3: self.forward_batch.oe_context.get_gram(3).cuda(),
+            }
+        )
+        oe_vocab_sizes = [11, 7, 13, 17]
+        modules = [
+            FakeShardedEmbedding(
+                local_weight=torch.randn(vs, 3, device="cuda"),
+                vocab_start=0,
+                vocab_end=vs,
+                padded_end=vs,
+                tp_size=1,
+            )
+            for vs in oe_vocab_sizes
+        ]
+
+        self.assertTrue(
+            _can_use_specialized_welm_oe_hash_prepare(
+                input_ids,
+                [2, 2, 3, 3],
+                oe_vocab_sizes,
+                modules,
+                use_triton_preprocess=True,
+            )
+        )
+
+        generic = _compute_welm_oe_hashed_inputs_fused(
+            input_ids=input_ids,
+            oe_context=oe_context,
+            oe_grams=[2, 2, 3, 3],
+            oe_vocab_sizes=oe_vocab_sizes,
+            vocab_size=self.vocab_size,
+            oe_embed_modules=modules,
+            use_triton_preprocess=False,
+        )
+        specialized = _compute_welm_oe_hashed_inputs_specialized_2233(
+            input_ids=input_ids,
+            oe_context=oe_context,
+            oe_vocab_sizes=oe_vocab_sizes,
+            vocab_size=self.vocab_size,
+        )
+
+        for got, expected in zip(specialized, generic):
+            torch.testing.assert_close(got.cpu(), expected.cpu())
+
+    def test_specialized_hash_prepare_handles_missing_grams_like_generic(self):
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA is required to validate specialized Triton dispatch")
+
+        input_ids = self.input_ids.cuda()
+        oe_vocab_sizes = [11, 7, 13, 17]
+        modules = [
+            FakeShardedEmbedding(
+                local_weight=torch.randn(vs, 3, device="cuda"),
+                vocab_start=0,
+                vocab_end=vs,
+                padded_end=vs,
+                tp_size=1,
+            )
+            for vs in oe_vocab_sizes
+        ]
+        oe_context = DummyOEContext({2: self.forward_batch.oe_context.get_gram(2).cuda()})
+
+        generic = _compute_welm_oe_hashed_inputs_fused(
+            input_ids=input_ids,
+            oe_context=oe_context,
+            oe_grams=[2, 2, 3, 3],
+            oe_vocab_sizes=oe_vocab_sizes,
+            vocab_size=self.vocab_size,
+            oe_embed_modules=modules,
+            use_triton_preprocess=False,
+        )
+        specialized = _compute_welm_oe_hashed_inputs_specialized_2233(
+            input_ids=input_ids,
+            oe_context=oe_context,
+            oe_vocab_sizes=oe_vocab_sizes,
+            vocab_size=self.vocab_size,
+        )
+
+        for got, expected in zip(specialized, generic):
+            torch.testing.assert_close(got.cpu(), expected.cpu())
 
     def test_concat_local_partials_supports_repeated_oe_grams(self):
         oe_grams = [2, 2, 4]
