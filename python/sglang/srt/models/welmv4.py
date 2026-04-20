@@ -74,6 +74,10 @@ from sglang.srt.layers.welmv4_op import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.models.welm_perf_opt import (
+    compute_welm_oe_embedding,
+    hash_input_ids_vectorized,
+)
 from sglang.srt.server_args import get_global_server_args
 
 # from sglang.srt.two_batch_overlap import model_forward_maybe_tbo
@@ -82,14 +86,6 @@ from sglang.srt.utils import add_prefix, is_cuda, make_layers
 logger = logging.getLogger(__name__)
 
 _is_cuda = is_cuda()
-
-
-def hash_input_ids_vectorized(input_ids: torch.Tensor) -> torch.Tensor:
-    ids = input_ids.to(torch.int64)
-    result = ids * 2654435761
-    result = result & 0xFFFFFFFF
-    return result.to(input_ids.dtype)
-
 
 class KVMirrorManager:
     """
@@ -1255,24 +1251,16 @@ class Qwen2MoeModel(nn.Module):
             oe_embed_modules = self.oe_embed
         if oe_up_proj_module is None:
             oe_up_proj_module = self.oe_gate_up_proj
-
-        input_ids_ngram = []
-        input_ids_ngram_tmp = input_ids
-        for g in range(1, max(self.oe_grams)):
-            gram_tensor = forward_batch.oe_context.get_gram(g + 1)
-            if gram_tensor is not None:
-                input_ids_ngram_tmp = input_ids_ngram_tmp + gram_tensor * (
-                    self.vocab_size**g
-                )
-            input_ids_ngram.append(hash_input_ids_vectorized(input_ids_ngram_tmp))
-
-        emb_ngram = []
-        for i, vs in enumerate(self.oe_vocab_sizes):
-            input_ids_ngram_hashed_tmp = input_ids_ngram[self.oe_grams[i] - 2] % vs
-            emb_ngram_tmp = oe_embed_modules[i](input_ids_ngram_hashed_tmp)
-            emb_ngram.append(emb_ngram_tmp)
-        emb_new, _ = oe_up_proj_module(torch.cat(emb_ngram, dim=-1))
-        return (base_hidden_states + emb_new) / 2.0
+        return compute_welm_oe_embedding(
+            input_ids=input_ids,
+            forward_batch=forward_batch,
+            base_hidden_states=base_hidden_states,
+            oe_grams=self.oe_grams,
+            oe_vocab_sizes=self.oe_vocab_sizes,
+            vocab_size=self.vocab_size,
+            oe_embed_modules=oe_embed_modules,
+            oe_proj_module=oe_up_proj_module,
+        )
 
     def _expand_scale_seq(self, input_ids, forward_batch, hidden_states):
         """Expand hidden_states from (T, D) to (T * scale, D) by interleaving
