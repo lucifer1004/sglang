@@ -12,7 +12,6 @@ from sglang.srt.models.welm_perf_opt import (
     _compute_welm_oe_proj_reference,
     compute_welm_oe_concat_local_partials,
     compute_welm_oe_embedding,
-    compute_welm_oe_proj_local_partials,
     get_welm_oe_implementation,
     should_use_welm_oe_triton_preprocess,
     hash_and_localize_welm_oe_input_ids,
@@ -262,26 +261,6 @@ class TestWelmV4OEEmbedding(unittest.TestCase):
             [RecordingEmbedding(self.full_weight_0), RecordingEmbedding(self.full_weight_1)]
         )
 
-        partial_rank0 = compute_welm_oe_proj_local_partials(
-            input_ids=self.input_ids,
-            forward_batch=self.forward_batch,
-            oe_grams=self.oe_grams,
-            oe_vocab_sizes=self.oe_vocab_sizes,
-            vocab_size=self.vocab_size,
-            oe_embed_modules=rank0_modules,
-            oe_proj_module=self.proj_module,
-            use_triton_preprocess=False,
-        )
-        partial_rank1 = compute_welm_oe_proj_local_partials(
-            input_ids=self.input_ids,
-            forward_batch=self.forward_batch,
-            oe_grams=self.oe_grams,
-            oe_vocab_sizes=self.oe_vocab_sizes,
-            vocab_size=self.vocab_size,
-            oe_embed_modules=rank1_modules,
-            oe_proj_module=self.proj_module,
-            use_triton_preprocess=False,
-        )
         expected_proj = _compute_welm_oe_proj_reference(
             input_ids=self.input_ids,
             forward_batch=self.forward_batch,
@@ -292,8 +271,6 @@ class TestWelmV4OEEmbedding(unittest.TestCase):
             oe_proj_module=self.proj_module,
         )
         expected_proj_no_bias = expected_proj - self.proj_module.bias
-
-        torch.testing.assert_close(partial_rank0 + partial_rank1, expected_proj_no_bias)
 
         concat_rank0 = compute_welm_oe_concat_local_partials(
             input_ids=self.input_ids,
@@ -337,6 +314,10 @@ class TestWelmV4OEEmbedding(unittest.TestCase):
             dim=-1,
         )
         torch.testing.assert_close(concat_rank0 + concat_rank1, expected_concat)
+        torch.testing.assert_close(
+            F.linear(concat_rank0 + concat_rank1, self.proj_module.weight, bias=None),
+            expected_proj_no_bias,
+        )
 
         expected = (self.base_hidden_states + expected_proj) / 2.0
         actual = compute_welm_oe_embedding(

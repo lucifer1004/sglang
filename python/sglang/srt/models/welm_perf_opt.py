@@ -88,25 +88,22 @@ def hash_and_localize_welm_oe_input_ids(
         return empty, empty, torch.empty_like(input_ids, dtype=torch.bool)
 
     if use_triton and input_ids.is_cuda:
-        try:
-            hashed = torch.empty_like(input_ids, dtype=torch.int64)
-            local_idx = torch.empty_like(input_ids, dtype=torch.int64)
-            valid_mask = torch.empty_like(input_ids, dtype=torch.int8)
-            grid = (triton.cdiv(input_ids.numel(), 256),)
-            _hash_mod_localize_kernel[grid](
-                input_ids,
-                hashed,
-                local_idx,
-                valid_mask,
-                input_ids.numel(),
-                vocab_size,
-                shard_start,
-                shard_end,
-                BLOCK_SIZE=256,
-            )
-            return hashed, local_idx, valid_mask.to(torch.bool)
-        except Exception:
-            pass
+        hashed = torch.empty_like(input_ids, dtype=torch.int64)
+        local_idx = torch.empty_like(input_ids, dtype=torch.int64)
+        valid_mask = torch.empty_like(input_ids, dtype=torch.int8)
+        grid = (triton.cdiv(input_ids.numel(), 256),)
+        _hash_mod_localize_kernel[grid](
+            input_ids,
+            hashed,
+            local_idx,
+            valid_mask,
+            input_ids.numel(),
+            vocab_size,
+            shard_start,
+            shard_end,
+            BLOCK_SIZE=256,
+        )
+        return hashed, local_idx, valid_mask.to(torch.bool)
 
     hashed = hash_input_ids_vectorized(input_ids.to(torch.int64)) % vocab_size
     valid_mask = (hashed >= shard_start) & (hashed < shard_end)
@@ -149,51 +146,6 @@ def _lookup_local_embedding(module, token_ids: torch.Tensor) -> torch.Tensor:
         emb_local = F.embedding(masked_input.long(), module.weight)
     emb_local.masked_fill_(input_mask.unsqueeze(-1), 0)
     return emb_local
-
-
-def compute_welm_oe_proj_local_partials(
-    *,
-    input_ids: torch.Tensor,
-    forward_batch,
-    oe_grams: Sequence[int],
-    oe_vocab_sizes: Sequence[int],
-    vocab_size: int,
-    oe_embed_modules: Sequence,
-    oe_proj_module,
-    use_triton_preprocess: bool = True,
-) -> torch.Tensor:
-    """Compute the local OE projection contribution before any TP all-reduce."""
-    if not oe_grams:
-        out_features = oe_proj_module.weight.shape[0]
-        return input_ids.new_zeros((input_ids.shape[0], out_features), dtype=oe_proj_module.weight.dtype)
-
-    ngram_inputs = _resolve_oe_gram_inputs(
-        input_ids,
-        forward_batch.oe_context,
-        vocab_size,
-        max(oe_grams),
-    )
-
-    local_embeddings = []
-    for i, vocab_size_i in enumerate(oe_vocab_sizes):
-        module = oe_embed_modules[i]
-        if not _supports_tp_fused_lookup(module):
-            raise TypeError("OE TP fused lookup requires embedding modules with weight/tp_size/shard_indices")
-
-        ngram_input = ngram_inputs[oe_grams[i] - 2]
-        hashed_ids, _, _ = hash_and_localize_welm_oe_input_ids(
-            ngram_input,
-            vocab_size_i,
-            module.shard_indices.org_vocab_start_index,
-            module.shard_indices.org_vocab_end_index,
-            use_triton=use_triton_preprocess,
-        )
-        local_embeddings.append(_lookup_local_embedding(module, hashed_ids))
-
-    concat_hidden = torch.cat(local_embeddings, dim=-1)
-    if hasattr(oe_proj_module, "weight"):
-        return F.linear(concat_hidden, oe_proj_module.weight, bias=None)
-    return _apply_oe_proj(oe_proj_module, concat_hidden)
 
 
 def compute_welm_oe_concat_local_partials(
