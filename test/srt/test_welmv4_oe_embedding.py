@@ -23,6 +23,7 @@ from sglang.srt.models.welm_perf_opt import (
     hash_and_localize_welm_oe_input_ids,
     hash_input_ids_vectorized,
     WELM_OE_IMPL_ENV,
+    WELM_OE_POST_PROJ_ALL_REDUCE_ENV,
     WELM_OE_TRITON_PREPROCESS_ENV,
 )
 from sglang.srt.models.welmv4 import Qwen2MoeModel
@@ -456,7 +457,6 @@ class TestWelmV4OEEmbedding(unittest.TestCase):
             F.linear(concat_rank0 + concat_rank1, self.proj_module.weight, bias=None),
             expected_proj_no_bias,
         )
-
         expected = (self.base_hidden_states + expected_proj) / 2.0
         actual = compute_welm_oe_embedding(
             input_ids=self.input_ids,
@@ -472,6 +472,25 @@ class TestWelmV4OEEmbedding(unittest.TestCase):
             all_reduce_fn=lambda x: x + concat_rank1,
         )
         torch.testing.assert_close(actual, expected)
+
+        rank1_proj_no_bias = F.linear(concat_rank1, self.proj_module.weight, bias=None)
+        with patch.dict(
+            os.environ, {WELM_OE_POST_PROJ_ALL_REDUCE_ENV: "1"}, clear=False
+        ):
+            actual_post_proj = compute_welm_oe_embedding(
+                input_ids=self.input_ids,
+                forward_batch=self.forward_batch,
+                base_hidden_states=self.base_hidden_states,
+                oe_grams=self.oe_grams,
+                oe_vocab_sizes=self.oe_vocab_sizes,
+                vocab_size=self.vocab_size,
+                oe_embed_modules=rank0_modules,
+                oe_proj_module=self.proj_module,
+                implementation="tp_fused",
+                use_triton_preprocess=False,
+                all_reduce_fn=lambda x: x + rank1_proj_no_bias,
+            )
+        torch.testing.assert_close(actual_post_proj, expected)
 
     def test_hash_and_localize_matches_reference_formula(self):
         input_ids = torch.tensor([1, 17, 33, 49, 65], dtype=torch.int64)
@@ -737,6 +756,25 @@ class TestWelmV4OEEmbedding(unittest.TestCase):
         )
         torch.testing.assert_close(fused, legacy, atol=1e-3, rtol=1e-3)
 
+        rank1_proj_no_bias = F.linear(rank1_concat, proj_module.weight, bias=None)
+        with patch.dict(
+            os.environ, {WELM_OE_POST_PROJ_ALL_REDUCE_ENV: "1"}, clear=False
+        ):
+            fused_post_proj = compute_welm_oe_embedding(
+                input_ids=input_ids,
+                forward_batch=SimpleNamespace(oe_context=oe_context),
+                base_hidden_states=base_hidden_states,
+                oe_grams=[2, 2, 3, 3],
+                oe_vocab_sizes=oe_vocab_sizes,
+                vocab_size=self.vocab_size,
+                oe_embed_modules=rank0_modules,
+                oe_proj_module=proj_module,
+                implementation="tp_fused",
+                use_triton_preprocess=True,
+                all_reduce_fn=lambda x: x + rank1_proj_no_bias,
+            )
+        torch.testing.assert_close(fused_post_proj, legacy, atol=1e-3, rtol=1e-3)
+
     def test_concat_local_partials_supports_repeated_oe_grams(self):
         oe_grams = [2, 2, 4]
         oe_vocab_sizes = [11, 7, 13]
@@ -872,7 +910,6 @@ class TestWelmV4OEEmbedding(unittest.TestCase):
             oe_embed_modules=rank1_modules,
             use_triton_preprocess=False,
         )
-
         with patch.dict(os.environ, {WELM_OE_IMPL_ENV: "legacy"}, clear=False):
             legacy_out = compute_welm_oe_embedding(
                 input_ids=self.input_ids,
@@ -901,6 +938,28 @@ class TestWelmV4OEEmbedding(unittest.TestCase):
             )
 
         torch.testing.assert_close(fused_out, legacy_out)
+        rank1_proj_no_bias = F.linear(concat_rank1, self.proj_module.weight, bias=None)
+        with patch.dict(
+            os.environ,
+            {
+                WELM_OE_IMPL_ENV: "tp_fused",
+                WELM_OE_POST_PROJ_ALL_REDUCE_ENV: "1",
+            },
+            clear=False,
+        ):
+            fused_out_post_proj = compute_welm_oe_embedding(
+                input_ids=self.input_ids,
+                forward_batch=self.forward_batch,
+                base_hidden_states=self.base_hidden_states,
+                oe_grams=self.oe_grams,
+                oe_vocab_sizes=self.oe_vocab_sizes,
+                vocab_size=self.vocab_size,
+                oe_embed_modules=rank0_modules,
+                oe_proj_module=self.proj_module,
+                use_triton_preprocess=False,
+                all_reduce_fn=lambda x: x + rank1_proj_no_bias,
+            )
+        torch.testing.assert_close(fused_out_post_proj, legacy_out)
         self.assertEqual(get_welm_oe_implementation("legacy"), "legacy")
         self.assertEqual(get_welm_oe_implementation("tp_fused"), "tp_fused")
         self.assertEqual(get_welm_oe_implementation("bad-value"), "legacy")

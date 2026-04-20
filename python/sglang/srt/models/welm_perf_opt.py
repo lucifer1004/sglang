@@ -17,6 +17,7 @@ logger = logging.getLogger(__name__)
 
 WELM_OE_IMPL_ENV = "SGLANG_WELM_OE_IMPL"
 WELM_OE_TRITON_PREPROCESS_ENV = "SGLANG_WELM_OE_TRITON_PREPROCESS"
+WELM_OE_POST_PROJ_ALL_REDUCE_ENV = "SGLANG_WELM_OE_POST_PROJ_ALL_REDUCE"
 WELM_OE_IMPL_LEGACY = "legacy"
 WELM_OE_IMPL_TP_FUSED = "tp_fused"
 SPECIALIZED_WELM_OE_GRAMS = (2, 2, 3, 3)
@@ -292,6 +293,19 @@ def _apply_oe_proj(oe_proj_module, hidden_states: torch.Tensor) -> torch.Tensor:
     return output
 
 
+def _apply_oe_proj_no_bias(oe_proj_module, hidden_states: torch.Tensor) -> torch.Tensor:
+    if hasattr(oe_proj_module, "weight"):
+        return F.linear(hidden_states, oe_proj_module.weight, bias=None)
+    return _apply_oe_proj(oe_proj_module, hidden_states)
+
+
+def _add_oe_proj_bias(oe_proj_module, hidden_states: torch.Tensor) -> torch.Tensor:
+    bias = getattr(oe_proj_module, "bias", None)
+    if bias is None:
+        return hidden_states
+    return hidden_states + bias
+
+
 def _supports_tp_fused_lookup(module) -> bool:
     return hasattr(module, "weight")
 
@@ -437,6 +451,11 @@ def should_use_welm_oe_triton_preprocess(
     return value in {"1", "true", "yes", "on"}
 
 
+def should_use_welm_oe_post_proj_all_reduce() -> bool:
+    value = os.getenv(WELM_OE_POST_PROJ_ALL_REDUCE_ENV, "0").strip().lower()
+    return value in {"1", "true", "yes", "on"}
+
+
 def compute_welm_oe_embedding(
     *,
     input_ids: torch.Tensor,
@@ -472,9 +491,15 @@ def compute_welm_oe_embedding(
             oe_embed_modules=oe_embed_modules,
             use_triton_preprocess=use_triton_preprocess,
         )
-        if any(getattr(module, "tp_size", 1) > 1 for module in oe_embed_modules):
-            concat_hidden = all_reduce_fn(concat_hidden)
-        emb_new = _apply_oe_proj(oe_proj_module, concat_hidden)
+        if should_use_welm_oe_post_proj_all_reduce():
+            emb_new_local = _apply_oe_proj_no_bias(oe_proj_module, concat_hidden)
+            if any(getattr(module, "tp_size", 1) > 1 for module in oe_embed_modules):
+                emb_new_local = all_reduce_fn(emb_new_local)
+            emb_new = _add_oe_proj_bias(oe_proj_module, emb_new_local)
+        else:
+            if any(getattr(module, "tp_size", 1) > 1 for module in oe_embed_modules):
+                concat_hidden = all_reduce_fn(concat_hidden)
+            emb_new = _apply_oe_proj(oe_proj_module, concat_hidden)
     else:
         emb_new = _compute_welm_oe_proj_reference(
             input_ids=input_ids,
