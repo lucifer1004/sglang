@@ -293,11 +293,15 @@ def _apply_oe_proj(oe_proj_module, hidden_states: torch.Tensor) -> torch.Tensor:
 
 
 def _supports_tp_fused_lookup(module) -> bool:
-    required_attrs = ("weight", "tp_size", "shard_indices")
-    return all(hasattr(module, attr) for attr in required_attrs)
+    return hasattr(module, "weight")
 
 
 def _lookup_local_embedding(module, token_ids: torch.Tensor) -> torch.Tensor:
+    if not hasattr(module, "shard_indices"):
+        if hasattr(module, "quant_method") and hasattr(module.quant_method, "embedding"):
+            return module.quant_method.embedding(module, token_ids.long())
+        return F.embedding(token_ids.long(), module.weight)
+
     shard_indices = module.shard_indices
     masked_input, input_mask = get_masked_input_and_mask(
         token_ids.long(),
@@ -356,10 +360,8 @@ def compute_welm_oe_concat_local_partials(
     local_embeddings = []
     for i, _ in enumerate(oe_vocab_sizes):
         module = oe_embed_modules[i]
-        if not _supports_tp_fused_lookup(module):
-            raise TypeError(
-                "OE TP fused lookup requires embedding modules with weight/tp_size/shard_indices"
-            )
+        if not hasattr(module, "weight"):
+            raise TypeError("OE lookup requires embedding modules with weight")
 
         local_embeddings.append(_lookup_local_embedding(module, hashed_inputs[i]))
 
