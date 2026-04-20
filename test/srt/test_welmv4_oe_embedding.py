@@ -543,7 +543,7 @@ class TestWelmV4OEEmbedding(unittest.TestCase):
         )
         torch.testing.assert_close(specialized, generic)
 
-    def test_specialized_lookup_concat_2233_handles_missing_gram3_like_generic(self):
+    def test_specialized_lookup_concat_2233_requires_gram3(self):
         if not torch.cuda.is_available():
             self.skipTest("CUDA is required to validate specialized Triton dispatch")
 
@@ -561,23 +561,16 @@ class TestWelmV4OEEmbedding(unittest.TestCase):
             for vs in oe_vocab_sizes
         ]
 
-        generic = compute_welm_oe_concat_local_partials(
-            input_ids=input_ids,
-            forward_batch=SimpleNamespace(oe_context=oe_context),
-            oe_grams=[2, 2, 3, 3],
-            oe_vocab_sizes=oe_vocab_sizes,
-            vocab_size=self.vocab_size,
-            oe_embed_modules=modules,
-            use_triton_preprocess=False,
-        )
-        specialized = _compute_welm_oe_concat_local_partials_specialized_2233(
-            input_ids=input_ids,
-            oe_context=oe_context,
-            oe_vocab_sizes=oe_vocab_sizes,
-            vocab_size=self.vocab_size,
-            oe_embed_modules=modules,
-        )
-        torch.testing.assert_close(specialized, generic)
+        with self.assertRaisesRegex(
+            AssertionError, r"oe_context\.get_gram\(3\)"
+        ):
+            _compute_welm_oe_concat_local_partials_specialized_2233(
+                input_ids=input_ids,
+                oe_context=oe_context,
+                oe_vocab_sizes=oe_vocab_sizes,
+                vocab_size=self.vocab_size,
+                oe_embed_modules=modules,
+            )
 
     def test_specialized_tp_fused_2233_matches_legacy_end_to_end(self):
         if not torch.cuda.is_available():

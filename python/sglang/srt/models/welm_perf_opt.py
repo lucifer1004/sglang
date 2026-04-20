@@ -217,10 +217,8 @@ def _compute_welm_oe_concat_local_partials_specialized_2233(
 
     gram2 = oe_context.get_gram(2)
     gram3 = oe_context.get_gram(3)
-    if gram2 is None:
-        gram2 = torch.zeros_like(input_ids)
-    if gram3 is None:
-        gram3 = torch.zeros_like(input_ids)
+    assert gram2 is not None, "2233 specialized OE path requires oe_context.get_gram(2)"
+    assert gram3 is not None, "2233 specialized OE path requires oe_context.get_gram(3)"
 
     output = torch.empty(
         (input_ids.numel(), SPECIALIZED_WELM_OE_BRANCHES * SPECIALIZED_WELM_OE_DIM),
