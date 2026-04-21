@@ -657,17 +657,25 @@ async def async_request_sglang_generate(
                         else:
                             data = json.loads(chunk)
 
-                            # NOTE: Some completion API might have a last
-                            # usage summary response without a token so we
-                            # want to check a token was generated
-                            if "text" in data and data["text"]:
+                            # Gate on token count, not text content:
+                            # at temperature=0 on random-token prompts, the
+                            # model may generate tokens that decode to empty
+                            # strings, leaving data["text"] unchanged while
+                            # completion_tokens increments. Using the count
+                            # makes TTFT/TPOT/ITL correct regardless of
+                            # whether tokens produce visible characters.
+                            cur_completion = data.get("meta_info", {}).get(
+                                "completion_tokens", 0
+                            )
+                            if cur_completion > last_output_len:
                                 timestamp = time.perf_counter()
-                                generated_text = data["text"]
-                                output_len = data["meta_info"]["completion_tokens"]
+                                if "text" in data:
+                                    generated_text = data["text"]
+                                output_len = cur_completion
 
                                 # First token
                                 if ttft == 0.0:
-                                    ttft = time.perf_counter() - st
+                                    ttft = timestamp - st
                                     output.ttft = ttft
 
                                 # Decoding phase
