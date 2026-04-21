@@ -2,7 +2,7 @@
 End-to-end test for commit 212cc70bc: fix welmv4 RL CUDA graph + weight update.
 
 This test instantiates REAL Qwen2MoeAttention objects from welmv4.py and uses
-the REAL LayerManager.post_init. Only the SGLang distributed runtime and
+the REAL WeLM kv-mirror finalize path. Only the SGLang distributed runtime and
 RadixAttention are mocked (they are not relevant to the KV-mirror / CUDA graph
 fix being tested).
 
@@ -24,7 +24,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from sglang.srt.models.welmv4 import LayerManager, Qwen2MoeAttention
+from sglang.srt.models.welmv4 import LayerManager, Qwen2MoeAttention, WeLMV4MoeForCausalLM
 
 
 # ---------------------------------------------------------------------------
@@ -70,7 +70,7 @@ def mock_sglang_runtime():
 
 
 # ---------------------------------------------------------------------------
-# Thin wrapper: LayerManager.post_init accesses layer.self_attn, but we
+# Thin wrapper: the WeLM finalize path accesses layer.self_attn, but we
 # create Qwen2MoeAttention directly (not via the full Qwen2MoeDecoderLayer
 # which pulls in MoE, LayerNorm, etc.).
 # ---------------------------------------------------------------------------
@@ -128,6 +128,21 @@ def _teardown_layer_manager():
     LayerManager.num_nextn_predict_layer_idx = []
 
 
+def _run_finalize(kv_mirror_layers, kv_mirror_imitated_layers, is_nextn=False):
+    """Run the current WeLM kv-mirror finalize path against LayerManager state."""
+    model = type("DummyModel", (), {})()
+    model.config = type("DummyConfig", (), {
+        "kv_mirror_layers": kv_mirror_layers,
+        "kv_mirror_imitated_layers": kv_mirror_imitated_layers,
+    })()
+    model.layers = list(LayerManager.decoder_layer.values())
+    model.decoder_layers = list(LayerManager.decoder_layer.values())
+    dummy = type("DummyEntry", (), {"model": model})()
+    return WeLMV4MoeForCausalLM._finalize_kv_mirror_qkv_weights(
+        dummy, is_nextn=is_nextn
+    )
+
+
 def _simulate_weight_update(*attns):
     """In-place randomize nn.Parameter data, as
     default_weight_loader(param, loaded_weight) -> param.data.copy_() does."""
@@ -150,8 +165,8 @@ def _qkv_forward(attn, x):
 
 
 @unittest.skipIf(not torch.cuda.is_available(), "CUDA required")
-class TestLayerManagerPostInitE2E(unittest.TestCase):
-    """End-to-end tests using REAL Qwen2MoeAttention + REAL LayerManager.post_init."""
+class TestKVMirrorFinalizeE2E(unittest.TestCase):
+    """End-to-end tests using REAL Qwen2MoeAttention + REAL WeLM kv-mirror finalize."""
 
     HIDDEN = 64
     NUM_HEADS = 4
@@ -237,7 +252,7 @@ class TestLayerManagerPostInitE2E(unittest.TestCase):
 
     def test_post_init_creates_derived_tensors(self):
         mid, iid, mirror, imitated = self._build_mirror_imitated_pair()
-        LayerManager.post_init([mid], [iid])
+        _run_finalize([mid], [iid])
 
         self.assertIsNotNone(mirror.self_attn.qkv_proj_weight)
         self.assertIsNotNone(imitated.self_attn.qkv_proj_weight)
@@ -249,7 +264,7 @@ class TestLayerManagerPostInitE2E(unittest.TestCase):
         updates + post_init calls."""
         mid, iid, mirror, imitated = self._build_mirror_imitated_pair()
 
-        LayerManager.post_init([mid], [iid])
+        _run_finalize([mid], [iid])
         addrs = {
             "mw": mirror.self_attn.qkv_proj_weight.data_ptr(),
             "iw": imitated.self_attn.qkv_proj_weight.data_ptr(),
@@ -258,7 +273,7 @@ class TestLayerManagerPostInitE2E(unittest.TestCase):
         }
 
         _simulate_weight_update(mirror.self_attn, imitated.self_attn)
-        LayerManager.post_init([mid], [iid])
+        _run_finalize([mid], [iid])
 
         self.assertEqual(addrs["mw"], mirror.self_attn.qkv_proj_weight.data_ptr(),
                          "mirror qkv_proj_weight address changed")
@@ -272,14 +287,14 @@ class TestLayerManagerPostInitE2E(unittest.TestCase):
     def test_post_init_preserves_addresses_no_bias(self):
         mid, iid, mirror, imitated = self._build_mirror_imitated_pair(bias=False)
 
-        LayerManager.post_init([mid], [iid])
+        _run_finalize([mid], [iid])
         self.assertIsNone(mirror.self_attn.qkv_proj_bias)
 
         m_w_addr = mirror.self_attn.qkv_proj_weight.data_ptr()
         i_w_addr = imitated.self_attn.qkv_proj_weight.data_ptr()
 
         _simulate_weight_update(mirror.self_attn, imitated.self_attn)
-        LayerManager.post_init([mid], [iid])
+        _run_finalize([mid], [iid])
 
         self.assertEqual(m_w_addr, mirror.self_attn.qkv_proj_weight.data_ptr())
         self.assertEqual(i_w_addr, imitated.self_attn.qkv_proj_weight.data_ptr())
@@ -288,7 +303,7 @@ class TestLayerManagerPostInitE2E(unittest.TestCase):
         """Addresses remain stable across 10 simulated RL iterations."""
         mid, iid, mirror, imitated = self._build_mirror_imitated_pair()
 
-        LayerManager.post_init([mid], [iid])
+        _run_finalize([mid], [iid])
         addrs = {
             "mw": mirror.self_attn.qkv_proj_weight.data_ptr(),
             "iw": imitated.self_attn.qkv_proj_weight.data_ptr(),
@@ -298,7 +313,7 @@ class TestLayerManagerPostInitE2E(unittest.TestCase):
 
         for i in range(10):
             _simulate_weight_update(mirror.self_attn, imitated.self_attn)
-            LayerManager.post_init([mid], [iid])
+            _run_finalize([mid], [iid])
             self.assertEqual(addrs["mw"], mirror.self_attn.qkv_proj_weight.data_ptr(),
                              f"mirror weight addr changed at iteration {i}")
             self.assertEqual(addrs["iw"], imitated.self_attn.qkv_proj_weight.data_ptr(),
@@ -320,7 +335,7 @@ class TestLayerManagerPostInitE2E(unittest.TestCase):
             mirror.self_attn.qkv_proj.weight.fill_(1.0)
             imitated.self_attn.qkv_proj.weight.fill_(2.0)
 
-        LayerManager.post_init([mid], [iid])
+        _run_finalize([mid], [iid])
 
         expected = mirror.self_attn.qkv_proj.weight[: self.q_size, :]
         self.assertTrue(
@@ -337,7 +352,7 @@ class TestLayerManagerPostInitE2E(unittest.TestCase):
             mirror.self_attn.qkv_proj.weight.fill_(1.0)
             imitated.self_attn.qkv_proj.weight.fill_(2.0)
 
-        LayerManager.post_init([mid], [iid])
+        _run_finalize([mid], [iid])
 
         expected = torch.concat([
             imitated.self_attn.qkv_proj.weight,
@@ -349,10 +364,10 @@ class TestLayerManagerPostInitE2E(unittest.TestCase):
         )
 
     def test_derived_values_updated_after_weight_change(self):
-        """After weight update + post_init, derived values reflect new weights."""
+        """After weight update + finalize, derived values reflect new weights."""
         mid, iid, mirror, imitated = self._build_mirror_imitated_pair(bias=True)
 
-        LayerManager.post_init([mid], [iid])
+        _run_finalize([mid], [iid])
 
         with torch.no_grad():
             mirror.self_attn.qkv_proj.weight.fill_(5.0)
@@ -360,7 +375,7 @@ class TestLayerManagerPostInitE2E(unittest.TestCase):
             mirror.self_attn.qkv_proj.bias.fill_(0.5)
             imitated.self_attn.qkv_proj.bias.fill_(0.7)
 
-        LayerManager.post_init([mid], [iid])
+        _run_finalize([mid], [iid])
 
         self.assertTrue(torch.all(mirror.self_attn.qkv_proj_weight == 5.0))
         self.assertTrue(torch.all(mirror.self_attn.qkv_proj_bias == 0.5))
@@ -382,7 +397,7 @@ class TestLayerManagerPostInitE2E(unittest.TestCase):
         -> verify output matches eager."""
         mid, iid, mirror, imitated = self._build_mirror_imitated_pair()
 
-        LayerManager.post_init([mid], [iid])
+        _run_finalize([mid], [iid])
 
         x_static = torch.randn(self.BS, self.HIDDEN, device="cuda")
         _ = _qkv_forward(imitated.self_attn, x_static)
@@ -392,7 +407,7 @@ class TestLayerManagerPostInitE2E(unittest.TestCase):
             out_static = _qkv_forward(imitated.self_attn, x_static)
 
         _simulate_weight_update(mirror.self_attn, imitated.self_attn)
-        LayerManager.post_init([mid], [iid])
+        _run_finalize([mid], [iid])
 
         gc.collect()
         torch.cuda.empty_cache()
@@ -413,7 +428,7 @@ class TestLayerManagerPostInitE2E(unittest.TestCase):
         """CUDA graph correctness for the mirror layer's forward path."""
         mid, iid, mirror, imitated = self._build_mirror_imitated_pair()
 
-        LayerManager.post_init([mid], [iid])
+        _run_finalize([mid], [iid])
 
         x_static = torch.randn(self.BS, self.HIDDEN, device="cuda")
         _ = _qkv_forward(mirror.self_attn, x_static)
@@ -423,7 +438,7 @@ class TestLayerManagerPostInitE2E(unittest.TestCase):
             out_static = _qkv_forward(mirror.self_attn, x_static)
 
         _simulate_weight_update(mirror.self_attn, imitated.self_attn)
-        LayerManager.post_init([mid], [iid])
+        _run_finalize([mid], [iid])
 
         gc.collect()
         torch.cuda.empty_cache()
@@ -441,10 +456,10 @@ class TestLayerManagerPostInitE2E(unittest.TestCase):
         )
 
     def test_cuda_graph_correctness_over_multiple_rl_iterations(self):
-        """Capture graph once, then 5 RL update cycles, each verified."""
+        """Capture graph once, then 5 RL update cycles, each verified after finalize."""
         mid, iid, mirror, imitated = self._build_mirror_imitated_pair()
 
-        LayerManager.post_init([mid], [iid])
+        _run_finalize([mid], [iid])
 
         x_static = torch.randn(self.BS, self.HIDDEN, device="cuda")
         _ = _qkv_forward(imitated.self_attn, x_static)
@@ -455,7 +470,7 @@ class TestLayerManagerPostInitE2E(unittest.TestCase):
 
         for i in range(5):
             _simulate_weight_update(mirror.self_attn, imitated.self_attn)
-            LayerManager.post_init([mid], [iid])
+            _run_finalize([mid], [iid])
 
             x_new = torch.randn(self.BS, self.HIDDEN, device="cuda")
             x_static.copy_(x_new)
@@ -492,7 +507,7 @@ class TestLayerManagerPostInitE2E(unittest.TestCase):
                 layers[lid] = DecoderLayerStub(attn).cuda()
 
         _setup_layer_manager(layers)
-        LayerManager.post_init(kv_mirror_layers, kv_mirror_imitated_layers)
+        _run_finalize(kv_mirror_layers, kv_mirror_imitated_layers)
 
         addrs = {}
         for lid in range(total_layers):
@@ -503,7 +518,7 @@ class TestLayerManagerPostInitE2E(unittest.TestCase):
         for lid in range(total_layers):
             _simulate_weight_update(layers[lid].self_attn)
 
-        LayerManager.post_init(kv_mirror_layers, kv_mirror_imitated_layers)
+        _run_finalize(kv_mirror_layers, kv_mirror_imitated_layers)
 
         for lid in range(total_layers):
             attn = layers[lid].self_attn
@@ -519,7 +534,7 @@ class TestLayerManagerPostInitE2E(unittest.TestCase):
     def test_derived_tensor_shapes(self):
         """Verify derived tensor shapes match WelmV4Attention.forward expectations."""
         mid, iid, mirror, imitated = self._build_mirror_imitated_pair()
-        LayerManager.post_init([mid], [iid])
+        _run_finalize([mid], [iid])
 
         self.assertEqual(
             mirror.self_attn.qkv_proj_weight.shape,
