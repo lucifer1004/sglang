@@ -118,7 +118,6 @@ class LayerManager:
     def set_decoder_layer(layer_idx, decoder_layer):
         LayerManager.decoder_layer[layer_idx] = decoder_layer
 
-
 class Qwen2MoeMLP(nn.Module):
     def __init__(
         self,
@@ -1347,6 +1346,7 @@ class WeLMV4MoeForCausalLM(nn.Module):
         self.logits_processor = LogitsProcessor(config)
         # For EAGLE3 support
         self.capture_aux_hidden_states = False
+        self.post_init_after_load_weights(is_nextn=False)
 
     @torch.no_grad()
     def forward(
