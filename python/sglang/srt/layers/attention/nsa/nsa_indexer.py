@@ -37,15 +37,96 @@ if _is_cuda:
     if _sm_major >= 12 or isinstance(deep_gemm, Exception):
         try:
             from flashinfer.fp8_paged_mqa_logits import (
-                fp8_paged_mqa_logits as _flashinfer_fp8_paged_mqa_logits,
+                fp8_paged_mqa_logits as _fi_fp8_paged_mqa_logits_impl,
                 get_paged_mqa_logits_metadata as _flashinfer_get_paged_mqa_logits_metadata,
             )
             from flashinfer.fp8_ragged_mqa_logits import (
-                fp8_ragged_mqa_logits as _flashinfer_fp8_ragged_mqa_logits,
+                fp8_ragged_mqa_logits as _fi_fp8_ragged_mqa_logits_impl,
             )
             _use_flashinfer_mqa_logits = True
         except ImportError:
             pass
+
+# Prefer hand-tuned CUDA MQA logits kernel on SM120 (sparse_mla_sm120).
+# Ragged microbench: 1.75-2.9× over FlashInfer Triton at our workload shapes
+# (seq_q <= 16, seq_kv 1-16K, num_heads=16). Falls back to FlashInfer Triton
+# if sparse_mla_sm120 is not installed.
+_use_sparse_mla_sm120_mqa = False
+try:
+    import sparse_mla_sm120._C as _smla_C  # noqa: F401
+    _use_sparse_mla_sm120_mqa = True
+except ImportError:
+    pass
+
+
+def _flashinfer_fp8_ragged_mqa_logits(q, kv_fp8, weights, ks, ke, clean_logits=False):
+    """Ragged FP8 MQA logits with sparse_mla_sm120 CUDA fast path + Triton fallback.
+
+    Args match flashinfer.fp8_ragged_mqa_logits:
+      q: [num_q, (next_n,) num_heads, head_dim] fp8_e4m3fn
+      kv_fp8: (k_fp8 [total_kv, head_dim] fp8, k_scale [total_kv, num_scale_groups] f32)
+      weights: [num_q * next_n, num_heads] f32
+      ks, ke: [num_q * next_n] i32
+    Returns:
+      logits: [num_q * next_n, total_kv] f32
+    """
+    if not _use_sparse_mla_sm120_mqa:
+        return _fi_fp8_ragged_mqa_logits_impl(q, kv_fp8, weights, ks, ke, clean_logits)
+
+    # Normalize q to 3D for the CUDA kernel
+    if q.ndim == 4:
+        num_q, next_n, num_heads, head_dim = q.shape
+        assert next_n == 1, "sparse_mla_sm120 ragged fast-path supports next_n=1"
+        q3 = q.squeeze(1).contiguous()
+    else:
+        q3 = q.contiguous()
+        num_heads, head_dim = q3.shape[-2], q3.shape[-1]
+
+    # CUDA kernel requires head_dim == 128 (DSV3.2 indexer dim) and
+    # num_heads in {16, 128}. DSV3.2 NSA indexer uses num_heads=64 (not sharded
+    # by TP), which the CUDA kernel doesn't support — fall back in that case.
+    if head_dim != 128 or num_heads not in (16, 128):
+        return _fi_fp8_ragged_mqa_logits_impl(q, kv_fp8, weights, ks, ke, clean_logits)
+
+    k_fp8, k_scale = kv_fp8
+    # CUDA kernel expects kv_scale as [seq_kv] f32 (num_scale_groups==1 for D=128)
+    if k_scale.ndim == 2:
+        if k_scale.shape[1] != 1:
+            return _fi_fp8_ragged_mqa_logits_impl(q, kv_fp8, weights, ks, ke, clean_logits)
+        k_scale_1d = k_scale.squeeze(-1).contiguous()
+    else:
+        k_scale_1d = k_scale.contiguous()
+
+    seq_q = q3.shape[0]
+    seq_kv = k_fp8.shape[0]
+    # CUDA kernel writes to a pre-allocated output with stride padded to 256
+    align = 256
+    stride = ((seq_kv + align - 1) // align) * align
+    logits_padded = torch.full(
+        (seq_q, stride),
+        float("-inf") if clean_logits else 0.0,
+        dtype=torch.float32,
+        device=q3.device,
+    )
+    out_view = logits_padded[:, :seq_kv]
+    _smla_C.fp8_mqa_logits_ragged_fwd(
+        q3, k_fp8.contiguous(), k_scale_1d,
+        weights.contiguous(),
+        ks.to(torch.int32).contiguous() if ks.dtype != torch.int32 else ks.contiguous(),
+        ke.to(torch.int32).contiguous() if ke.dtype != torch.int32 else ke.contiguous(),
+        out_view, seq_kv,
+    )
+    return logits_padded[:, :seq_kv]
+
+
+def _flashinfer_fp8_paged_mqa_logits(*args, **kwargs):
+    """Paged MQA logits — not yet adapted to sparse_mla_sm120 (different KV layout).
+
+    FlashInfer uses fused FP8+scales layout; sparse_mla_sm120 uses separate tensors.
+    Splitting in the adapter would add memory-bandwidth overhead that likely
+    negates the kernel speedup. Leave on FlashInfer Triton for now.
+    """
+    return _fi_fp8_paged_mqa_logits_impl(*args, **kwargs)
 
 if is_npu():
     import torch_npu
