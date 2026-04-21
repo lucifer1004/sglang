@@ -76,8 +76,6 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTe
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.welm_perf_opt import (
     compute_welm_oe_embedding,
-    get_welm_oe_implementation,
-    hash_input_ids_vectorized,
 )
 from sglang.srt.server_args import get_global_server_args
 
@@ -119,57 +117,6 @@ class LayerManager:
     @staticmethod
     def set_decoder_layer(layer_idx, decoder_layer):
         LayerManager.decoder_layer[layer_idx] = decoder_layer
-
-    @staticmethod
-    def post_init(kv_mirror_layers, kv_mirror_imitated_layers, is_nextn=False):
-
-        if is_nextn:
-            LayerManager.num_nextn_predict_layer_idx = kv_mirror_layers
-        for mirror_layer_id in kv_mirror_layers:
-            if mirror_layer_id >= len(LayerManager.decoder_layer):
-                continue
-            imitated_layer_id = kv_mirror_imitated_layers[
-                kv_mirror_layers.index(mirror_layer_id)
-            ]
-            mirror_layer_attn = LayerManager.decoder_layer[mirror_layer_id].self_attn
-            imitated_layer_attn = LayerManager.decoder_layer[
-                imitated_layer_id
-            ].self_attn
-
-            mirror_qkv_proj_weight = mirror_layer_attn.qkv_proj.weight
-            mirror_qkv_proj_bias = getattr(mirror_layer_attn.qkv_proj, "bias", None)
-            imitated_qkv_proj_weight = imitated_layer_attn.qkv_proj.weight
-            imitated_qkv_proj_bias = getattr(imitated_layer_attn.qkv_proj, "bias", None)
-            assert (mirror_qkv_proj_bias is not None) == (
-                imitated_qkv_proj_bias is not None
-            )
-
-            mirror_layer_attn.qkv_proj_weight = mirror_qkv_proj_weight[
-                : mirror_layer_attn.q_size, :
-            ].clone()
-            imitated_layer_attn.qkv_proj_weight = torch.concat(
-                [
-                    imitated_qkv_proj_weight,
-                    mirror_qkv_proj_weight[mirror_layer_attn.q_size :, :],
-                ],
-                dim=0,
-            )
-            if mirror_qkv_proj_bias is not None:
-                mirror_layer_attn.qkv_proj_bias = mirror_qkv_proj_bias[
-                    : mirror_layer_attn.q_size
-                ].clone()
-                imitated_layer_attn.qkv_proj_bias = torch.concat(
-                    [
-                        imitated_qkv_proj_bias,
-                        mirror_qkv_proj_bias[mirror_layer_attn.q_size :],
-                    ],
-                    dim=0,
-                )
-            else:
-                imitated_layer_attn.qkv_proj_bias = None
-                mirror_layer_attn.qkv_proj_bias = None
-
-        torch.cuda.empty_cache()
 
 
 class Qwen2MoeMLP(nn.Module):
@@ -833,6 +780,7 @@ class Qwen2MoeAttention(nn.Module):
         self.kv_mirror_layer_idx = (
             layer_idx if not is_nextn else layer_idx + len(LayerManager.decoder_layer)
         )
+        self.is_nextn_kv_mirror_predict_layer = False
         if get_global_server_args().speculative_algorithm is not None:
             self.need_clear_kv_cache = (
                 self.layer_idx == LayerManager.num_nextn_predict_layers - 1
@@ -1252,26 +1200,6 @@ class Qwen2MoeModel(nn.Module):
             oe_embed_modules = self.oe_embed
         if oe_up_proj_module is None:
             oe_up_proj_module = self.oe_gate_up_proj
-
-        if get_welm_oe_implementation() == "legacy":
-            input_ids_ngram = []
-            input_ids_ngram_tmp = input_ids
-            for g in range(1, max(self.oe_grams)):
-                gram_tensor = forward_batch.oe_context.get_gram(g + 1)
-                if gram_tensor is not None:
-                    input_ids_ngram_tmp = input_ids_ngram_tmp + gram_tensor * (
-                        self.vocab_size**g
-                    )
-                input_ids_ngram.append(hash_input_ids_vectorized(input_ids_ngram_tmp))
-
-            emb_ngram = []
-            for i, vs in enumerate(self.oe_vocab_sizes):
-                input_ids_ngram_hashed_tmp = input_ids_ngram[self.oe_grams[i] - 2] % vs
-                emb_ngram_tmp = oe_embed_modules[i](input_ids_ngram_hashed_tmp)
-                emb_ngram.append(emb_ngram_tmp)
-            emb_new, _ = oe_up_proj_module(torch.cat(emb_ngram, dim=-1))
-            return (base_hidden_states + emb_new) / 2.0
-
         return compute_welm_oe_embedding(
             input_ids=input_ids,
             forward_batch=forward_batch,
@@ -1728,7 +1656,12 @@ class WeLMV4MoeForCausalLM(nn.Module):
                             weight_loader(param, loaded_weight)
                     else:
                         logger.warning(f"Parameter {name} not found in params_dict")
-        self.post_init_after_load_weights(is_nextn=is_nextn)
+        if self._finalize_kv_mirror_qkv_weights(is_nextn=is_nextn):
+            # Keep the synchronization WeLM-specific and as narrow as possible.
+            # The finalize step mutates qkv-derived tensors that may be replayed by
+            # cuda-graph immediately after runtime weight updates; waiting on the
+            # current stream is sufficient for the writes issued above.
+            torch.cuda.current_stream().synchronize()
 
     def get_embed_and_head(self):
         return [
@@ -1745,23 +1678,38 @@ class WeLMV4MoeForCausalLM(nn.Module):
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
 
-    def post_init_after_load_weights(self, is_nextn=False):
+    def _finalize_kv_mirror_qkv_weights(self, is_nextn=False):
+        def refresh_tensor_attr(module, attr_name, new_value):
+            existing = getattr(module, attr_name, None)
+            if (
+                existing is not None
+                and existing.shape == new_value.shape
+                and existing.dtype == new_value.dtype
+                and existing.device == new_value.device
+            ):
+                existing.copy_(new_value)
+                return True
+            setattr(module, attr_name, new_value)
+            return True
+
         total_kv_mirror_layers = getattr(self.model.config, "kv_mirror_layers", [])
         total_kv_mirror_imitated_layers = getattr(
             self.model.config, "kv_mirror_imitated_layers", []
         )
         if is_nextn:
+            decoder_layers = list(self.model.decoder_layers)
             kv_mirror_layer_ids = [
-                decoder.self_attn.kv_mirror_layer_idx
-                for decoder in self.model.decoder_layers
+                decoder.self_attn.kv_mirror_layer_idx for decoder in decoder_layers
             ]
             kv_mirror_imitated_layers = total_kv_mirror_imitated_layers[
                 : len(kv_mirror_layer_ids)
             ]
+            LayerManager.num_nextn_predict_layer_idx = kv_mirror_layer_ids
         else:
+            decoder_layers = list(self.model.layers)
             kv_mirror_layer_ids = [
                 decoder_layer.self_attn.kv_mirror_layer_idx
-                for decoder_layer in self.model.layers
+                for decoder_layer in decoder_layers
             ]
             kv_mirror_layer_ids = [
                 layer_id
@@ -1771,9 +1719,75 @@ class WeLMV4MoeForCausalLM(nn.Module):
             kv_mirror_imitated_layers = total_kv_mirror_imitated_layers[
                 -len(kv_mirror_layer_ids) :
             ]
-        LayerManager.post_init(
-            kv_mirror_layer_ids, kv_mirror_imitated_layers, is_nextn=is_nextn
-        )
+
+        if not kv_mirror_layer_ids:
+            return False
+
+        if len(kv_mirror_layer_ids) != len(kv_mirror_imitated_layers):
+            raise ValueError(
+                "KV mirror layer mapping length mismatch: "
+                f"{len(kv_mirror_layer_ids)=}, "
+                f"{len(kv_mirror_imitated_layers)=}, "
+                f"{is_nextn=}"
+            )
+
+        decoder_layers_by_idx = dict(LayerManager.decoder_layer)
+        did_refresh = False
+        for decoder in decoder_layers:
+            decoder.self_attn.is_nextn_kv_mirror_predict_layer = False
+
+        for mirror_layer_id, imitated_layer_id in zip(
+            kv_mirror_layer_ids, kv_mirror_imitated_layers
+        ):
+            mirror_layer = decoder_layers_by_idx.get(mirror_layer_id)
+            imitated_layer = decoder_layers_by_idx.get(imitated_layer_id)
+            if mirror_layer is None or imitated_layer is None:
+                continue
+
+            mirror_layer_attn = mirror_layer.self_attn
+            imitated_layer_attn = imitated_layer.self_attn
+
+            mirror_qkv_proj_weight = mirror_layer_attn.qkv_proj.weight
+            mirror_qkv_proj_bias = getattr(mirror_layer_attn.qkv_proj, "bias", None)
+            imitated_qkv_proj_weight = imitated_layer_attn.qkv_proj.weight
+            imitated_qkv_proj_bias = getattr(imitated_layer_attn.qkv_proj, "bias", None)
+            assert (mirror_qkv_proj_bias is not None) == (
+                imitated_qkv_proj_bias is not None
+            )
+
+            mirror_weight = mirror_qkv_proj_weight[: mirror_layer_attn.q_size, :].clone()
+            imitated_weight = torch.concat(
+                [imitated_qkv_proj_weight, mirror_qkv_proj_weight[mirror_layer_attn.q_size :, :]],
+                dim=0,
+            )
+            did_refresh |= refresh_tensor_attr(
+                mirror_layer_attn, "qkv_proj_weight", mirror_weight
+            )
+            did_refresh |= refresh_tensor_attr(
+                imitated_layer_attn, "qkv_proj_weight", imitated_weight
+            )
+            if mirror_qkv_proj_bias is not None:
+                mirror_bias = mirror_qkv_proj_bias[: mirror_layer_attn.q_size].clone()
+                imitated_bias = torch.concat(
+                    [
+                        imitated_qkv_proj_bias,
+                        mirror_qkv_proj_bias[mirror_layer_attn.q_size :],
+                    ],
+                    dim=0,
+                )
+                did_refresh |= refresh_tensor_attr(
+                    mirror_layer_attn, "qkv_proj_bias", mirror_bias
+                )
+                did_refresh |= refresh_tensor_attr(
+                    imitated_layer_attn, "qkv_proj_bias", imitated_bias
+                )
+            else:
+                imitated_layer_attn.qkv_proj_bias = None
+                mirror_layer_attn.qkv_proj_bias = None
+                did_refresh = True
+
+        torch.cuda.empty_cache()
+        return did_refresh
 
     @classmethod
     def get_model_config_for_expert_location(cls, config):

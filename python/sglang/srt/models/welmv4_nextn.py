@@ -15,10 +15,10 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.models.welm_perf_opt import hash_input_ids_vectorized
 from sglang.srt.models.welmv4 import (
     Qwen2MoeDecoderLayer,
     WeLMV4MoeForCausalLM,
-    hash_input_ids_vectorized,
 )
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix, is_cuda, is_npu

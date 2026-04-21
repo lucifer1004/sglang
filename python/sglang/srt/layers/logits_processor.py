@@ -146,6 +146,7 @@ class LogitsMetadata:
 
     # For KV Mirror
     enable_welm_kv_mirror_opt: bool = False
+    scale_seq_factor: int = 1
 
     @classmethod
     def from_forward_batch(cls, forward_batch: ForwardBatch):
@@ -198,6 +199,7 @@ class LogitsMetadata:
             global_num_tokens_for_logprob_gpu=forward_batch.global_num_tokens_for_logprob_gpu,
             dp_padding_mode=DpPaddingMode.SUM_LEN,
             enable_welm_kv_mirror_opt=forward_batch.enable_welm_kv_mirror_opt,
+            scale_seq_factor=forward_batch.scale_seq_factor,
         )
 
     def compute_dp_attention_metadata(self):
