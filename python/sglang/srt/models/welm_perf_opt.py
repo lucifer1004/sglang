@@ -424,7 +424,7 @@ def _should_use_tp_fused_path(
 
 def get_welm_oe_implementation(implementation: str | None = None) -> str:
     if implementation is None:
-        implementation = os.getenv(WELM_OE_IMPL_ENV, WELM_OE_IMPL_LEGACY)
+        implementation = os.getenv(WELM_OE_IMPL_ENV, WELM_OE_IMPL_TP_FUSED)
 
     normalized = implementation.strip().lower()
     if normalized in {"legacy", "reference", "old"}:
@@ -447,7 +447,7 @@ def should_use_welm_oe_triton_preprocess(
     if use_triton_preprocess is not None:
         return use_triton_preprocess
 
-    value = os.getenv(WELM_OE_TRITON_PREPROCESS_ENV, "0").strip().lower()
+    value = os.getenv(WELM_OE_TRITON_PREPROCESS_ENV, "1").strip().lower()
     return value in {"1", "true", "yes", "on"}
 
 

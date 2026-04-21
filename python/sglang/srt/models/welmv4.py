@@ -76,6 +76,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTe
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.welm_perf_opt import (
     compute_welm_oe_embedding,
+    get_welm_oe_implementation,
     hash_input_ids_vectorized,
 )
 from sglang.srt.server_args import get_global_server_args
@@ -1251,6 +1252,26 @@ class Qwen2MoeModel(nn.Module):
             oe_embed_modules = self.oe_embed
         if oe_up_proj_module is None:
             oe_up_proj_module = self.oe_gate_up_proj
+
+        if get_welm_oe_implementation() == "legacy":
+            input_ids_ngram = []
+            input_ids_ngram_tmp = input_ids
+            for g in range(1, max(self.oe_grams)):
+                gram_tensor = forward_batch.oe_context.get_gram(g + 1)
+                if gram_tensor is not None:
+                    input_ids_ngram_tmp = input_ids_ngram_tmp + gram_tensor * (
+                        self.vocab_size**g
+                    )
+                input_ids_ngram.append(hash_input_ids_vectorized(input_ids_ngram_tmp))
+
+            emb_ngram = []
+            for i, vs in enumerate(self.oe_vocab_sizes):
+                input_ids_ngram_hashed_tmp = input_ids_ngram[self.oe_grams[i] - 2] % vs
+                emb_ngram_tmp = oe_embed_modules[i](input_ids_ngram_hashed_tmp)
+                emb_ngram.append(emb_ngram_tmp)
+            emb_new, _ = oe_up_proj_module(torch.cat(emb_ngram, dim=-1))
+            return (base_hidden_states + emb_new) / 2.0
+
         return compute_welm_oe_embedding(
             input_ids=input_ids,
             forward_batch=forward_batch,
