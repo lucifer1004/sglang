@@ -29,6 +29,8 @@ def rms_norm_kernel(  # pylint: disable=too-many-arguments,too-many-locals
     cols: int,
     eps: float,
     hidden_states_row_stride: int,
+    hidden_states_num_kv: int,
+    hidden_states_kv_stride: int,
     residual_row_stride: int,
     residual_after_layernorm: tl.constexpr,
     NUM_SMS: tl.constexpr,  # pylint: disable=invalid-name
@@ -41,7 +43,11 @@ def rms_norm_kernel(  # pylint: disable=too-many-arguments,too-many-locals
 
     original_dtype = hidden_states_ptr.dtype.element_ty
     for row_id in tl.range(row_start, rows, NUM_SMS, num_stages=4):
-        h_offs = (row_id * hidden_states_row_stride + cols_off).to(tl.int64)
+        kv_idx = row_id // hidden_states_num_kv
+        row_idx = row_id % hidden_states_num_kv
+        kv_off = kv_idx * hidden_states_kv_stride
+        h_offs = row_idx * hidden_states_row_stride + kv_off + cols_off
+        #h_offs = (row_id * hidden_states_row_stride + cols_off).to(tl.int64)
         r_offs = (row_id * residual_row_stride + cols_off).to(tl.int64)
         h = tl.load(hidden_states_ptr + h_offs, mask=mask, other=0.0).to(tl.float32)
         if reisdual_ptr is not None:
@@ -84,6 +90,7 @@ class WelmV4FusedRMSNorm(CustomOp):
         residual_after_layernorm: bool = False,
         clone_fp32_out: bool = False,
     ):
+        assert x.dim() in [2, 3]
         output = torch.empty_like(x)
         fp32_out = None
         out_residual = None
@@ -95,9 +102,16 @@ class WelmV4FusedRMSNorm(CustomOp):
         rows = x.numel() // cols
 
         if residual is not None:
+            assert residual.is_contiguous()
             residual_row_stride = residual.stride(0)
         else:
             residual_row_stride = 0
+        x_row_stride = x.stride(-2)
+        x_num_kv = x.shape[-2]
+        if x.dim() == 2:
+            kv_stride = x.numel()
+        else:
+            kv_stride = x.stride(0)
 
         num_sms = min(rows, self.num_sms)
         block_size = triton.next_power_of_2(cols)
@@ -111,7 +125,9 @@ class WelmV4FusedRMSNorm(CustomOp):
             rows,
             cols,
             self.eps,
-            x.stride(0),
+            x_row_stride,
+            x_num_kv,
+            kv_stride,
             residual_row_stride,
             residual_after_layernorm,
             num_sms,
@@ -153,6 +169,7 @@ def inplace_sigmoid_mul(x: torch.Tensor, y: torch.Tensor):
     cols = y.shape[-1]
     rows = y.numel() // cols
     block_size = triton.next_power_of_2(cols)
+    assert x.is_contiguous()
     sigmoid_mul_kernel[(num_sms,)](x, y, rows, cols, y.stride(-2), block_size, num_sms)
 
 
