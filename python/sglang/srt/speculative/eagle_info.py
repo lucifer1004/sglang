@@ -597,6 +597,9 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                         unfinished_index_device
                     ],
                 )
+                draft_input.model_specific_states = getattr(
+                    batch.spec_info, "model_specific_states", None
+                )
             else:
                 draft_input = EagleDraftInput.create_idle_input(
                     device=batch.device,
@@ -841,6 +844,7 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
             self.verified_id = spec_info.verified_id
             self.topk_p = spec_info.topk_p
             self.topk_index = spec_info.topk_index
+            self.model_specific_states = getattr(spec_info, "model_specific_states", None)
             return
         if spec_info.hidden_states is None:
             return
@@ -850,6 +854,8 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
         self.verified_id = torch.cat([self.verified_id, spec_info.verified_id], axis=0)
         self.topk_p = torch.cat([self.topk_p, spec_info.topk_p])
         self.topk_index = torch.cat([self.topk_index, spec_info.topk_index])
+        if getattr(self, "model_specific_states", None) is None:
+            self.model_specific_states = getattr(spec_info, "model_specific_states", None)
 
 
 @dataclass

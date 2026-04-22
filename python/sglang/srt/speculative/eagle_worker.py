@@ -606,6 +606,7 @@ class EAGLEWorker(TpModelWorker):
             spec_info.topk_index,
             spec_info.hidden_states,
         )
+        model_specific_states = getattr(spec_info, "model_specific_states", None)
         if self.hot_token_id is not None:
             topk_index = self.hot_token_id[topk_index]
         # TODO: We only need self.speculative_num_steps - 1 cache loc
@@ -653,6 +654,7 @@ class EAGLEWorker(TpModelWorker):
             forward_batch.positions.add_(1)
             forward_batch.attn_backend = self.draft_attn_backend.attn_backends[i]
             spec_info.hidden_states = hidden_states
+            spec_info.model_specific_states = model_specific_states
 
             # Run forward
             logits_output, _ = self.draft_model_runner.forward(
@@ -665,6 +667,7 @@ class EAGLEWorker(TpModelWorker):
             if self.hot_token_id is not None:
                 topk_index = self.hot_token_id[topk_index]
             hidden_states = logits_output.hidden_states
+            model_specific_states = logits_output.model_specific_states
 
         parent_list, top_scores_index, draft_tokens = organize_draft_results(
             score_list, token_list, parents_list, self.speculative_num_draft_tokens
@@ -731,6 +734,7 @@ class EAGLEWorker(TpModelWorker):
             detect_nan(logits_output)
 
         spec_info.hidden_states = logits_output.hidden_states
+        spec_info.model_specific_states = logits_output.model_specific_states
         res: EagleVerifyOutput = spec_info.verify(
             batch,
             logits_output,
@@ -992,6 +996,9 @@ class EAGLEWorker(TpModelWorker):
                 logits_output.topk_index,
             )
             forward_batch.spec_info.hidden_states = logits_output.hidden_states
+            forward_batch.spec_info.model_specific_states = (
+                logits_output.model_specific_states
+            )
         else:
             forward_batch.can_run_dp_cuda_graph = False
             if not forward_batch.forward_mode.is_idle():
@@ -1023,6 +1030,7 @@ class EAGLEWorker(TpModelWorker):
         probs = torch.softmax(logits_output.next_token_logits, dim=-1)
         draft_input.topk_p, draft_input.topk_index = fast_topk(probs, self.topk, dim=-1)
         draft_input.hidden_states = logits_output.hidden_states
+        draft_input.model_specific_states = logits_output.model_specific_states
 
     def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
         monkey_patch_torch_reductions()

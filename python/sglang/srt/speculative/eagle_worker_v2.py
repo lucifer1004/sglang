@@ -349,6 +349,7 @@ class EagleDraftWorker(BaseDraftWorker):
             spec_info.topk_index,
             spec_info.hidden_states,
         )
+        model_specific_states = getattr(spec_info, "model_specific_states", None)
         if self.hot_token_id is not None:
             topk_index = self.hot_token_id[topk_index]
 
@@ -384,6 +385,7 @@ class EagleDraftWorker(BaseDraftWorker):
             forward_batch.positions.add_(1)
             forward_batch.attn_backend = self.draft_attn_backend.attn_backends[i]
             spec_info.hidden_states = hidden_states
+            spec_info.model_specific_states = model_specific_states
 
             # Run forward
             logits_output, _ = self.draft_runner.forward(
@@ -396,6 +398,7 @@ class EagleDraftWorker(BaseDraftWorker):
             if self.hot_token_id is not None:
                 topk_index = self.hot_token_id[topk_index]
             hidden_states = logits_output.hidden_states
+            model_specific_states = logits_output.model_specific_states
 
         # Organize the results
         score_list = torch.cat(score_list, dim=1).flatten(
@@ -455,6 +458,9 @@ class EagleDraftWorker(BaseDraftWorker):
             num_tokens_per_batch=1,
             num_tokens_for_logprob_per_batch=1,
         )
+        next_draft_input.model_specific_states = (
+            batch_result.logits_output.model_specific_states
+        )
 
         batch.spec_info = next_draft_input
 
@@ -468,6 +474,7 @@ class EagleDraftWorker(BaseDraftWorker):
             probs, self.topk, dim=-1
         )
         next_draft_input.hidden_states = logits_output.hidden_states
+        next_draft_input.model_specific_states = logits_output.model_specific_states
         return next_draft_input
 
     def _draft_extend_for_decode(
@@ -478,6 +485,9 @@ class EagleDraftWorker(BaseDraftWorker):
             hidden_states=batch_result.logits_output.hidden_states,
             num_tokens_per_batch=self.speculative_num_steps + 1,
             num_tokens_for_logprob_per_batch=1,
+        )
+        draft_input.model_specific_states = (
+            batch_result.logits_output.model_specific_states
         )
         select_index = (
             torch.arange(len(batch.seq_lens), device=self.device)
@@ -537,6 +547,7 @@ class EagleDraftWorker(BaseDraftWorker):
             ret_topk_index,
             ret_hidden_states,
         )
+        next_draft_input.model_specific_states = draft_logits_output.model_specific_states
 
 
 class EAGLEWorkerV2(BaseSpecWorker):

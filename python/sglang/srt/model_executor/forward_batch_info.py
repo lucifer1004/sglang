@@ -405,6 +405,7 @@ class ForwardBatch:
             dimensions=batch.dimensions,
             oe_context=batch.oe_context,
             scale_seq_factor=batch.scale_seq_factor,
+            model_specific_states=getattr(batch.spec_info, "model_specific_states", None),
         )
         device = model_runner.device
         ret.enable_welm_kv_mirror_opt = model_runner.server_args.enable_welm_kv_mirror_opt
