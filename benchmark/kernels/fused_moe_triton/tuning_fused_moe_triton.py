@@ -28,6 +28,10 @@ from sglang.srt.layers.moe.fused_moe_triton.fused_moe_triton_config import (
 )
 from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
 from sglang.srt.layers.moe.topk import TopKConfig, select_experts
+from sglang.srt.server_args import (
+    ServerArgs,
+    set_global_server_args_for_scheduler,
+)
 from sglang.srt.utils import is_hip
 
 _is_hip = is_hip()
@@ -202,6 +206,9 @@ class BenchmarkWorker:
         # Get the device ID to allocate tensors and kernels
         # on the respective GPU.
         self.device_id = int(ray.get_gpu_ids()[0])
+        # Required so get_moe_configs() inside the kernel can read
+        # enable_deterministic_inference from global server args.
+        set_global_server_args_for_scheduler(ServerArgs(model_path="dummy"))
 
     def benchmark(
         self,
@@ -359,6 +366,8 @@ def main(args: argparse.Namespace):
                 for config in search_space
                 if block_k % config["BLOCK_SIZE_K"] == 0
             ]
+        if args.max_configs is not None and args.max_configs > 0:
+            search_space = search_space[: args.max_configs]
 
         filename = get_config_filename(
             E,
@@ -453,6 +462,12 @@ if __name__ == "__main__":
     parser.add_argument("--batch-size", type=int, required=False)
     parser.add_argument("--tune", action="store_true")
     parser.add_argument("--disable-shared-experts-fusion", action="store_true")
+    parser.add_argument(
+        "--max-configs",
+        type=int,
+        default=None,
+        help="Smoke-test helper: limit search space to first N configs.",
+    )
     args = parser.parse_args()
 
     main(args)
