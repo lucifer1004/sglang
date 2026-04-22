@@ -380,3 +380,11 @@ class PyNcclCommunicator:
 
         self.disabled = old_disable
         self.stream = old_stream
+
+    def nccl_pause(self):
+        """Pause NCCL operations and release GPU memory (AMem NCCL plugin)."""
+        self.nccl.ncclPause(self.comm)
+
+    def nccl_resume(self):
+        """Resume NCCL operations after pause (AMem NCCL plugin)."""
+        self.nccl.ncclResume(self.comm)
