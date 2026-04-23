@@ -42,6 +42,7 @@ import logging
 import re
 import time
 from enum import Enum, auto
+from functools import lru_cache
 from http import HTTPStatus
 from itertools import chain
 from typing import TYPE_CHECKING, Any, ClassVar, List, Optional, Set, Tuple, Union
@@ -57,10 +58,7 @@ from sglang.srt.disaggregation.decode_schedule_batch_mixin import (
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.distributed.parallel_state import get_tensor_model_parallel_rank
 from sglang.srt.environ import envs
-from sglang.srt.mem_cache.allocator import (
-    BaseTokenToKVPoolAllocator,
-    SWATokenToKVPoolAllocator,
-)
+from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.chunk_cache import SWAChunkCache
 from sglang.srt.mem_cache.common import (
@@ -72,6 +70,7 @@ from sglang.srt.mem_cache.common import (
 from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
 from sglang.srt.metrics.collector import SchedulerMetricsCollector, TimeStats
 from sglang.srt.model_executor.forward_batch_info import (
@@ -79,6 +78,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
 )
+from sglang.srt.observability.metrics_collector import DPCooperationInfo
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs, get_global_server_args
@@ -91,13 +91,31 @@ _is_npu = is_npu()
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
+    from sglang.srt.observability.scheduler_metrics_mixin import PrefillStats
     from sglang.srt.speculative.eagle_info import EagleDraftInput
     from sglang.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
 
 INIT_INCREMENTAL_DETOKENIZATION_OFFSET = 5
 
+# Constant used as the base offset for MM (multimodal) pad values.
+MM_PAD_SHIFT_VALUE = 1_000_000
+
 
 logger = logging.getLogger(__name__)
+
+
+@lru_cache(maxsize=1)
+def sanity_check_mm_pad_shift_value(vocab_size: int) -> None:
+    if vocab_size > MM_PAD_SHIFT_VALUE:
+        raise ValueError(
+            f"Model vocab_size ({vocab_size}) exceeds MM_PAD_SHIFT_VALUE ({MM_PAD_SHIFT_VALUE}). "
+            f"MM pad_values may overlap with valid token IDs. "
+            f"Please increase MM_PAD_SHIFT_VALUE in schedule_batch.py."
+        )
+
+
+def _compute_pad_value(hash: int) -> int:
+    return MM_PAD_SHIFT_VALUE + (hash % (1 << 30))
 
 
 class BaseFinishReason:
@@ -192,6 +210,12 @@ class Modality(Enum):
         return [Modality.IMAGE, Modality.VIDEO, Modality.AUDIO]
 
 
+class MultimodalInputFormat(Enum):
+    NORMAL = auto()
+    PROCESSOR_OUTPUT = auto()
+    PRECOMPUTED_EMBEDDING = auto()
+
+
 @dataclasses.dataclass
 class MultimodalDataItem:
     """
@@ -206,6 +230,7 @@ class MultimodalDataItem:
     hash: int = None
     pad_value: int = None
     offsets: Optional[list] = None
+    format: MultimodalInputFormat = MultimodalInputFormat.NORMAL
 
     # the raw features returned by processor, e.g. pixel_values or audio_features
     feature: Union[torch.Tensor, np.ndarray] = None
@@ -255,7 +280,7 @@ class MultimodalDataItem:
                 hashed_feature = self.precomputed_embeddings
             self.hash = hash_feature(hashed_feature)
         assert self.hash is not None
-        self.pad_value = self.hash % (1 << 30)
+        self.pad_value = _compute_pad_value(self.hash)
 
     def is_modality(self, modality: Modality) -> bool:
         return self.modality == modality
@@ -276,6 +301,9 @@ class MultimodalDataItem:
         ...
         # TODO
 
+    def is_precomputed_embedding(self):
+        return self.format == MultimodalInputFormat.PRECOMPUTED_EMBEDDING
+
     @staticmethod
     def from_dict(obj: dict):
         kwargs = dict(obj)
@@ -291,6 +319,55 @@ class MultimodalDataItem:
         self.offsets += other.offsets
         self.hash = hash((self.hash, other.hash))
         self.set_pad_value()
+
+
+@dataclasses.dataclass
+class MultimodalProcessorOutput:
+    """Typed multimodal processor output before pad/hash materialization."""
+
+    mm_items: List[MultimodalDataItem]
+    input_ids: Optional[List[int]] = None
+
+    # image
+    im_token_id: Optional[int] = None
+    im_start_id: Optional[int] = None
+    im_end_id: Optional[int] = None
+    slice_start_id: Optional[int] = None
+    slice_end_id: Optional[int] = None
+
+    # video
+    video_token_id: Optional[int] = None
+
+    # audio
+    audio_token_id: Optional[int] = None
+    audio_start_id: Optional[int] = None
+    audio_end_id: Optional[int] = None
+
+    # Qwen2-VL related
+    mrope_positions: Optional[torch.Tensor] = None
+    mrope_position_delta: Optional[torch.Tensor] = None
+
+    # for transformers-compatibility
+    token_type_ids: Optional[torch.Tensor] = None
+
+    @staticmethod
+    def from_dict(d: dict) -> "MultimodalProcessorOutput":
+        return MultimodalProcessorOutput(
+            mm_items=d["mm_items"],
+            input_ids=d.get("input_ids"),
+            im_token_id=d.get("im_token_id"),
+            im_start_id=d.get("im_start_id"),
+            im_end_id=d.get("im_end_id"),
+            slice_start_id=d.get("slice_start_id"),
+            slice_end_id=d.get("slice_end_id"),
+            video_token_id=d.get("video_token_id"),
+            audio_token_id=d.get("audio_token_id"),
+            audio_start_id=d.get("audio_start_id"),
+            audio_end_id=d.get("audio_end_id"),
+            mrope_positions=d.get("mrope_positions"),
+            mrope_position_delta=d.get("mrope_position_delta"),
+            token_type_ids=d.get("token_type_ids"),
+        )
 
 
 @dataclasses.dataclass
@@ -320,6 +397,8 @@ class MultimodalInputs:
     # QWen2-VL related
     mrope_positions: Optional[torch.Tensor] = None
     mrope_position_delta: Optional[torch.Tensor] = None
+    mrope_position_delta_repeated_cache: Optional[torch.Tensor] = None
+    token_type_ids: Optional[torch.Tensor] = None
 
     @staticmethod
     def from_dict(obj: dict):
@@ -344,6 +423,7 @@ class MultimodalInputs:
             "audio_start_id",
             "audio_end_id",
             "audio_token_id",
+            "token_type_ids",
         ]
         for arg in optional_args:
             if arg in obj:
@@ -481,11 +561,17 @@ class OverEncodingContext:
         gram_tensor = torch.tensor(all_flat, dtype=torch.int64).to(
             device, non_blocking=True
         )
+        buffer_builder = cls()
+        input_ids_buffer = torch.tensor(
+            sum([buffer_builder.get_token_ids_buffer(r.fill_ids) for r in reqs], []),
+            dtype=torch.int64,
+        ).to(device, non_blocking=True)
         return cls(
             input_ids_grams=[
                 gram_tensor[i * n_tokens : (i + 1) * n_tokens]
                 for i in range(cls.NUM_GRAMS)
-            ]
+            ],
+            input_ids_buffer=input_ids_buffer,
         )
 
     @classmethod
@@ -518,10 +604,24 @@ class OverEncodingContext:
         gram_tensor = torch.tensor(all_grams, dtype=torch.int64).to(
             device, non_blocking=True
         )
+        buffer_builder = cls()
+        input_ids_buffer = torch.tensor(
+            sum(
+                [
+                    buffer_builder.get_token_ids_buffer(
+                        r.origin_input_ids + r.output_ids
+                    )
+                    for r in reqs
+                ],
+                [],
+            ),
+            dtype=torch.int64,
+        ).to(device, non_blocking=True)
         return cls(
             input_ids_grams=[
                 gram_tensor[i * bs : (i + 1) * bs] for i in range(cls.NUM_GRAMS)
-            ]
+            ],
+            input_ids_buffer=input_ids_buffer,
         )
 
     # ------------------------------------------------------------------
@@ -615,6 +715,28 @@ class OverEncodingContext:
 class Req:
     """The input and output status of a request."""
 
+    _COMPAT_DEFAULTS = {
+        "dllm_config": None,
+        "decode_batch_idx": 0,
+        "extend_batch_idx": 0,
+        "swa_evicted_seqlen": 0,
+        "cached_tokens": 0,
+        "cached_tokens_device": 0,
+        "cached_tokens_host": 0,
+        "cached_tokens_storage": 0,
+        "_cache_breakdown_computed": False,
+        "mamba_ping_pong_track_buffer": None,
+        "mamba_next_track_idx": None,
+        "mamba_last_track_seqlen": None,
+        "mamba_branching_seqlen": None,
+        "mamba_pool_idx": None,
+        "customized_info": None,
+        "spec_acceptance_histogram": None,
+        "require_reasoning": False,
+        "reasoning_tokens": 0,
+        "return_hidden_states_before_norm": False,
+    }
+
     def __init__(
         self,
         rid: str,
@@ -632,6 +754,7 @@ class Req:
         token_type_ids: List[int] = None,
         session_id: Optional[str] = None,
         custom_logit_processor: Optional[str] = None,
+        require_reasoning: bool = False,
         return_hidden_states: bool = False,
         return_routed_experts: bool = False,
         eos_token_ids: Optional[Set[int]] = None,
@@ -646,6 +769,7 @@ class Req:
         extra_key: Optional[str] = None,
         dimensions: Optional[int] = None,
         http_worker_ipc: Optional[str] = None,
+        **extra_fields,
     ):
         # Input and output info
         self.rid = rid
@@ -664,6 +788,8 @@ class Req:
         self.fill_ids = []
         self.session_id = session_id
         self.input_embeds = input_embeds
+        self.require_reasoning = require_reasoning
+        self.reasoning_tokens = 0
 
         # For req-level memory management
         self.kv_committed_len = 0
@@ -679,6 +805,19 @@ class Req:
 
         # For multi-http worker
         self.http_worker_ipc = http_worker_ipc
+
+        for key, value in extra_fields.items():
+            if key == "time_stats" and value is not None:
+                try:
+                    from sglang.srt.observability.req_time_stats import (
+                        SchedulerReqTimeStats,
+                    )
+
+                    if not hasattr(value, "set_wait_queue_entry_time"):
+                        value = SchedulerReqTimeStats.new_from_obj(value)
+                except Exception:
+                    pass
+            setattr(self, key, value)
 
         # Sampling info
         if isinstance(sampling_params.custom_params, dict):
@@ -703,6 +842,10 @@ class Req:
         # Memory pool info
         self.req_pool_idx: Optional[int] = None
         self.mamba_pool_idx: Optional[torch.Tensor] = None  # shape (1)
+        self.mamba_ping_pong_track_buffer: Optional[torch.Tensor] = None  # shape (2)
+        self.mamba_next_track_idx: Optional[int] = None  # 0 or 1
+        self.mamba_last_track_seqlen: Optional[int] = None
+        self.mamba_branching_seqlen: Optional[int] = None
 
         # Check finish
         self.tokenizer = None
@@ -752,6 +895,16 @@ class Req:
         self.cache_protected_len: int = 0
         # Physical-to-logical KV scale factor, set by init_next_round_input
         self._scale_seq_factor: int = 1
+        # Cached-token accounting
+        self.cached_tokens = 0
+        self.cached_tokens_device = 0
+        self.cached_tokens_host = 0
+        self.cached_tokens_storage = 0
+        self._cache_breakdown_computed = False
+        self.swa_evicted_seqlen = 0
+        self.extend_batch_idx = 0
+        self.decode_batch_idx = 0
+        self.spec_acceptance_histogram = []
 
         # Whether or not if it is chunked. It increments whenever
         # it is chunked, and decrement whenever chunked request is
@@ -817,6 +970,7 @@ class Req:
         self.hidden_states_tensor = None  # Note: use tensor instead of list to transfer hidden_states when PD + MTP
         self.output_topk_p = None
         self.output_topk_index = None
+        self.customized_info = None
 
         self.routed_experts: List[List[List[int]]] = []
 
@@ -877,6 +1031,23 @@ class Req:
         self.dllm_ids = []
         self.dllm_block_offset = 0
         self.dllm_config = dllm_config
+
+    def update_spec_acceptance_histogram(self, accepted_draft_tokens: int):
+        if len(self.spec_acceptance_histogram) <= accepted_draft_tokens:
+            self.spec_acceptance_histogram.extend(
+                [0]
+                * (accepted_draft_tokens - len(self.spec_acceptance_histogram) + 1)
+            )
+        self.spec_acceptance_histogram[accepted_draft_tokens] += 1
+
+    def __getattr__(self, name: str):
+        if name in self._COMPAT_DEFAULTS:
+            value = self._COMPAT_DEFAULTS[name]
+            if isinstance(value, list):
+                value = list(value)
+            object.__setattr__(self, name, value)
+            return value
+        raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
 
     @property
     def seqlen(self) -> int:
@@ -1299,9 +1470,15 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     global_num_tokens: Optional[List[int]] = None
     global_num_tokens_for_logprob: Optional[List[int]] = None
     is_extend_in_batch: bool = False
+    all_extend_in_batch: bool = False
     can_run_dp_cuda_graph: bool = False
     tbo_split_seq_index: Optional[int] = None
     global_forward_mode: Optional[ForwardMode] = None
+
+    # For mamba state tracking
+    mamba_track_indices: Optional[torch.Tensor] = None
+    mamba_track_mask: Optional[torch.Tensor] = None
+    mamba_track_seqlens: Optional[torch.Tensor] = None
 
     # For processing logprobs
     return_logprob: bool = False
@@ -1329,6 +1506,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     # For matryoshka embeddings
     dimensions: Optional[list[int]] = None
+
+    # Metrics
+    dp_cooperation_info: Optional[DPCooperationInfo] = None
+    prefill_stats: Optional[PrefillStats] = None
 
     # For split prefill
     split_index: int = 0
@@ -1925,6 +2106,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # FIXME: finally deprecate is_v2_eagle
         return self.enable_overlap and self.spec_algorithm.is_eagle()
 
+    @property
+    def is_spec_v2(self):
+        ret = self.enable_overlap and not self.spec_algorithm.is_none()
+        assert not ret or self.spec_algorithm.supports_spec_v2()
+        return ret
+
     def prepare_for_decode(self):
         scale = self._get_scale_seq_factor()
 
@@ -2007,6 +2194,47 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.extend_logprob_start_lens = [0] * bs
             self.extend_input_logprob_token_ids = None
 
+    def maybe_evict_swa(self):
+        if self.tree_cache.supports_swa():
+            sliding_window_size = self.tree_cache.sliding_window_size
+            server_args = get_global_server_args()
+
+            for idx, req in enumerate(self.reqs):
+                if self.forward_mode.is_decode():
+                    if req.decode_batch_idx % sliding_window_size == 1:
+                        self._evict_swa(req, req.seqlen - 1)
+                elif self.forward_mode.is_extend() and self.tree_cache.is_chunk_cache():
+                    pre_len = self.prefix_lens[idx]
+                    if self.enable_overlap:
+                        if req.extend_batch_idx < 2:
+                            continue
+                        pre_len = (
+                            pre_len - server_args.chunked_prefill_size
+                            if server_args.chunked_prefill_size > 0
+                            else pre_len
+                        )
+                    self._evict_swa(req, pre_len)
+
+    def _evict_swa(self, req: Req, pre_len: int):
+        assert self.tree_cache.supports_swa(), "prefix cache must support swa"
+        sliding_window_size = self.tree_cache.sliding_window_size
+
+        if req.cache_protected_len % self.tree_cache.page_size != 0:
+            return
+
+        new_swa_evicted_seqlen = (
+            (pre_len - req.cache_protected_len) // sliding_window_size
+        ) * sliding_window_size
+        new_swa_evicted_seqlen = max(new_swa_evicted_seqlen, req.swa_evicted_seqlen)
+        if new_swa_evicted_seqlen <= req.swa_evicted_seqlen:
+            return
+
+        free_slots = self.req_to_token_pool.req_to_token[
+            req.req_pool_idx, req.swa_evicted_seqlen : new_swa_evicted_seqlen
+        ]
+        self.token_to_kv_pool_allocator.free_swa(free_slots)
+        req.swa_evicted_seqlen = new_swa_evicted_seqlen
+
     def maybe_wait_verify_done(self):
         if self.is_v2_eagle:
             draft_input: EagleDraftInput = self.spec_info
@@ -2017,6 +2245,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self,
         chunked_req_to_exclude: Optional[Union[Req, List[Req]]] = None,
         keep_indices: Optional[List[int]] = None,
+        v1_spec_info_filtered: Optional[bool] = False,
     ):
         # FIXME(lsyin): used here to get the correct seq_lens
         # The batch has been launched but we need it verified to get correct next batch info
@@ -2060,7 +2289,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.orig_seq_lens = self.orig_seq_lens[keep_indices_device]
         self.out_cache_loc = None
         self.seq_lens_sum = self.seq_lens.sum().item()
-        self.output_ids = self.output_ids[keep_indices_device]
+        if self.output_ids is not None:
+            self.output_ids = self.output_ids[keep_indices_device]
+        self.mamba_track_indices = None
+        self.mamba_track_mask = None
+        self.mamba_track_seqlens = None
         self.return_logprob = any(req.return_logprob for req in self.reqs)
         if self.return_logprob:
             self.top_logprobs_nums = [self.top_logprobs_nums[i] for i in keep_indices]
@@ -2074,10 +2307,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         self.sampling_info.filter_batch(keep_indices, keep_indices_device)
         if self.spec_info:
-            if chunked_req_to_exclude is not None and len(chunked_req_to_exclude) > 0:
-                has_been_filtered = False
-            else:
-                has_been_filtered = True
+            has_been_filtered = v1_spec_info_filtered and not self.is_spec_v2
             self.spec_info.filter_batch(
                 new_indices=keep_indices_device,
                 has_been_filtered=has_been_filtered,
@@ -2170,6 +2400,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             global_num_tokens=self.global_num_tokens,
             global_num_tokens_for_logprob=self.global_num_tokens_for_logprob,
             is_extend_in_batch=self.is_extend_in_batch,
+            all_extend_in_batch=getattr(self, "all_extend_in_batch", False),
             can_run_dp_cuda_graph=self.can_run_dp_cuda_graph,
             tbo_split_seq_index=self.tbo_split_seq_index,
             global_forward_mode=self.global_forward_mode,
@@ -2189,6 +2420,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             spec_algorithm=self.spec_algorithm,
             spec_info=self.spec_info,
             hicache_consumer_index=self.hicache_consumer_index,
+            mamba_track_indices=self.mamba_track_indices,
+            mamba_track_mask=self.mamba_track_mask,
+            mamba_track_seqlens=self.mamba_track_seqlens,
             capture_hidden_mode=(
                 CaptureHiddenMode.FULL
                 if self.return_hidden_states
@@ -2207,6 +2441,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             dllm_config=self.dllm_config,
             reqs=self.reqs,
             has_grammar=self.has_grammar,
+            dp_cooperation_info=self.dp_cooperation_info,
+            prefill_stats=self.prefill_stats,
             oe_context=self.oe_context,
             scale_seq_factor=scale,
         )
@@ -2316,9 +2552,20 @@ class ModelWorkerBatch:
     # If set, the output of the batch contains the hidden states of the run.
     capture_hidden_mode: CaptureHiddenMode = None
     hicache_consumer_index: int = -1
+    all_extend_in_batch: bool = False
+    return_hidden_states_before_norm: bool = False
+
+    # For mamba state tracking
+    mamba_track_indices: Optional[torch.Tensor] = None
+    mamba_track_mask: Optional[torch.Tensor] = None
+    mamba_track_seqlens: Optional[torch.Tensor] = None
 
     # For matryoshka embeddings
     dimensions: Optional[list[int]] = None
+
+    # Metrics
+    dp_cooperation_info: Optional[DPCooperationInfo] = None
+    prefill_stats: Optional[PrefillStats] = None
 
     # Whether this batch is prefill-only (no token generation needed)
     is_prefill_only: bool = False

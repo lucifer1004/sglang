@@ -14,16 +14,23 @@ from sglang.srt.function_call.core_types import ToolCallItem
 from sglang.srt.function_call.deepseekv3_detector import DeepSeekV3Detector
 from sglang.srt.function_call.deepseekv31_detector import DeepSeekV31Detector
 from sglang.srt.function_call.deepseekv32_detector import DeepSeekV32Detector
+from sglang.srt.function_call.gigachat3_detector import GigaChat3Detector
 from sglang.srt.function_call.glm4_moe_detector import Glm4MoeDetector
+from sglang.srt.function_call.glm47_moe_detector import Glm47MoeDetector
 from sglang.srt.function_call.gpt_oss_detector import GptOssDetector
+from sglang.srt.function_call.hermes_detector import HermesDetector
+from sglang.srt.function_call.internlm_detector import InternlmDetector
 from sglang.srt.function_call.kimik2_detector import KimiK2Detector
+from sglang.srt.function_call.lfm2_detector import Lfm2Detector
 from sglang.srt.function_call.llama32_detector import Llama32Detector
+from sglang.srt.function_call.mimo_detector import MiMoDetector
 from sglang.srt.function_call.minimax_m2 import MinimaxM2Detector
 from sglang.srt.function_call.mistral_detector import MistralDetector
 from sglang.srt.function_call.pythonic_detector import PythonicDetector
 from sglang.srt.function_call.qwen3_coder_detector import Qwen3CoderDetector
 from sglang.srt.function_call.qwen25_detector import Qwen25Detector
 from sglang.srt.function_call.step3_detector import Step3Detector
+from sglang.srt.function_call.trinity_detector import TrinityDetector
 from sglang.srt.function_call.utils import get_json_schema_constraint
 
 logger = logging.getLogger(__name__)
@@ -44,16 +51,24 @@ class FunctionCallParser:
         "deepseekv32": DeepSeekV32Detector,
         "glm": Glm4MoeDetector,
         "glm45": Glm4MoeDetector,
+        "glm47": Glm47MoeDetector,
         "gpt-oss": GptOssDetector,
         "kimi_k2": KimiK2Detector,
+        "lfm2": Lfm2Detector,
         "llama3": Llama32Detector,
+        "mimo": MiMoDetector,
         "mistral": MistralDetector,
         "pythonic": PythonicDetector,
         "qwen": Qwen25Detector,
         "qwen25": Qwen25Detector,
         "qwen3_coder": Qwen3CoderDetector,
         "step3": Step3Detector,
+        "step3p5": Qwen3CoderDetector,
         "minimax-m2": MinimaxM2Detector,
+        "trinity": TrinityDetector,
+        "interns1": InternlmDetector,
+        "hermes": HermesDetector,
+        "gigachat3": GigaChat3Detector,
     }
 
     def __init__(self, tools: List[Tool], tool_call_parser: str):
@@ -169,7 +184,9 @@ class FunctionCallParser:
         )
 
     def get_structure_constraint(
-        self, tool_choice: Union[ToolChoice, Literal["auto", "required"]]
+        self,
+        tool_choice: Union[ToolChoice, Literal["auto", "required"]],
+        parallel_tool_calls: bool = True,
     ) -> Optional[ToolCallConstraint]:
         """
         Returns the appropriate structure constraint for tool calls based on the tool_choice.
@@ -195,5 +212,7 @@ class FunctionCallParser:
             tag = self.get_structure_tag()
             return ("structural_tag", tag)
         elif tool_choice == "required" or isinstance(tool_choice, ToolChoice):
-            json_schema = get_json_schema_constraint(self.tools, tool_choice)
+            json_schema = get_json_schema_constraint(
+                self.tools, tool_choice, parallel_tool_calls=parallel_tool_calls
+            )
             return ("json_schema", json_schema)

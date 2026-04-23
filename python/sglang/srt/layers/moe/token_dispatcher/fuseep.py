@@ -5,6 +5,7 @@ from typing import NamedTuple
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.moe.token_dispatcher.base import (
     BaseDispatcher,
     CombineInput,
@@ -15,7 +16,6 @@ from sglang.srt.layers.moe.token_dispatcher.base import (
 from sglang.srt.layers.moe.token_dispatcher.deepep import DeepEPBuffer
 from sglang.srt.layers.moe.topk import TopKOutput
 from sglang.srt.layers.moe.utils import DeepEPMode
-from sglang.srt.utils import get_int_env_var
 
 logger = logging.getLogger(__name__)
 
@@ -62,8 +62,8 @@ class NpuFuseEPDispatcher(BaseDispatcher):
         self.deepep_mode = deepep_mode
 
         self.params_bytes = 2
-        self.num_max_dispatch_tokens_per_rank = get_int_env_var(
-            "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK", 128
+        self.num_max_dispatch_tokens_per_rank = (
+            envs.SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get()
         )
 
     def dispatch(
@@ -79,6 +79,7 @@ class NpuFuseEPDispatcher(BaseDispatcher):
             gmm2_weight_scale=kwargs["gmm2_weight_scale"],
             num_max_dispatch_tokens_per_rank=self.num_max_dispatch_tokens_per_rank,
             num_experts=self.num_experts,
+            fuse_mode=envs.SGLANG_NPU_FUSED_MOE_MODE.get(),
         )
         return FuseEPDispatchOutput(hidden_states)
 

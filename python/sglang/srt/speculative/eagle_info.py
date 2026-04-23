@@ -1,16 +1,13 @@
 import logging
 from copy import copy
 from dataclasses import dataclass
-from typing import ClassVar, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
-from sglang.jit_kernel.ngram_ops import (
-    assign_ngram_input_ids_draft_extend_after_decode,
-    build_ngram_with_target_verify,
-)
 import torch
 import torch.nn.functional as F
 
 from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.sampler import apply_custom_logit_processor
@@ -42,13 +39,7 @@ from sglang.srt.speculative.spec_utils import (
     get_src_tgt_cache_loc,
     get_target_cache_loc,
 )
-from sglang.srt.utils import is_cuda, is_npu, next_power_of_2
-from sglang.srt.utils.over_encoding_utils import (
-    assign_ngram_buffer,
-    assign_ngram_input_ids_draft_extend,
-)
-
-_is_npu = is_npu()
+from sglang.srt.utils import is_cuda, next_power_of_2
 
 if is_cuda():
     from sgl_kernel import (
@@ -77,6 +68,9 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
     seq_lens_cpu: torch.Tensor
     grammar: BaseGrammarObject = None
 
+    # Shape info for padding
+    num_tokens_per_req: int = -1
+
     def __post_init__(self):
         super().__init__(SpecInputType.EAGLE_VERIFY)
 
@@ -85,22 +79,18 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
 
     @classmethod
     def create_idle_input(cls, topk: int, spec_steps: int, num_verify_tokens: int):
-        if not _is_npu:
-            device = "cuda"
-        else:
-            device = "npu"
         return cls(
-            draft_token=torch.empty((0,), dtype=torch.long, device=device),
-            custom_mask=torch.full((0,), True, dtype=torch.bool, device=device),
-            positions=torch.empty((0,), dtype=torch.int64, device=device),
+            draft_token=torch.empty((0,), dtype=torch.long, device="cuda"),
+            custom_mask=torch.full((0,), True, dtype=torch.bool, device="cuda"),
+            positions=torch.empty((0,), dtype=torch.int64, device="cuda"),
             retrive_index=torch.full(
-                (0, num_verify_tokens), -1, dtype=torch.long, device=device
+                (0, num_verify_tokens), -1, dtype=torch.long, device="cuda"
             ),
             retrive_next_token=torch.full(
-                (0, num_verify_tokens), -1, dtype=torch.long, device=device
+                (0, num_verify_tokens), -1, dtype=torch.long, device="cuda"
             ),
             retrive_next_sibling=torch.full(
-                (0, num_verify_tokens), -1, dtype=torch.long, device=device
+                (0, num_verify_tokens), -1, dtype=torch.long, device="cuda"
             ),
             retrive_cum_len=None,
             topk=topk,
@@ -117,14 +107,13 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             return
 
         batch.input_ids = self.draft_token
+
         if page_size == 1:
             batch.out_cache_loc = alloc_token_slots(
                 batch.tree_cache,
                 len(batch.input_ids),
             )
             end_offset = batch.seq_lens + self.draft_token_num
-            for req in batch.reqs:
-                req.kv_allocated_len += 1
         else:
             prefix_lens = batch.seq_lens
             prefix_lens_cpu = batch.seq_lens_cpu
@@ -155,25 +144,18 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             batch.out_cache_loc,
             bs,
         )
-        if getattr(batch, "oe_context", None) is not None:
-            n_gram_tensors = [
-                torch.empty_like(self.draft_token)
-                for _ in batch.oe_context.input_ids_grams
-            ]
-            for idx, gram_tensor in enumerate(n_gram_tensors):
-                n = idx + 2
-                build_ngram_with_target_verify(
-                    gram_tensor,
-                    batch.oe_context.input_ids_buffer,
-                    self.draft_token,
-                    self.custom_mask,
-                    self.positions,
-                    batch.seq_lens,
-                    n,
-                    self.draft_token_num,
-                    batch.oe_context.buffer_size,
-                )
-                batch.oe_context.set_gram(n, gram_tensor)
+
+        if get_global_server_args().enable_mamba_extra_buffer():
+            batch.mamba_track_indices = torch.tensor(
+                [
+                    req.mamba_ping_pong_track_buffer[req.mamba_next_track_idx]
+                    for req in batch.reqs
+                ],
+                dtype=torch.int64,
+                device=batch.device,
+            )
+            batch.mamba_track_mask = None
+            batch.mamba_track_seqlens = None
 
     def generate_attn_arg_prefill(
         self,
@@ -212,6 +194,25 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             kv_indices,
             req_to_token.size(1),
         )
+        mask_numel = (
+            paged_kernel_lens_sum * self.draft_token_num
+            + (self.draft_token_num**2) * batch_size
+        )
+        if self.custom_mask.numel() < mask_numel:
+            # FIXME(attn): temporary fix for custom mask padding with cuda graph
+            self.custom_mask = torch.cat(
+                [
+                    self.custom_mask,
+                    torch.full(
+                        (mask_numel - self.custom_mask.numel(),),
+                        True,
+                        dtype=torch.bool,
+                        device=device,
+                    ),
+                ],
+                dim=0,
+            )
+
         return kv_indices, cum_kv_seq_len, qo_indptr, self.custom_mask
 
     def verify(
@@ -283,15 +284,15 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             or sampling_info.logit_bias is not None
         ):
             # This is a relaxed version of penalties for speculative decoding.
-            linear_penalty = torch.zeros(
-                (bs, logits_output.next_token_logits.shape[1]),
-                dtype=torch.float32,
-                device=batch.device,
+            sampling_info.penalizer_orchestrator.apply(
+                logits_output.next_token_logits, repeat=self.draft_token_num
             )
-            sampling_info.apply_logits_bias(linear_penalty)
-            logits_output.next_token_logits.add_(
-                torch.repeat_interleave(linear_penalty, self.draft_token_num, dim=0)
-            )
+            if sampling_info.logit_bias is not None:
+                logits_output.next_token_logits.add_(
+                    torch.repeat_interleave(
+                        sampling_info.logit_bias, self.draft_token_num, dim=0
+                    )
+                )
 
         # Apply grammar mask
         if vocab_mask is not None:
@@ -308,7 +309,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 "Falling back to greedy verification."
             )
 
-        if is_all_greedy or not TREE_SPEC_KERNEL_AVAILABLE or _is_npu:
+        if is_all_greedy or not TREE_SPEC_KERNEL_AVAILABLE:
             target_predict = torch.argmax(logits_output.next_token_logits, dim=-1)
             target_predict = target_predict.reshape(bs, self.draft_token_num)
             predict, accept_index, accept_length = verify_tree_greedy_func(
@@ -338,7 +339,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                     sampling_info.top_ks, self.draft_token_num, dim=0
                 ),
             )  # (bs * draft_token_num, vocab_size)
-            if not torch.all(sampling_info.top_ps == 1.0):
+            if sampling_info.need_top_p_sampling:
                 target_probs = top_p_renorm_prob(
                     target_probs,
                     torch.repeat_interleave(
@@ -395,9 +396,11 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
         # Iterate every accepted token and check if req has finished after append the token
         # should be checked BEFORE free kv cache slots
         for i, (req, accept_index_row) in enumerate(zip(batch.reqs, accept_index_cpu)):
+            num_accepted = 0
             for j, idx in enumerate(accept_index_row):
                 if idx == -1:
                     break
+                num_accepted += 1
                 id = predict_cpu[idx]
                 req.output_ids.append(id)
                 req.check_finished()
@@ -415,6 +418,9 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                                 f"{i=}, {req=}\n" f"{accept_index=}\n" f"{predict=}\n"
                             )
                             raise e
+            # Update KV cache tracking for the accepted tokens
+            req.kv_committed_len += num_accepted
+            req.kv_allocated_len = req.kv_committed_len
             if not req.finished():
                 unfinished_index.append(i)
                 if idx == -1:
@@ -422,9 +428,10 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 else:
                     unfinished_accept_index.append(accept_index[i])
             req.spec_verify_ct += 1
-            req.spec_accepted_tokens += (
-                sum(1 for idx in accept_index_row if idx != -1) - 1
-            )
+            accepted_draft_tokens = sum(1 for idx in accept_index_row if idx != -1) - 1
+            req.spec_accepted_tokens += accepted_draft_tokens
+            req.update_spec_acceptance_histogram(accepted_draft_tokens)
+
         if has_finished:
             accept_length = (accept_index != -1).sum(dim=1) - 1
 
@@ -442,9 +449,6 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
         if page_size == 1:
             # TODO: boolean array index leads to a device sync. Remove it.
             token_to_kv_pool_allocator.free(batch.out_cache_loc[evict_mask])
-            for i, req in enumerate(batch.reqs):
-                req.kv_committed_len += accept_length_list[i] + 1
-                req.kv_allocated_len = req.kv_committed_len
         else:
             if self.topk == 1:
                 # Only evict full empty page. Do not evict partial empty page
@@ -456,9 +460,6 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                     next_power_of_2(self.draft_token_num),
                 )
                 token_to_kv_pool_allocator.free(batch.out_cache_loc[evict_mask])
-                for i, req in enumerate(batch.reqs):
-                    req.kv_committed_len += accept_length_list[i] + 1
-                    req.kv_allocated_len = req.kv_committed_len
             else:
                 # Shift the accepted tokens to the beginning.
                 # Only evict the last part
@@ -581,8 +582,6 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                         next_power_of_2(bs),
                         next_power_of_2(self.draft_token_num),
                     )
-                if batch.oe_context:
-                    batch.oe_context.filter_buffer(unfinished_index_device)
 
                 draft_input = EagleDraftInput(
                     hidden_states=batch.spec_info.hidden_states[
@@ -596,9 +595,6 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                     req_pool_indices_for_draft_extend=batch.req_pool_indices[
                         unfinished_index_device
                     ],
-                )
-                draft_input.model_specific_states = getattr(
-                    batch.spec_info, "model_specific_states", None
                 )
             else:
                 draft_input = EagleDraftInput.create_idle_input(
@@ -620,9 +616,6 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
 
 @dataclass
 class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
-    # Constant: alloc length per decode step
-    ALLOC_LEN_PER_DECODE: ClassVar[int] = None
-
     # The inputs for decode
     # shape: (b, topk)
     topk_p: torch.Tensor = None
@@ -643,8 +636,8 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
     kv_indices: torch.Tensor = None
 
     # Shape info for padding
-    num_tokens_per_batch: int = -1
-    num_tokens_for_logprob_per_batch: int = -1
+    num_tokens_per_req: int = -1
+    num_tokens_for_logprob_per_req: int = -1
 
     # Inputs for draft extend
     # shape: (b,)
@@ -661,7 +654,7 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
         super().__init__(SpecInputType.EAGLE_DRAFT)
 
     def get_spec_adjust_token_coefficient(self) -> Tuple[int, int]:
-        return self.num_tokens_per_batch, self.num_tokens_for_logprob_per_batch
+        return self.num_tokens_per_req, self.num_tokens_for_logprob_per_req
 
     def prepare_for_extend(self, batch: ScheduleBatch):
 
@@ -678,28 +671,6 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
                 (input_ids[1:], self.verified_id[i].reshape(1))
             )
             pt += extend_len
-
-        if hasattr(batch, "oe_context") and batch.oe_context is not None:
-            for idx, gram_tensor in enumerate(batch.oe_context.input_ids_grams):
-                n = idx + 2
-                assign_ngram_input_ids_draft_extend(
-                    batch.input_ids,
-                    gram_tensor,
-                    batch.extend_lens,
-                    n,
-                )
-            buffer = torch.empty(
-                batch.batch_size() * batch.oe_context.buffer_size,
-                device=batch.input_ids.device,
-                dtype=batch.input_ids.dtype,
-            )
-            assign_ngram_buffer(
-                batch.input_ids,
-                buffer,
-                batch.seq_lens,
-                batch.oe_context.buffer_size,
-            )
-            batch.oe_context.input_ids_buffer = buffer
 
     @classmethod
     def create_idle_input(
@@ -753,27 +724,6 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
             next_power_of_2(max(speculative_num_steps + 1, len(batch.seq_lens))),
         )
 
-        batch.input_ids = batch.input_ids.to(torch.int64)
-        if batch.oe_context is not None:
-            buffer = batch.oe_context.input_ids_buffer
-            buffer_size = batch.oe_context.buffer_size
-            accept_length = self.accept_length.to(torch.int32)
-            num_grams = len(batch.oe_context.input_ids_grams)
-            for idx in range(num_grams):
-                n = idx + 2
-                n_gram = torch.empty_like(batch.input_ids, dtype=torch.int64)
-                update_buffer = idx == num_grams - 1
-                assign_ngram_input_ids_draft_extend_after_decode(
-                    batch.input_ids,
-                    buffer,
-                    n_gram,
-                    accept_length,
-                    n,
-                    buffer_size,
-                    update_buffer,
-                )
-                batch.oe_context.set_gram(n, n_gram)
-
     def generate_attn_arg_prefill(
         self,
         req_pool_indices: torch.Tensor,
@@ -811,13 +761,17 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
             self.future_indices.indices = self.future_indices.indices[new_indices]
             return
 
+        strict_check = envs.SGLANG_SPEC_ENABLE_STRICT_FILTER_CHECK.get()
         if has_been_filtered:
             # in eagle_utils.py:verify, we have already filtered the batch by `unfinished_index`
             # therefore, we don't need to filter the batch again in scheduler
+            error_msg = f"length of new_indices: {len(new_indices)} != length of topk_p: {len(self.topk_p)}, this should not happen"
             if len(new_indices) != len(self.topk_p):
-                logger.warning(
-                    f"length of new_indices: {len(new_indices)} != length of topk_p: {len(self.topk_p)}, this should not happen"
-                )
+                if strict_check:
+                    raise ValueError(error_msg)
+                else:
+                    logger.warning(error_msg)
+
             self.topk_p = self.topk_p[: len(new_indices)]
             self.topk_index = self.topk_index[: len(new_indices)]
             self.hidden_states = self.hidden_states[: len(new_indices)]
@@ -844,7 +798,6 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
             self.verified_id = spec_info.verified_id
             self.topk_p = spec_info.topk_p
             self.topk_index = spec_info.topk_index
-            self.model_specific_states = getattr(spec_info, "model_specific_states", None)
             return
         if spec_info.hidden_states is None:
             return
@@ -854,8 +807,6 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
         self.verified_id = torch.cat([self.verified_id, spec_info.verified_id], axis=0)
         self.topk_p = torch.cat([self.topk_p, spec_info.topk_p])
         self.topk_index = torch.cat([self.topk_index, spec_info.topk_index])
-        if getattr(self, "model_specific_states", None) is None:
-            self.model_specific_states = getattr(spec_info, "model_specific_states", None)
 
 
 @dataclass

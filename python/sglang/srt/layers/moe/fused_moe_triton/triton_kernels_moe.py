@@ -70,7 +70,6 @@ def triton_kernel_moe_forward(
         a1_scale=a1_scale,
         a2_scale=a2_scale,
         block_shape=block_shape,
-        swiglu_clamp_limit=moe_runner_config.swiglu_clamp_limit,
     )
 
 
@@ -94,7 +93,6 @@ def triton_kernel_fused_experts(
     a1_scale: Optional[torch.Tensor] = None,
     a2_scale: Optional[torch.Tensor] = None,
     block_shape: Optional[list[int]] = None,
-    swiglu_clamp_limit: Optional[float] = None,
 ) -> torch.Tensor:
 
     assert use_fp8_w8a8 is False, "use_fp8_w8a8 is not supported"
@@ -146,13 +144,7 @@ def triton_kernel_fused_experts(
     )
 
     if activation == "silu":
-        if swiglu_clamp_limit is not None and swiglu_clamp_limit > 0:
-            cache_view = intermediate_cache1.view(-1, N)
-            gate = torch.nn.functional.silu(cache_view[:, :N // 2]).clamp_(max=swiglu_clamp_limit)
-            up = cache_view[:, N // 2:].clamp(min=-swiglu_clamp_limit, max=swiglu_clamp_limit)
-            intermediate_cache2 = gate * up
-        else:
-            silu_and_mul(intermediate_cache1.view(-1, N), intermediate_cache2)
+        silu_and_mul(intermediate_cache1.view(-1, N), intermediate_cache2)
     elif activation == "gelu":
         gelu_and_mul(intermediate_cache1.view(-1, N), intermediate_cache2)
     else:
@@ -222,7 +214,6 @@ def triton_kernel_moe_with_bias_forward(
         block_shape=block_shape,
         gemm1_alpha=moe_runner_config.gemm1_alpha,
         gemm1_clamp_limit=moe_runner_config.gemm1_clamp_limit,
-        swiglu_clamp_limit=moe_runner_config.swiglu_clamp_limit,
     )
 
 
@@ -251,7 +242,6 @@ def triton_kernel_fused_experts_with_bias(
     block_shape: Optional[list[int]] = None,
     gemm1_alpha: Optional[float] = None,
     gemm1_clamp_limit: Optional[float] = None,
-    swiglu_clamp_limit: Optional[float] = None,
 ) -> torch.Tensor:
     assert use_fp8_w8a8 is False, "use_fp8_w8a8 is not supported"
     assert per_channel_quant is False, "per_channel_quant is not supported"
@@ -281,7 +271,9 @@ def triton_kernel_fused_experts_with_bias(
     # feature check
     assert inplace is False, "Inplace is not supported in new triton MoE kernel"
 
-    E, _, _ = w1.shape
+    M, K = hidden_states.shape
+    E, _, N = w1.shape
+    n_expts_act = routing_data.n_expts_act
 
     if global_num_experts == -1:
         global_num_experts = E
@@ -296,44 +288,41 @@ def triton_kernel_fused_experts_with_bias(
         w2, w2_flex = quantize(w2, "bf16", device, **optg)
         w2_pcg = PrecisionConfig(flex_ctx=FlexCtx(rhs_data=w2_flex))
 
-    if swiglu_clamp_limit is not None and swiglu_clamp_limit > 0:
-        intermediate_raw = matmul_ogs(
-            hidden_states,
-            w1,
-            b1,
-            routing_data,
-            gather_indx=gather_indx,
-            precision_config=w1_pcg,
-            gammas=routing_data.gate_scal if apply_router_weight_on_input else None,
-        )
-        N = intermediate_raw.shape[-1]
-        gate = torch.nn.functional.silu(intermediate_raw[:, :N // 2]).clamp_(max=swiglu_clamp_limit)
-        up = intermediate_raw[:, N // 2:].clamp(min=-swiglu_clamp_limit, max=swiglu_clamp_limit)
-        intermediate_cache = gate * up
-    else:
-        act = FusedActivation(
-            FnSpecs("swiglu", swiglu_fn, ("alpha", "limit")),
-            (gemm1_alpha, gemm1_clamp_limit),
-            2,
-        )
+    act = FusedActivation(
+        FnSpecs("swiglu", swiglu_fn, ("alpha", "limit")),
+        (gemm1_alpha, gemm1_clamp_limit),
+        2,
+    )
 
-        intermediate_cache = matmul_ogs(
-            hidden_states,
-            w1,
-            b1,
-            routing_data,
-            gather_indx=gather_indx,
-            precision_config=w1_pcg,
-            gammas=routing_data.gate_scal if apply_router_weight_on_input else None,
-            fused_activation=act,
-        )
+    intermediate_cache = torch.empty(
+        (1, M * n_expts_act, N // 2),
+        device=hidden_states.device,
+        dtype=hidden_states.dtype,
+    )
+    output = torch.empty(
+        (1, M, K), device=hidden_states.device, dtype=hidden_states.dtype
+    )
 
-    return matmul_ogs(
-        intermediate_cache,
+    matmul_ogs(
+        hidden_states,
+        w1,
+        b1,
+        routing_data,
+        gather_indx=gather_indx,
+        precision_config=w1_pcg,
+        gammas=routing_data.gate_scal if apply_router_weight_on_input else None,
+        fused_activation=act,
+        y=intermediate_cache,
+    )
+
+    matmul_ogs(
+        intermediate_cache.view(M * n_expts_act, N // 2),
         w2,
         b2,
         routing_data,
         scatter_indx=scatter_indx,
         precision_config=w2_pcg,
         gammas=None if apply_router_weight_on_input else routing_data.gate_scal,
+        y=output,
     )
+    return output.view(M, K)

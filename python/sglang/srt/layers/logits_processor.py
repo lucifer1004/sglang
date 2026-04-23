@@ -104,6 +104,11 @@ class LogitsProcessorOutput:
     ## Part 4: Diffusion LLM only.
     full_logits: Optional[torch.Tensor] = None
 
+    ## Part 5: Customized Info
+    customized_info: Optional[Dict[str, List[Any]]] = None
+
+    mm_input_embeds: Optional[torch.Tensor] = None
+
 
 @dataclasses.dataclass
 class LogitsMetadata:
@@ -276,9 +281,9 @@ class LogitsProcessor(nn.Module):
         self.return_full_logits = return_full_logits
 
         # enable chunked logprobs processing
-        self.enable_logprobs_chunk = envs.SGLANG_ENABLE_LOGITS_PROCESSER_CHUNK.value
+        self.enable_logprobs_chunk = envs.SGLANG_ENABLE_LOGITS_PROCESSER_CHUNK.get()
         # chunk size for logprobs processing
-        self.logprobs_chunk_size = envs.SGLANG_LOGITS_PROCESSER_CHUNK_SIZE.value
+        self.logprobs_chunk_size = envs.SGLANG_LOGITS_PROCESSER_CHUNK_SIZE.get()
 
     def compute_logprobs_for_multi_item_scoring(
         self,

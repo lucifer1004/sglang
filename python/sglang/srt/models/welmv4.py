@@ -1257,6 +1257,7 @@ class Qwen2MoeDecoderLayer(nn.Module):
             num_layers=config.num_hidden_layers,
             is_layer_sparse=self.is_layer_sparse,
             is_previous_layer_sparse=is_previous_layer_sparse,
+            is_next_layer_sparse=True,
         )
 
         if self.is_layer_sparse:

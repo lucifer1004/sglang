@@ -34,7 +34,6 @@ from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.utils.common import (
     LORA_TARGET_ALL_MODULES,
     SUPPORTED_LORA_TARGET_MODULES,
-    configure_ipv6,
     cpu_has_amx_support,
     get_bool_env_var,
     get_device,
@@ -48,20 +47,23 @@ from sglang.srt.utils.common import (
     is_hopper_with_cuda_12_3,
     is_no_spec_infer_or_topk_one,
     is_npu,
-    is_port_available,
     is_remote_url,
     is_sm90_supported,
     is_sm100_supported,
     is_sm120_supported,
     is_triton_kernels_available,
-    is_valid_ipv6_address,
     json_list_type,
     nullable_str,
     parse_connector_type,
-    wait_port_available,
     xpu_has_xmx_support,
 )
 from sglang.srt.utils.hf_transformers_utils import check_gguf_file, get_config
+from sglang.srt.utils.network import (
+    configure_ipv6,
+    is_port_available,
+    is_valid_ipv6_address,
+    wait_port_available,
+)
 from sglang.utils import is_in_ci
 
 logger = logging.getLogger(__name__)
@@ -339,6 +341,8 @@ class ServerArgs:
     tool_call_parser: Optional[str] = None
     tool_server: Optional[str] = None
     sampling_defaults: str = "model"
+    encoder_only: bool = False
+    language_only: bool = False
 
     # Data parallelism
     dp_size: int = 1
@@ -355,6 +359,8 @@ class ServerArgs:
     # Model override args in JSON
     json_model_override_args: str = "{}"
     preferred_sampling_params: Optional[str] = None
+    decrypted_config_file: Optional[str] = None
+    decrypted_draft_config_file: Optional[str] = None
 
     # LoRA
     enable_lora: Optional[bool] = None
@@ -392,6 +398,7 @@ class ServerArgs:
     speculative_accept_threshold_acc: float = 1.0
     speculative_token_map: Optional[str] = None
     speculative_attention_mode: str = "prefill"
+    speculative_draft_model_quantization: Optional[str] = None
     speculative_moe_runner_backend: Optional[str] = None
 
     # Speculative decoding (ngram)
@@ -402,6 +409,7 @@ class ServerArgs:
     speculative_ngram_match_type: Literal["BFS", "PROB"] = "BFS"
     speculative_ngram_branch_length: int = 18
     speculative_ngram_capacity: int = 10 * 1000 * 1000
+    enable_multi_layer_eagle: bool = False
 
     # Expert parallelism
     ep_size: int = 1
@@ -596,6 +604,83 @@ class ServerArgs:
     enable_over_encoding: bool = False
     enable_welm_kv_mirror_opt: bool = False
     prepare_n_gram_inputs: bool = False
+
+    # Compatibility defaults for upstream v0.5.10.post1 fields that this branch
+    # does not customize directly but newer launch/runtime paths expect to exist.
+    ssl_keyfile: Optional[str] = None
+    ssl_certfile: Optional[str] = None
+    ssl_ca_certs: Optional[str] = None
+    ssl_keyfile_password: Optional[str] = None
+    enable_ssl_refresh: bool = False
+    rl_quant_profile: Optional[str] = None
+    enable_dynamic_chunking: bool = False
+    prefill_max_requests: Optional[int] = None
+    disable_priority_preemption: bool = False
+    default_priority_value: Optional[int] = None
+    enable_prefill_delayer: bool = False
+    prefill_delayer_max_delay_passes: int = 30
+    prefill_delayer_token_usage_low_watermark: Optional[float] = None
+    prefill_delayer_forward_passes_buckets: Optional[List[float]] = None
+    prefill_delayer_wait_seconds_buckets: Optional[List[float]] = None
+    pp_async_batch_depth: int = 0
+    stream_response_default_include_usage: bool = False
+    incremental_streaming_output: bool = False
+    enable_streaming_session: bool = False
+    soft_watchdog_timeout: Optional[float] = None
+    model_checksum: Optional[str] = None
+    use_ray: bool = False
+    custom_sigquit_handler: Optional[Callable] = None
+    log_requests_format: str = "text"
+    log_requests_target: Optional[List[str]] = None
+    uvicorn_access_log_exclude_prefixes: List[str] = dataclasses.field(
+        default_factory=list
+    )
+    enable_mfu_metrics: bool = False
+    extra_metric_labels: Optional[Dict[str, str]] = None
+    admin_api_key: Optional[str] = None
+    hf_chat_template_name: Optional[str] = None
+    attn_cp_size: int = 1
+    moe_dp_size: int = 1
+    enable_lora_overlap_loading: Optional[bool] = None
+    experts_shared_outer_loras: Optional[bool] = None
+    fp8_gemm_runner_backend: str = "auto"
+    fp4_gemm_runner_backend: str = "auto"
+    disable_flashinfer_autotune: bool = False
+    mamba_backend: str = "triton"
+    speculative_draft_attention_backend: Optional[str] = None
+    speculative_moe_a2a_backend: Optional[str] = None
+    speculative_ngram_max_trie_depth: int = 18
+    enforce_disable_flashinfer_allreduce_fusion: bool = False
+    enable_aiter_allreduce_fusion: bool = False
+    enable_elastic_expert_backup: bool = False
+    mamba_scheduler_strategy: str = "auto"
+    mamba_track_interval: int = 256
+    linear_attn_backend: str = "triton"
+    linear_attn_decode_backend: Optional[str] = None
+    linear_attn_prefill_backend: Optional[str] = None
+    enable_hisparse: bool = False
+    hisparse_config: Optional[str] = None
+    dllm_algorithm_config: Optional[str] = None
+    pre_warm_nccl: bool = False
+    disable_piecewise_cuda_graph: bool = False
+    enforce_piecewise_cuda_graph: bool = False
+    gc_threshold: Optional[List[int]] = None
+    nsa_prefill_cp_mode: str = "round-robin-split"
+    enable_fused_qk_norm_rope: bool = False
+    enable_precise_embedding_interpolation: bool = False
+    enable_fused_moe_sum_all_reduce: bool = False
+    enable_prefill_context_parallel: bool = False
+    prefill_cp_mode: str = "in-seq-split"
+    encoder_transfer_backend: str = "mooncake"
+    encoder_urls: List[str] = dataclasses.field(default_factory=list)
+    enable_adaptive_dispatch_to_encoder: bool = False
+    remote_instance_weight_loader_backend: Optional[str] = None
+    remote_instance_weight_loader_start_seed_via_transfer_engine: bool = False
+    engine_info_bootstrap_port: int = 6789
+    modelexpress_config: Optional[str] = None
+    enable_prefix_mm_cache: bool = False
+    limit_mm_data_per_request: Optional[Union[str, Dict[str, int]]] = None
+    enable_mm_global_cache: bool = False
 
     def __post_init__(self):
         """
@@ -954,6 +1039,7 @@ class ServerArgs:
         model_arch = hf_config.architectures[0]
         if model_arch in ["WeLMV4MoeForCausalLM"]:
             self.prepare_n_gram_inputs = True
+            self.disable_piecewise_cuda_graph = True
         if model_arch in ["DeepseekV3ForCausalLM"]:
             if is_deepseek_nsa(hf_config):
                 if (
@@ -3972,14 +4058,61 @@ class ServerArgs:
         args.dp_size = args.data_parallel_size
         args.ep_size = args.expert_parallel_size
 
-        attrs = [attr.name for attr in dataclasses.fields(cls)]
-        return cls(**{attr: getattr(args, attr) for attr in attrs})
+        values = {}
+        for field in dataclasses.fields(cls):
+            if hasattr(args, field.name):
+                values[field.name] = getattr(args, field.name)
+            elif field.default is not dataclasses.MISSING:
+                values[field.name] = field.default
+            elif field.default_factory is not dataclasses.MISSING:
+                values[field.name] = field.default_factory()
+
+        return cls(**values)
 
     def url(self):
         if is_valid_ipv6_address(self.host):
             return f"http://[{self.host}]:{self.port}"
         else:
             return f"http://{self.host}:{self.port}"
+
+    @property
+    def modelexpress_source(self) -> bool:
+        return False
+
+    @property
+    def modelexpress_url(self) -> Optional[str]:
+        return None
+
+    @property
+    def modelexpress_model_name(self) -> Optional[str]:
+        return None
+
+    def remote_instance_weight_loader_use_transfer_engine(self):
+        if self.remote_instance_weight_loader_start_seed_via_transfer_engine:
+            return True
+        if self.modelexpress_source:
+            return True
+        return (
+            self.load_format == "remote_instance"
+            and self.remote_instance_weight_loader_backend
+            in ("transfer_engine", "modelexpress")
+        )
+
+    def enable_mamba_extra_buffer(self) -> bool:
+        return self.mamba_scheduler_strategy == "extra_buffer"
+
+    def ssl_verify(self):
+        if self.ssl_ca_certs:
+            return self.ssl_ca_certs
+        if self.ssl_certfile:
+            if not getattr(self, "_ssl_verify_warned", False):
+                logger.warning(
+                    "SSL is enabled but --ssl-ca-certs was not provided. "
+                    "Certificate verification is disabled for internal health checks."
+                )
+                self._ssl_verify_warned = True
+            return False
+        return True
 
     def get_hf_config(self):
         kwargs = {}

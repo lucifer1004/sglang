@@ -21,8 +21,9 @@ import inspect
 import logging
 import os
 from contextlib import contextmanager
+from dataclasses import dataclass
 from functools import partial
-from typing import TYPE_CHECKING, Callable, Optional, Union
+from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Tuple, Union
 
 import torch
 import tqdm
@@ -30,7 +31,6 @@ from torch.profiler import ProfilerActivity, profile
 
 from sglang.srt.batch_overlap.two_batch_overlap import TboCudaGraphRunnerPlugin
 from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH
-from sglang.srt.custom_op import CustomOp
 from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     set_graph_pool_id,
@@ -40,9 +40,11 @@ from sglang.srt.distributed.parallel_state import (
     graph_capture,
     set_pdmux_status,
 )
+from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.layers.attention.nsa.utils import is_nsa_enable_prefill_cp
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
+    get_attention_cp_size,
     get_attention_tp_rank,
     get_attention_tp_size,
     set_dp_buffer_len,
@@ -51,16 +53,18 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.moe.token_dispatcher.deepep import DeepEPBuffer
 from sglang.srt.layers.moe.utils import get_deepep_mode, get_moe_a2a_backend
-from sglang.srt.layers.torchao_utils import save_gemlite_cache
+from sglang.srt.layers.utils import MultiPlatformOp
 from sglang.srt.managers.schedule_batch import OverEncodingContext
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
     ForwardMode,
+    NgramEmbeddingInfo,
     PPProxyTensors,
+    compute_local_num_token_non_padded,
     enable_num_token_non_padded,
 )
-from sglang.srt.model_executor.input_buffers import GraphInputBuffers
+from sglang.srt.model_executor.input_buffers import ForwardInputBuffers
 from sglang.srt.multiplex.pdmux_context import get_current_stream_idx, get_stream_groups
 from sglang.srt.utils import (
     empty_context,
@@ -89,6 +93,289 @@ logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
+
+_has_foreach_copy = hasattr(torch, "_foreach_copy_")
+
+
+def _grouped_foreach_copy_(dsts: List[torch.Tensor], srcs: List[torch.Tensor]) -> None:
+    """Call torch._foreach_copy_ grouped by (dst_dtype, src_dtype) pairs."""
+
+    def foreach_copy(dsts: List[torch.Tensor], srcs: List[torch.Tensor]) -> None:
+        if _has_foreach_copy:
+            torch._foreach_copy_(dsts, srcs)
+        else:
+            for dst, src in zip(dsts, srcs):
+                dst.copy_(src)
+
+    groups: Dict[Tuple[torch.dtype, torch.dtype], Tuple[List, List]] = {}
+    for dst, src in zip(dsts, srcs):
+        key = (dst.dtype, src.dtype)
+        if key not in groups:
+            groups[key] = ([], [])
+        groups[key][0].append(dst)
+        groups[key][1].append(src)
+    for group_dsts, group_srcs in groups.values():
+        foreach_copy(group_dsts, group_srcs)
+
+
+@dataclass
+class DecodeInputBuffers(ForwardInputBuffers):
+
+    input_ids: torch.Tensor
+    input_embeds: torch.Tensor
+    req_pool_indices: torch.Tensor
+    seq_lens: torch.Tensor
+    seq_lens_cpu: torch.Tensor
+    out_cache_loc: torch.Tensor
+    positions: torch.Tensor
+    mrope_positions: torch.Tensor
+    num_token_non_padded: torch.Tensor
+    custom_mask: torch.Tensor
+    next_token_logits_buffer: torch.Tensor
+    mamba_track_indices: Optional[torch.Tensor]
+    mamba_track_mask: Optional[torch.Tensor]
+    global_num_tokens_gpu: torch.Tensor
+    global_num_tokens_for_logprob_gpu: torch.Tensor
+    encoder_lens: Optional[torch.Tensor]
+    pp_proxy_tensors: Optional[Dict[str, torch.Tensor]]
+    ngram_embedding_info: Optional["NgramEmbeddingInfo"]
+    input_ids_grams: List[torch.Tensor]
+    scale_seq_factor: int = 1
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        device: torch.device,
+        max_bs: int,
+        max_num_token: int,
+        hidden_size: int,
+        vocab_size: int,
+        dtype: torch.dtype,
+        dp_size: int,
+        pp_size: int,
+        is_encoder_decoder: bool,
+        require_mlp_tp_gather: bool,
+        seq_len_fill_value: int,
+        encoder_len_fill_value: int,
+        num_tokens_per_bs: int,
+        cache_loc_dtype: torch.dtype,
+        enable_mamba_track: bool,
+        prepare_n_gram_inputs: bool,
+        scale_seq_factor: int,
+        ne_token_table: Optional[torch.Tensor] = None,
+    ) -> "DecodeInputBuffers":
+        with torch.device(device):
+            if prepare_n_gram_inputs:
+                input_ids_grams = [
+                    torch.zeros((max_num_token,), dtype=torch.int64) for _ in range(3)
+                ]
+            else:
+                input_ids_grams = []
+            input_ids = torch.zeros((max_num_token,), dtype=torch.int64)
+            input_embeds = torch.zeros((max_num_token, hidden_size), dtype=dtype)
+            req_pool_indices = torch.zeros((max_bs,), dtype=torch.int64)
+            seq_lens = torch.full((max_bs,), seq_len_fill_value, dtype=torch.int32)
+            out_cache_loc = torch.zeros((max_num_token,), dtype=cache_loc_dtype)
+            positions = torch.zeros((max_num_token,), dtype=torch.int64)
+            mrope_positions = torch.zeros((3, max_num_token), dtype=torch.int64)
+            num_token_non_padded = torch.zeros((1,), dtype=torch.int32)
+            custom_mask = torch.ones(
+                (max_bs * seq_len_fill_value + max_num_token) * num_tokens_per_bs,
+                dtype=torch.bool,
+            )
+            next_token_logits_buffer = torch.zeros(
+                (max_num_token, vocab_size),
+                dtype=torch.float,
+            )
+            mamba_track_indices = (
+                torch.zeros((max_bs,), dtype=torch.int64)
+                if enable_mamba_track
+                else None
+            )
+            mamba_track_mask = (
+                torch.zeros((max_bs,), dtype=torch.bool) if enable_mamba_track else None
+            )
+
+            if pp_size > 1:
+                pp_proxy_tensors = {
+                    "hidden_states": torch.zeros((max_bs, hidden_size), dtype=dtype),
+                    "residual": torch.zeros((max_bs, hidden_size), dtype=dtype),
+                }
+            else:
+                pp_proxy_tensors = None
+
+            if is_encoder_decoder:
+                encoder_lens = torch.full(
+                    (max_bs,), encoder_len_fill_value, dtype=torch.int32
+                )
+            else:
+                encoder_lens = None
+
+            if require_mlp_tp_gather:
+                global_num_tokens_gpu = torch.zeros((dp_size,), dtype=torch.int32)
+                global_num_tokens_for_logprob_gpu = torch.zeros(
+                    (dp_size,), dtype=torch.int32
+                )
+            else:
+                global_num_tokens_gpu = torch.zeros((1,), dtype=torch.int32)
+                global_num_tokens_for_logprob_gpu = torch.zeros((1,), dtype=torch.int32)
+
+            ngram_embedding_info = (
+                NgramEmbeddingInfo(
+                    token_table=ne_token_table,
+                    column_starts=torch.zeros([max_bs], dtype=torch.int32),
+                    req_lens=torch.ones([max_bs], dtype=torch.int32),
+                    out_column_starts=torch.zeros([max_bs], dtype=torch.int32),
+                    out_req_lens=torch.ones([max_bs], dtype=torch.int32),
+                )
+                if ne_token_table is not None
+                else None
+            )
+
+        # Keep seq_lens_cpu as a true CPU tensor, like the old implementation.
+        seq_lens_cpu = torch.full(
+            (max_bs,),
+            seq_len_fill_value,
+            dtype=torch.int32,
+            device="cpu",
+        )
+
+        return cls(
+            input_ids=input_ids,
+            input_embeds=input_embeds,
+            req_pool_indices=req_pool_indices,
+            seq_lens=seq_lens,
+            seq_lens_cpu=seq_lens_cpu,
+            out_cache_loc=out_cache_loc,
+            positions=positions,
+            mrope_positions=mrope_positions,
+            num_token_non_padded=num_token_non_padded,
+            custom_mask=custom_mask,
+            next_token_logits_buffer=next_token_logits_buffer,
+            mamba_track_indices=mamba_track_indices,
+            mamba_track_mask=mamba_track_mask,
+            encoder_lens=encoder_lens,
+            global_num_tokens_gpu=global_num_tokens_gpu,
+            global_num_tokens_for_logprob_gpu=global_num_tokens_for_logprob_gpu,
+            pp_proxy_tensors=pp_proxy_tensors,
+            ngram_embedding_info=ngram_embedding_info,
+            input_ids_grams=input_ids_grams,
+            scale_seq_factor=scale_seq_factor,
+        )
+
+    def populate_from_forward_batch(
+        self,
+        *,
+        forward_batch: ForwardBatch,
+        raw_bs: int,
+        raw_num_token: int,
+        bs: int,
+        seq_len_fill_value: int,
+        require_gathered_buffer: bool,
+        num_tokens_per_bs: int,
+        nsa_enable_prefill_cp: bool,
+        enable_num_token_non_padded_flag: bool,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
+    ):
+        if bs != raw_bs:
+            self.seq_lens.fill_(seq_len_fill_value)
+            self.out_cache_loc.zero_()
+            if self.mamba_track_indices is not None:
+                self.mamba_track_indices.zero_()
+            if self.mamba_track_mask is not None:
+                self.mamba_track_mask.fill_(False)
+
+        # Build batched copy lists for all GPU tensors.
+        is_scale_seq = self.scale_seq_factor > 1
+        raw_model_input = raw_bs if is_scale_seq else raw_num_token
+        dsts = [
+            self.input_ids[:raw_model_input],
+            self.req_pool_indices[:raw_bs],
+            self.seq_lens[:raw_bs],
+            self.out_cache_loc[:raw_num_token],
+            self.positions[:raw_num_token],
+        ]
+        srcs = [
+            forward_batch.input_ids,
+            forward_batch.req_pool_indices,
+            forward_batch.seq_lens,
+            forward_batch.out_cache_loc,
+            forward_batch.positions,
+        ]
+
+        if forward_batch.oe_context is not None and len(self.input_ids_grams) > 0:
+            for buf_gram, src_gram in zip(
+                self.input_ids_grams,
+                forward_batch.oe_context.input_ids_grams,
+            ):
+                copy_len = min(buf_gram.shape[0], src_gram.shape[0])
+                buf_gram[:copy_len].copy_(src_gram[:copy_len])
+
+        if self.ngram_embedding_info is not None:
+            ngram_embedding_info = forward_batch.ngram_embedding_info
+            self.ngram_embedding_info.column_starts[:raw_bs].copy_(
+                ngram_embedding_info.column_starts
+            )
+            self.ngram_embedding_info.req_lens[:raw_bs].copy_(
+                ngram_embedding_info.req_lens
+            )
+
+        if (
+            self.mamba_track_indices is not None
+            and forward_batch.mamba_track_indices is not None
+        ):
+            dsts.append(self.mamba_track_indices[:raw_bs])
+            srcs.append(forward_batch.mamba_track_indices)
+        if (
+            self.mamba_track_mask is not None
+            and forward_batch.mamba_track_mask is not None
+        ):
+            dsts.append(self.mamba_track_mask[:raw_bs])
+            srcs.append(forward_batch.mamba_track_mask)
+
+        if self.encoder_lens is not None and forward_batch.encoder_lens is not None:
+            dsts.append(self.encoder_lens[:raw_bs])
+            srcs.append(forward_batch.encoder_lens)
+
+        if forward_batch.mrope_positions is not None:
+            dsts.append(self.mrope_positions[:, :raw_num_token])
+            srcs.append(forward_batch.mrope_positions)
+
+        if require_gathered_buffer:
+            self.global_num_tokens_gpu.fill_(bs * num_tokens_per_bs)
+            self.global_num_tokens_for_logprob_gpu.fill_(bs * num_tokens_per_bs)
+
+        if enable_num_token_non_padded_flag:
+            if require_gathered_buffer and not nsa_enable_prefill_cp:
+                num_tokens_per_dp = bs * num_tokens_per_bs
+                local = compute_local_num_token_non_padded(
+                    global_num_token_non_padded=forward_batch.num_token_non_padded,
+                    num_tokens_per_dp=num_tokens_per_dp,
+                )
+                dsts.append(self.num_token_non_padded)
+                srcs.append(local)
+            else:
+                dsts.append(self.num_token_non_padded)
+                srcs.append(forward_batch.num_token_non_padded)
+
+        # Pipeline-parallel proxy tensors.
+        if pp_proxy_tensors is not None and self.pp_proxy_tensors is not None:
+            for key, buf in self.pp_proxy_tensors.items():
+                src = pp_proxy_tensors.tensors[key]
+                dim = src.shape[0]
+                dsts.append(buf[:dim])
+                srcs.append(src)
+
+        # Batch all GPU copies, grouped by dtype pair.
+        _grouped_foreach_copy_(dsts, srcs)
+
+        # CPU tensor copy (cannot be batched with GPU tensors).
+        if forward_batch.seq_lens_cpu is not None:
+            if bs != raw_bs:
+                self.seq_lens_cpu.fill_(seq_len_fill_value)
+            self.seq_lens_cpu[:raw_bs].copy_(forward_batch.seq_lens_cpu)
+
 
 # Detect whether the current forward pass is in capture mode
 is_capture_mode = False
@@ -129,7 +416,7 @@ def freeze_gc(enable_cudagraph_gc: bool):
 
 def _to_torch(model: torch.nn.Module, reverse: bool, num_tokens: int):
     for sub in model._modules.values():
-        if isinstance(sub, CustomOp):
+        if isinstance(sub, MultiPlatformOp):
             if reverse:
                 sub.leave_torch_compile()
             else:
@@ -187,27 +474,34 @@ def set_torch_compile_config():
     monkey_patch_torch_compile()
 
 
-def get_batch_sizes_to_capture(model_runner: ModelRunner):
+def get_batch_sizes_to_capture(model_runner: ModelRunner, num_tokens_per_bs=1):
     server_args = model_runner.server_args
     capture_bs = server_args.cuda_graph_bs
-
-    if max(capture_bs) > model_runner.req_to_token_pool.size:
-        # In some cases (e.g., with a small GPU or --max-running-requests), the #max-running-requests
-        # is very small. We add more values here to make sure we capture the maximum bs.
-        capture_bs += [model_runner.req_to_token_pool.size]
+    num_max_requests = model_runner.req_to_token_pool.size
 
     mul_base = 1
-
     if server_args.enable_two_batch_overlap:
         mul_base *= 2
+        num_tokens_per_bs = 1  # tbo not test, set num_tokens_per_bs to 1
 
     if require_gathered_buffer(server_args):
         mul_base *= get_attention_tp_size()
 
-    capture_bs = [bs for bs in capture_bs if bs % mul_base == 0]
+    if mul_base % get_attention_cp_size() != 0:
+        mul_base *= get_attention_cp_size()
 
-    capture_bs = [bs for bs in capture_bs if bs <= model_runner.req_to_token_pool.size]
+    # pad `num_max_requests` to avoid being filtered out
+    num_max_requests = (num_max_requests + mul_base - 1) // mul_base * mul_base
+    if max(capture_bs) > num_max_requests:
+        # In some cases (e.g., with a small GPU or --max-running-requests), the #max-running-requests
+        # is very small. We add more values here to make sure we capture the maximum bs.
+        capture_bs += [num_max_requests]
+
+    # Model input token count = bs * num_tokens_per_bs; must be a multiple of attn_tp_size.
+    capture_bs = [bs for bs in capture_bs if bs * num_tokens_per_bs % mul_base == 0]
+    capture_bs = [bs for bs in capture_bs if bs <= num_max_requests]
     capture_bs = list(sorted(set(capture_bs)))
+
     assert len(capture_bs) > 0 and capture_bs[0] > 0, f"{capture_bs=}"
     compile_bs = (
         [bs for bs in capture_bs if bs <= server_args.torch_compile_max_bs]
@@ -250,6 +544,11 @@ class CudaGraphRunner:
         self.enable_two_batch_overlap = (
             model_runner.server_args.enable_two_batch_overlap
         )
+        self.use_ngram_embedding = model_runner.use_ngram_embedding
+        if self.use_ngram_embedding:
+            hf_config = model_runner.model_config.hf_config
+            self.ngram_embedding_n = hf_config.ngram_embedding_n
+            self.ngram_embedding_k = hf_config.ngram_embedding_k
         self.speculative_algorithm = model_runner.server_args.speculative_algorithm
         self.enable_profile_cuda_graph = (
             model_runner.server_args.enable_profile_cuda_graph
@@ -265,11 +564,9 @@ class CudaGraphRunner:
 
         self.deepep_adapter = DeepEPCudaGraphRunnerAdapter()
 
-        # Batch sizes to capture
-        self.capture_bs, self.compile_bs = get_batch_sizes_to_capture(model_runner)
-        log_info_on_rank0(logger, f"Capture cuda graph bs {self.capture_bs}")
-        if KTRANSFORMERS_AVAILABLE:
-            KTMoEWrapper.set_capture_batch_sizes(self.capture_bs)
+        self.dllm_config = DllmConfig.from_server_args(model_runner.server_args)
+        self.is_dllm = self.dllm_config is not None
+
         self.capture_forward_mode = ForwardMode.DECODE
         self.capture_hidden_mode = CaptureHiddenMode.NULL
         self.num_tokens_per_bs = 1
@@ -285,12 +582,24 @@ class CudaGraphRunner:
                 self.num_tokens_per_bs = (
                     self.model_runner.server_args.speculative_num_draft_tokens
                 )
+        elif self.is_dllm:
+            self.capture_forward_mode = ForwardMode.DLLM_EXTEND
+            self.num_tokens_per_bs = self.dllm_config.block_size
+
         self.scale_seq_factor = (
             getattr(model_runner.model_config.hf_config, "scale_seq_times", 0) + 1
         )
         if self.scale_seq_factor > 1 and self.num_tokens_per_bs == 1:
             self.num_tokens_per_bs = self.scale_seq_factor
             self.capture_forward_mode = ForwardMode.TARGET_VERIFY
+
+        # Batch sizes to capture
+        self.capture_bs, self.compile_bs = get_batch_sizes_to_capture(
+            model_runner, self.num_tokens_per_bs
+        )
+        log_info_on_rank0(logger, f"Capture cuda graph bs {self.capture_bs}")
+        if KTRANSFORMERS_AVAILABLE:
+            KTMoEWrapper.set_capture_batch_sizes(self.capture_bs)
 
         # If returning hidden states is enabled, set initial capture hidden mode to full to avoid double-capture on startup
         if model_runner.server_args.enable_return_hidden_states:
@@ -307,22 +616,37 @@ class CudaGraphRunner:
         self.maybe_init_pdmux()
         self.seq_len_fill_value = (
             self.model_runner.attn_backend.get_cuda_graph_seq_len_fill_value()
+            if self.dllm_config is None
+            else self.dllm_config.block_size
         )
 
-        self.encoder_len_fill_value = 0
+        # Non-zero encoder length ensures cross-attention kernels are captured in the graph.
+        self.encoder_len_fill_value = (
+            getattr(model_runner.model_config.hf_config, "max_source_positions", 0)
+            if self.is_encoder_decoder
+            else 0
+        )
 
         if self.enable_torch_compile:
             set_torch_compile_config()
 
         if self.model_runner.server_args.enable_lora:
+            # Phase 2 of LoRA CUDA graph init: dense LoRA batch metadata.
+            # Phase 1 (MoE buffers) was handled earlier in ModelRunner via
+            # lora_manager.init_cuda_graph_moe_buffers().
             self.model_runner.lora_manager.init_cuda_graph_batch_info(
                 max_bs_in_cuda_graph=self.max_bs,
                 num_tokens_per_bs=self.num_tokens_per_bs,
             )
 
+        enable_mamba_track = (
+            self.model_runner.server_args.enable_mamba_extra_buffer()
+            and self.model_runner.spec_algorithm.is_none()
+        )
+
         if self.require_gathered_buffer:
             assert self.require_mlp_tp_gather or self.require_attn_tp_gather
-        self.buffers: GraphInputBuffers = GraphInputBuffers.create(
+        self.buffers: DecodeInputBuffers = DecodeInputBuffers.create(
             device=self.device,
             max_bs=self.max_bs,
             max_num_token=self.max_num_token,
@@ -337,14 +661,22 @@ class CudaGraphRunner:
             encoder_len_fill_value=self.encoder_len_fill_value,
             num_tokens_per_bs=self.num_tokens_per_bs,
             cache_loc_dtype=self._cache_loc_dtype(),
+            enable_mamba_track=enable_mamba_track,
             prepare_n_gram_inputs=self.model_runner.server_args.prepare_n_gram_inputs,
             scale_seq_factor=self.scale_seq_factor,
+            ne_token_table=(
+                model_runner.token_table if self.use_ngram_embedding else None
+            ),
         )
+        self.buffers.share_buffers()
 
         self.tbo_plugin = TboCudaGraphRunnerPlugin()
 
         # Speculative_inference
-        if model_runner.spec_algorithm.is_eagle3():
+        if (
+            model_runner.spec_algorithm.is_eagle3()
+            and model_runner.eagle_use_aux_hidden_state
+        ):
             self.model_runner.model.set_eagle3_layers_to_capture()
 
         # Capture
@@ -370,6 +702,7 @@ class CudaGraphRunner:
             cuda_graph_bs = (
                 max(forward_batch.global_num_tokens_cpu) // self.num_tokens_per_bs
                 if self.model_runner.spec_algorithm.is_eagle()
+                or self.model_runner.spec_algorithm.is_standalone()
                 else max(forward_batch.global_num_tokens_cpu)
             )
         else:
@@ -498,9 +831,6 @@ class CudaGraphRunner:
                     self.graphs[key] = graph
                     self.output_buffers[key] = output_buffers
 
-                    # Save gemlite cache after each capture
-                    save_gemlite_cache()
-
         # Trigger CUDA graph capture for specific shapes.
         # Capture the large shapes first so that the smaller shapes
         # can reuse the memory pool allocated for the large shapes.
@@ -541,16 +871,13 @@ class CudaGraphRunner:
     def capture_one_batch_size(
         self, bs: int, forward: Callable, stream_idx: Optional[int] = None
     ):
-        buffers = self.buffers
+        buffers: DecodeInputBuffers = self.buffers
         graph = self._create_device_graph()
         stream = self.stream
         num_tokens = bs * self.num_tokens_per_bs
 
         # Graph inputs
-        is_scale_seq = self.scale_seq_factor > 1
-        model_input_len = bs if is_scale_seq else num_tokens
-        input_ids = buffers.input_ids[:model_input_len]
-
+        input_ids = buffers.input_ids[:num_tokens]
         req_pool_indices = buffers.req_pool_indices[:bs]
         seq_lens = buffers.seq_lens[:bs]
         seq_lens_cpu = buffers.seq_lens_cpu[:bs]
@@ -561,7 +888,7 @@ class CudaGraphRunner:
         else:
             encoder_lens = None
         mrope_positions = buffers.mrope_positions[:, :num_tokens]
-        next_token_logits_buffer = buffers.next_token_logits_buffer[:model_input_len]
+        next_token_logits_buffer = buffers.next_token_logits_buffer[:num_tokens]
         buffers.num_token_non_padded[...] = num_tokens
 
         # pipeline parallelism
@@ -618,6 +945,18 @@ class CudaGraphRunner:
         else:
             lora_ids = None
 
+        # mamba state tracking
+        mamba_track_indices = (
+            buffers.mamba_track_indices[:bs]
+            if buffers.mamba_track_indices is not None
+            else None
+        )
+        mamba_track_mask = (
+            buffers.mamba_track_mask[:bs]
+            if buffers.mamba_track_mask is not None
+            else None
+        )
+
         if stream_idx is None:
             attn_backend = self.model_runner.attn_backend
         else:
@@ -638,6 +977,9 @@ class CudaGraphRunner:
             attn_backend=attn_backend,
             out_cache_loc=out_cache_loc,
             seq_lens_sum=seq_lens.sum().item(),
+            mamba_track_indices=mamba_track_indices,
+            mamba_track_mask=mamba_track_mask,
+            mamba_track_seqlens=None,  # Prefill only
             encoder_lens=encoder_lens,
             return_logprob=False,
             positions=positions,
@@ -654,11 +996,21 @@ class CudaGraphRunner:
             lora_ids=lora_ids,
         )
         if self.model_runner.server_args.prepare_n_gram_inputs:
+            model_input_len = bs if self.scale_seq_factor > 1 else num_tokens
             forward_batch.oe_context = OverEncodingContext(
                 input_ids_grams=[
                     gram[:model_input_len] for gram in buffers.input_ids_grams
                 ],
             )
+
+        # HiSparse: set coordinator so the hisparse code path is captured into the graph
+        forward_batch.hisparse_coordinator = self.model_runner.hisparse_coordinator
+        if forward_batch.hisparse_coordinator is not None:
+            forward_batch.hisparse_coordinator.num_real_reqs.fill_(bs)
+
+        if buffers.ngram_embedding_info is not None:
+            forward_batch.ngram_embedding_info = buffers.ngram_embedding_info.slice(bs)
+
         self.tbo_plugin.capture_one_batch_size(forward_batch, num_tokens=num_tokens)
 
         if lora_ids is not None:
@@ -769,6 +1121,7 @@ class CudaGraphRunner:
             max_batch_size = (
                 max_num_tokens / self.num_tokens_per_bs
                 if self.model_runner.spec_algorithm.is_eagle()
+                or self.model_runner.spec_algorithm.is_standalone()
                 else max_num_tokens
             )
             index = bisect.bisect_left(self.capture_bs, max_batch_size)
@@ -776,7 +1129,7 @@ class CudaGraphRunner:
             index = bisect.bisect_left(self.capture_bs, raw_bs)
         bs = self.capture_bs[index]
 
-        seq_lens_cpu = buffers.populate_from_forward_batch(
+        buffers.populate_from_forward_batch(
             forward_batch=forward_batch,
             raw_bs=raw_bs,
             raw_num_token=raw_num_token,
@@ -785,8 +1138,6 @@ class CudaGraphRunner:
             require_gathered_buffer=self.require_gathered_buffer,
             num_tokens_per_bs=self.num_tokens_per_bs,
             nsa_enable_prefill_cp=self.nsa_enable_prefill_cp,
-            attn_tp_rank=self.attn_tp_rank,
-            attn_tp_size=self.attn_tp_size,
             enable_num_token_non_padded_flag=enable_num_token_non_padded(
                 self.model_runner.server_args
             ),
@@ -815,13 +1166,16 @@ class CudaGraphRunner:
             buffers.encoder_lens[:bs] if self.is_encoder_decoder else None,
             self.capture_forward_mode,
             forward_batch.spec_info,
-            seq_lens_cpu=seq_lens_cpu,
+            seq_lens_cpu=buffers.seq_lens_cpu[:bs],
         )
 
         # Store fields
         self.raw_bs = raw_bs
         self.raw_num_token = raw_num_token
         self.bs = bs
+
+        if self.model_runner.hisparse_coordinator is not None:
+            self.model_runner.hisparse_coordinator.num_real_reqs.fill_(raw_bs)
 
     def replay(
         self,
@@ -830,6 +1184,7 @@ class CudaGraphRunner:
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
         self.deepep_adapter.replay()
+
         if not skip_attn_backend_init:
             self.replay_prepare(forward_batch, pp_proxy_tensors)
         else:
@@ -843,17 +1198,25 @@ class CudaGraphRunner:
         else:
             graph_key = self.bs
         self.graphs[graph_key].replay()
-
-        output_len = self.raw_bs if self.scale_seq_factor > 1 else self.raw_num_token
         output = self.output_buffers[graph_key]
+
         if isinstance(output, LogitsProcessorOutput):
+            if self.is_dllm:
+                next_token_logits = None
+                full_logits = output.full_logits[: self.raw_num_token]
+            else:
+                full_logits = None
+                next_token_logits = output.next_token_logits[: self.raw_num_token]
+
             return LogitsProcessorOutput(
-                next_token_logits=output.next_token_logits[:output_len],
+                next_token_logits=next_token_logits,
+                full_logits=full_logits,
                 hidden_states=(
-                    output.hidden_states[:output_len]
+                    output.hidden_states[: self.raw_num_token]
                     if output.hidden_states is not None
                     else None
                 ),
+                customized_info=output.customized_info,
             )
         else:
             assert isinstance(output, PPProxyTensors)
