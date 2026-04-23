@@ -37,7 +37,6 @@ from sglang.srt.utils import get_device, is_hip, is_xpu
 _is_hip = is_hip()
 _is_xpu = is_xpu()
 
-
 def benchmark_config(
     config: BenchmarkConfig,
     num_tokens: int,
@@ -418,6 +417,8 @@ def main(args: argparse.Namespace):
                 for config in search_space
                 if block_k % config["BLOCK_SIZE_K"] == 0
             ]
+        if args.max_configs is not None and args.max_configs > 0:
+            search_space = search_space[: args.max_configs]
 
         filename = get_config_filename(
             E,
@@ -515,6 +516,12 @@ if __name__ == "__main__":
     parser.add_argument("--batch-size", type=int, required=False)
     parser.add_argument("--tune", action="store_true")
     parser.add_argument("--disable-shared-experts-fusion", action="store_true")
+    parser.add_argument(
+        "--max-configs",
+        type=int,
+        default=None,
+        help="Smoke-test helper: limit search space to first N configs.",
+    )
     args = parser.parse_args()
 
     main(args)
