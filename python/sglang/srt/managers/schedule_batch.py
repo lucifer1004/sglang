@@ -1049,6 +1049,20 @@ class Req:
             return value
         raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
 
+    def set_extend_input_len(self, extend_input_len: int):
+        self.extend_input_len = extend_input_len
+
+        scale = getattr(self, "_scale_seq_factor", 1) or 1
+        prefix_len = len(self.prefix_indices) // scale
+        if self.logprob_start_len == -1:
+            logprob_start_len = len(self.fill_ids) - 1
+        else:
+            logprob_start_len = max(self.logprob_start_len, prefix_len)
+        self.extend_logprob_start_len = min(
+            logprob_start_len - prefix_len,
+            self.extend_input_len,
+        )
+
     @property
     def seqlen(self) -> int:
         """Get the current sequence length of the request."""
@@ -1186,7 +1200,9 @@ class Req:
             )
 
         if tree_cache is not None:
-            self._scale_seq_factor = tree_cache.scale_seq_factor
+            # Not all cache implementations carry scale_seq_factor
+            # (e.g. RadixCache). Fall back to logical scale 1.
+            self._scale_seq_factor = getattr(tree_cache, "scale_seq_factor", 1)
         self.extend_input_len = (
             len(self.fill_ids) - len(self.prefix_indices) // self._scale_seq_factor
         )
