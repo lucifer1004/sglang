@@ -16,6 +16,7 @@
 # https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/models/qwen2_moe.py
 """Inference-only Qwen2MoE model compatible with HuggingFace weights."""
 import logging
+import math
 import os
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
@@ -99,7 +100,7 @@ from sglang.srt.utils import (
 logger = logging.getLogger(__name__)
 
 _is_cuda = is_cuda()
-WELM_KV_MIRROR_CTX_KEY = "welm_kv_mirror_ctx"
+WELM_KV_MIRROR_PP_KEY_PREFIX = "welm_kv_mirror"
 _WELM_DUMP_PROCESS_DIR = None
 
 
@@ -143,14 +144,82 @@ def _welm_dump_tensor(name: str, tensor: torch.Tensor) -> None:
     torch.save(tensor.detach().cpu(), _WELM_DUMP_PROCESS_DIR / f"{name}.pt")
 
 
-def _get_welm_kv_mirror_ctx(forward_batch: ForwardBatch) -> Dict[int, Tuple[torch.Tensor, torch.Tensor]]:
-    if forward_batch.model_specific_states is None:
-        forward_batch.model_specific_states = {}
-    ctx = forward_batch.model_specific_states.get(WELM_KV_MIRROR_CTX_KEY)
-    if ctx is None:
-        ctx = {}
-        forward_batch.model_specific_states[WELM_KV_MIRROR_CTX_KEY] = ctx
-    return ctx
+def _welm_kv_mirror_pp_key(layer_idx: int, suffix: str) -> str:
+    return f"{WELM_KV_MIRROR_PP_KEY_PREFIX}.{layer_idx}.{suffix}"
+
+
+def _empty_welm_kv_mirror_states() -> Dict[int, Tuple[torch.Tensor, torch.Tensor]]:
+    return {}
+
+
+def _pack_welm_kv_mirror_pp_tensor(
+    proxy_tensors: Dict[str, Any],
+    key: str,
+    tensor: torch.Tensor,
+) -> None:
+    flat = tensor.contiguous().view(-1)
+    try:
+        tp_size = get_attention_tp_size()
+    except AssertionError:
+        tp_size = 1
+    pad_len = 0
+    if tp_size > 1:
+        pad_len = 1
+        while (flat.numel() + pad_len) % tp_size == 0:
+            pad_len += 1
+    proxy_tensors[key] = torch.cat([flat, flat.new_empty(pad_len)]) if pad_len else flat
+    proxy_tensors[f"{key}.shape"] = tuple(tensor.shape)
+
+
+def _unpack_welm_kv_mirror_pp_tensor(
+    pp_proxy_tensors: PPProxyTensors,
+    key: str,
+    tensor: torch.Tensor,
+) -> torch.Tensor:
+    shape = pp_proxy_tensors.tensors.get(f"{key}.shape")
+    if shape is None:
+        return tensor
+    numel = math.prod(shape)
+    return tensor[:numel].view(shape)
+
+
+def _pack_welm_kv_mirror_states(
+    proxy_tensors: Dict[str, Any],
+    kv_mirror_states: Optional[Dict[int, Tuple[torch.Tensor, torch.Tensor]]],
+) -> None:
+    if not kv_mirror_states:
+        return
+    for layer_idx, (mirror_k, mirror_v) in kv_mirror_states.items():
+        _pack_welm_kv_mirror_pp_tensor(
+            proxy_tensors, _welm_kv_mirror_pp_key(layer_idx, "k"), mirror_k
+        )
+        _pack_welm_kv_mirror_pp_tensor(
+            proxy_tensors, _welm_kv_mirror_pp_key(layer_idx, "v"), mirror_v
+        )
+
+
+def _unpack_welm_kv_mirror_states(
+    pp_proxy_tensors: PPProxyTensors,
+) -> Dict[int, Tuple[torch.Tensor, torch.Tensor]]:
+    kv_mirror_states = _empty_welm_kv_mirror_states()
+    for key, tensor in pp_proxy_tensors.tensors.items():
+        if not key.startswith(f"{WELM_KV_MIRROR_PP_KEY_PREFIX}."):
+            continue
+        if key.endswith(".shape"):
+            continue
+        _, layer_idx, suffix = key.rsplit(".", 2)
+        tensor = _unpack_welm_kv_mirror_pp_tensor(pp_proxy_tensors, key, tensor)
+        if suffix == "k":
+            mirror_k, mirror_v = kv_mirror_states.get(int(layer_idx), (None, None))
+            kv_mirror_states[int(layer_idx)] = (tensor, mirror_v)
+        elif suffix == "v":
+            mirror_k, mirror_v = kv_mirror_states.get(int(layer_idx), (None, None))
+            kv_mirror_states[int(layer_idx)] = (mirror_k, tensor)
+    return {
+        layer_idx: (mirror_k, mirror_v)
+        for layer_idx, (mirror_k, mirror_v) in kv_mirror_states.items()
+        if mirror_k is not None and mirror_v is not None
+    }
 
 
 def _welm_should_contract_kv_mirror(forward_batch: ForwardBatch) -> bool:
@@ -355,6 +424,7 @@ class StandardQkvProjection(BaseWelmQkvProjection):
         attn: "Qwen2MoeAttention",
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
+        kv_mirror_states: Dict[int, Tuple[torch.Tensor, torch.Tensor]],
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         qkv = self._apply_qkv(hidden_states)
         q, k, v = self._split_qkv(attn, qkv)
@@ -371,16 +441,14 @@ class ImitateQkvKvProjection(BaseWelmQkvProjection):
         attn: "Qwen2MoeAttention",
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
+        kv_mirror_states: Dict[int, Tuple[torch.Tensor, torch.Tensor]],
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         qkv = self._apply_qkv(hidden_states)
         q, k, v, mirror_k, mirror_v = qkv.split(
             [attn.q_size, attn.kv_size, attn.kv_size, attn.kv_size, attn.kv_size],
             dim=-1,
         )
-        _get_welm_kv_mirror_ctx(forward_batch)[attn.kv_mirror_layer_idx] = (
-            mirror_k,
-            mirror_v,
-        )
+        kv_mirror_states[attn.kv_mirror_layer_idx] = (mirror_k, mirror_v)
         return q, k, v, hidden_states
 
 
@@ -394,6 +462,7 @@ class MirrorQProjection(BaseWelmQkvProjection):
         attn: "Qwen2MoeAttention",
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
+        kv_mirror_states: Dict[int, Tuple[torch.Tensor, torch.Tensor]],
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         project_hidden_states = hidden_states
         if (
@@ -405,8 +474,7 @@ class MirrorQProjection(BaseWelmQkvProjection):
             )
             project_hidden_states = hidden_states[forward_batch.custom_last_index]
 
-        mirror_ctx = _get_welm_kv_mirror_ctx(forward_batch)
-        kv_activation = mirror_ctx.pop(self.imitated_layer_idx, None)
+        kv_activation = kv_mirror_states.pop(self.imitated_layer_idx, None)
         if kv_activation is None:
             raise RuntimeError(
                 f"Missing mirrored KV activation for imitated_layer_idx={self.imitated_layer_idx}"
@@ -414,11 +482,7 @@ class MirrorQProjection(BaseWelmQkvProjection):
 
         k, v = kv_activation
         if attn.need_clear_kv_cache:
-            mirror_ctx.clear()
-        if not mirror_ctx:
-            forward_batch.model_specific_states.pop(WELM_KV_MIRROR_CTX_KEY, None)
-        if not forward_batch.model_specific_states:
-            forward_batch.model_specific_states = None
+            kv_mirror_states.clear()
         q = F.linear(project_hidden_states, self.weight, self.bias)
         return q, k, v, project_hidden_states
 
@@ -433,6 +497,7 @@ class NextnMirrorQProjection(BaseWelmQkvProjection):
         attn: "Qwen2MoeAttention",
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
+        kv_mirror_states: Dict[int, Tuple[torch.Tensor, torch.Tensor]],
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         if not _welm_should_contract_kv_mirror(forward_batch):
             qkv = self._apply_qkv(hidden_states)
@@ -446,19 +511,14 @@ class NextnMirrorQProjection(BaseWelmQkvProjection):
             )
         project_hidden_states = hidden_states[forward_batch.custom_last_index]
 
-        mirror_ctx = _get_welm_kv_mirror_ctx(forward_batch)
-        kv_activation = mirror_ctx.pop(self.imitated_layer_idx, None)
+        kv_activation = kv_mirror_states.pop(self.imitated_layer_idx, None)
         assert (
             kv_activation is not None
         ), f"Missing mirrored KV activation for nextn imitated_layer_idx={self.imitated_layer_idx}"
 
         k, v = kv_activation
         if attn.need_clear_kv_cache:
-            mirror_ctx.clear()
-        if not mirror_ctx:
-            forward_batch.model_specific_states.pop(WELM_KV_MIRROR_CTX_KEY, None)
-        if not forward_batch.model_specific_states:
-            forward_batch.model_specific_states = None
+            kv_mirror_states.clear()
         q_weight = self.weight[: attn.q_size, :]
         q_bias = None if self.bias is None else self.bias[: attn.q_size]
         q = F.linear(project_hidden_states, q_weight, q_bias)
@@ -1213,6 +1273,7 @@ class Qwen2MoeAttention(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
+        kv_mirror_states: Dict[int, Tuple[torch.Tensor, torch.Tensor]],
         skip_o_norm: bool = False,
     ) -> torch.Tensor:
         dump_this_layer = _welm_should_dump_layer(self.layer_idx)
@@ -1239,7 +1300,7 @@ class Qwen2MoeAttention(nn.Module):
                     forward_batch.req_pool_indices,
                 )
         q, k, v, hidden_states = self.qkv_proj.forward(
-            self, hidden_states, forward_batch
+            self, hidden_states, forward_batch, kv_mirror_states
         )
         if dump_this_layer:
             _welm_dump_tensor(f"{dump_prefix}.positions", positions)
@@ -1465,7 +1526,8 @@ class Qwen2MoeDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        kv_mirror_states: Dict[int, Tuple[torch.Tensor, torch.Tensor]],
+    ) -> Tuple[torch.Tensor, torch.Tensor, Dict[int, Tuple[torch.Tensor, torch.Tensor]]]:
         dump_this_layer = _welm_should_dump_layer(self.layer_id)
         if dump_this_layer:
             _welm_dump_tensor(f"model.layers.{self.layer_id}.__input__.0", hidden_states)
@@ -1509,6 +1571,7 @@ class Qwen2MoeDecoderLayer(nn.Module):
                 positions=positions,
                 hidden_states=hidden_states,
                 forward_batch=forward_batch,
+                kv_mirror_states=kv_mirror_states,
                 skip_o_norm=use_mmq_norm_after_attn,
             )
         if (
@@ -1590,7 +1653,7 @@ class Qwen2MoeDecoderLayer(nn.Module):
                 hidden_states.contiguous(), residual.contiguous()
             )
             residual = None
-        return hidden_states, residual
+        return hidden_states, residual, kv_mirror_states
 
 
 class Qwen2MoeModel(nn.Module):
@@ -1788,13 +1851,17 @@ class Qwen2MoeModel(nn.Module):
                     input_ids, forward_batch, hidden_states
                 )
             residual = None
+            kv_mirror_states = _empty_welm_kv_mirror_states()
         else:
             assert pp_proxy_tensors is not None
             hidden_states = pp_proxy_tensors["hidden_states"]
             residual = pp_proxy_tensors.tensors.get("residual", None)
+            kv_mirror_states = _unpack_welm_kv_mirror_states(pp_proxy_tensors)
 
         aux_hidden_states = []
-        if forward_batch.can_run_tbo:
+        if forward_batch.can_run_tbo and not _welm_should_contract_kv_mirror(
+            forward_batch
+        ):
             hidden_states, residual = model_forward_maybe_tbo(
                 layers=self.layers,
                 enable_tbo=True,
@@ -1814,13 +1881,18 @@ class Qwen2MoeModel(nn.Module):
                     )
                 with get_global_expert_distribution_recorder().with_current_layer(i):
                     layer = self.layers[i]
-                    hidden_states, residual = layer(
-                        positions, hidden_states, forward_batch, residual
+                    hidden_states, residual, kv_mirror_states = layer(
+                        positions,
+                        hidden_states,
+                        forward_batch,
+                        residual,
+                        kv_mirror_states,
                     )
         if not self.pp_group.is_last_rank:
             proxy_tensors = {"hidden_states": hidden_states}
             if residual is not None:
                 proxy_tensors["residual"] = residual
+            _pack_welm_kv_mirror_states(proxy_tensors, kv_mirror_states)
             return PPProxyTensors(proxy_tensors)
         else:
             if hidden_states.shape[0] != 0:
@@ -1991,16 +2063,24 @@ class WeLMV4MoeForCausalLM(nn.Module):
                 forward_batch.hidden_states = self.model._expand_scale_seq(
                     input_ids, forward_batch, forward_batch.hidden_states
                 )
+            forward_batch.kv_mirror_states = _empty_welm_kv_mirror_states()
+        elif not hasattr(forward_batch, "kv_mirror_states"):
+            forward_batch.kv_mirror_states = _empty_welm_kv_mirror_states()
 
         # decoder layer
         for i in range(start, end):
             with get_global_expert_distribution_recorder().with_current_layer(i):
                 layer = self.model.layers[i]
-                forward_batch.hidden_states, forward_batch.residual = layer(
+                (
+                    forward_batch.hidden_states,
+                    forward_batch.residual,
+                    forward_batch.kv_mirror_states,
+                ) = layer(
                     positions,
                     forward_batch.hidden_states,
                     forward_batch,
                     forward_batch.residual,
+                    forward_batch.kv_mirror_states,
                 )
 
         if end == self.model.config.num_hidden_layers:
@@ -2088,6 +2168,44 @@ class WeLMV4MoeForCausalLM(nn.Module):
             for module in modules_dict.values()
             if isinstance(module, Qwen2MoeAttention)
         }
+        mirror_to_imitated, _ = _get_kv_mirror_pair_maps(
+            getattr(self.config, "kv_mirror_layers", []),
+            getattr(self.config, "kv_mirror_imitated_layers", []),
+            num_hidden_layers=self.config.num_hidden_layers,
+            num_nextn_predict_layers=getattr(self.config, "num_nextn_predict_layers", 0),
+            is_nextn=is_nextn,
+        )
+
+        def maybe_load_remote_kv_mirror_pair_weight(
+            name: str, loaded_weight: torch.Tensor, layer_id: Optional[int]
+        ) -> bool:
+            if layer_id is None:
+                return False
+            if ".self_attn.k_proj." in name:
+                pair_shard_id = "k2"
+            elif ".self_attn.v_proj." in name:
+                pair_shard_id = "v2"
+            else:
+                return False
+            imitated_layer_idx = mirror_to_imitated.get(layer_id)
+            if imitated_layer_idx is None:
+                return False
+            pair_attn = attn_by_kv_mirror_layer_idx.get(imitated_layer_idx)
+            if not (
+                pair_attn is not None
+                and isinstance(pair_attn.qkv_proj, ImitateQkvKvProjection)
+            ):
+                return False
+            pair_param = (
+                pair_attn.qkv_proj.bias
+                if name.endswith(".bias")
+                else pair_attn.qkv_proj.weight
+            )
+            if pair_param is None:
+                return True
+            pair_param.weight_loader(pair_param, loaded_weight, pair_shard_id)
+            return True
+
         if is_nextn:
             nextn_spec_weight_names = [
                 "shared_head.norm",
@@ -2146,6 +2264,10 @@ class WeLMV4MoeForCausalLM(nn.Module):
                     or layer_id >= self.model.end_layer
                 )
             ):
+                if maybe_load_remote_kv_mirror_pair_weight(
+                    name, loaded_weight, layer_id
+                ):
+                    continue
                 continue
             if "rotary_emb.inv_freq" in name:
                 continue

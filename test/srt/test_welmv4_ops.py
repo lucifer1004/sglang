@@ -24,6 +24,12 @@ from sglang.srt.layers.welmv4_op import (
     inplace_sigmoid_mul,
     mmq_style_add_residual,
 )
+from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
+from sglang.srt.models.welmv4 import (
+    _pack_welm_kv_mirror_states,
+    _unpack_welm_kv_mirror_states,
+    _welm_kv_mirror_pp_key,
+)
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.test.test_utils import CustomTestCase
 
@@ -53,6 +59,36 @@ num_tokens_list = [127]
 def setUpModule():
     """Set global server args required by RotaryEmbedding init."""
     set_global_server_args_for_scheduler(ServerArgs(model_path="dummy"))
+
+
+class TestWelmV4KvMirrorPPProxy(CustomTestCase):
+    def test_pack_uses_distinct_layer_keys(self):
+        states = {
+            0: (torch.randn(2, 3), torch.randn(2, 3)),
+            15: (torch.randn(1, 3), torch.randn(1, 3)),
+        }
+        proxy_tensors = {"hidden_states": torch.randn(2, 3)}
+
+        _pack_welm_kv_mirror_states(proxy_tensors, states)
+
+        expected_keys = {
+            "hidden_states",
+            _welm_kv_mirror_pp_key(0, "k"),
+            f"{_welm_kv_mirror_pp_key(0, 'k')}.shape",
+            _welm_kv_mirror_pp_key(0, "v"),
+            f"{_welm_kv_mirror_pp_key(0, 'v')}.shape",
+            _welm_kv_mirror_pp_key(15, "k"),
+            f"{_welm_kv_mirror_pp_key(15, 'k')}.shape",
+            _welm_kv_mirror_pp_key(15, "v"),
+            f"{_welm_kv_mirror_pp_key(15, 'v')}.shape",
+        }
+        self.assertEqual(set(proxy_tensors), expected_keys)
+
+        unpacked = _unpack_welm_kv_mirror_states(PPProxyTensors(proxy_tensors))
+        self.assertEqual(set(unpacked), set(states))
+        for layer_idx, (mirror_k, mirror_v) in states.items():
+            torch.testing.assert_close(unpacked[layer_idx][0], mirror_k)
+            torch.testing.assert_close(unpacked[layer_idx][1], mirror_v)
 
 
 # =====================================================================

@@ -19,6 +19,7 @@ from sglang.srt.models.welm_perf_opt import hash_input_ids_vectorized
 from sglang.srt.models.welmv4 import (
     Qwen2MoeDecoderLayer,
     WeLMV4MoeForCausalLM,
+    _empty_welm_kv_mirror_states,
 )
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix, is_cuda, is_npu
@@ -158,13 +159,15 @@ class WeLMV4ModelNextN(nn.Module):
             )
 
         residual = None
+        kv_mirror_states = _empty_welm_kv_mirror_states()
         with get_global_expert_distribution_recorder().disable_this_region():
             for layer in self.decoder_layers:
-                hidden_states, residual = layer(
+                hidden_states, residual, kv_mirror_states = layer(
                     positions,
                     hidden_states,
                     forward_batch,
                     residual,
+                    kv_mirror_states,
                 )
 
         if not forward_batch.forward_mode.is_idle():
