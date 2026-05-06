@@ -1819,7 +1819,12 @@ class Qwen2MoeModel(nn.Module):
                     final_shared_output = getattr(
                         last_layer, "final_mlp_shared_output", None
                     )
-                    if final_experts_output is not None:
+                    # In TP>1, component tensors are still pre-all-reduce.
+                    can_rebuild_final_mlp = (
+                        final_experts_output is not None
+                        and getattr(last_layer.mlp, "tp_size", 1) == 1
+                    )
+                    if can_rebuild_final_mlp:
                         hidden_states = final_experts_output.float() + residual.float()
                         if final_shared_output is not None:
                             hidden_states = hidden_states + final_shared_output.float()
@@ -1832,12 +1837,15 @@ class Qwen2MoeModel(nn.Module):
                             eps=self.norm.variance_epsilon,
                         )
                     else:
+                        hidden_states = hidden_states.float() + residual.float()
                         if _welm_dump_enabled():
-                            _welm_dump_tensor(
-                                "model.ln_f.__input__.0",
-                                hidden_states.float() + residual.float(),
-                            )
-                        hidden_states, _ = self.norm(hidden_states, residual)
+                            _welm_dump_tensor("model.ln_f.__input__.0", hidden_states)
+                        hidden_states = F.rms_norm(
+                            hidden_states.to(self.norm.weight.dtype),
+                            self.norm.weight.shape,
+                            self.norm.weight,
+                            eps=self.norm.variance_epsilon,
+                        )
                 if _welm_dump_enabled():
                     _welm_dump_tensor("model.ln_f", hidden_states)
 
