@@ -9,11 +9,250 @@ from sglang.srt.custom_op import CustomOp
 from sglang.srt.layers.rotary_embedding import FusedSetKVBufferArg, RotaryEmbedding
 
 
+def _get_num_sms(multiplier: int = 1) -> int:
+    return (
+        torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
+        * multiplier
+    )
+
+
+def _router_matmul_get_configs():
+    return [
+        triton.Config(
+            {
+                "BLOCK_SIZE_M": block_m,
+                "BLOCK_SIZE_N": block_n,
+                "BLOCK_SIZE_K": block_k,
+                "GROUP_SIZE_M": 8,
+            },
+            num_stages=num_stages,
+            num_warps=8,
+        )
+        for block_m in [128]
+        for block_n in [16, 32]
+        for block_k in [64, 128]
+        for num_stages in [3, 4]
+    ]
+
+
+@triton.jit
+def _router_matmul_compute_pid(tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M, NUM_SMS):
+    group_id = tile_id // num_pid_in_group
+    first_pid_m = group_id * GROUP_SIZE_M
+    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+    pid_m = first_pid_m + (tile_id % group_size_m)
+    pid_n = (tile_id % num_pid_in_group) // group_size_m
+    return pid_m, pid_n
+
+
+@triton.autotune(configs=_router_matmul_get_configs(), key=["N", "K"], restore_value=["c_ptr"])
+@triton.jit
+def mmq_style_router_linear_kernel(  # pylint: disable=too-many-arguments,too-many-locals
+    a_ptr,
+    b_ptr,
+    c_ptr,
+    M,
+    N,
+    K,
+    stride_am,
+    stride_ak,
+    stride_bk,
+    stride_bn,
+    stride_cm,
+    stride_cn,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+    NUM_SMS: tl.constexpr,
+):
+    start_pid = tl.program_id(axis=0)
+    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
+    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+    k_tiles = tl.cdiv(K, BLOCK_SIZE_K)
+    num_tiles = num_pid_m * num_pid_n
+
+    offs_k_for_mask = tl.arange(0, BLOCK_SIZE_K)
+    num_pid_in_group = GROUP_SIZE_M * num_pid_n
+
+    for tile_id in tl.range(start_pid, num_tiles, NUM_SMS):
+        pid_m, pid_n = _router_matmul_compute_pid(
+            tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M, NUM_SMS
+        )
+        start_m = pid_m * BLOCK_SIZE_M
+        start_n = pid_n * BLOCK_SIZE_N
+        offs_am = start_m + tl.arange(0, BLOCK_SIZE_M)
+        offs_bn = start_n + tl.arange(0, BLOCK_SIZE_N)
+        offs_am = tl.where(offs_am < M, offs_am, 0)
+        offs_bn = tl.where(offs_bn < N, offs_bn, 0)
+        offs_am = tl.max_contiguous(tl.multiple_of(offs_am, BLOCK_SIZE_M), BLOCK_SIZE_M)
+        offs_bn = tl.max_contiguous(tl.multiple_of(offs_bn, BLOCK_SIZE_N), BLOCK_SIZE_N)
+
+        offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+        offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+        c_ptrs = (
+            c_ptr
+            + stride_cm * offs_cm[:, None].to(tl.int64)
+            + stride_cn * offs_cn[None, :].to(tl.int64)
+        )
+        c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
+        accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+
+        for ki in tl.range(k_tiles):
+            offs_k = ki * BLOCK_SIZE_K + tl.arange(0, BLOCK_SIZE_K)
+            a_ptrs = a_ptr + (
+                offs_am[:, None].to(tl.int64) * stride_am
+                + offs_k[None, :].to(tl.int64) * stride_ak
+            )
+            b_ptrs = b_ptr + (
+                offs_k[:, None].to(tl.int64) * stride_bk
+                + offs_bn[None, :].to(tl.int64) * stride_bn
+            )
+
+            a = tl.load(
+                a_ptrs,
+                mask=offs_k_for_mask[None, :] < K - ki * BLOCK_SIZE_K,
+                other=0.0,
+            ).to(tl.float32)
+            b = tl.load(
+                b_ptrs,
+                mask=offs_k_for_mask[:, None] < K - ki * BLOCK_SIZE_K,
+                other=0.0,
+            ).to(tl.float32)
+            accumulator = tl.dot(a, b, accumulator)
+
+        c = accumulator.to(c_ptr.dtype.element_ty)
+        tl.store(c_ptrs, c, mask=c_mask)
+
+
+def mmq_style_router_linear(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    assert x.dim() == 2
+    assert weight.dim() == 2
+    assert x.shape[1] == weight.shape[1]
+    assert x.dtype in (torch.bfloat16, torch.float16)
+    weight = weight.to(x.dtype)
+    weight_t = weight.t()
+    output = torch.empty((x.shape[0], weight.shape[0]), device=x.device, dtype=torch.float32)
+    tokens, hidden_size = x.shape
+    num_experts = weight.shape[0]
+    num_sms = min(
+        _get_num_sms(),
+        triton.cdiv(tokens, 128) * triton.cdiv(num_experts, 16),
+    )
+    mmq_style_router_linear_kernel[(num_sms,)](
+        x,
+        weight_t,
+        output,
+        tokens,
+        num_experts,
+        hidden_size,
+        x.stride(0),
+        x.stride(1),
+        weight_t.stride(0),
+        weight_t.stride(1),
+        output.stride(0),
+        output.stride(1),
+        NUM_SMS=num_sms,
+    )
+    return output
+
+
+@triton.jit
+def mmq_style_expert_bias_topk_kernel(
+    scores_ptr,
+    bias_ptr,
+    topk_weights_ptr,
+    topk_ids_ptr,
+    M,
+    N: tl.constexpr,
+    score_stride_m,
+    score_stride_n,
+    TOPK: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    row = tl.program_id(0)
+    offs = tl.arange(0, BLOCK_SIZE)
+    mask = offs < N
+    scores = tl.load(
+        scores_ptr + row * score_stride_m + offs * score_stride_n,
+        mask=mask,
+        other=-float("inf"),
+    )
+    scores = tl.where(scores == scores, scores, -float("inf"))
+    bias = tl.load(bias_ptr + offs, mask=mask, other=0.0)
+    routing_scores = tl.where(mask, scores + bias, -float("inf"))
+    candidate_mask = mask
+
+    elems_per_copy = 4
+    copy_stride = 32 * elems_per_copy
+    lane_idx = (offs % copy_stride) // elems_per_copy
+    local_idx = (offs // copy_stride) * elems_per_copy + (offs % elems_per_copy)
+    tie_rank = lane_idx * (N // 32) + local_idx
+    invalid_rank = N + 1
+
+    for k in tl.static_range(0, TOPK):
+        max_routing_score = tl.max(routing_scores, axis=0)
+        selected_rank = tl.min(
+            tl.where(
+                (routing_scores == max_routing_score) & candidate_mask,
+                tie_rank,
+                invalid_rank,
+            ),
+            axis=0,
+        )
+        selected_idx = tl.min(
+            tl.where((tie_rank == selected_rank) & candidate_mask, offs, invalid_rank),
+            axis=0,
+        )
+        selected_score = tl.max(
+            tl.where((offs == selected_idx) & candidate_mask, scores, -float("inf")),
+            axis=0,
+        )
+        tl.store(topk_weights_ptr + row * TOPK + k, selected_score)
+        tl.store(topk_ids_ptr + row * TOPK + k, selected_idx)
+        candidate_mask = candidate_mask & (offs != selected_idx)
+        routing_scores = tl.where(
+            candidate_mask, routing_scores, -float("inf")
+        )
+
+
+def mmq_style_expert_bias_topk(
+    scores: torch.Tensor, expert_bias: torch.Tensor, topk: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    assert scores.dim() == 2
+    assert expert_bias.dim() == 1
+    assert scores.shape[1] == expert_bias.shape[0]
+    assert scores.dtype == torch.float32
+    assert expert_bias.dtype == torch.float32
+    assert scores.is_cuda and expert_bias.is_cuda
+
+    num_tokens, num_experts = scores.shape
+    assert num_experts % 128 == 0
+    topk_weights = torch.empty(
+        (num_tokens, topk), dtype=torch.float32, device=scores.device
+    )
+    topk_ids = torch.empty((num_tokens, topk), dtype=torch.int64, device=scores.device)
+    mmq_style_expert_bias_topk_kernel[(num_tokens,)](
+        scores,
+        expert_bias,
+        topk_weights,
+        topk_ids,
+        num_tokens,
+        num_experts,
+        scores.stride(0),
+        scores.stride(1),
+        TOPK=topk,
+        BLOCK_SIZE=triton.next_power_of_2(num_experts),
+    )
+    return topk_weights, topk_ids
+
+
 @triton.jit
 def _do_rms_norm(hidden, gamma, cols: int, eps: tl.constexpr):
+    hidden = hidden.to(gamma.dtype).to(tl.float32)
     inv_rms = tl.math.rsqrt(tl.sum(hidden * hidden, axis=-1) / cols + eps)
     out = hidden * inv_rms
-    out *= gamma.to(hidden.dtype)
+    out *= gamma
     return out
 
 
@@ -26,7 +265,7 @@ def rms_norm_kernel(  # pylint: disable=too-many-arguments,too-many-locals
     out_residual_ptr: tl.tensor,
     out_copy_ptr: tl.tensor,
     rows: int,
-    cols: int,
+    cols: tl.constexpr,
     eps: float,
     hidden_states_row_stride: int,
     hidden_states_num_kv: int,
@@ -41,8 +280,8 @@ def rms_norm_kernel(  # pylint: disable=too-many-arguments,too-many-locals
     mask = cols_off < cols
     gamma_shm = tl.load(gamma_ptr + cols_off, mask=mask, other=0.0)
 
-    original_dtype = hidden_states_ptr.dtype.element_ty
-    for row_id in tl.range(row_start, rows, NUM_SMS, num_stages=4):
+    output_dtype = out_ptr.dtype.element_ty
+    for row_id in tl.range(row_start, rows, NUM_SMS, num_stages=2):
         kv_idx = row_id // hidden_states_num_kv
         row_idx = row_id % hidden_states_num_kv
         kv_off = kv_idx * hidden_states_kv_stride
@@ -66,7 +305,7 @@ def rms_norm_kernel(  # pylint: disable=too-many-arguments,too-many-locals
         if out_copy_ptr is not None:
             tl.store(out_copy_ptr + output_offs, out, mask=mask)
 
-        out = out.to(original_dtype)
+        out = out.to(output_dtype)
         if residual_after_layernorm:
             tl.store(out_residual_ptr + output_offs, out, mask=mask)
 
@@ -81,7 +320,7 @@ class WelmV4FusedRMSNorm(CustomOp):
         self.hidden_size = hidden_size
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(hidden_size, dtype=weight_dtype))
-        self.num_sms = 78 * 8
+        self.num_sms = _get_num_sms(multiplier=8)
 
     def forward_cuda(
         self,
@@ -89,13 +328,16 @@ class WelmV4FusedRMSNorm(CustomOp):
         residual: Optional[torch.Tensor] = None,
         residual_after_layernorm: bool = False,
         clone_fp32_out: bool = False,
+        output_dtype: Optional[torch.dtype] = None,
     ):
         assert x.dim() in [2, 3]
-        output = torch.empty_like(x)
+        output = torch.empty_like(x, dtype=output_dtype or x.dtype)
         fp32_out = None
         out_residual = None
-        if residual is not None or residual_after_layernorm:
+        if residual_after_layernorm:
             out_residual = torch.empty_like(x)
+        elif residual is not None:
+            out_residual = torch.empty_like(residual)
         if clone_fp32_out:
             fp32_out = torch.empty_like(x, dtype=torch.float32)
         cols = x.shape[-1]
@@ -143,6 +385,130 @@ class WelmV4FusedRMSNorm(CustomOp):
 
 
 @triton.jit
+def mmq_style_shared_experts_add_residual_rms_norm_kernel(
+    experts_output_ptr: tl.tensor,
+    shared_output_ptr: tl.tensor,
+    residual_ptr: tl.tensor,
+    gamma_ptr: tl.tensor,
+    out_ptr: tl.tensor,
+    rows: int,
+    cols: tl.constexpr,
+    eps: float,
+    NUM_SMS: tl.constexpr,  # pylint: disable=invalid-name
+    BLOCK_SIZE: tl.constexpr,  # pylint: disable=invalid-name
+):
+    row_start = tl.program_id(0)
+    cols_off = tl.arange(0, BLOCK_SIZE)
+    mask = cols_off < cols
+    gamma_shm = tl.load(gamma_ptr + cols_off, mask=mask, other=0.0)
+    output_dtype = out_ptr.dtype.element_ty
+
+    for row_id in tl.range(row_start, rows, NUM_SMS, num_stages=2):
+        offs = (row_id * cols + cols_off).to(tl.int64)
+        experts_output = tl.load(
+            experts_output_ptr + offs, mask=mask, other=0.0
+        ).to(tl.float32)
+        shared_output = tl.load(
+            shared_output_ptr + offs, mask=mask, other=0.0
+        ).to(tl.float32)
+        residual = tl.load(residual_ptr + offs, mask=mask, other=0.0).to(tl.float32)
+
+        hidden_state = experts_output + shared_output
+        hidden_state = hidden_state + residual
+        out = _do_rms_norm(hidden_state, gamma_shm, cols, eps)
+        tl.store(out_ptr + offs, out.to(output_dtype), mask=mask)
+
+
+def mmq_style_shared_experts_add_residual_rms_norm(
+    experts_output: torch.Tensor,
+    shared_output: torch.Tensor,
+    residual: torch.Tensor,
+    gamma: torch.Tensor,
+    eps: float,
+) -> torch.Tensor:
+    assert experts_output.dim() == 2
+    assert shared_output.shape == experts_output.shape
+    assert residual.shape == experts_output.shape
+    assert gamma.dim() == 1 and gamma.shape[0] == experts_output.shape[1]
+    assert experts_output.is_cuda and shared_output.is_cuda and residual.is_cuda
+    assert experts_output.is_contiguous()
+    assert shared_output.is_contiguous()
+    assert residual.is_contiguous()
+
+    output = torch.empty_like(experts_output)
+    rows, cols = experts_output.shape
+    num_sms = min(rows, _get_num_sms(multiplier=8))
+    block_size = triton.next_power_of_2(cols)
+    mmq_style_shared_experts_add_residual_rms_norm_kernel[(num_sms,)](
+        experts_output,
+        shared_output,
+        residual,
+        gamma,
+        output,
+        rows,
+        cols,
+        eps,
+        num_sms,
+        block_size,
+    )
+    return output
+
+
+@triton.jit
+def mmq_style_k_rms_norm_kernel(
+    x_ptr: tl.tensor,
+    gamma_ptr: tl.tensor,
+    out_ptr: tl.tensor,
+    tokens: int,
+    kv_heads: tl.constexpr,
+    head_dim: tl.constexpr,
+    x_token_stride: int,
+    out_token_stride: int,
+    eps: float,
+    NUM_SMS: tl.constexpr,  # pylint: disable=invalid-name
+    KV_HEADS_BLOCK: tl.constexpr,  # pylint: disable=invalid-name
+):
+    head_dim_offs = tl.arange(0, head_dim)
+    kv_head_offs = tl.arange(0, KV_HEADS_BLOCK)
+    block_offs = kv_head_offs[:, None] * head_dim + head_dim_offs[None, :]
+    gamma = tl.load(gamma_ptr + head_dim_offs)
+
+    for token_id in tl.range(tl.program_id(0), tokens, NUM_SMS, num_stages=4):
+        in_offs = token_id * x_token_stride.to(tl.int64) + block_offs
+        x = tl.load(
+            x_ptr + in_offs, mask=kv_head_offs[:, None] < kv_heads, other=0.0
+        ).to(tl.float32)
+        inv_rms = tl.math.rsqrt(tl.sum(x * x, axis=-1) / head_dim + eps)
+        out = x * inv_rms[:, None]
+        out *= gamma[None, :]
+
+        out_offs = token_id * out_token_stride.to(tl.int64) + block_offs
+        tl.store(out_ptr + out_offs, out, mask=kv_head_offs[:, None] < kv_heads)
+
+
+def mmq_style_k_rms_norm(x: torch.Tensor, gamma: torch.Tensor, eps: float):
+    assert x.dim() == 3
+    assert x.is_contiguous()
+    output = torch.empty_like(x)
+    tokens, kv_heads, head_dim = x.shape
+    num_sms = min(tokens, _get_num_sms())
+    mmq_style_k_rms_norm_kernel[(num_sms,)](
+        x,
+        gamma,
+        output,
+        tokens,
+        kv_heads,
+        head_dim,
+        x.stride(0),
+        output.stride(0),
+        eps,
+        num_sms,
+        triton.next_power_of_2(kv_heads),
+    )
+    return output
+
+
+@triton.jit
 def sigmoid_mul_kernel(
     x: tl.tensor,
     y: tl.tensor,
@@ -165,7 +531,7 @@ def sigmoid_mul_kernel(
 
 # return sigmoid(x) * y
 def inplace_sigmoid_mul(x: torch.Tensor, y: torch.Tensor):
-    num_sms = 78 * 8
+    num_sms = _get_num_sms(multiplier=8)
     cols = y.shape[-1]
     rows = y.numel() // cols
     block_size = triton.next_power_of_2(cols)
@@ -287,7 +653,7 @@ class WelmV4InplaceRotaryEmbedding(RotaryEmbedding):
         super().__init__(
             head_size, rotary_dim, max_position_embeddings, base, is_neox_style, dtype
         )
-        self.num_sms = 78 * 8
+        self.num_sms = _get_num_sms(multiplier=8)
 
     def forward_cuda(
         self,

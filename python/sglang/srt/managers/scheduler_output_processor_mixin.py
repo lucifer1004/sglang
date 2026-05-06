@@ -687,7 +687,7 @@ class SchedulerOutputProcessorMixin:
         # Only add input logprobs if there are input tokens to process
         # Note: For prefill-only requests with default logprob_start_len, this will be 0,
         # meaning we only compute output logprobs (which is the intended behavior)
-        if num_input_logprobs > 0:
+        if num_input_logprobs > 0 and output.input_token_logprobs is not None:
             self.add_input_logprob_return_values(
                 i, req, output, pt, num_input_logprobs, last_prefill_chunk=True
             )

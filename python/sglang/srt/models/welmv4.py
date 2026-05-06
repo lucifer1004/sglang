@@ -71,13 +71,16 @@ from sglang.srt.layers.welmv4_op import (
     WelmV4FusedRMSNorm,
     WelmV4InplaceRotaryEmbedding,
     inplace_sigmoid_mul,
+    mmq_style_expert_bias_topk,
+    mmq_style_router_linear,
+    mmq_style_k_rms_norm,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.server_args import get_global_server_args
 
 # from sglang.srt.two_batch_overlap import model_forward_maybe_tbo
-from sglang.srt.utils import add_prefix, is_cuda, make_layers
+from sglang.srt.utils import add_prefix, get_bool_env_var, is_cuda, make_layers
 
 logger = logging.getLogger(__name__)
 
@@ -272,9 +275,16 @@ def expert_bias_routing(
     else:
         scores = torch.sigmoid(gating_output).type_as(gating_output)
 
-    scores_for_routing = scores + expert_bias
-    _, indices = torch.topk(scores_for_routing, topk, dim=-1)
-    topk_scores = torch.gather(scores, dim=1, index=indices).type_as(scores)
+    if (
+        scores.is_cuda
+        and scores.dtype == torch.float32
+        and expert_bias.dtype == torch.float32
+    ):
+        topk_scores, indices = mmq_style_expert_bias_topk(scores, expert_bias, topk)
+    else:
+        scores_for_routing = scores + expert_bias
+        _, indices = torch.topk(scores_for_routing, topk, dim=-1)
+        topk_scores = torch.gather(scores, dim=1, index=indices).type_as(scores)
 
     return topk_scores, indices
 
@@ -312,6 +322,9 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             torch.zeros((config.num_experts), dtype=torch.float32)
         )
         self.layer_id = layer_id
+        self.num_hidden_layers = config.num_hidden_layers
+        self.last_final_experts_output: Optional[torch.Tensor] = None
+        self.last_final_shared_output: Optional[torch.Tensor] = None
         self.alt_stream = alt_stream
         if self.tp_size > config.num_experts:
             raise ValueError(
@@ -370,6 +383,9 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("experts", prefix),
             swiglu_clamp_limit=moe_clamp_limit,
+            apply_router_weight_on_swiglu=get_bool_env_var(
+                "SGLANG_WELMV4_MMQ_SCORE_ON_SWIGLU", "false"
+            ),
         )
 
         self.gate = ReplicatedLinear(
@@ -416,10 +432,20 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 shared_output = (
                     F.sigmoid(self.shared_expert_gate(hidden_states)) * shared_output
                 )
-        router_logits = F.linear(hidden_states_fp32, self.gate.weight)
+        router_logits = mmq_style_router_linear(hidden_states, self.gate.weight)
         topk_output = self.topk(hidden_states, router_logits)
-        final_hidden_states = self.experts(hidden_states, topk_output)
+        experts_output = self.experts(hidden_states, topk_output)
+        final_hidden_states = experts_output
+        self.last_final_experts_output = None
+        self.last_final_shared_output = None
         if shared_output is not None:
+            if (
+                self.layer_id == self.num_hidden_layers - 1
+                and self.tp_size == 1
+                and not use_reduce_scatter
+            ):
+                self.last_final_experts_output = experts_output
+                self.last_final_shared_output = shared_output
             final_hidden_states = final_hidden_states + shared_output
         if self.tp_size > 1 and not use_reduce_scatter:
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
@@ -689,7 +715,6 @@ class Qwen2MoeAttention(nn.Module):
         qk_norm: bool = False,
         k_norm: bool = False,
         qk_rope_head_dim: int = 0,
-        qk_norm_eps: float = 1e-5,
         quant_config: Optional[QuantizationConfig] = None,
         dual_chunk_attention_config: Optional[dict[str, Any]] = None,
         prefix: str = "",
@@ -699,6 +724,7 @@ class Qwen2MoeAttention(nn.Module):
         enable_attn_sink_layerwise=[],
         layer_idx: Optional[int] = None,
         o_norm=False,
+        rms_norm_eps: float = 1e-5,
         total_layer_num: int = 1,
         is_nextn: bool = False,
     ) -> None:
@@ -733,17 +759,21 @@ class Qwen2MoeAttention(nn.Module):
         self.only_k_norm = k_norm
         self.use_o_norm = o_norm
         self.total_layer_num = total_layer_num
-        self.o_norm = RMSNorm(self.hidden_size) if self.use_o_norm else nn.Identity()
+        self.o_norm = (
+            WelmV4FusedRMSNorm(self.hidden_size, eps=rms_norm_eps)
+            if self.use_o_norm
+            else None
+        )
 
         self.q_norm = (
-            WelmV4FusedRMSNorm(self.head_dim, eps=qk_norm_eps)
+            WelmV4FusedRMSNorm(self.head_dim, eps=rms_norm_eps)
             if self.qk_norm
-            else nn.Identity()
+            else None
         )
         self.k_norm = (
-            WelmV4FusedRMSNorm(self.head_dim, eps=qk_norm_eps)
+            WelmV4FusedRMSNorm(self.head_dim, eps=rms_norm_eps)
             if self.qk_norm or self.only_k_norm
-            else nn.Identity()
+            else None
         )
 
         self.kv_mirror_layers = kv_mirror_layers
@@ -926,15 +956,15 @@ class Qwen2MoeAttention(nn.Module):
         k_shape = k.shape
 
         q_by_head = q.view(*q.shape[:-1], q.shape[-1] // self.head_dim, self.head_dim)
-        if self.qk_norm:
+        if self.q_norm is not None:
             q_by_head, _ = self.q_norm(q_by_head)
         q = q_by_head.view(q.shape)
 
         k_by_head = k.view(*k.shape[:-1], k.shape[-1] // self.head_dim, self.head_dim)
-        # for welmv4, qk_norm is false and only_k_norm is true
-        # fuse: implement a high precision and fused k_norm
-        if self.qk_norm or self.only_k_norm:
-            k_by_head, _ = self.k_norm(k_by_head)
+        if self.k_norm is not None:
+            k_by_head = mmq_style_k_rms_norm(
+                k_by_head.contiguous(), self.k_norm.weight, self.k_norm.eps
+            )
         k = k_by_head.view(k.shape)
 
         qk_nope_head_dim = self.head_dim - self.qk_rope_head_dim
@@ -965,8 +995,8 @@ class Qwen2MoeAttention(nn.Module):
             attn_output = attn_output.view(attn_shape)
 
         output, _ = self.o_proj(attn_output)
-        if self.use_o_norm:
-            output = self.o_norm(output)
+        if self.o_norm is not None:
+            output, _ = self.o_norm(output)
         return output
 
 
@@ -1054,6 +1084,7 @@ class Qwen2MoeDecoderLayer(nn.Module):
             enable_attn_sink_layerwise=self.enable_attn_sink_layerwise,
             layer_idx=layer_id,
             o_norm=o_norm and layer_id not in self.prenorm_layer_idx,
+            rms_norm_eps=config.rms_norm_eps,
             total_layer_num=total_layer_num,
             is_nextn=is_nextn,
         )
@@ -1098,6 +1129,8 @@ class Qwen2MoeDecoderLayer(nn.Module):
         self.post_attention_layernorm = WelmV4FusedRMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
+        self.final_mlp_experts_output: Optional[torch.Tensor] = None
+        self.final_mlp_shared_output: Optional[torch.Tensor] = None
 
         self.layer_communicator = LayerCommunicator(
             layer_scatter_modes=self.layer_scatter_modes,
@@ -1117,13 +1150,21 @@ class Qwen2MoeDecoderLayer(nn.Module):
         residual_after_layernorm = (
             self.ppln and self.layer_id not in self.prenorm_layer_idx
         )
-        hidden_states, residual = self.input_layernorm(
-            hidden_states, residual, residual_after_layernorm=residual_after_layernorm
-        )
-
-        if self.ppln and self.layer_id not in self.prenorm_layer_idx:
-            residual = hidden_states.clone().to(
-                dtype=hidden_states.dtype, device=hidden_states.device
+        if residual_after_layernorm:
+            hidden_states, _, residual = self.input_layernorm(
+                hidden_states,
+                residual,
+                residual_after_layernorm=residual_after_layernorm,
+                clone_fp32_out=True,
+                output_dtype=self.input_layernorm.weight.dtype
+                if hidden_states.dtype == torch.float32
+                else hidden_states.dtype,
+            )
+        else:
+            hidden_states, residual = self.input_layernorm(
+                hidden_states,
+                residual,
+                residual_after_layernorm=residual_after_layernorm,
             )
         if hidden_states.shape[0] != 0:
             hidden_states = self.self_attn(
@@ -1137,15 +1178,19 @@ class Qwen2MoeDecoderLayer(nn.Module):
             and self.layer_id == self.kv_mirror_layers[-1]
         ):
             residual = residual[forward_batch.custom_last_index]
-        hidden_states, residual, hidden_states_fp32 = self.post_attention_layernorm(
-            hidden_states, residual, clone_fp32_out=True
-        )
+        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         # For DP with padding, reduce scatter can be used instead of all-reduce.
         use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
             forward_batch
         )
         hidden_states = self.mlp(
-            hidden_states, hidden_states_fp32, forward_batch, use_reduce_scatter
+            hidden_states, hidden_states.float(), forward_batch, use_reduce_scatter
+        )
+        self.final_mlp_experts_output = getattr(
+            self.mlp, "last_final_experts_output", None
+        )
+        self.final_mlp_shared_output = getattr(
+            self.mlp, "last_final_shared_output", None
         )
         return hidden_states, residual
 
@@ -1252,7 +1297,9 @@ class Qwen2MoeModel(nn.Module):
             prefix=add_prefix("layers", prefix),
         )
         if self.pp_group.is_last_rank:
-            self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            self.norm = WelmV4FusedRMSNorm(
+                config.hidden_size, eps=config.rms_norm_eps
+            )
         else:
             self.norm = PPMissingLayer(return_tuple=True)
 
@@ -1393,9 +1440,38 @@ class Qwen2MoeModel(nn.Module):
         else:
             if hidden_states.shape[0] != 0:
                 if residual is None:
-                    hidden_states = self.norm(hidden_states)
+                    hidden_states, _ = self.norm(hidden_states)
                 else:
-                    hidden_states, _ = self.norm(hidden_states, residual)
+                    last_layer = self.layers[self.end_layer - 1]
+                    final_experts_output = getattr(
+                        last_layer, "final_mlp_experts_output", None
+                    )
+                    final_shared_output = getattr(
+                        last_layer, "final_mlp_shared_output", None
+                    )
+                    if (
+                        final_experts_output is not None
+                        and final_shared_output is not None
+                    ):
+                        hidden_states = (
+                            final_experts_output.float()
+                            + residual.float()
+                            + final_shared_output.float()
+                        ).to(self.norm.weight.dtype)
+                        hidden_states = F.rms_norm(
+                            hidden_states,
+                            self.norm.weight.shape,
+                            self.norm.weight,
+                            eps=self.norm.eps,
+                        )
+                    else:
+                        hidden_states, _ = self.norm(
+                            hidden_states,
+                            residual,
+                            output_dtype=self.norm.weight.dtype
+                            if hidden_states.dtype == torch.float32
+                            else hidden_states.dtype,
+                        )
 
         if len(aux_hidden_states) == 0:
             return hidden_states
