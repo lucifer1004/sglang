@@ -69,6 +69,200 @@ def should_enable_swap_ab(
 
 
 @triton.jit
+def _apply_routed_weight_to_cache_kernel(
+    cache_ptr,
+    topk_weights_ptr,
+    sorted_token_ids_ptr,
+    num_tokens_post_padded_ptr,
+    N: tl.constexpr,
+    total_topk_ids: tl.constexpr,
+    CACHE_SORTED: tl.constexpr,
+    stride_cm: tl.constexpr,
+    stride_cn: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr)
+    if CACHE_SORTED:
+        row_mask = offs_m < num_tokens_post_padded
+        token_ids = tl.load(
+            sorted_token_ids_ptr + offs_m, mask=row_mask, other=total_topk_ids
+        )
+    else:
+        row_mask = offs_m < total_topk_ids
+        token_ids = offs_m
+    token_mask = row_mask & (token_ids < total_topk_ids)
+    weights = tl.load(topk_weights_ptr + token_ids, mask=token_mask, other=0.0)
+    ptrs = cache_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+    mask = row_mask[:, None] & (offs_n[None, :] < N)
+    values = tl.load(ptrs, mask=mask, other=0.0)
+    tl.store(ptrs, values * weights[:, None], mask=mask)
+
+
+def apply_routed_weight_to_cache(
+    cache: torch.Tensor,
+    topk_weights: torch.Tensor,
+    sorted_token_ids: torch.Tensor,
+    num_tokens_post_padded: torch.Tensor,
+    cache_sorted: bool,
+) -> None:
+    assert cache.is_contiguous()
+    assert topk_weights.stride(1) == 1
+    assert sorted_token_ids.stride(0) == 1
+    n = cache.shape[-1]
+    block_size_m = 16
+    block_size_n = min(triton.next_power_of_2(n), 1024)
+    grid = (
+        triton.cdiv(cache.shape[0], block_size_m),
+        triton.cdiv(n, block_size_n),
+    )
+    _apply_routed_weight_to_cache_kernel[grid](
+        cache,
+        topk_weights,
+        sorted_token_ids,
+        num_tokens_post_padded,
+        N=n,
+        total_topk_ids=topk_weights.numel(),
+        CACHE_SORTED=cache_sorted,
+        stride_cm=cache.stride(0),
+        stride_cn=cache.stride(1),
+        BLOCK_SIZE_M=block_size_m,
+        BLOCK_SIZE_N=block_size_n,
+    )
+
+
+@triton.jit
+def _tanh_approx_f32(x):
+    return tl.inline_asm_elementwise(
+        asm="tanh.approx.f32 $0, $1;",
+        constraints="=f,f",
+        args=[x],
+        dtype=tl.float32,
+        is_pure=True,
+        pack=1,
+    )
+
+
+@triton.jit
+def _mmq_swiglu_mul_routed_weight_kernel(
+    input_ptr,
+    output_ptr,
+    topk_weights_ptr,
+    sorted_token_ids_ptr,
+    num_tokens_post_padded_ptr,
+    N: tl.constexpr,
+    total_topk_ids: tl.constexpr,
+    CACHE_SORTED: tl.constexpr,
+    GATE_UP_LAYOUT: tl.constexpr,
+    stride_im: tl.constexpr,
+    stride_in: tl.constexpr,
+    stride_om: tl.constexpr,
+    stride_on: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+
+    num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr)
+    if CACHE_SORTED:
+        row_mask = offs_m < num_tokens_post_padded
+        token_ids = tl.load(
+            sorted_token_ids_ptr + offs_m, mask=row_mask, other=total_topk_ids
+        )
+    else:
+        row_mask = offs_m < total_topk_ids
+        token_ids = offs_m
+    token_mask = row_mask & (token_ids < total_topk_ids)
+
+    if GATE_UP_LAYOUT:
+        gate_offsets = offs_n
+        up_offsets = offs_n + N // 2
+    else:
+        up_offsets = offs_n
+        gate_offsets = offs_n + N // 2
+
+    gate = tl.load(
+        input_ptr + offs_m[:, None] * stride_im + gate_offsets[None, :] * stride_in,
+        mask=row_mask[:, None] & (offs_n[None, :] < N // 2),
+        other=0.0,
+    ).to(tl.bfloat16)
+    up = tl.load(
+        input_ptr + offs_m[:, None] * stride_im + up_offsets[None, :] * stride_in,
+        mask=row_mask[:, None] & (offs_n[None, :] < N // 2),
+        other=0.0,
+    ).to(tl.bfloat16)
+    probs = tl.load(topk_weights_ptr + token_ids, mask=token_mask, other=0.0).to(
+        tl.float32
+    )
+
+    # Match MMQ's CUDA JIT path: bf16 multiply by 0.5, tanh.approx sigmoid,
+    # round sigmoid*prob to bf16, then do the bf16 hmul chain.
+    half_gate = (gate * 0.5).to(tl.bfloat16).to(tl.float32)
+    tanh_gate = _tanh_approx_f32(half_gate)
+    sigmoid_prob = ((1.0 + tanh_gate) * 0.5 * probs[:, None]).to(tl.bfloat16)
+    values = (sigmoid_prob * gate).to(tl.bfloat16)
+    values = (values * up).to(tl.bfloat16)
+
+    output_ptrs = (
+        output_ptr + offs_m[:, None] * stride_om + offs_n[None, :] * stride_on
+    )
+    tl.store(
+        output_ptrs,
+        values,
+        mask=row_mask[:, None] & (offs_n[None, :] < N // 2),
+    )
+
+
+def mmq_swiglu_mul_routed_weight(
+    input_cache: torch.Tensor,
+    output_cache: torch.Tensor,
+    topk_weights: torch.Tensor,
+    sorted_token_ids: torch.Tensor,
+    num_tokens_post_padded: torch.Tensor,
+    cache_sorted: bool,
+    gate_up_layout: bool,
+) -> None:
+    assert input_cache.is_contiguous()
+    assert output_cache.is_contiguous()
+    assert topk_weights.stride(1) == 1
+    assert sorted_token_ids.stride(0) == 1
+    n = input_cache.shape[-1]
+    assert n % 2 == 0
+    assert output_cache.shape[-1] == n // 2
+    block_size_m = 2
+    block_size_n = 128
+    assert (n // 2) % block_size_n == 0
+    grid = (
+        triton.cdiv(input_cache.shape[0], block_size_m),
+        triton.cdiv(n // 2, block_size_n),
+    )
+    _mmq_swiglu_mul_routed_weight_kernel[grid](
+        input_cache,
+        output_cache,
+        topk_weights,
+        sorted_token_ids,
+        num_tokens_post_padded,
+        N=n,
+        total_topk_ids=topk_weights.numel(),
+        CACHE_SORTED=cache_sorted,
+        GATE_UP_LAYOUT=gate_up_layout,
+        stride_im=input_cache.stride(0),
+        stride_in=input_cache.stride(1),
+        stride_om=output_cache.stride(0),
+        stride_on=output_cache.stride(1),
+        BLOCK_SIZE_M=block_size_m,
+        BLOCK_SIZE_N=block_size_n,
+    )
+
+
+@triton.jit
 def write_zeros_to_output(
     c_ptr,
     stride_cm,

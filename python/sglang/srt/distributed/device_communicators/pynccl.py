@@ -1,7 +1,7 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/distributed/device_communicators/pynccl.py
 
 import logging
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from typing import Optional, Union
 
 # ===================== import region =====================
@@ -367,9 +367,11 @@ class PyNcclCommunicator:
         self.nccl.ncclGroupEnd()
 
     @contextmanager
-    def change_state(self, enable: Optional[bool] = None):
+    def change_state(
+        self, enable: Optional[bool] = None, stream: Optional[torch.cuda.Stream] = None
+    ):
         """
-        A context manager to change the enabled state of the communicator.
+        A context manager to change the state of the communicator.
         """
         if enable is None:
             # guess a default value when not specified
@@ -377,7 +379,17 @@ class PyNcclCommunicator:
 
         old_disable = self.disabled
         self.disabled = not enable
+        stream_context = torch.cuda.stream(stream) if stream is not None else nullcontext()
         try:
-            yield
+            with stream_context:
+                yield
         finally:
             self.disabled = old_disable
+
+    def nccl_pause(self):
+        """Pause NCCL operations and release GPU memory (AMem NCCL plugin)."""
+        self.nccl.ncclPause(self.comm)
+
+    def nccl_resume(self):
+        """Resume NCCL operations after pause (AMem NCCL plugin)."""
+        self.nccl.ncclResume(self.comm)

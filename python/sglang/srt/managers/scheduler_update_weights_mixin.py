@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import traceback
 from typing import TYPE_CHECKING, Tuple
 
@@ -12,6 +13,8 @@ from sglang.srt.constants import (
     GPU_MEMORY_TYPE_KV_CACHE,
     GPU_MEMORY_TYPE_WEIGHTS,
 )
+from sglang.srt.distributed import get_moe_ep_group, get_moe_tp_group, get_tp_group
+from sglang.srt.layers.dp_attention import get_attention_tp_group
 from sglang.srt.managers.io_struct import (
     CheckWeightsReqInput,
     CheckWeightsReqOutput,
@@ -150,6 +153,20 @@ class SchedulerUpdateWeightsMixin:
         if GPU_MEMORY_TYPE_CUDA_GRAPH in tags:
             self.memory_saver_adapter.pause(GPU_MEMORY_TYPE_CUDA_GRAPH)
 
+            if os.environ.get("AMEM_ENABLE", "0") == "1":
+                tp_group = get_tp_group()
+                if tp_group is not None and tp_group.pynccl_comm is not None:
+                    tp_group.pynccl_comm.nccl_pause()
+                attn_tp_group = get_attention_tp_group()
+                if attn_tp_group is not None and attn_tp_group.pynccl_comm is not None:
+                    attn_tp_group.pynccl_comm.nccl_pause()
+                moe_ep_group = get_moe_ep_group()
+                if moe_ep_group is not None and moe_ep_group.pynccl_comm is not None:
+                    moe_ep_group.pynccl_comm.nccl_pause()
+                moe_tp_group = get_moe_tp_group()
+                if moe_tp_group is not None and moe_tp_group.pynccl_comm is not None:
+                    moe_tp_group.pynccl_comm.nccl_pause()
+
         torch.get_device_module().synchronize()
 
         return ReleaseMemoryOccupationReqOutput()
@@ -167,6 +184,20 @@ class SchedulerUpdateWeightsMixin:
 
         if GPU_MEMORY_TYPE_CUDA_GRAPH in tags:
             self.memory_saver_adapter.resume(GPU_MEMORY_TYPE_CUDA_GRAPH)
+
+            if os.environ.get("AMEM_ENABLE", "0") == "1":
+                tp_group = get_tp_group()
+                if tp_group is not None and tp_group.pynccl_comm is not None:
+                    tp_group.pynccl_comm.nccl_resume()
+                attn_tp_group = get_attention_tp_group()
+                if attn_tp_group is not None and attn_tp_group.pynccl_comm is not None:
+                    attn_tp_group.pynccl_comm.nccl_resume()
+                moe_ep_group = get_moe_ep_group()
+                if moe_ep_group is not None and moe_ep_group.pynccl_comm is not None:
+                    moe_ep_group.pynccl_comm.nccl_resume()
+                moe_tp_group = get_moe_tp_group()
+                if moe_tp_group is not None and moe_tp_group.pynccl_comm is not None:
+                    moe_tp_group.pynccl_comm.nccl_resume()
 
         if GPU_MEMORY_TYPE_WEIGHTS in tags:
             self.memory_saver_adapter.resume(GPU_MEMORY_TYPE_WEIGHTS)

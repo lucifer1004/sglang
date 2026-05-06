@@ -20,7 +20,14 @@ from sglang.srt.layers.moe.moe_runner.base import (
     register_pre_permute,
 )
 from sglang.srt.layers.moe.utils import MoeRunnerBackend
-from sglang.srt.utils import cpu_has_amx_support, is_cpu, is_cuda, is_hip, is_xpu
+from sglang.srt.utils import (
+    cpu_has_amx_support,
+    get_bool_env_var,
+    is_cpu,
+    is_cuda,
+    is_hip,
+    is_xpu,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher.standard import (
@@ -36,6 +43,34 @@ _is_cpu = is_cpu()
 _use_aiter = bool(int(os.getenv("SGLANG_USE_AITER", "0")))
 _is_xpu = is_xpu()
 _MOE_PADDING_SIZE = 128 if bool(int(os.getenv("SGLANG_MOE_PADDING", "0"))) else 0
+
+
+def _dump_moe_debug_tensor(
+    layer_id: Optional[int], name: str, tensor: torch.Tensor
+) -> None:
+    if os.getenv("SGLANG_DUMP_ACTIVATIONS", "0").lower() not in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    ):
+        return
+    layer_filter = os.getenv("SGLANG_DUMP_ACTIVATIONS_LAYER_IDXS", "")
+    if layer_filter:
+        layer_ids = {int(x) for x in layer_filter.split(",") if x.strip()}
+        if layer_id not in layer_ids:
+            return
+    dump_root = os.getenv("SGLANG_DUMP_ACTIVATIONS_DIR")
+    if not dump_root:
+        return
+    process_dir = os.getenv("SGLANG_DUMP_ACTIVATIONS_PROCESS_DIR")
+    if not process_dir:
+        process_dir = os.path.join(
+            dump_root, f"TP0_PP0_Rank0_pid{os.getpid()}", "Pass00000"
+        )
+        os.environ["SGLANG_DUMP_ACTIVATIONS_PROCESS_DIR"] = process_dir
+    os.makedirs(process_dir, exist_ok=True)
+    torch.save(tensor.detach().cpu(), os.path.join(process_dir, name))
 
 
 if _is_cuda or _is_hip:
@@ -131,7 +166,10 @@ class TritonRunnerCore(MoeRunnerCore):
         from sglang.srt.layers.moe.fused_moe_triton.fused_moe import (
             _swiglu_gpt_oss_sigmoid_alpha,
             _swiglu_silu_clamp_mul,
+            apply_routed_weight_to_cache,
             invoke_fused_moe_kernel,
+            mmq_sequential_moe_sum,
+            mmq_swiglu_mul_routed_weight,
             moe_sum_reduce_torch_compile,
             moe_sum_reduce_triton,
         )
@@ -168,8 +206,12 @@ class TritonRunnerCore(MoeRunnerCore):
         swiglu_clamp_limit = self.config.swiglu_clamp_limit
         routed_scaling_factor = self.config.routed_scaling_factor
         apply_router_weight_on_input = self.config.apply_router_weight_on_input
+        apply_router_weight_on_swiglu = self.config.apply_router_weight_on_swiglu
 
         assert self.config.is_gated, "Only gated MoEs are supported for Triton runner"
+        assert not (
+            apply_router_weight_on_input and apply_router_weight_on_swiglu
+        ), "Cannot apply router weights both on MoE input and SwiGLU output"
 
         M = hidden_states.shape[0]
         E, N, _ = w13.shape
@@ -207,6 +249,11 @@ class TritonRunnerCore(MoeRunnerCore):
             per_channel_quant=per_channel_quant,
             block_shape=block_shape,
         )
+        _dump_moe_debug_tensor(
+            self.config.layer_id,
+            f"model.layers.{self.config.layer_id}.mlp.experts.fc1_output.pt",
+            intermediate_cache1,
+        )
 
         intermediate_cache2 = torch.empty(
             (M * topk_ids.shape[1], N // 2),
@@ -214,11 +261,31 @@ class TritonRunnerCore(MoeRunnerCore):
             dtype=hidden_states.dtype,
         )
 
+        fused_router_weight_on_swiglu = False
         if activation == "silu":
-            if swiglu_clamp_limit is not None and swiglu_clamp_limit > 0:
+            if (
+                apply_router_weight_on_swiglu
+                and swiglu_clamp_limit is None
+                and gemm1_alpha is None
+                and gemm1_limit is None
+                and (_is_cuda or _is_hip)
+            ):
+                mmq_swiglu_mul_routed_weight(
+                    intermediate_cache1,
+                    intermediate_cache2,
+                    topk_weights,
+                    sorted_token_ids,
+                    num_tokens_post_padded,
+                    False,
+                    True,
+                )
+                fused_router_weight_on_swiglu = True
+            elif swiglu_clamp_limit is not None and swiglu_clamp_limit > 0:
                 cache_view = intermediate_cache1.view(-1, N)
                 gate = F.silu(cache_view[:, :N // 2]).clamp_(max=swiglu_clamp_limit)
-                up = cache_view[:, N // 2:].clamp(min=-swiglu_clamp_limit, max=swiglu_clamp_limit)
+                up = cache_view[:, N // 2 :].clamp(
+                    min=-swiglu_clamp_limit, max=swiglu_clamp_limit
+                )
                 intermediate_cache2 = gate * up
             elif gemm1_alpha is not None:
                 assert gemm1_limit is not None
@@ -246,6 +313,20 @@ class TritonRunnerCore(MoeRunnerCore):
                 )
         else:
             raise ValueError(f"Unsupported activation: {activation=}")
+
+        if apply_router_weight_on_swiglu and not fused_router_weight_on_swiglu:
+            apply_routed_weight_to_cache(
+                intermediate_cache2,
+                topk_weights,
+                sorted_token_ids,
+                num_tokens_post_padded,
+                False,
+            )
+        _dump_moe_debug_tensor(
+            self.config.layer_id,
+            f"model.layers.{self.config.layer_id}.mlp.experts.swiglu_output.pt",
+            intermediate_cache2,
+        )
 
         intermediate_cache3 = torch.empty(
             (M, topk_ids.shape[1], w2.shape[1]),
@@ -282,7 +363,7 @@ class TritonRunnerCore(MoeRunnerCore):
             sorted_token_ids,
             expert_ids,
             num_tokens_post_padded,
-            not apply_router_weight_on_input,
+            not apply_router_weight_on_input and not apply_router_weight_on_swiglu,
             1,
             running_state["config"],
             compute_type=compute_type,
@@ -293,15 +374,29 @@ class TritonRunnerCore(MoeRunnerCore):
             per_channel_quant=per_channel_quant,
             block_shape=block_shape,
         )
+        _dump_moe_debug_tensor(
+            self.config.layer_id,
+            f"model.layers.{self.config.layer_id}.mlp.experts.fc2_output_permuted.pt",
+            intermediate_cache3,
+        )
 
         if routed_scaling_factor is None:
             routed_scaling_factor = 1.0
 
+        use_mmq_moe_combine = apply_router_weight_on_swiglu and get_bool_env_var(
+            "SGLANG_WELMV4_MMQ_MOE_COMBINE", "false"
+        )
         if no_combine:
             pass
         elif _is_cuda:
             if topk_ids.shape[1] == 1 and routed_scaling_factor == 1.0:
                 pass  # we write directly into out_hidden_states
+            elif use_mmq_moe_combine:
+                mmq_sequential_moe_sum(
+                    intermediate_cache3,
+                    out_hidden_states,
+                    routed_scaling_factor,
+                )
             elif topk_ids.shape[1] == 2 and routed_scaling_factor == 1.0:
                 torch.add(
                     intermediate_cache3[:, 0],
@@ -352,6 +447,11 @@ class TritonRunnerCore(MoeRunnerCore):
                 out_hidden_states,
             )
 
+        _dump_moe_debug_tensor(
+            self.config.layer_id,
+            f"model.layers.{self.config.layer_id}.mlp.experts_output.pt",
+            out_hidden_states,
+        )
         return TritonRunnerOutput(
             hidden_states=out_hidden_states,
         )

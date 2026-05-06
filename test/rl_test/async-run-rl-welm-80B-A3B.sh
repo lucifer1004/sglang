@@ -35,7 +35,7 @@ fi
 # zstd -cd slime.tar.zst | tar -xf -
 # pip install ./slime
 # popd
-# 
+#
 # unset http_proxy
 # unset https_proxy
 
@@ -105,9 +105,9 @@ SGLANG_ARGS=(
     --rollout-num-gpus-per-engine ${ROLLOUR_NUM_GPUS_PER_ENGINE}
     # --sglang-expert-parallel-size ${ROLLOUR_NUM_GPUS_PER_ENGINE}
     --sglang-cuda-graph-bs 1 2 4 8 $(seq 16 8 256)
-    --sglang-attention-backend fa3    
-    --sglang-disable-overlap-schedule 
-    --sglang-enable-over-encoding 
+    --sglang-attention-backend fa3
+    --sglang-disable-overlap-schedule
+    --sglang-enable-over-encoding
     --sglang-served-model-name welmv4
 )
 if [[ "${SGLANG_DUMMY_LOAD}" == "1" ]]; then
@@ -118,7 +118,7 @@ fi
 # if [[ "$DEBUG_ROLLOUT_ONLY" == "1" ]]; then
 #     DEBUG_ARGS+=(--debug-rollout-only)
 #     SGLANG_ARGS+=(--sglang-mem-fraction-static 0.9)
-# else 
+# else
 #     SGLANG_ARGS+=(--sglang-load-format dummy)
 #     SGLANG_ARGS+=(--sglang-mem-fraction-static 0.8)
 # fi
