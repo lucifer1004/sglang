@@ -76,6 +76,7 @@ from sglang.srt.layers.welmv4_op import (
     inplace_sigmoid_mul,
     mmq_style_expert_bias_topk,
     mmq_style_k_rms_norm,
+    mmq_style_norm_after_attn,
     mmq_style_router_linear,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
@@ -149,6 +150,13 @@ def _get_welm_kv_mirror_ctx(forward_batch: ForwardBatch) -> Dict[int, Tuple[torc
         ctx = {}
         forward_batch.model_specific_states[WELM_KV_MIRROR_CTX_KEY] = ctx
     return ctx
+
+
+def _welm_should_contract_kv_mirror(forward_batch: ForwardBatch) -> bool:
+    return (
+        forward_batch.enable_welm_kv_mirror_opt
+        and forward_batch.forward_mode.is_extend_without_speculative()
+    )
 
 
 def _get_kv_mirror_pair_maps(
@@ -388,8 +396,7 @@ class MirrorQProjection(BaseWelmQkvProjection):
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         project_hidden_states = hidden_states
         if (
-            forward_batch.enable_welm_kv_mirror_opt
-            and forward_batch.forward_mode.is_extend_without_speculative()
+            _welm_should_contract_kv_mirror(forward_batch)
             and not hasattr(forward_batch, "custom_last_index")
         ):
             forward_batch.custom_last_index = (
@@ -426,7 +433,7 @@ class NextnMirrorQProjection(BaseWelmQkvProjection):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        if not forward_batch.forward_mode.is_extend_without_speculative():
+        if not _welm_should_contract_kv_mirror(forward_batch):
             qkv = self._apply_qkv(hidden_states)
             q, k, v = self._split_qkv(attn, qkv)
             return q, k, v, hidden_states
@@ -674,6 +681,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         hidden_states_fp32: torch.Tensor,
         forward_batch: Optional[ForwardBatch] = None,
         use_reduce_scatter: bool = False,
+        return_components: bool = False,
     ) -> torch.Tensor:
         dump_this_layer = _welm_should_dump_layer(self.layer_id)
         dump_prefix = f"model.layers.{self.layer_id}.mlp"
@@ -704,6 +712,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             _welm_dump_tensor(f"{dump_prefix}.router.topk_scores", topk_output.topk_weights)
             _welm_dump_tensor(f"{dump_prefix}.router.topk_ids", topk_output.topk_ids)
         final_hidden_states = self.experts(hidden_states, topk_output)
+        experts_output = final_hidden_states
         if dump_this_layer:
             _welm_dump_tensor(f"{dump_prefix}.experts_output", final_hidden_states)
         if shared_output is not None:
@@ -715,7 +724,16 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         if self.tp_size > 1 and not use_reduce_scatter:
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
 
-        return final_hidden_states.view(num_tokens, hidden_dim)
+        final_hidden_states = final_hidden_states.view(num_tokens, hidden_dim)
+        if return_components:
+            return (
+                final_hidden_states,
+                experts_output.view(num_tokens, hidden_dim),
+                None
+                if shared_output is None
+                else shared_output.view(num_tokens, hidden_dim),
+            )
+        return final_hidden_states
 
 
 class LinearScalingRotaryEmbedding(WelmV4InplaceRotaryEmbedding):
@@ -1154,7 +1172,6 @@ class Qwen2MoeAttention(nn.Module):
         self.kv_mirror_layer_idx = (
             layer_idx if not is_nextn else layer_idx + total_layer_num
         )
-        kv_mirror_enabled = get_global_server_args().enable_welm_kv_mirror_opt
         mirror_to_imitated, imitated_to_mirror = _get_kv_mirror_pair_maps(
             self.kv_mirror_layers,
             self.kv_mirror_imitated_layers,
@@ -1162,9 +1179,7 @@ class Qwen2MoeAttention(nn.Module):
             num_nextn_predict_layers=num_nextn_predict_layers,
             is_nextn=is_nextn,
         )
-        if not kv_mirror_enabled:
-            self.qkv_proj = StandardQkvProjection(**qkv_proj_kwargs)
-        elif self.kv_mirror_layer_idx in mirror_to_imitated:
+        if self.kv_mirror_layer_idx in mirror_to_imitated:
             projection_cls = NextnMirrorQProjection if is_nextn else MirrorQProjection
             self.qkv_proj = projection_cls(
                 imitated_layer_idx=mirror_to_imitated[self.kv_mirror_layer_idx],
@@ -1188,9 +1203,31 @@ class Qwen2MoeAttention(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
+        skip_o_norm: bool = False,
     ) -> torch.Tensor:
         dump_this_layer = _welm_should_dump_layer(self.layer_idx)
         dump_prefix = f"model.layers.{self.layer_idx}.self_attn"
+        if dump_this_layer:
+            _welm_dump_tensor(f"{dump_prefix}.positions", positions)
+            if forward_batch.extend_seq_lens is not None:
+                _welm_dump_tensor(
+                    f"{dump_prefix}.extend_seq_lens",
+                    forward_batch.extend_seq_lens,
+                )
+            if forward_batch.extend_prefix_lens is not None:
+                _welm_dump_tensor(
+                    f"{dump_prefix}.extend_prefix_lens",
+                    forward_batch.extend_prefix_lens,
+                )
+            if forward_batch.out_cache_loc is not None:
+                _welm_dump_tensor(
+                    f"{dump_prefix}.out_cache_loc", forward_batch.out_cache_loc
+                )
+            if forward_batch.req_pool_indices is not None:
+                _welm_dump_tensor(
+                    f"{dump_prefix}.req_pool_indices",
+                    forward_batch.req_pool_indices,
+                )
         q, k, v, hidden_states = self.qkv_proj.forward(
             self, hidden_states, forward_batch
         )
@@ -1224,8 +1261,7 @@ class Qwen2MoeAttention(nn.Module):
         qk_nope_head_dim = self.head_dim - self.qk_rope_head_dim
         if qk_nope_head_dim > 0:
             if (
-                forward_batch.enable_welm_kv_mirror_opt
-                and forward_batch.forward_mode.is_extend_without_speculative()
+                _welm_should_contract_kv_mirror(forward_batch)
                 and self.kv_mirror_layer_idx in self.kv_mirror_layers
             ):
                 self.rotary_emb.forward_cuda(
@@ -1241,7 +1277,10 @@ class Qwen2MoeAttention(nn.Module):
             _welm_dump_tensor(f"{dump_prefix}.q_post_rope", q)
             _welm_dump_tensor(f"{dump_prefix}.k_post_rope", k)
 
-        attn_output = self.attn(q, k, v, forward_batch, sinks=self.attn_sink)
+        attn_kwargs = {}
+        if self.attn_sink is not None:
+            attn_kwargs["sinks"] = self.attn_sink
+        attn_output = self.attn(q, k, v, forward_batch, **attn_kwargs)
         if dump_this_layer:
             _welm_dump_tensor(f"{dump_prefix}.attn_output", attn_output)
         if self.gated_self_attention_headwise:
@@ -1264,7 +1303,7 @@ class Qwen2MoeAttention(nn.Module):
             _welm_dump_tensor(
                 f"model.layers.{self.layer_idx}.attn.mixer.o_proj_out", output
             )
-        if self.use_o_norm:
+        if self.use_o_norm and not skip_o_norm:
             output = self.o_norm(output)
             if dump_this_layer:
                 _welm_dump_tensor(
@@ -1364,6 +1403,7 @@ class Qwen2MoeDecoderLayer(nn.Module):
             is_nextn=is_nextn,
         )
         self.layer_id = layer_id
+        self.is_final_layer = layer_id == total_layer_num - 1
 
         self.attn_tp_size = get_attention_tp_size()
         self.attn_tp_rank = get_attention_tp_rank()
@@ -1422,10 +1462,7 @@ class Qwen2MoeDecoderLayer(nn.Module):
         residual_after_layernorm = (
             self.ppln and self.layer_id not in self.prenorm_layer_idx
         )
-        use_fp32_ppln_residual = residual_after_layernorm and (
-            _welm_dump_enabled()
-            or get_bool_env_var("SGLANG_WELMV4_MMQ_FP32_PPLN_RESIDUAL", "false")
-        )
+        use_fp32_ppln_residual = residual_after_layernorm
         if use_fp32_ppln_residual:
             hidden_states, _, residual = self.input_layernorm(
                 hidden_states,
@@ -1453,38 +1490,74 @@ class Qwen2MoeDecoderLayer(nn.Module):
             residual = hidden_states.clone().to(
                 dtype=hidden_states.dtype, device=hidden_states.device
             )
+        use_mmq_norm_after_attn = use_fp32_ppln_residual and self.self_attn.use_o_norm
         if hidden_states.shape[0] != 0:
             hidden_states = self.self_attn(
                 positions=positions,
                 hidden_states=hidden_states,
                 forward_batch=forward_batch,
+                skip_o_norm=use_mmq_norm_after_attn,
             )
         if (
-            forward_batch.enable_welm_kv_mirror_opt
-            and forward_batch.forward_mode.is_extend_without_speculative()
+            _welm_should_contract_kv_mirror(forward_batch)
             and self.layer_id == self.kv_mirror_layers[-1]
         ):
             residual = residual[forward_batch.custom_last_index]
-        hidden_states, residual, hidden_states_fp32 = self.post_attention_layernorm(
-            hidden_states, residual, clone_fp32_out=True
-        )
+        if use_mmq_norm_after_attn:
+            hidden_states, residual, hidden_states_fp32 = mmq_style_norm_after_attn(
+                hidden_states,
+                residual,
+                self.self_attn.o_norm.weight,
+                self.post_attention_layernorm.weight,
+                self.post_attention_layernorm.eps,
+            )
+        else:
+            hidden_states, residual, hidden_states_fp32 = self.post_attention_layernorm(
+                hidden_states, residual, clone_fp32_out=True
+            )
         if dump_this_layer:
-            _welm_dump_tensor(f"model.layers.{self.layer_id}.attn.mixer.0", hidden_states)
             _welm_dump_tensor(
-                f"model.layers.{self.layer_id}.attn.mixer.0_fp32", hidden_states_fp32
+                f"model.layers.{self.layer_id}.norm_after_attn.output", hidden_states
+            )
+            _welm_dump_tensor(
+                f"model.layers.{self.layer_id}.norm_after_attn.output_fp32",
+                hidden_states_fp32,
             )
             if residual is not None:
-                _welm_dump_tensor(f"model.layers.{self.layer_id}.attn.mixer.1", residual)
+                _welm_dump_tensor(
+                    f"model.layers.{self.layer_id}.norm_after_attn.residual", residual
+                )
         # For DP with padding, reduce scatter can be used instead of all-reduce.
         use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
             forward_batch
         )
-        hidden_states = self.mlp(
-            hidden_states, hidden_states_fp32, forward_batch, use_reduce_scatter
+        self.final_mlp_experts_output = None
+        self.final_mlp_shared_output = None
+        mlp_output = self.mlp(
+            hidden_states,
+            hidden_states_fp32,
+            forward_batch,
+            use_reduce_scatter,
+            return_components=dump_this_layer or self.is_final_layer,
         )
+        experts_output = None
+        shared_output = None
+        if isinstance(mlp_output, tuple):
+            hidden_states, experts_output, shared_output = mlp_output
+        else:
+            hidden_states = mlp_output
+        if self.is_final_layer:
+            self.final_mlp_experts_output = experts_output
+            self.final_mlp_shared_output = shared_output
         if dump_this_layer:
+            output_with_residual = hidden_states
+            if residual is not None and experts_output is not None:
+                output_with_residual = experts_output.float() + residual.float()
+                if shared_output is not None:
+                    output_with_residual = output_with_residual + shared_output.float()
             _welm_dump_tensor(
-                f"model.layers.{self.layer_id}.mlp.output_with_residual", hidden_states
+                f"model.layers.{self.layer_id}.mlp.output_with_residual",
+                output_with_residual,
             )
         return hidden_states, residual
 
@@ -1723,9 +1796,38 @@ class Qwen2MoeModel(nn.Module):
         else:
             if hidden_states.shape[0] != 0:
                 if residual is None:
+                    if _welm_dump_enabled():
+                        _welm_dump_tensor("model.ln_f.__input__.0", hidden_states)
                     hidden_states = self.norm(hidden_states)
                 else:
-                    hidden_states, _ = self.norm(hidden_states, residual)
+                    last_layer = self.layers[self.end_layer - 1]
+                    final_experts_output = getattr(
+                        last_layer, "final_mlp_experts_output", None
+                    )
+                    final_shared_output = getattr(
+                        last_layer, "final_mlp_shared_output", None
+                    )
+                    if final_experts_output is not None:
+                        hidden_states = final_experts_output.float() + residual.float()
+                        if final_shared_output is not None:
+                            hidden_states = hidden_states + final_shared_output.float()
+                        if _welm_dump_enabled():
+                            _welm_dump_tensor("model.ln_f.__input__.0", hidden_states)
+                        hidden_states = F.rms_norm(
+                            hidden_states.to(self.norm.weight.dtype),
+                            self.norm.weight.shape,
+                            self.norm.weight,
+                            eps=self.norm.variance_epsilon,
+                        )
+                    else:
+                        if _welm_dump_enabled():
+                            _welm_dump_tensor(
+                                "model.ln_f.__input__.0",
+                                hidden_states.float() + residual.float(),
+                            )
+                        hidden_states, _ = self.norm(hidden_states, residual)
+                if _welm_dump_enabled():
+                    _welm_dump_tensor("model.ln_f", hidden_states)
 
         if len(aux_hidden_states) == 0:
             return hidden_states

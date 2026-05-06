@@ -257,6 +257,87 @@ def _do_rms_norm(hidden, gamma, cols: int, eps: tl.constexpr):
 
 
 @triton.jit
+def _do_mmq_rms_norm(hidden, gamma, cols: int, eps: tl.constexpr):
+    hidden = hidden.to(gamma.dtype)
+    hidden = hidden.to(tl.float32)
+    inv_rms = tl.math.rsqrt(tl.sum(hidden * hidden, axis=-1) / cols + eps)
+    out = hidden * inv_rms
+    out *= gamma
+    return out, inv_rms
+
+
+@triton.jit
+def mmq_style_norm_after_attn_kernel(
+    hidden_states_ptr: tl.tensor,
+    residual_ptr: tl.tensor,
+    onorm_gamma_ptr: tl.tensor,
+    rnorm_gamma_ptr: tl.tensor,
+    output_ptr: tl.tensor,
+    residual_out_ptr: tl.tensor,
+    fp32_out_ptr: tl.tensor,
+    rows: int,
+    cols: tl.constexpr,
+    eps: float,
+    NUM_SMS: tl.constexpr,  # pylint: disable=invalid-name
+    BLOCK_SIZE: tl.constexpr,  # pylint: disable=invalid-name
+):
+    cols_offsets = tl.arange(0, BLOCK_SIZE)
+    mask = cols_offsets < cols
+    onorm_gamma = tl.load(onorm_gamma_ptr + cols_offsets, mask=mask, other=0.0)
+    rnorm_gamma = tl.load(rnorm_gamma_ptr + cols_offsets, mask=mask, other=0.0)
+    output_dtype = output_ptr.dtype.element_ty
+
+    for row_id in tl.range(tl.program_id(0), rows, NUM_SMS, num_stages=2):
+        offsets = (row_id * cols + cols_offsets).to(tl.int64)
+        hs = tl.load(hidden_states_ptr + offsets, mask=mask, other=0.0)
+        onorm_out, _ = _do_mmq_rms_norm(hs, onorm_gamma, cols, eps)
+        hs = onorm_out.to(hs.dtype)
+        residual = tl.load(residual_ptr + offsets, mask=mask, other=0.0)
+        hs += residual
+        rnorm_out, _ = _do_mmq_rms_norm(hs, rnorm_gamma, cols, eps)
+        tl.store(residual_out_ptr + offsets, hs, mask=mask)
+        tl.store(fp32_out_ptr + offsets, rnorm_out, mask=mask)
+        tl.store(output_ptr + offsets, rnorm_out.to(output_dtype), mask=mask)
+
+
+def mmq_style_norm_after_attn(
+    hidden_states: torch.Tensor,
+    residual: torch.Tensor,
+    onorm_weight: torch.Tensor,
+    rnorm_weight: torch.Tensor,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    assert hidden_states.dim() == 2
+    assert residual.dim() == 2
+    assert hidden_states.shape == residual.shape
+    hidden_states = hidden_states.contiguous()
+    residual = residual.contiguous()
+    onorm_weight = onorm_weight.contiguous()
+    rnorm_weight = rnorm_weight.contiguous()
+    output = torch.empty_like(hidden_states)
+    residual_out = torch.empty_like(hidden_states, dtype=torch.float32)
+    fp32_out = torch.empty_like(hidden_states, dtype=torch.float32)
+    rows, cols = hidden_states.shape
+    num_sms = min(rows, _get_num_sms(multiplier=8))
+    block_size = triton.next_power_of_2(cols)
+    mmq_style_norm_after_attn_kernel[(num_sms,)](
+        hidden_states,
+        residual,
+        onorm_weight,
+        rnorm_weight,
+        output,
+        residual_out,
+        fp32_out,
+        rows,
+        cols,
+        eps,
+        num_sms,
+        block_size,
+    )
+    return output, residual_out, fp32_out
+
+
+@triton.jit
 def rms_norm_kernel(  # pylint: disable=too-many-arguments,too-many-locals
     hidden_states_ptr: tl.tensor,
     reisdual_ptr: tl.tensor,

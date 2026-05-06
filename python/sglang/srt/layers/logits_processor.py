@@ -63,6 +63,62 @@ class InputLogprobsResult:
     input_token_ids_logprobs_idx: Optional[List] = None
 
 
+@triton.jit
+def _flash_attn_style_target_logprobs_kernel(
+    out_ptr,
+    logits_ptr,
+    labels_ptr,
+    n_rows: int,
+    n_cols: int,
+    logits_row_stride: int,
+    BLOCK_SIZE: tl.constexpr,
+):
+    row_idx = tl.program_id(0)
+    logits_row_ptr = logits_ptr + row_idx * logits_row_stride.to(tl.int64)
+
+    m_i = -float("inf")
+    l_i = 0.0
+    for col_offset in range(0, n_cols, BLOCK_SIZE):
+        cols = col_offset + tl.arange(0, BLOCK_SIZE)
+        logits = tl.load(
+            logits_row_ptr + cols, mask=cols < n_cols, other=-float("inf")
+        ).to(tl.float32)
+        m_i_new = tl.maximum(m_i, tl.max(logits))
+        l_i = tl.exp(m_i - m_i_new) * l_i + tl.sum(tl.exp(logits - m_i_new))
+        m_i = m_i_new
+    lse = tl.log(l_i) + m_i
+
+    label_idx = tl.load(labels_ptr + row_idx)
+    label_logit = tl.load(logits_row_ptr + label_idx).to(tl.float32)
+    tl.store(out_ptr + row_idx, label_logit - lse)
+
+
+def _flash_attn_style_target_logprobs(
+    logits: torch.Tensor, labels: torch.Tensor
+) -> torch.Tensor:
+    assert logits.is_cuda and labels.is_cuda
+    assert logits.dim() == 2 and labels.dim() == 1
+    assert logits.shape[0] == labels.shape[0]
+    if logits.stride(-1) != 1:
+        logits = logits.contiguous()
+    n_rows, n_cols = logits.shape
+    max_block_size = 16 * 1024
+    block_size = min(triton.next_power_of_2(n_cols), max_block_size)
+    num_warps = 4 if block_size < 2048 else (8 if block_size < 8192 else 16)
+    out = torch.empty(n_rows, dtype=torch.float32, device=logits.device)
+    _flash_attn_style_target_logprobs_kernel[(n_rows,)](
+        out,
+        logits,
+        labels,
+        n_rows,
+        n_cols,
+        logits.stride(0),
+        BLOCK_SIZE=block_size,
+        num_warps=num_warps,
+    )
+    return out
+
+
 @dataclasses.dataclass
 class LogitsProcessorOutput:
     ## Part 1: This part will be assigned in python/sglang/srt/layers/logits_processor.py::LogitsProcessor
@@ -284,6 +340,9 @@ class LogitsProcessor(nn.Module):
         self.enable_logprobs_chunk = envs.SGLANG_ENABLE_LOGITS_PROCESSER_CHUNK.get()
         # chunk size for logprobs processing
         self.logprobs_chunk_size = envs.SGLANG_LOGITS_PROCESSER_CHUNK_SIZE.get()
+        self.use_flash_attn_style_input_logprobs = (
+            getattr(config, "model_type", None) == "welmv4_moe"
+        )
 
     def compute_logprobs_for_multi_item_scoring(
         self,
@@ -555,10 +614,8 @@ class LogitsProcessor(nn.Module):
 
         del hidden_states
 
-        # When kv_mirror is active in extend mode, hidden_states have been
-        # subsampled to only the last token per request.  There are no
-        # intermediate-token logits available, so input logprobs cannot be
-        # computed.  Treat this the same as "no return_logprob".
+        # KV mirror extend keeps only the final logical state per request for
+        # logits, so full input-token logprobs are unavailable in this mode.
         kv_mirror_extend = logits_metadata.enable_welm_kv_mirror_opt and (
             logits_metadata.forward_mode.is_extend_without_speculative()
             or logits_metadata.scale_seq_factor > 1
@@ -641,6 +698,13 @@ class LogitsProcessor(nn.Module):
         )
 
     def _process_input_logprobs(self, input_logprobs, logits_metadata):
+        if self._can_use_flash_attn_style_input_logprobs(logits_metadata):
+            input_token_logprobs = _flash_attn_style_target_logprobs(
+                input_logprobs.to(torch.bfloat16),
+                logits_metadata.extend_input_logprob_token_ids_gpu,
+            )
+            return InputLogprobsResult(input_token_logprobs=input_token_logprobs)
+
         input_logprobs = self.compute_temp_top_p_normalized_logprobs(
             input_logprobs, logits_metadata
         )
@@ -760,6 +824,14 @@ class LogitsProcessor(nn.Module):
 
             # Compute the logprobs of the chunk
             chunk_input_logprobs = chunk_logits[chunk_indices]
+            if self._can_use_flash_attn_style_input_logprobs(logits_metadata):
+                chunk_input_token_logprobs = _flash_attn_style_target_logprobs(
+                    chunk_input_logprobs.to(torch.bfloat16),
+                    logits_metadata.extend_input_logprob_token_ids_gpu[mask_indices],
+                )
+                input_token_logprobs.append(chunk_input_token_logprobs)
+                continue
+
             chunk_temperature = (
                 logits_metadata.temperature[global_indices]
                 if logits_metadata.temperature is not None
@@ -835,6 +907,17 @@ class LogitsProcessor(nn.Module):
                 input_token_ids_logprobs_idx=input_token_ids_logprobs_idx,
             ),
             sampled_logits,
+        )
+
+    def _can_use_flash_attn_style_input_logprobs(
+        self, logits_metadata: LogitsMetadata
+    ) -> bool:
+        return (
+            self.use_flash_attn_style_input_logprobs
+            and not logits_metadata.extend_return_top_logprob
+            and not logits_metadata.extend_token_ids_logprob
+            and not logits_metadata.temp_scaled_logprobs
+            and not logits_metadata.top_p_normalized_logprobs
         )
 
     def _get_logits(
