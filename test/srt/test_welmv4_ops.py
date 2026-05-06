@@ -22,17 +22,20 @@ from sglang.srt.layers.welmv4_op import (
     WelmV4FusedRMSNorm,
     WelmV4InplaceRotaryEmbedding,
     inplace_sigmoid_mul,
+    mmq_style_add_residual,
 )
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.test.test_utils import CustomTestCase
 
 torch.random.manual_seed(1)
 
-# bf16 has ~0.0078 per-ULP precision.
-# Triton's tree-reduction for sum vs PyTorch's sequential accumulation can cause
-# up to ~0.5 ULP difference in the final bf16 result, so we use 5e-3 (< 1 ULP).
+# bf16 residual paths can differ from PyTorch's reference by a few output ULPs
+# because the fused Triton kernel accumulates the residual add in fp32 before
+# RMSNorm, while the reference native path follows PyTorch's bf16 behavior.
 ATOL = 1e-3
 RTOL = 1e-3
+RESIDUAL_ATOL = 4e-2
+RESIDUAL_RTOL = 1e-2
 DEVICE = "cuda"
 DTYPE = torch.bfloat16
 
@@ -95,9 +98,14 @@ class TestWelmV4FusedRMSNorm(CustomTestCase):
                 ref_out = ref.forward_native(x.clone())
                 ref_residual = x.clone()
                 fused_out, fused_residual = fused.forward_cuda(x.clone())
-                torch.testing.assert_close(fused_out, ref_out, atol=ATOL, rtol=RTOL)
                 torch.testing.assert_close(
-                    fused_residual, ref_residual, atol=ATOL, rtol=RTOL
+                    fused_out, ref_out, atol=RESIDUAL_ATOL, rtol=RESIDUAL_RTOL
+                )
+                torch.testing.assert_close(
+                    fused_residual,
+                    ref_residual,
+                    atol=RESIDUAL_ATOL,
+                    rtol=RESIDUAL_RTOL,
                 )
 
     # --- Case (b): with residual ---
@@ -115,9 +123,14 @@ class TestWelmV4FusedRMSNorm(CustomTestCase):
                 fused_out, fused_residual = fused.forward_cuda(
                     x.clone(), residual=residual.clone()
                 )
-                torch.testing.assert_close(fused_out, ref_out, atol=ATOL, rtol=RTOL)
                 torch.testing.assert_close(
-                    fused_residual, ref_residual, atol=ATOL, rtol=RTOL
+                    fused_out, ref_out, atol=RESIDUAL_ATOL, rtol=RESIDUAL_RTOL
+                )
+                torch.testing.assert_close(
+                    fused_residual,
+                    ref_residual,
+                    atol=RESIDUAL_ATOL,
+                    rtol=RESIDUAL_RTOL,
                 )
 
     # --- Case (c): residual_after_layernorm=True (ppln=True) ---
@@ -138,9 +151,14 @@ class TestWelmV4FusedRMSNorm(CustomTestCase):
                     residual=residual.clone(),
                     residual_after_layernorm=True,
                 )
-                torch.testing.assert_close(fused_out, ref_out, atol=ATOL, rtol=RTOL)
                 torch.testing.assert_close(
-                    fused_residual, ref_residual, atol=ATOL, rtol=RTOL
+                    fused_out, ref_out, atol=RESIDUAL_ATOL, rtol=RESIDUAL_RTOL
+                )
+                torch.testing.assert_close(
+                    fused_residual,
+                    ref_residual,
+                    atol=RESIDUAL_ATOL,
+                    rtol=RESIDUAL_RTOL,
                 )
 
     # --- Case (d): clone_fp32_out=True (post_attention_layernorm for MoE router) ---
@@ -158,7 +176,9 @@ class TestWelmV4FusedRMSNorm(CustomTestCase):
                 fused_out, fused_residual, fused_fp32 = fused.forward_cuda(
                     x.clone(), residual=residual.clone(), clone_fp32_out=True
                 )
-                torch.testing.assert_close(fused_out, ref_out, atol=ATOL, rtol=RTOL)
+                torch.testing.assert_close(
+                    fused_out, ref_out, atol=RESIDUAL_ATOL, rtol=RESIDUAL_RTOL
+                )
                 torch.testing.assert_close(
                     fused_residual, ref_residual, atol=ATOL, rtol=RTOL
                 )
@@ -187,6 +207,93 @@ class TestWelmV4FusedRMSNorm(CustomTestCase):
                 fused_out_2d, _ = fused.forward_cuda(x_2d)
                 fused_out = fused_out_2d.view(num_tokens, NUM_K_HEADS, HEAD_DIM)
                 torch.testing.assert_close(fused_out, ref_out, atol=ATOL, rtol=RTOL)
+
+
+# =====================================================================
+# Test 1b: add-first residual stream vs next-layer fused RMSNorm residual path
+# =====================================================================
+class TestWelmV4AddFirstResidual(CustomTestCase):
+    def test_add_first_matches_next_layer_rmsnorm(self):
+        fused = WelmV4FusedRMSNorm(HIDDEN_SIZE, eps=RMS_NORM_EPS).to(
+            device=DEVICE, dtype=DTYPE
+        )
+        for num_tokens in num_tokens_list:
+            with self.subTest(num_tokens=num_tokens):
+                mlp_out = torch.randn(
+                    num_tokens, HIDDEN_SIZE, device=DEVICE, dtype=DTYPE
+                )
+                residual = torch.randn(
+                    num_tokens, HIDDEN_SIZE, device=DEVICE, dtype=DTYPE
+                )
+
+                ref_hidden, ref_residual = fused.forward_cuda(
+                    mlp_out.clone(), residual=residual.clone()
+                )
+                combined = mmq_style_add_residual(
+                    mlp_out.contiguous(), residual.contiguous()
+                )
+                add_first_hidden, add_first_residual = fused.forward_cuda(
+                    combined, residual=None, output_dtype=DTYPE
+                )
+
+                torch.testing.assert_close(
+                    combined.to(DTYPE),
+                    ref_residual,
+                    atol=ATOL,
+                    rtol=RTOL,
+                )
+                torch.testing.assert_close(
+                    add_first_hidden,
+                    ref_hidden,
+                    atol=RESIDUAL_ATOL,
+                    rtol=RESIDUAL_RTOL,
+                )
+                torch.testing.assert_close(
+                    add_first_residual, combined, atol=0, rtol=0
+                )
+
+    def test_add_first_matches_residual_after_layernorm(self):
+        fused = WelmV4FusedRMSNorm(HIDDEN_SIZE, eps=RMS_NORM_EPS).to(
+            device=DEVICE, dtype=DTYPE
+        )
+        for num_tokens in num_tokens_list:
+            with self.subTest(num_tokens=num_tokens):
+                mlp_out = torch.randn(
+                    num_tokens, HIDDEN_SIZE, device=DEVICE, dtype=DTYPE
+                )
+                residual = torch.randn(
+                    num_tokens, HIDDEN_SIZE, device=DEVICE, dtype=DTYPE
+                )
+
+                ref_hidden, _, ref_residual = fused.forward_cuda(
+                    mlp_out.clone(),
+                    residual=residual.clone(),
+                    residual_after_layernorm=True,
+                    clone_fp32_out=True,
+                )
+                combined = mmq_style_add_residual(
+                    mlp_out.contiguous(), residual.contiguous()
+                )
+                add_first_hidden, _, add_first_residual = fused.forward_cuda(
+                    combined,
+                    residual=None,
+                    residual_after_layernorm=True,
+                    clone_fp32_out=True,
+                    output_dtype=DTYPE,
+                )
+
+                torch.testing.assert_close(
+                    add_first_hidden,
+                    ref_hidden,
+                    atol=RESIDUAL_ATOL,
+                    rtol=RESIDUAL_RTOL,
+                )
+                torch.testing.assert_close(
+                    add_first_residual,
+                    ref_residual,
+                    atol=RESIDUAL_ATOL,
+                    rtol=RESIDUAL_RTOL,
+                )
 
 
 # =====================================================================

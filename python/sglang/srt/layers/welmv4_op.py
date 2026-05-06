@@ -338,6 +338,56 @@ def mmq_style_norm_after_attn(
 
 
 @triton.jit
+def mmq_style_add_residual_kernel(
+    hidden_states_ptr: tl.tensor,
+    residual_ptr: tl.tensor,
+    output_ptr: tl.tensor,
+    rows: int,
+    cols: tl.constexpr,
+    NUM_SMS: tl.constexpr,  # pylint: disable=invalid-name
+    BLOCK_SIZE: tl.constexpr,  # pylint: disable=invalid-name
+):
+    cols_off = tl.arange(0, BLOCK_SIZE)
+    mask = cols_off < cols
+
+    for row_id in tl.range(tl.program_id(0), rows, NUM_SMS, num_stages=2):
+        offs = (row_id * cols + cols_off).to(tl.int64)
+        hidden_states = tl.load(
+            hidden_states_ptr + offs, mask=mask, other=0.0
+        ).to(tl.float32)
+        residual = tl.load(residual_ptr + offs, mask=mask, other=0.0).to(tl.float32)
+        tl.store(output_ptr + offs, hidden_states + residual, mask=mask)
+
+
+def mmq_style_add_residual(
+    hidden_states: torch.Tensor, residual: torch.Tensor
+) -> torch.Tensor:
+    assert hidden_states.dim() == 2
+    assert residual.dim() == 2
+    assert hidden_states.shape == residual.shape
+    assert hidden_states.is_cuda and residual.is_cuda
+    assert hidden_states.is_contiguous()
+    assert residual.is_contiguous()
+
+    output = torch.empty_like(hidden_states, dtype=torch.float32)
+    if hidden_states.numel() == 0:
+        return output
+    rows, cols = hidden_states.shape
+    num_sms = min(rows, _get_num_sms(multiplier=8))
+    block_size = triton.next_power_of_2(cols)
+    mmq_style_add_residual_kernel[(num_sms,)](
+        hidden_states,
+        residual,
+        output,
+        rows,
+        cols,
+        num_sms,
+        block_size,
+    )
+    return output
+
+
+@triton.jit
 def rms_norm_kernel(  # pylint: disable=too-many-arguments,too-many-locals
     hidden_states_ptr: tl.tensor,
     reisdual_ptr: tl.tensor,

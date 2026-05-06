@@ -74,6 +74,7 @@ from sglang.srt.layers.welmv4_op import (
     WelmV4FusedRMSNorm,
     WelmV4InplaceRotaryEmbedding,
     inplace_sigmoid_mul,
+    mmq_style_add_residual,
     mmq_style_expert_bias_topk,
     mmq_style_k_rms_norm,
     mmq_style_norm_after_attn,
@@ -1487,6 +1488,9 @@ class Qwen2MoeDecoderLayer(nn.Module):
                 hidden_states,
                 residual,
                 residual_after_layernorm=residual_after_layernorm,
+                output_dtype=self.input_layernorm.weight.dtype
+                if hidden_states.dtype == torch.float32
+                else hidden_states.dtype,
             )
         if dump_this_layer:
             _welm_dump_tensor(
@@ -1540,8 +1544,6 @@ class Qwen2MoeDecoderLayer(nn.Module):
         use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
             forward_batch
         )
-        self.final_mlp_experts_output = None
-        self.final_mlp_shared_output = None
         mlp_output = self.mlp(
             hidden_states,
             hidden_states_fp32,
@@ -1561,9 +1563,6 @@ class Qwen2MoeDecoderLayer(nn.Module):
             hidden_states, experts_output, shared_output = mlp_output
         else:
             hidden_states = mlp_output
-        if self.is_final_layer:
-            self.final_mlp_experts_output = experts_output
-            self.final_mlp_shared_output = shared_output
         if dump_this_layer:
             output_with_residual = hidden_states
             if residual is not None and experts_output is not None:
@@ -1574,6 +1573,23 @@ class Qwen2MoeDecoderLayer(nn.Module):
                 f"model.layers.{self.layer_id}.mlp.output_with_residual",
                 output_with_residual,
             )
+        can_add_final_components = (
+            residual is not None
+            and self.is_final_layer
+            and experts_output is not None
+            and getattr(self.mlp, "tp_size", 1) == 1
+        )
+        can_add_first_residual = getattr(self.mlp, "tp_size", 1) == 1
+        if can_add_final_components:
+            hidden_states = experts_output.float() + residual.float()
+            if shared_output is not None:
+                hidden_states = hidden_states + shared_output.float()
+            residual = None
+        elif residual is not None and can_add_first_residual:
+            hidden_states = mmq_style_add_residual(
+                hidden_states.contiguous(), residual.contiguous()
+            )
+            residual = None
         return hidden_states, residual
 
 
@@ -1775,7 +1791,7 @@ class Qwen2MoeModel(nn.Module):
         else:
             assert pp_proxy_tensors is not None
             hidden_states = pp_proxy_tensors["hidden_states"]
-            residual = pp_proxy_tensors["residual"]
+            residual = pp_proxy_tensors.tensors.get("residual", None)
 
         aux_hidden_states = []
         if forward_batch.can_run_tbo:
@@ -1802,18 +1818,24 @@ class Qwen2MoeModel(nn.Module):
                         positions, hidden_states, forward_batch, residual
                     )
         if not self.pp_group.is_last_rank:
-            return PPProxyTensors(
-                {
-                    "hidden_states": hidden_states,
-                    "residual": residual,
-                }
-            )
+            proxy_tensors = {"hidden_states": hidden_states}
+            if residual is not None:
+                proxy_tensors["residual"] = residual
+            return PPProxyTensors(proxy_tensors)
         else:
             if hidden_states.shape[0] != 0:
                 if residual is None:
                     if _welm_dump_enabled():
                         _welm_dump_tensor("model.ln_f.__input__.0", hidden_states)
-                    hidden_states = self.norm(hidden_states)
+                    if hidden_states.dtype == torch.float32:
+                        hidden_states = F.rms_norm(
+                            hidden_states.to(self.norm.weight.dtype),
+                            self.norm.weight.shape,
+                            self.norm.weight,
+                            eps=self.norm.variance_epsilon,
+                        )
+                    else:
+                        hidden_states = self.norm(hidden_states)
                 else:
                     last_layer = self.layers[self.end_layer - 1]
                     final_experts_output = getattr(
@@ -1831,24 +1853,16 @@ class Qwen2MoeModel(nn.Module):
                         hidden_states = final_experts_output.float() + residual.float()
                         if final_shared_output is not None:
                             hidden_states = hidden_states + final_shared_output.float()
-                        if _welm_dump_enabled():
-                            _welm_dump_tensor("model.ln_f.__input__.0", hidden_states)
-                        hidden_states = F.rms_norm(
-                            hidden_states.to(self.norm.weight.dtype),
-                            self.norm.weight.shape,
-                            self.norm.weight,
-                            eps=self.norm.variance_epsilon,
-                        )
                     else:
                         hidden_states = hidden_states.float() + residual.float()
-                        if _welm_dump_enabled():
-                            _welm_dump_tensor("model.ln_f.__input__.0", hidden_states)
-                        hidden_states = F.rms_norm(
-                            hidden_states.to(self.norm.weight.dtype),
-                            self.norm.weight.shape,
-                            self.norm.weight,
-                            eps=self.norm.variance_epsilon,
-                        )
+                    if _welm_dump_enabled():
+                        _welm_dump_tensor("model.ln_f.__input__.0", hidden_states)
+                    hidden_states = F.rms_norm(
+                        hidden_states.to(self.norm.weight.dtype),
+                        self.norm.weight.shape,
+                        self.norm.weight,
+                        eps=self.norm.variance_epsilon,
+                    )
                 if _welm_dump_enabled():
                     _welm_dump_tensor("model.ln_f", hidden_states)
 

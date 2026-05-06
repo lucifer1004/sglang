@@ -362,7 +362,9 @@ class DecodeInputBuffers(ForwardInputBuffers):
         # Pipeline-parallel proxy tensors.
         if pp_proxy_tensors is not None and self.pp_proxy_tensors is not None:
             for key, buf in self.pp_proxy_tensors.items():
-                src = pp_proxy_tensors.tensors[key]
+                src = pp_proxy_tensors.tensors.get(key, None)
+                if src is None:
+                    continue
                 dim = src.shape[0]
                 dsts.append(buf[:dim])
                 srcs.append(src)
