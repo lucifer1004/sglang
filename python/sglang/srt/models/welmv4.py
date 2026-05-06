@@ -1354,7 +1354,10 @@ class Qwen2MoeDecoderLayer(nn.Module):
             use_reduce_scatter,
             return_components=dump_this_layer or self.is_final_layer,
             skip_component_output=(
-                self.is_final_layer and residual is not None and not dump_this_layer
+                self.is_final_layer
+                and residual is not None
+                and not dump_this_layer
+                and getattr(self.mlp, "tp_size", 1) == 1
             ),
         )
         experts_output = None
