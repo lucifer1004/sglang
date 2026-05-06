@@ -1633,28 +1633,28 @@ class Qwen2MoeModel(nn.Module):
                     final_shared_output = getattr(
                         last_layer, "final_mlp_shared_output", None
                     )
-                    if (
+                    # In TP>1, component tensors are still pre-all-reduce.
+                    can_rebuild_final_mlp = (
                         final_experts_output is not None
-                        and final_shared_output is not None
-                    ):
-                        hidden_states = (
-                            final_experts_output.float()
-                            + residual.float()
-                            + final_shared_output.float()
-                        ).to(self.norm.weight.dtype)
+                        and getattr(last_layer.mlp, "tp_size", 1) == 1
+                    )
+                    if can_rebuild_final_mlp:
+                        hidden_states = final_experts_output.float() + residual.float()
+                        if final_shared_output is not None:
+                            hidden_states = hidden_states + final_shared_output.float()
                         hidden_states = F.rms_norm(
-                            hidden_states,
+                            hidden_states.to(self.norm.weight.dtype),
                             self.norm.weight.shape,
                             self.norm.weight,
                             eps=self.norm.eps,
                         )
                     else:
-                        hidden_states, _ = self.norm(
-                            hidden_states,
-                            residual,
-                            output_dtype=self.norm.weight.dtype
-                            if hidden_states.dtype == torch.float32
-                            else hidden_states.dtype,
+                        hidden_states = hidden_states.float() + residual.float()
+                        hidden_states = F.rms_norm(
+                            hidden_states.to(self.norm.weight.dtype),
+                            self.norm.weight.shape,
+                            self.norm.weight,
+                            eps=self.norm.eps,
                         )
 
         if len(aux_hidden_states) == 0:
