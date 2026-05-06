@@ -682,6 +682,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         forward_batch: Optional[ForwardBatch] = None,
         use_reduce_scatter: bool = False,
         return_components: bool = False,
+        skip_component_output: bool = False,
     ) -> torch.Tensor:
         dump_this_layer = _welm_should_dump_layer(self.layer_id)
         dump_prefix = f"model.layers.{self.layer_id}.mlp"
@@ -715,6 +716,14 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         experts_output = final_hidden_states
         if dump_this_layer:
             _welm_dump_tensor(f"{dump_prefix}.experts_output", final_hidden_states)
+        if return_components and skip_component_output:
+            return (
+                experts_output.view(num_tokens, hidden_dim),
+                experts_output.view(num_tokens, hidden_dim),
+                None
+                if shared_output is None
+                else shared_output.view(num_tokens, hidden_dim),
+            )
         if shared_output is not None:
             if dump_this_layer:
                 _welm_dump_tensor(f"{dump_prefix}.shared_output", shared_output)
@@ -1539,6 +1548,9 @@ class Qwen2MoeDecoderLayer(nn.Module):
             forward_batch,
             use_reduce_scatter,
             return_components=dump_this_layer or self.is_final_layer,
+            skip_component_output=(
+                self.is_final_layer and residual is not None and not dump_this_layer
+            ),
         )
         experts_output = None
         shared_output = None
