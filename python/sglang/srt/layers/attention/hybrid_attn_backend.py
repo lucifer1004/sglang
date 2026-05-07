@@ -56,10 +56,26 @@ class HybridAttnBackend(AttentionBackend):
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         self.decode_backend.init_cuda_graph_state(max_bs, max_num_tokens)
-        if (
+        needs_prefill_graph_state = (
             self.model_runner.server_args.speculative_algorithm is not None
             and self.model_runner.server_args.speculative_attention_mode == "prefill"
+        )
+        # WeLM scale_seq: every logical decode step runs `scale_seq_factor`
+        # physical tokens and is promoted to TARGET_VERIFY in
+        # forward_batch_info.py. HybridAttn._select_backend() routes
+        # target_verify to prefill_backend by default, so the prefill
+        # backend (e.g. fa3) needs its cuda-graph state (in particular
+        # its `scale_seq_metadata` dict) initialized even when speculative
+        # decoding is disabled — otherwise capture_cuda_graph will hit
+        # KeyError on `scale_seq_metadata["cache_seqlens"]`.
+        if (
+            getattr(
+                self.model_runner.model_config.hf_config, "scale_seq_times", 0
+            )
+            > 0
         ):
+            needs_prefill_graph_state = True
+        if needs_prefill_graph_state:
             # When speculative decoding is enabled, we need to initialize the backend
             # that will be used for target_verify.
             self.prefill_backend.init_cuda_graph_state(max_bs, max_num_tokens)
