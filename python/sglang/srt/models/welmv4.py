@@ -119,10 +119,11 @@ class WelmV4CommunicatorRMSNorm(nn.Module):
         self,
         x: torch.Tensor,
         residual: Optional[torch.Tensor] = None,
+        *args,
         **kwargs,
     ):
-        output = self.norm(x, residual, **kwargs)
-        if not kwargs and residual is None and isinstance(output, tuple):
+        output = self.norm(x, residual, *args, **kwargs)
+        if not args and not kwargs and residual is None and isinstance(output, tuple):
             return output[0]
         return output
 
@@ -1123,6 +1124,7 @@ class Qwen2MoeAttention(nn.Module):
         enable_attn_sink_layerwise=[],
         layer_idx: Optional[int] = None,
         o_norm=False,
+        rms_norm_eps: float = 1e-5,
         total_layer_num: int = 1,
         num_nextn_predict_layers: int = 0,
         is_nextn: bool = False,
@@ -1158,7 +1160,11 @@ class Qwen2MoeAttention(nn.Module):
         self.only_k_norm = k_norm
         self.use_o_norm = o_norm
         self.total_layer_num = total_layer_num
-        self.o_norm = RMSNorm(self.hidden_size) if self.use_o_norm else nn.Identity()
+        self.o_norm = (
+            WelmV4FusedRMSNorm(self.hidden_size, eps=rms_norm_eps)
+            if self.use_o_norm
+            else nn.Identity()
+        )
 
         self.q_norm = (
             WelmV4FusedRMSNorm(self.head_dim, eps=qk_norm_eps)
@@ -1516,6 +1522,7 @@ class Qwen2MoeDecoderLayer(nn.Module):
             enable_attn_sink_layerwise=self.enable_attn_sink_layerwise,
             layer_idx=layer_id,
             o_norm=o_norm and layer_id not in self.prenorm_layer_idx,
+            rms_norm_eps=config.rms_norm_eps,
             total_layer_num=total_layer_num,
             num_nextn_predict_layers=getattr(config, "num_nextn_predict_layers", 0),
             is_nextn=is_nextn,
@@ -1907,7 +1914,9 @@ class Qwen2MoeModel(nn.Module):
             prefix=add_prefix("layers", prefix),
         )
         if self.pp_group.is_last_rank:
-            self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            self.norm = WelmV4FusedRMSNorm(
+                config.hidden_size, eps=config.rms_norm_eps
+            )
         else:
             self.norm = PPMissingLayer(return_tuple=True)
 
@@ -1951,10 +1960,11 @@ class Qwen2MoeModel(nn.Module):
             _welm_dump_tensor("model.oe.input_ids", input_ids)
             _welm_dump_tensor("model.oe.base_hidden_states", base_hidden_states)
 
+        oe_context = getattr(forward_batch, "oe_context", None)
         input_ids_ngram = []
         input_ids_ngram_tmp = input_ids
         for g in range(1, max(self.oe_grams)):
-            gram_tensor = forward_batch.n_gram_input_ids.get_gram(g + 1)
+            gram_tensor = oe_context.get_gram(g + 1)
             if gram_tensor is not None:
                 if dump_oe:
                     _welm_dump_tensor(f"model.oe.gram{g + 1}.ids", gram_tensor)
@@ -1998,7 +2008,7 @@ class Qwen2MoeModel(nn.Module):
 
         for s in range(self.scale_seq_times):
             hs_s = self.scale_seq_embed_tokens_list[s](input_ids)  # (T, D)
-            if len(self.oe_grams) > 0 and forward_batch.n_gram_input_ids is not None:
+            if len(self.oe_grams) > 0 and getattr(forward_batch, "oe_context", None):
                 hs_s = self._compute_oe_embedding(
                     input_ids,
                     forward_batch,
@@ -2031,7 +2041,7 @@ class Qwen2MoeModel(nn.Module):
             if _welm_dump_enabled():
                 _welm_dump_tensor("model.embed_tokens.output", hidden_states)
 
-            if len(self.oe_grams) > 0 and forward_batch.n_gram_input_ids is not None:
+            if len(self.oe_grams) > 0 and getattr(forward_batch, "oe_context", None):
                 hidden_states = self._compute_oe_embedding(
                     input_ids, forward_batch, hidden_states
                 )
@@ -2094,7 +2104,7 @@ class Qwen2MoeModel(nn.Module):
                             hidden_states.to(self.norm.weight.dtype),
                             self.norm.weight.shape,
                             self.norm.weight,
-                            eps=self.norm.variance_epsilon,
+                            eps=self.norm.eps,
                         )
                     else:
                         hidden_states = self.norm(hidden_states)
@@ -2124,7 +2134,7 @@ class Qwen2MoeModel(nn.Module):
                         hidden_states.to(self.norm.weight.dtype),
                         self.norm.weight.shape,
                         self.norm.weight,
-                        eps=self.norm.variance_epsilon,
+                        eps=self.norm.eps,
                     )
                 if _welm_dump_enabled():
                     _welm_dump_tensor("model.ln_f", hidden_states)
@@ -2247,7 +2257,7 @@ class WeLMV4MoeForCausalLM(nn.Module):
 
             if (
                 len(self.model.oe_grams) > 0
-                and forward_batch.n_gram_input_ids is not None
+                and getattr(forward_batch, "oe_context", None)
             ):
                 forward_batch.hidden_states = self.model._compute_oe_embedding(
                     input_ids, forward_batch, forward_batch.hidden_states
