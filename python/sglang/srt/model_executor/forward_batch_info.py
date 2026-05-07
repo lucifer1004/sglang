@@ -840,6 +840,15 @@ class ForwardBatch:
             self.encoder_lens = self._pad_tensor_to_size(self.encoder_lens, bs)
         self.positions = self._pad_tensor_to_size(self.positions, num_tokens)
 
+        if (
+            self.n_gram_input_ids is not None
+            and self.n_gram_input_ids.input_ids_grams is not None
+        ):
+            self.n_gram_input_ids.input_ids_grams = [
+                self._pad_tensor_to_size(gram, num_tokens)
+                for gram in self.n_gram_input_ids.input_ids_grams
+            ]
+
         if self.mrope_positions is not None:
             self.mrope_positions = self._pad_tensor_to_size(self.mrope_positions, bs)
 
