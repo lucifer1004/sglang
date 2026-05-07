@@ -19,6 +19,7 @@ import bisect
 import gc
 import inspect
 import logging
+import math
 import os
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -90,6 +91,22 @@ except ImportError:
 _is_hip = is_hip()
 
 logger = logging.getLogger(__name__)
+
+WELM_KV_MIRROR_PP_KEY_PREFIX = "welm_kv_mirror"
+
+
+def _welm_kv_mirror_packed_len(numel: int) -> int:
+    try:
+        tp_size = get_attention_tp_size()
+    except AssertionError:
+        tp_size = 1
+    if tp_size <= 1:
+        return numel
+
+    pad_len = 1
+    while (numel + pad_len) % tp_size == 0:
+        pad_len += 1
+    return numel + pad_len
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -163,6 +180,8 @@ class DecodeInputBuffers(ForwardInputBuffers):
         enable_mamba_track: bool,
         prepare_n_gram_inputs: bool,
         scale_seq_factor: int,
+        kv_mirror_imitated_layers: Optional[List[int]] = None,
+        kv_mirror_tensor_size: Optional[int] = None,
         ne_token_table: Optional[torch.Tensor] = None,
     ) -> "DecodeInputBuffers":
         with torch.device(device):
@@ -200,8 +219,18 @@ class DecodeInputBuffers(ForwardInputBuffers):
             if pp_size > 1:
                 pp_proxy_tensors = {
                     "hidden_states": torch.zeros((max_bs, hidden_size), dtype=dtype),
-                    "residual": torch.zeros((max_bs, hidden_size), dtype=dtype),
+                    "residual": torch.zeros(
+                        (max_bs, hidden_size), dtype=torch.float32
+                    ),
                 }
+                if kv_mirror_imitated_layers and kv_mirror_tensor_size:
+                    for layer_idx in kv_mirror_imitated_layers:
+                        pp_proxy_tensors[
+                            f"{WELM_KV_MIRROR_PP_KEY_PREFIX}.{layer_idx}.k"
+                        ] = torch.zeros((max_bs, kv_mirror_tensor_size), dtype=dtype)
+                        pp_proxy_tensors[
+                            f"{WELM_KV_MIRROR_PP_KEY_PREFIX}.{layer_idx}.v"
+                        ] = torch.zeros((max_bs, kv_mirror_tensor_size), dtype=dtype)
             else:
                 pp_proxy_tensors = None
 
@@ -361,10 +390,19 @@ class DecodeInputBuffers(ForwardInputBuffers):
 
         # Pipeline-parallel proxy tensors.
         if pp_proxy_tensors is not None and self.pp_proxy_tensors is not None:
+            for buf in self.pp_proxy_tensors.values():
+                buf.zero_()
             for key, buf in self.pp_proxy_tensors.items():
                 src = pp_proxy_tensors.tensors.get(key, None)
                 if src is None:
                     continue
+                shape = pp_proxy_tensors.tensors.get(f"{key}.shape")
+                if (
+                    shape is not None
+                    and key.startswith(f"{WELM_KV_MIRROR_PP_KEY_PREFIX}.")
+                    and src.dim() == 1
+                ):
+                    src = src[: math.prod(shape)].view(shape)
                 dim = src.shape[0]
                 dsts.append(buf[:dim])
                 srcs.append(src)
@@ -648,6 +686,32 @@ class CudaGraphRunner:
 
         if self.require_gathered_buffer:
             assert self.require_mlp_tp_gather or self.require_attn_tp_gather
+
+        hf_config = self.model_runner.model_config.hf_config
+        kv_mirror_imitated_layers = []
+        kv_mirror_tensor_size = None
+        if (
+            self.pp_size > 1
+            and self.model_runner.server_args.enable_welm_kv_mirror_opt
+        ):
+            num_hidden_layers = getattr(hf_config, "num_hidden_layers", 0)
+            kv_mirror_imitated_layers = [
+                int(layer_idx)
+                for layer_idx in getattr(hf_config, "kv_mirror_imitated_layers", [])
+                if 0 <= int(layer_idx) < num_hidden_layers
+            ]
+            if kv_mirror_imitated_layers:
+                num_attention_heads = getattr(hf_config, "num_attention_heads")
+                num_key_value_heads = getattr(hf_config, "num_key_value_heads")
+                head_dim = getattr(
+                    hf_config,
+                    "head_dim",
+                    self.model_runner.model_config.hidden_size // num_attention_heads,
+                )
+                kv_mirror_tensor_size = (
+                    max(1, num_key_value_heads // self.attn_tp_size) * head_dim
+                )
+
         self.buffers: DecodeInputBuffers = DecodeInputBuffers.create(
             device=self.device,
             max_bs=self.max_bs,
@@ -666,6 +730,8 @@ class CudaGraphRunner:
             enable_mamba_track=enable_mamba_track,
             prepare_n_gram_inputs=self.model_runner.server_args.prepare_n_gram_inputs,
             scale_seq_factor=self.scale_seq_factor,
+            kv_mirror_imitated_layers=kv_mirror_imitated_layers,
+            kv_mirror_tensor_size=kv_mirror_tensor_size,
             ne_token_table=(
                 model_runner.token_table if self.use_ngram_embedding else None
             ),
@@ -1222,7 +1288,26 @@ class CudaGraphRunner:
             )
         else:
             assert isinstance(output, PPProxyTensors)
-            return PPProxyTensors({k: v[: self.bs] for k, v in output.tensors.items()})
+            tensors = {}
+            for key, value in output.tensors.items():
+                if key.endswith(".shape"):
+                    continue
+                if not isinstance(value, torch.Tensor):
+                    tensors[key] = value
+                    continue
+
+                shape = output.tensors.get(f"{key}.shape")
+                if (
+                    shape is not None
+                    and key.startswith(f"{WELM_KV_MIRROR_PP_KEY_PREFIX}.")
+                ):
+                    replay_shape = (self.raw_num_token, *tuple(shape[1:]))
+                    packed_len = _welm_kv_mirror_packed_len(math.prod(replay_shape))
+                    tensors[key] = value[:packed_len].clone()
+                    tensors[f"{key}.shape"] = replay_shape
+                else:
+                    tensors[key] = value[: self.raw_num_token].clone()
+            return PPProxyTensors(tensors)
 
     def get_spec_info(self, num_tokens: int):
         spec_info = None
