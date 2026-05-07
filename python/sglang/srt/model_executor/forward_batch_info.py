@@ -970,6 +970,15 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 self.mamba_track_seqlens, bs
             )
 
+        if (
+            self.n_gram_input_ids is not None
+            and self.n_gram_input_ids.input_ids_grams is not None
+        ):
+            self.n_gram_input_ids.input_ids_grams = [
+                self._pad_tensor_to_size(gram, num_tokens)
+                for gram in self.n_gram_input_ids.input_ids_grams
+            ]
+
         if self.mrope_positions is not None:
             self.mrope_positions = torch.cat(
                 [

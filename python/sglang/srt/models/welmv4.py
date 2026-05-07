@@ -47,7 +47,6 @@ from sglang.srt.layers.dp_attention import (
     get_attention_tp_size,
     is_dp_attention_enabled,
 )
-from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
@@ -102,6 +101,30 @@ logger = logging.getLogger(__name__)
 _is_cuda = is_cuda()
 WELM_KV_MIRROR_PP_KEY_PREFIX = "welm_kv_mirror"
 _WELM_DUMP_PROCESS_DIR = None
+_WELM_DUMP_BASE_DIR = None
+_WELM_DUMP_PASS_ID = -1
+
+
+class WelmV4CommunicatorRMSNorm(nn.Module):
+    """Adapt WeLM fused RMSNorm to LayerCommunicator's return-value contract."""
+
+    def __init__(self, hidden_size: int, eps: float):
+        super().__init__()
+        self.norm = WelmV4FusedRMSNorm(hidden_size, eps=eps)
+        self.weight = self.norm.weight
+        self.eps = self.norm.eps
+        self.variance_epsilon = self.norm.eps
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        residual: Optional[torch.Tensor] = None,
+        **kwargs,
+    ):
+        output = self.norm(x, residual, **kwargs)
+        if not kwargs and residual is None and isinstance(output, tuple):
+            return output[0]
+        return output
 
 
 def _welm_dump_enabled() -> bool:
@@ -142,6 +165,28 @@ def _welm_dump_tensor(name: str, tensor: torch.Tensor) -> None:
             )
         _WELM_DUMP_PROCESS_DIR.mkdir(parents=True, exist_ok=True)
     torch.save(tensor.detach().cpu(), _WELM_DUMP_PROCESS_DIR / f"{name}.pt")
+
+
+def _welm_start_dump_pass() -> None:
+    global _WELM_DUMP_BASE_DIR, _WELM_DUMP_PASS_ID, _WELM_DUMP_PROCESS_DIR
+    if not _welm_dump_enabled():
+        return
+    if _WELM_DUMP_BASE_DIR is None:
+        _WELM_DUMP_BASE_DIR = (
+            Path(os.getenv("SGLANG_DUMP_ACTIVATIONS_DIR", "/tmp/sglang_welm_dump"))
+            / f"TP0_PP0_Rank0_pid{os.getpid()}"
+        )
+    _WELM_DUMP_PASS_ID += 1
+    _WELM_DUMP_PROCESS_DIR = _WELM_DUMP_BASE_DIR / f"Pass{_WELM_DUMP_PASS_ID:05d}"
+    os.environ["SGLANG_DUMP_ACTIVATIONS_PROCESS_DIR"] = str(_WELM_DUMP_PROCESS_DIR)
+    _WELM_DUMP_PROCESS_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def hash_input_ids_vectorized(input_ids: torch.Tensor) -> torch.Tensor:
+    ids = input_ids.to(torch.int64)
+    result = ids * 2654435761
+    result = result & 0xFFFFFFFF
+    return result.to(input_ids.dtype)
 
 
 def _welm_kv_mirror_pp_key(layer_idx: int, suffix: str) -> str:
@@ -1183,7 +1228,7 @@ class Qwen2MoeAttention(nn.Module):
             quant_config=quant_config,
             tp_rank=attn_tp_rank,
             tp_size=attn_tp_size,
-            reduce_results=True,
+            reduce_results=not is_dp_attention_enabled(),
             prefix=add_prefix("o_proj", prefix),
         )
         if rope_scaling is None:
@@ -1234,6 +1279,8 @@ class Qwen2MoeAttention(nn.Module):
                 hidden_size,
                 self.total_num_heads,
                 bias=False,
+                tp_rank=attn_tp_rank,
+                tp_size=attn_tp_size,
             )
         self.attn.is_kv_mirror = (
             get_global_server_args().enable_welm_kv_mirror_opt
@@ -1507,10 +1554,10 @@ class Qwen2MoeDecoderLayer(nn.Module):
                 quant_config=quant_config,
                 prefix=add_prefix("mlp", prefix),
             )
-        self.input_layernorm = WelmV4FusedRMSNorm(
+        self.input_layernorm = WelmV4CommunicatorRMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
-        self.post_attention_layernorm = WelmV4FusedRMSNorm(
+        self.post_attention_layernorm = WelmV4CommunicatorRMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
 
@@ -1534,8 +1581,17 @@ class Qwen2MoeDecoderLayer(nn.Module):
         residual_after_layernorm = (
             self.ppln and self.layer_id not in self.prenorm_layer_idx
         )
-        use_fp32_ppln_residual = residual_after_layernorm
-        if use_fp32_ppln_residual:
+        use_dp_layer_communicator = is_dp_attention_enabled()
+        use_fp32_ppln_residual = (
+            residual_after_layernorm and not use_dp_layer_communicator
+        )
+        if use_dp_layer_communicator:
+            hidden_states, residual = self.layer_communicator.prepare_attn(
+                hidden_states, residual, forward_batch
+            )
+            if residual_after_layernorm:
+                residual = hidden_states.to(torch.float32)
+        elif use_fp32_ppln_residual:
             hidden_states, _, residual = self.input_layernorm(
                 hidden_states,
                 residual,
@@ -1561,11 +1617,15 @@ class Qwen2MoeDecoderLayer(nn.Module):
             if residual is not None:
                 _welm_dump_tensor(f"model.layers.{self.layer_id}.attn.mixer.1", residual)
 
-        if residual_after_layernorm and not use_fp32_ppln_residual:
+        if (
+            residual_after_layernorm
+            and not use_fp32_ppln_residual
+            and not use_dp_layer_communicator
+        ):
             residual = hidden_states.clone().to(
                 dtype=hidden_states.dtype, device=hidden_states.device
             )
-        use_mmq_norm_after_attn = use_fp32_ppln_residual and self.self_attn.use_o_norm
+        use_mmq_norm_after_attn = residual_after_layernorm and self.self_attn.use_o_norm
         if hidden_states.shape[0] != 0:
             hidden_states = self.self_attn(
                 positions=positions,
@@ -1579,6 +1639,51 @@ class Qwen2MoeDecoderLayer(nn.Module):
             and self.layer_id == self.kv_mirror_layers[-1]
         ):
             residual = residual[forward_batch.custom_last_index]
+            if is_dp_attention_enabled():
+                from sglang.srt.layers.dp_attention import (
+                    get_attention_dp_rank,
+                    set_dp_buffer_len,
+                )
+
+                dp_rank = get_attention_dp_rank()
+                new_local_num_tokens = hidden_states.shape[0]
+                scale = max(getattr(forward_batch, "scale_seq_factor", 1), 1)
+                if scale > 1:
+                    new_global_num_tokens_gpu = (
+                        forward_batch.global_num_tokens_gpu // scale
+                    )
+                    forward_batch.global_num_tokens_gpu.copy_(
+                        new_global_num_tokens_gpu
+                    )
+                    new_global_num_tokens = [
+                        int(x) for x in new_global_num_tokens_gpu.tolist()
+                    ]
+                    if forward_batch.global_num_tokens_cpu is not None:
+                        forward_batch.global_num_tokens_cpu = new_global_num_tokens
+                else:
+                    forward_batch.global_num_tokens_gpu[dp_rank] = (
+                        new_local_num_tokens
+                    )
+                    new_global_num_tokens = None
+                forward_batch.dp_local_start_pos = None
+                forward_batch.dp_local_num_tokens = None
+                if new_global_num_tokens is not None:
+                    if forward_batch.dp_padding_mode.is_max_len():
+                        global_dp_buffer_len = max(new_global_num_tokens) * len(
+                            new_global_num_tokens
+                        )
+                    else:
+                        global_dp_buffer_len = sum(new_global_num_tokens)
+                    forward_batch.global_dp_buffer_len = global_dp_buffer_len
+                else:
+                    global_dp_buffer_len = forward_batch.global_dp_buffer_len
+                set_dp_buffer_len(
+                    global_dp_buffer_len,
+                    new_local_num_tokens,
+                    forward_batch.dp_padding_mode.is_max_len(),
+                    new_global_num_tokens,
+                )
+
         if use_mmq_norm_after_attn:
             hidden_states, residual, hidden_states_fp32 = mmq_style_norm_after_attn(
                 hidden_states,
@@ -1587,10 +1692,38 @@ class Qwen2MoeDecoderLayer(nn.Module):
                 self.post_attention_layernorm.weight,
                 self.post_attention_layernorm.eps,
             )
+            if (
+                is_dp_attention_enabled()
+                and self.attn_tp_size == 1
+                and self.layer_scatter_modes.mlp_mode == ScatterMode.FULL
+            ):
+                from sglang.srt.layers.dp_attention import (
+                    dp_gather_partial,
+                    get_attention_dp_size,
+                    get_global_dp_buffer,
+                )
+
+                if get_attention_dp_size() != 1:
+                    local_hidden_states = hidden_states
+                    hidden_states = get_global_dp_buffer()
+                    dp_gather_partial(
+                        hidden_states, local_hidden_states, forward_batch
+                    )
+                    hidden_states_fp32 = hidden_states.to(torch.float32)
         else:
-            hidden_states, residual, hidden_states_fp32 = self.post_attention_layernorm(
-                hidden_states, residual, clone_fp32_out=True
-            )
+            if use_dp_layer_communicator:
+                hidden_states, residual = self.layer_communicator.prepare_mlp(
+                    hidden_states, residual, forward_batch
+                )
+                hidden_states_fp32 = hidden_states.to(torch.float32)
+            else:
+                (
+                    hidden_states,
+                    residual,
+                    hidden_states_fp32,
+                ) = self.post_attention_layernorm(
+                    hidden_states, residual, clone_fp32_out=True
+                )
         if dump_this_layer:
             _welm_dump_tensor(
                 f"model.layers.{self.layer_id}.norm_after_attn.output", hidden_states
@@ -1618,6 +1751,7 @@ class Qwen2MoeDecoderLayer(nn.Module):
                 and residual is not None
                 and not dump_this_layer
                 and getattr(self.mlp, "tp_size", 1) == 1
+                and not is_dp_attention_enabled()
             ),
         )
         experts_output = None
@@ -1626,9 +1760,22 @@ class Qwen2MoeDecoderLayer(nn.Module):
             hidden_states, experts_output, shared_output = mlp_output
         else:
             hidden_states = mlp_output
+
+        if use_dp_layer_communicator:
+            hidden_states, residual = self.layer_communicator.postprocess_layer(
+                hidden_states, residual, forward_batch
+            )
+
+        if self.is_final_layer:
+            self.final_mlp_experts_output = experts_output
+            self.final_mlp_shared_output = shared_output
         if dump_this_layer:
             output_with_residual = hidden_states
-            if residual is not None and experts_output is not None:
+            if (
+                residual is not None
+                and experts_output is not None
+                and experts_output.shape == residual.shape
+            ):
                 output_with_residual = experts_output.float() + residual.float()
                 if shared_output is not None:
                     output_with_residual = output_with_residual + shared_output.float()
@@ -1682,6 +1829,7 @@ class Qwen2MoeModel(nn.Module):
                     VocabParallelEmbedding(
                         self.oe_vocab_sizes[i],
                         self.oe_dim,
+                        enable_tp=not is_dp_attention_enabled(),
                     )
                     for i in range(len(self.oe_vocab_sizes))
                 ]
@@ -1711,7 +1859,9 @@ class Qwen2MoeModel(nn.Module):
                         nn.ModuleList(
                             [
                                 VocabParallelEmbedding(
-                                    self.oe_vocab_sizes[j], self.oe_dim
+                                    self.oe_vocab_sizes[j],
+                                    self.oe_dim,
+                                    enable_tp=not is_dp_attention_enabled(),
                                 )
                                 for j in range(len(self.oe_vocab_sizes))
                             ]
@@ -1783,16 +1933,53 @@ class Qwen2MoeModel(nn.Module):
             oe_embed_modules = self.oe_embed
         if oe_up_proj_module is None:
             oe_up_proj_module = self.oe_gate_up_proj
-        return compute_welm_oe_embedding(
-            input_ids=input_ids,
-            forward_batch=forward_batch,
-            base_hidden_states=base_hidden_states,
-            oe_grams=self.oe_grams,
-            oe_vocab_sizes=self.oe_vocab_sizes,
-            vocab_size=self.vocab_size,
-            oe_embed_modules=oe_embed_modules,
-            oe_proj_module=oe_up_proj_module,
-        )
+
+        dump_oe = _welm_dump_enabled()
+        if not dump_oe:
+            return compute_welm_oe_embedding(
+                input_ids=input_ids,
+                forward_batch=forward_batch,
+                base_hidden_states=base_hidden_states,
+                oe_grams=self.oe_grams,
+                oe_vocab_sizes=self.oe_vocab_sizes,
+                vocab_size=self.vocab_size,
+                oe_embed_modules=oe_embed_modules,
+                oe_proj_module=oe_up_proj_module,
+            )
+
+        if dump_oe:
+            _welm_dump_tensor("model.oe.input_ids", input_ids)
+            _welm_dump_tensor("model.oe.base_hidden_states", base_hidden_states)
+
+        input_ids_ngram = []
+        input_ids_ngram_tmp = input_ids
+        for g in range(1, max(self.oe_grams)):
+            gram_tensor = forward_batch.n_gram_input_ids.get_gram(g + 1)
+            if gram_tensor is not None:
+                if dump_oe:
+                    _welm_dump_tensor(f"model.oe.gram{g + 1}.ids", gram_tensor)
+                input_ids_ngram_tmp = input_ids_ngram_tmp + gram_tensor * (
+                    self.vocab_size**g
+                )
+            input_ids_ngram.append(hash_input_ids_vectorized(input_ids_ngram_tmp))
+
+        emb_ngram = []
+        for i, vs in enumerate(self.oe_vocab_sizes):
+            input_ids_ngram_hashed_tmp = input_ids_ngram[self.oe_grams[i] - 2] % vs
+            if dump_oe:
+                _welm_dump_tensor(
+                    f"model.oe.vocab{i}.hashed_ids", input_ids_ngram_hashed_tmp
+                )
+            emb_ngram_tmp = oe_embed_modules[i](input_ids_ngram_hashed_tmp)
+            if dump_oe:
+                _welm_dump_tensor(f"model.oe.vocab{i}.embedding", emb_ngram_tmp)
+            emb_ngram.append(emb_ngram_tmp)
+        emb_new, _ = oe_up_proj_module(torch.cat(emb_ngram, dim=-1))
+        hidden_states = (base_hidden_states + emb_new) / 2.0
+        if dump_oe:
+            _welm_dump_tensor("model.oe.projected", emb_new)
+            _welm_dump_tensor("model.oe.output", hidden_states)
+        return hidden_states
 
     def _expand_scale_seq(self, input_ids, forward_batch, hidden_states):
         """Expand hidden_states from (T, D) to (T * scale, D) by interleaving
@@ -1811,7 +1998,7 @@ class Qwen2MoeModel(nn.Module):
 
         for s in range(self.scale_seq_times):
             hs_s = self.scale_seq_embed_tokens_list[s](input_ids)  # (T, D)
-            if len(self.oe_grams) > 0:
+            if len(self.oe_grams) > 0 and forward_batch.n_gram_input_ids is not None:
                 hs_s = self._compute_oe_embedding(
                     input_ids,
                     forward_batch,
@@ -1835,13 +2022,16 @@ class Qwen2MoeModel(nn.Module):
         input_embeds: torch.Tensor = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[torch.Tensor, PPProxyTensors]:
+        _welm_start_dump_pass()
         if self.pp_group.is_first_rank:
             if input_embeds is None:
                 hidden_states = self.embed_tokens(input_ids)
             else:
                 hidden_states = input_embeds
+            if _welm_dump_enabled():
+                _welm_dump_tensor("model.embed_tokens.output", hidden_states)
 
-            if len(self.oe_grams) > 0:
+            if len(self.oe_grams) > 0 and forward_batch.n_gram_input_ids is not None:
                 hidden_states = self._compute_oe_embedding(
                     input_ids, forward_batch, hidden_states
                 )
@@ -1920,6 +2110,7 @@ class Qwen2MoeModel(nn.Module):
                     can_rebuild_final_mlp = (
                         final_experts_output is not None
                         and getattr(last_layer.mlp, "tp_size", 1) == 1
+                        and not is_dp_attention_enabled()
                     )
                     if can_rebuild_final_mlp:
                         hidden_states = final_experts_output.float() + residual.float()
@@ -2054,7 +2245,10 @@ class WeLMV4MoeForCausalLM(nn.Module):
             else:
                 forward_batch.hidden_states = input_embeds
 
-            if len(self.model.oe_grams) > 0:
+            if (
+                len(self.model.oe_grams) > 0
+                and forward_batch.n_gram_input_ids is not None
+            ):
                 forward_batch.hidden_states = self.model._compute_oe_embedding(
                     input_ids, forward_batch, forward_batch.hidden_states
                 )
