@@ -22,7 +22,7 @@ from sglang.srt.models.welmv4 import (
     Qwen2MoeDecoderLayer,
     WelmV4FusedRMSNorm,
     WeLMV4MoeForCausalLM,
-    _empty_welm_kv_mirror_states,
+    _get_welm_kv_mirror_states,
 )
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix, is_cuda, is_npu
@@ -205,7 +205,7 @@ class WeLMV4ModelNextN(nn.Module):
             _dump_tensor("model.mtp.0.projector_out", hidden_states)
 
         residual = None
-        kv_mirror_states = _empty_welm_kv_mirror_states()
+        kv_mirror_states = _get_welm_kv_mirror_states(forward_batch)
         final_experts_output = None
         final_shared_output = None
         with get_global_expert_distribution_recorder().disable_this_region():
@@ -230,11 +230,9 @@ class WeLMV4ModelNextN(nn.Module):
                         hidden_states = hidden_states + final_shared_output.float()
                 else:
                     hidden_states = hidden_states.float() + residual.float()
-                hidden_states = hidden_states.to(self.shared_head.norm.weight.dtype)
-                _dump_tensor("model.mtp.0.decoder.0.output", hidden_states)
-                hidden_states, _ = self.shared_head.norm(hidden_states)
-            else:
-                hidden_states, _ = self.shared_head.norm(hidden_states)
+            hidden_states = hidden_states.to(self.shared_head.norm.weight.dtype)
+            _dump_tensor("model.mtp.0.decoder.0.output", hidden_states)
+            hidden_states, _ = self.shared_head.norm(hidden_states)
         _dump_tensor("model.mtp.0.ln_f", hidden_states)
         return hidden_states
 

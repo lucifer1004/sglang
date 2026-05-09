@@ -85,7 +85,11 @@ from sglang.srt.server_args import ServerArgs, get_global_server_args
 from sglang.srt.utils import flatten_nested_list
 from sglang.srt.utils.common import is_npu
 from sglang.srt.utils.cuda_ipc_transport_utils import CudaIpcTensorTransportProxy
-from sglang.srt.utils.over_encoding_utils import filter_buffer
+from sglang.srt.utils.over_encoding_utils import (
+    assign_ngram_buffer,
+    assign_ngram_input_ids_draft_extend,
+    filter_buffer,
+)
 
 _is_npu = is_npu()
 
@@ -647,6 +651,30 @@ class OverEncodingContext:
 
     def start_new_step(self):
         self.filtered = False
+
+    def refresh_for_draft_extend(
+        self,
+        input_ids: torch.Tensor,
+        extend_lens: List[int],
+        seq_lens: torch.Tensor,
+    ):
+        for idx, gram_tensor in enumerate(self.input_ids_grams):
+            if gram_tensor is None:
+                continue
+            assign_ngram_input_ids_draft_extend(
+                input_ids,
+                gram_tensor,
+                extend_lens,
+                idx + 2,
+            )
+
+        buffer = torch.empty(
+            seq_lens.numel() * self.buffer_size,
+            device=input_ids.device,
+            dtype=input_ids.dtype,
+        )
+        assign_ngram_buffer(input_ids, buffer, seq_lens, self.buffer_size)
+        self.input_ids_buffer = buffer
 
     # ------------------------------------------------------------------
     # Accessors
