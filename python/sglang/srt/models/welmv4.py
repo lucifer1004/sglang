@@ -1258,7 +1258,7 @@ class Qwen2MoeDecoderLayer(nn.Module):
             config, "num_nextn_predict_layers", 0
         )
         self.layer_id = layer_id
-        self.is_final_layer = layer_id == total_layer_num - 1
+        self.is_final_layer = layer_id == total_layer_num - 1 or is_nextn
 
         self.attn_tp_size = get_attention_tp_size()
         self.attn_tp_rank = get_attention_tp_rank()
@@ -1778,8 +1778,10 @@ class Qwen2MoeModel(nn.Module):
                 }
             )
         else:
+            pre_norm_hidden_states = None
             if hidden_states.shape[0] != 0:
                 if residual is None:
+                    pre_norm_hidden_states = hidden_states
                     hidden_states, _ = self.norm(hidden_states)
                 else:
                     last_layer = self.layers[self.end_layer - 1]
@@ -1799,20 +1801,29 @@ class Qwen2MoeModel(nn.Module):
                         hidden_states = final_experts_output.float() + residual.float()
                         if final_shared_output is not None:
                             hidden_states = hidden_states + final_shared_output.float()
+                        pre_norm_hidden_states = hidden_states.to(self.norm.weight.dtype)
                         hidden_states = F.rms_norm(
-                            hidden_states.to(self.norm.weight.dtype),
+                            pre_norm_hidden_states,
                             self.norm.weight.shape,
                             self.norm.weight,
                             eps=self.norm.eps,
                         )
                     else:
                         hidden_states = hidden_states.float() + residual.float()
+                        pre_norm_hidden_states = hidden_states.to(self.norm.weight.dtype)
                         hidden_states = F.rms_norm(
-                            hidden_states.to(self.norm.weight.dtype),
+                            pre_norm_hidden_states,
                             self.norm.weight.shape,
                             self.norm.weight,
                             eps=self.norm.eps,
                         )
+
+        if (
+            len(aux_hidden_states) == 0
+            and forward_batch.capture_hidden_mode.need_capture()
+            and pre_norm_hidden_states is not None
+        ):
+            aux_hidden_states = [pre_norm_hidden_states]
 
         if len(aux_hidden_states) == 0:
             return hidden_states
@@ -1861,7 +1872,7 @@ class WeLMV4MoeForCausalLM(nn.Module):
         input_embeds: torch.Tensor = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
-        hidden_states = self.model(
+        model_output = self.model(
             input_ids,
             positions,
             forward_batch,
@@ -1869,8 +1880,10 @@ class WeLMV4MoeForCausalLM(nn.Module):
             pp_proxy_tensors=pp_proxy_tensors,
         )
         aux_hidden_states = None
-        if self.capture_aux_hidden_states:
-            hidden_states, aux_hidden_states = hidden_states
+        if isinstance(model_output, tuple):
+            hidden_states, aux_hidden_states = model_output
+        else:
+            hidden_states = model_output
         if self.pp_group.is_last_rank:
             # Contract expanded hidden_states back to logical size for logits.
             # Transformer layers have already processed all T*scale states and
@@ -1891,6 +1904,10 @@ class WeLMV4MoeForCausalLM(nn.Module):
                         device=hidden_states.device,
                     )
                     hidden_states = hidden_states[indices]
+                    if aux_hidden_states is not None:
+                        aux_hidden_states = [
+                            hidden[indices] for hidden in aux_hidden_states
+                        ]
 
                 # Restore forward_batch metadata to logical space so that
                 # LogitsProcessor sees the un-expanded lengths.
@@ -1907,7 +1924,11 @@ class WeLMV4MoeForCausalLM(nn.Module):
                     )
 
             return self.logits_processor(
-                input_ids, hidden_states, self.lm_head, forward_batch, aux_hidden_states
+                input_ids,
+                hidden_states,
+                self.lm_head,
+                forward_batch,
+                aux_hidden_states,
             )
         else:
             return hidden_states
