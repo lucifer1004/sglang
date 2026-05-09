@@ -1,7 +1,7 @@
 import logging
 from copy import copy
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -649,6 +649,7 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
     future_indices: Optional[FutureIndices] = None
     new_seq_lens: Optional[torch.Tensor] = None
     verify_done: Optional[torch.cuda.Event] = None
+    model_specific_states: Optional[Dict[str, Any]] = None
 
     def __post_init__(self):
         super().__init__(SpecInputType.EAGLE_DRAFT)
@@ -671,6 +672,13 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
                 (input_ids[1:], self.verified_id[i].reshape(1))
             )
             pt += extend_len
+
+        if batch.oe_context is not None:
+            batch.oe_context.refresh_for_draft_extend(
+                batch.input_ids,
+                batch.extend_lens,
+                batch.seq_lens,
+            )
 
     @classmethod
     def create_idle_input(

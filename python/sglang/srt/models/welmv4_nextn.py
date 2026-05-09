@@ -1,6 +1,8 @@
 """Inference-only WeLMV4 NextN Speculative Decoding."""
 
 import logging
+import os
+from pathlib import Path
 from typing import Iterable, Optional, Tuple
 
 import torch
@@ -18,17 +20,48 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.models.welm_perf_opt import hash_input_ids_vectorized
 from sglang.srt.models.welmv4 import (
     Qwen2MoeDecoderLayer,
+    WelmV4FusedRMSNorm,
     WeLMV4MoeForCausalLM,
-    _empty_welm_kv_mirror_states,
+    _get_welm_kv_mirror_states,
 )
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix, is_cuda, is_npu
 
 logger = logging.getLogger(__name__)
 
-
 _is_cuda = is_cuda()
 _is_npu = is_npu()
+_MTP_DUMP_PASS = 0
+_MTP_DUMP_WRITTEN = set()
+
+
+def _mtp_dump_enabled() -> bool:
+    return os.environ.get("SGLANG_DUMP_MTP_ACTIVATIONS", "0").strip().lower() in {
+        "1",
+        "true",
+        "on",
+        "yes",
+    }
+
+
+def _mtp_dump_dir() -> Path:
+    root = os.environ.get("SGLANG_DUMP_MTP_ACTIVATIONS_DIR", "./sglang_mtp_dump")
+    rank = os.environ.get("RANK", "0")
+    path = Path(root) / f"Rank{rank}_pid{os.getpid()}" / f"Pass{_MTP_DUMP_PASS:05d}"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _safe_name(name: str) -> str:
+    return "".join(c if c.isalnum() or c in "._-" else "_" for c in name)
+
+
+def _dump_tensor(name: str, value) -> None:
+    if not _mtp_dump_enabled() or name in _MTP_DUMP_WRITTEN:
+        return
+    if isinstance(value, torch.Tensor):
+        torch.save(value.detach().cpu(), _mtp_dump_dir() / f"{_safe_name(name)}.pt")
+        _MTP_DUMP_WRITTEN.add(name)
 
 
 class WeLMV4ModelNextN(nn.Module):
@@ -95,7 +128,9 @@ class WeLMV4ModelNextN(nn.Module):
         )
 
         self.shared_head = nn.Module()
-        self.shared_head.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.shared_head.norm = WelmV4FusedRMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps
+        )
 
     def forward(
         self,
@@ -104,6 +139,10 @@ class WeLMV4ModelNextN(nn.Module):
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
     ) -> torch.Tensor:
+
+        _dump_tensor("model.mtp.0.input_ids", input_ids)
+        _dump_tensor("model.mtp.0.positions", positions)
+        _dump_tensor("model.mtp.0.main_hidden_in", forward_batch.spec_info.hidden_states)
 
         if input_embeds is None:
             hidden_states = self.embed_tokens(input_ids)
@@ -138,30 +177,39 @@ class WeLMV4ModelNextN(nn.Module):
             emb_new, _ = self.oe_gate_up_proj(torch.cat(emb_ngram, dim=-1))
             hidden_states = (hidden_states + emb_new) / 2.0
 
+        _dump_tensor("model.mtp.0.embedding", hidden_states)
+
         if (
             forward_batch.enable_welm_kv_mirror_opt
             and forward_batch.forward_mode.is_extend_without_speculative()
         ):
-            forward_batch.custom_last_index = (
-                torch.cumsum(forward_batch.extend_seq_lens, dim=0) - 1
-            )
-            hidden_states = hidden_states[forward_batch.custom_last_index]
+            main_hidden_states = forward_batch.spec_info.hidden_states
+            if (
+                main_hidden_states is not None
+                and hidden_states.shape[0] != main_hidden_states.shape[0]
+            ):
+                if not hasattr(forward_batch, "custom_last_index"):
+                    forward_batch.custom_last_index = (
+                        torch.cumsum(forward_batch.extend_seq_lens, dim=0) - 1
+                    )
+                hidden_states = hidden_states[forward_batch.custom_last_index]
 
         if hidden_states.shape[0] > 0:
+            enorm_output = self.enorm(hidden_states)
+            hnorm_output = self.hnorm(forward_batch.spec_info.hidden_states)
+            _dump_tensor("model.mtp.0.enorm", enorm_output)
+            _dump_tensor("model.mtp.0.hnorm", hnorm_output)
             hidden_states = self.eh_proj(
-                torch.cat(
-                    (
-                        self.enorm(hidden_states),
-                        self.hnorm(forward_batch.spec_info.hidden_states),
-                    ),
-                    dim=-1,
-                )
+                torch.cat((enorm_output, hnorm_output), dim=-1)
             )
+            _dump_tensor("model.mtp.0.projector_out", hidden_states)
 
         residual = None
-        kv_mirror_states = _empty_welm_kv_mirror_states()
+        kv_mirror_states = _get_welm_kv_mirror_states(forward_batch)
+        final_experts_output = None
+        final_shared_output = None
         with get_global_expert_distribution_recorder().disable_this_region():
-            for layer in self.decoder_layers:
+            for layer_idx, layer in enumerate(self.decoder_layers):
                 hidden_states, residual, kv_mirror_states = layer(
                     positions,
                     hidden_states,
@@ -169,12 +217,23 @@ class WeLMV4ModelNextN(nn.Module):
                     residual,
                     kv_mirror_states,
                 )
+                final_experts_output = getattr(layer, "final_mlp_experts_output", None)
+                final_shared_output = getattr(layer, "final_mlp_shared_output", None)
+                _dump_tensor(f"model.mtp.0.decoder.{layer_idx}.hidden", hidden_states)
+                _dump_tensor(f"model.mtp.0.decoder.{layer_idx}.residual", residual)
 
         if not forward_batch.forward_mode.is_idle():
             if residual is not None:
-                hidden_states, _ = self.shared_head.norm(hidden_states, residual)
-            else:
-                hidden_states = self.shared_head.norm(hidden_states)
+                if final_experts_output is not None:
+                    hidden_states = final_experts_output.float() + residual.float()
+                    if final_shared_output is not None:
+                        hidden_states = hidden_states + final_shared_output.float()
+                else:
+                    hidden_states = hidden_states.float() + residual.float()
+            hidden_states = hidden_states.to(self.shared_head.norm.weight.dtype)
+            _dump_tensor("model.mtp.0.decoder.0.output", hidden_states)
+            hidden_states, _ = self.shared_head.norm(hidden_states)
+        _dump_tensor("model.mtp.0.ln_f", hidden_states)
         return hidden_states
 
 
@@ -207,9 +266,11 @@ class WeLMV4MoeForCausalLMNextN(WeLMV4MoeForCausalLM):
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         hidden_states = self.model(input_ids, positions, forward_batch)
-        return self.logits_processor(
+        logits_output = self.logits_processor(
             input_ids, hidden_states, self.lm_head, forward_batch
         )
+        _dump_tensor("model.mtp.0.logits", logits_output.next_token_logits)
+        return logits_output
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         super().load_weights(weights, is_nextn=True)
