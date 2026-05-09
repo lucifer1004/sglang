@@ -321,7 +321,6 @@ class ModelConfig:
             and self.hf_config.architectures[0] == "WeLMV4MoeForCausalLM"
         ):
             self.hf_config.architectures[0] = "WeLMV4MoeForCausalLMNextN"
-            self.hf_config.num_target_hidden_layers = self.hf_config.num_hidden_layers
             self.hf_config.num_hidden_layers = self.hf_config.num_nextn_predict_layers
 
         if is_draft_model and self.hf_config.architectures[0] == "MiMoForCausalLM":

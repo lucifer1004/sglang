@@ -100,7 +100,6 @@ logger = logging.getLogger(__name__)
 
 _is_cuda = is_cuda()
 WELM_KV_MIRROR_PP_KEY_PREFIX = "welm_kv_mirror"
-WELM_KV_MIRROR_STATES_KEY = "welm_kv_mirror_states"
 _WELM_DUMP_PROCESS_DIR = None
 _WELM_DUMP_BASE_DIR = None
 _WELM_DUMP_PASS_ID = -1
@@ -199,28 +198,6 @@ def _empty_welm_kv_mirror_states() -> Dict[int, Tuple[torch.Tensor, torch.Tensor
     return {}
 
 
-def _get_welm_kv_mirror_states(
-    forward_batch: ForwardBatch,
-) -> Dict[int, Tuple[torch.Tensor, torch.Tensor]]:
-    model_specific_states = forward_batch.model_specific_states or {}
-    return dict(
-        model_specific_states.get(
-            WELM_KV_MIRROR_STATES_KEY, _empty_welm_kv_mirror_states()
-        )
-    )
-
-
-def _set_welm_kv_mirror_states(
-    forward_batch: ForwardBatch,
-    kv_mirror_states: Dict[int, Tuple[torch.Tensor, torch.Tensor]],
-) -> None:
-    if not kv_mirror_states:
-        return
-    model_specific_states = dict(forward_batch.model_specific_states or {})
-    model_specific_states[WELM_KV_MIRROR_STATES_KEY] = kv_mirror_states
-    forward_batch.model_specific_states = model_specific_states
-
-
 def _pack_welm_kv_mirror_pp_tensor(
     proxy_tensors: Dict[str, Any],
     key: str,
@@ -314,9 +291,7 @@ def _get_kv_mirror_pair_maps(
             )
             imitated_valid = 0 <= imitated < num_hidden_layers
         else:
-            mirror_valid = 0 <= mirror < (
-                num_hidden_layers + num_nextn_predict_layers
-            )
+            mirror_valid = 0 <= mirror < num_hidden_layers
             imitated_valid = 0 <= imitated < num_hidden_layers
         if mirror_valid and imitated_valid:
             valid_pairs.append((mirror, imitated))
@@ -570,25 +545,22 @@ class NextnMirrorQProjection(BaseWelmQkvProjection):
         forward_batch: ForwardBatch,
         kv_mirror_states: Dict[int, Tuple[torch.Tensor, torch.Tensor]],
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        if not forward_batch.forward_mode.is_extend_without_speculative():
+        if not _welm_should_contract_kv_mirror(forward_batch):
             qkv = self._apply_qkv(hidden_states)
             q, k, v = self._split_qkv(attn, qkv)
             return q, k, v, hidden_states
 
         project_hidden_states = hidden_states
-        if _welm_should_contract_kv_mirror(forward_batch) and not hasattr(
-            forward_batch, "custom_last_index"
-        ):
+        if not hasattr(forward_batch, "custom_last_index"):
             forward_batch.custom_last_index = (
                 torch.cumsum(forward_batch.extend_seq_lens, dim=0) - 1
             )
-            project_hidden_states = hidden_states[forward_batch.custom_last_index]
+        project_hidden_states = hidden_states[forward_batch.custom_last_index]
 
         kv_activation = kv_mirror_states.pop(self.imitated_layer_idx, None)
-        if kv_activation is None:
-            raise RuntimeError(
-                f"Missing mirrored KV activation for nextn imitated_layer_idx={self.imitated_layer_idx}"
-            )
+        assert (
+            kv_activation is not None
+        ), f"Missing mirrored KV activation for nextn imitated_layer_idx={self.imitated_layer_idx}"
 
         k, v = kv_activation
         if attn.need_clear_kv_cache:
@@ -597,7 +569,6 @@ class NextnMirrorQProjection(BaseWelmQkvProjection):
         q_bias = None if self.bias is None else self.bias[: attn.q_size]
         q = F.linear(project_hidden_states, q_weight, q_bias)
         return q, k, v, project_hidden_states
-
 
 class Qwen2MoeMLP(nn.Module):
     def __init__(
@@ -1526,9 +1497,7 @@ class Qwen2MoeDecoderLayer(nn.Module):
             "self.prenorm_layer_idx:",
             self.prenorm_layer_idx,
         )
-        total_layer_num = getattr(
-            config, "num_target_hidden_layers", config.num_hidden_layers
-        )
+        total_layer_num = config.num_hidden_layers
 
         self.self_attn = Qwen2MoeAttention(
             hidden_size=self.hidden_size,
@@ -1559,8 +1528,7 @@ class Qwen2MoeDecoderLayer(nn.Module):
             is_nextn=is_nextn,
         )
         self.layer_id = layer_id
-        self.is_nextn = is_nextn
-        self.is_final_layer = layer_id == total_layer_num - 1 or is_nextn
+        self.is_final_layer = layer_id == total_layer_num - 1
 
         self.attn_tp_size = get_attention_tp_size()
         self.attn_tp_rank = get_attention_tp_rank()
@@ -1825,13 +1793,10 @@ class Qwen2MoeDecoderLayer(nn.Module):
         can_add_final_components = (
             residual is not None
             and self.is_final_layer
-            and not self.is_nextn
             and experts_output is not None
             and getattr(self.mlp, "tp_size", 1) == 1
         )
-        can_add_first_residual = (
-            getattr(self.mlp, "tp_size", 1) == 1 and not self.is_nextn
-        )
+        can_add_first_residual = getattr(self.mlp, "tp_size", 1) == 1
         if can_add_final_components:
             hidden_states = experts_output.float() + residual.float()
             if shared_output is not None:
@@ -2123,7 +2088,6 @@ class Qwen2MoeModel(nn.Module):
                         residual,
                         kv_mirror_states,
                     )
-        _set_welm_kv_mirror_states(forward_batch, kv_mirror_states)
         if not self.pp_group.is_last_rank:
             proxy_tensors = {"hidden_states": hidden_states}
             if residual is not None:
@@ -2131,15 +2095,13 @@ class Qwen2MoeModel(nn.Module):
             _pack_welm_kv_mirror_states(proxy_tensors, kv_mirror_states)
             return PPProxyTensors(proxy_tensors)
         else:
-            pre_norm_hidden_states = None
             if hidden_states.shape[0] != 0:
                 if residual is None:
-                    pre_norm_hidden_states = hidden_states.to(self.norm.weight.dtype)
                     if _welm_dump_enabled():
-                        _welm_dump_tensor("model.ln_f.__input__.0", pre_norm_hidden_states)
+                        _welm_dump_tensor("model.ln_f.__input__.0", hidden_states)
                     if hidden_states.dtype == torch.float32:
                         hidden_states = F.rms_norm(
-                            pre_norm_hidden_states,
+                            hidden_states.to(self.norm.weight.dtype),
                             self.norm.weight.shape,
                             self.norm.weight,
                             eps=self.norm.eps,
@@ -2166,24 +2128,16 @@ class Qwen2MoeModel(nn.Module):
                             hidden_states = hidden_states + final_shared_output.float()
                     else:
                         hidden_states = hidden_states.float() + residual.float()
-                    pre_norm_hidden_states = hidden_states.to(self.norm.weight.dtype)
                     if _welm_dump_enabled():
-                        _welm_dump_tensor("model.ln_f.__input__.0", pre_norm_hidden_states)
+                        _welm_dump_tensor("model.ln_f.__input__.0", hidden_states)
                     hidden_states = F.rms_norm(
-                        pre_norm_hidden_states,
+                        hidden_states.to(self.norm.weight.dtype),
                         self.norm.weight.shape,
                         self.norm.weight,
                         eps=self.norm.eps,
                     )
                 if _welm_dump_enabled():
                     _welm_dump_tensor("model.ln_f", hidden_states)
-
-        if (
-            len(aux_hidden_states) == 0
-            and forward_batch.capture_hidden_mode.need_capture()
-            and pre_norm_hidden_states is not None
-        ):
-            aux_hidden_states = [pre_norm_hidden_states]
 
         if len(aux_hidden_states) == 0:
             return hidden_states
@@ -2231,7 +2185,7 @@ class WeLMV4MoeForCausalLM(nn.Module):
         input_embeds: torch.Tensor = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
-        model_output = self.model(
+        hidden_states = self.model(
             input_ids,
             positions,
             forward_batch,
@@ -2239,10 +2193,8 @@ class WeLMV4MoeForCausalLM(nn.Module):
             pp_proxy_tensors=pp_proxy_tensors,
         )
         aux_hidden_states = None
-        if isinstance(model_output, tuple):
-            hidden_states, aux_hidden_states = model_output
-        else:
-            hidden_states = model_output
+        if self.capture_aux_hidden_states:
+            hidden_states, aux_hidden_states = hidden_states
         if self.pp_group.is_last_rank:
             # Contract expanded hidden_states back to logical size for logits.
             # Transformer layers have already processed all T*scale states and
@@ -2263,10 +2215,6 @@ class WeLMV4MoeForCausalLM(nn.Module):
                         device=hidden_states.device,
                     )
                     hidden_states = hidden_states[indices]
-                    if aux_hidden_states is not None:
-                        aux_hidden_states = [
-                            hidden[indices] for hidden in aux_hidden_states
-                        ]
 
                 # Restore forward_batch metadata to logical space so that
                 # LogitsProcessor sees the un-expanded lengths.
@@ -2338,7 +2286,6 @@ class WeLMV4MoeForCausalLM(nn.Module):
                     forward_batch.residual,
                     forward_batch.kv_mirror_states,
                 )
-        _set_welm_kv_mirror_states(forward_batch, forward_batch.kv_mirror_states)
 
         if end == self.model.config.num_hidden_layers:
             # norm
@@ -2398,11 +2345,7 @@ class WeLMV4MoeForCausalLM(nn.Module):
         if is_nextn:
             if hasattr(self.config, "num_nextn_predict_layers"):
                 num_nextn_layers = self.config.num_nextn_predict_layers
-                num_target_layers = getattr(
-                    self.config,
-                    "num_target_hidden_layers",
-                    self.config.num_hidden_layers,
-                )
+                num_target_layers = self.config.num_hidden_layers
             else:
                 raise ValueError("num_nextn_predict_layers is not in the config")
 
@@ -2432,9 +2375,7 @@ class WeLMV4MoeForCausalLM(nn.Module):
         mirror_to_imitated, _ = _get_kv_mirror_pair_maps(
             getattr(self.config, "kv_mirror_layers", []),
             getattr(self.config, "kv_mirror_imitated_layers", []),
-            num_hidden_layers=getattr(
-                self.config, "num_target_hidden_layers", self.config.num_hidden_layers
-            ),
+            num_hidden_layers=self.config.num_hidden_layers,
             num_nextn_predict_layers=getattr(self.config, "num_nextn_predict_layers", 0),
             is_nextn=is_nextn,
         )
@@ -2487,9 +2428,6 @@ class WeLMV4MoeForCausalLM(nn.Module):
                             len(name_list) >= 3
                             and int(name_list[2]) >= self.config.num_hidden_layers
                         ):
-                            maybe_load_remote_kv_mirror_pair_weight(
-                                name, loaded_weight, int(name_list[2])
-                            )
                             continue
             else:
                 name_list = name.split(".")

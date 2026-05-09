@@ -304,7 +304,6 @@ class EAGLEWorker(TpModelWorker):
                     next_token_ids,
                     seq_lens_cpu,
                     logits_output.mm_input_embeds,
-                    logits_output.model_specific_states,
                 )
             return GenerationBatchResult(
                 logits_output=logits_output,
@@ -890,7 +889,6 @@ class EAGLEWorker(TpModelWorker):
         next_token_ids: torch.Tensor,
         seq_lens_cpu: Optional[torch.Tensor],
         mm_input_embeds: Optional[torch.Tensor] = None,
-        model_specific_states: Optional[dict] = None,
     ):
         """Run draft model extend. This API modifies the states of the batch.
 
@@ -904,7 +902,6 @@ class EAGLEWorker(TpModelWorker):
             verified_id=next_token_ids,
             num_tokens_per_req=1,
             num_tokens_for_logprob_per_req=1,
-            model_specific_states=model_specific_states,
         )
         batch.return_hidden_states = False
         batch.spec_info.prepare_for_extend(batch)
