@@ -171,6 +171,12 @@ class GenerateReqInput(BaseReq):
     return_routed_experts: bool = False
     # The start location in the prompt for returning routed experts.
     routed_experts_start_len: int = 0
+    # Force MoE router replay with structured expert ids.
+    # Single request: [router_seq_len, num_layers, top_k]
+    # Batch request: [batch, router_seq_len, num_layers, top_k]
+    routed_experts: Optional[
+        Union[List[List[List[int]]], List[List[List[List[int]]]]]
+    ] = None
 
     # The modalities of the image data [image, multi-images, video]
     modalities: Optional[List[str]] = None
@@ -354,6 +360,8 @@ class GenerateReqInput(BaseReq):
                 self.input_ids = [self.input_ids]
             if self.input_embeds is not None:
                 self.input_embeds = [self.input_embeds]
+            if self.routed_experts is not None:
+                self.routed_experts = [self.routed_experts]
 
     def _normalize_single_inputs(self):
         """Normalize inputs for a single example."""
@@ -387,6 +395,7 @@ class GenerateReqInput(BaseReq):
         self._normalize_video_data(num)
         self._normalize_audio_data(num)
         self._normalize_sampling_params(num)
+        self._normalize_routed_experts(num)
         self._normalize_logprob_params(num)
         self._normalize_custom_logit_processor(num)
         self._normalize_bootstrap_params(num)
@@ -488,6 +497,29 @@ class GenerateReqInput(BaseReq):
             self.sampling_params = [self.sampling_params] * num
         else:  # Already a list
             self.sampling_params = self.sampling_params * self.parallel_sample_num
+
+    def _normalize_routed_experts(self, num):
+        """Normalize MoE router replay traces for batch processing."""
+        if self.routed_experts is None:
+            return
+        if not isinstance(self.routed_experts, list):
+            raise ValueError("routed_experts should be a list.")
+        if len(self.routed_experts) != self.batch_size:
+            raise ValueError(
+                "The length of routed_experts should be equal to the batch size."
+            )
+
+        has_replay = [item is not None for item in self.routed_experts]
+        if not any(has_replay):
+            self.routed_experts = None
+            return
+        if not all(has_replay):
+            raise ValueError(
+                "In a batch generate request, all items must provide routed_experts "
+                "or none of them should."
+            )
+
+        self.routed_experts = self.routed_experts * self.parallel_sample_num
 
     def _normalize_rid(self, num):
         """Normalize request IDs for batch processing."""
@@ -625,6 +657,9 @@ class GenerateReqInput(BaseReq):
                 else self.return_hidden_states
             ),
             return_routed_experts=self.return_routed_experts,
+            routed_experts=(
+                self.routed_experts[i] if self.routed_experts is not None else None
+            ),
             modalities=self.modalities[i] if self.modalities else None,
             session_params=self.session_params,
             lora_path=self.lora_path[i] if self.lora_path is not None else None,
@@ -695,6 +730,8 @@ class TokenizedGenerateReqInput(BaseReq):
     return_routed_experts: bool = False
     # The start location in the prompt for returning routed experts.
     routed_experts_start_len: int = 0
+    # Replay-specific routed experts, still in structured request-list form.
+    router_replay_experts: Optional[Union[List[List[List[int]]], torch.Tensor]] = None
 
     # The input embeds
     input_embeds: Optional[Union[List[List[List[float]]], List[List[float]]]] = None

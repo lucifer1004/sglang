@@ -75,7 +75,7 @@ from sglang.srt.layers.dp_attention import (
     get_attention_cp_group,
     get_attention_tp_group,
 )
-from sglang.srt.layers.moe import initialize_moe_config
+from sglang.srt.layers.moe import get_moe_runner_backend, initialize_moe_config
 from sglang.srt.layers.quantization.fp4_utils import initialize_fp4_gemm_config
 from sglang.srt.layers.quantization.fp8_utils import initialize_fp8_gemm_config
 from sglang.srt.lora.lora_overlap_loader import LoRAOverlapLoader
@@ -157,6 +157,7 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalInputs,
     Req,
     ScheduleBatch,
+    validate_router_replay_experts,
 )
 from sglang.srt.managers.schedule_policy import (
     AddReqResult,
@@ -1721,6 +1722,119 @@ class Scheduler(
             mm_inputs.release_features()
             req.multimodal_inputs = None
 
+    def _get_router_replay_model_dims(self) -> Tuple[int, int, int]:
+        cfg = self.model_config.hf_text_config
+        num_layers = getattr(cfg, "num_hidden_layers")
+        num_experts_per_tok = getattr(cfg, "num_experts_per_tok")
+        num_logical_routed_experts = None
+        for attr in ("n_routed_experts", "num_experts", "num_local_experts"):
+            num_logical_routed_experts = getattr(cfg, attr, None)
+            if num_logical_routed_experts is not None:
+                break
+        if num_logical_routed_experts is None:
+            raise ValueError(
+                "router replay requires model config to expose the number of routed experts"
+            )
+        return num_layers, num_experts_per_tok, num_logical_routed_experts
+
+    def _validate_router_replay_request(
+        self, req: Req, recv_req: TokenizedGenerateReqInput
+    ) -> bool:
+        if recv_req.router_replay_experts is None:
+            return True
+
+        if not self.server_args.enable_moe_router_replay:
+            req.set_finish_with_abort(
+                "MoE router replay is not enabled. Please set "
+                "`--enable-moe-router-replay` to use routed_experts replay."
+            )
+            self.init_req_max_new_tokens(req)
+            self._add_request_to_queue(req)
+            return False
+
+        if not self.spec_algorithm.is_none():
+            req.set_finish_with_abort("router replay does not support speculative decode")
+            self.init_req_max_new_tokens(req)
+            self._add_request_to_queue(req)
+            return False
+
+        if self.server_args.enable_two_batch_overlap:
+            req.set_finish_with_abort("router replay does not support TBO")
+            self.init_req_max_new_tokens(req)
+            self._add_request_to_queue(req)
+            return False
+
+        moe_backend = get_moe_runner_backend()
+        if (
+            moe_backend.is_triton_kernels()
+            or moe_backend.is_flashinfer_trtllm()
+            or moe_backend.is_flashinfer_mxfp4()
+        ):
+            req.set_finish_with_abort(
+                f"MoE backend {moe_backend.value} does not support router replay"
+            )
+            self.init_req_max_new_tokens(req)
+            self._add_request_to_queue(req)
+            return False
+
+        try:
+            num_layers, num_experts_per_tok, num_logical_routed_experts = (
+                self._get_router_replay_model_dims()
+            )
+            req.router_replay_experts = validate_router_replay_experts(
+                recv_req.router_replay_experts,
+                num_layers=num_layers,
+                num_experts_per_tok=num_experts_per_tok,
+                num_logical_routed_experts=num_logical_routed_experts,
+                min_router_seq_len=len(req.origin_input_ids),
+                rid=req.rid,
+            )
+        except ValueError as exc:
+            req.set_finish_with_abort(str(exc))
+            self.init_req_max_new_tokens(req)
+            self._add_request_to_queue(req)
+            return False
+
+        return True
+
+    @staticmethod
+    def _is_router_replay_error(exc: ValueError) -> bool:
+        message = str(exc)
+        return "router replay" in message or "routed_experts" in message
+
+    def _abort_router_replay_running_batch(
+        self, batch: ScheduleBatch, exc: ValueError
+    ) -> ScheduleBatch:
+        error_msg = str(exc)
+        logger.error("Abort router replay batch: %s", error_msg)
+
+        keep_indices = []
+        for i, req in enumerate(batch.reqs):
+            if req.router_replay_experts is None:
+                keep_indices.append(i)
+                continue
+            req.set_finish_with_abort(error_msg)
+            abort_reason: FINISH_ABORT = req.to_finish
+            if self.enable_hisparse:
+                self.hisparse_coordinator.request_finished(req)
+            release_kv_cache(req, self.tree_cache)
+            self.send_to_tokenizer.send_output(
+                AbortReq(
+                    finished_reason=abort_reason.to_json(),
+                    rid=req.rid,
+                ),
+                req,
+            )
+
+        batch.router_replay_topk_ids = None
+        batch.router_replay_mask = None
+        if keep_indices:
+            batch.filter_batch(keep_indices=keep_indices)
+        else:
+            batch.reqs = []
+            batch.batch_is_full = False
+        return batch
+
     def handle_generate_request(
         self,
         recv_req: TokenizedGenerateReqInput,
@@ -1868,6 +1982,9 @@ class Scheduler(
         if error_msg:
             req.set_finish_with_abort(error_msg)
             self._add_request_to_queue(req)
+            return
+
+        if not self._validate_router_replay_request(req, recv_req):
             return
 
         if not recv_req.return_logprob and recv_req.logprob_start_len != -1:
@@ -2433,6 +2550,12 @@ class Scheduler(
                 ):
                     break
 
+            if adder.can_run_list and (
+                (adder.can_run_list[0].router_replay_experts is None)
+                != (req.router_replay_experts is None)
+            ):
+                break
+
             if self.enable_hicache_storage:
                 prefetch_done = self.tree_cache.check_prefetch_progress(req.rid)
                 if not prefetch_done:
@@ -2529,11 +2652,29 @@ class Scheduler(
             and not (new_batch.return_logprob or self.running_batch.return_logprob)
             # mix_with_running cats input_ids but not input_embeds — shapes would mismatch
             and new_batch.input_embeds is None
+            and not (new_batch.has_router_replay() or self.running_batch.has_router_replay())
         ):
             # TODO (lianmin): support return_logprob + mixed chunked prefill
             self.running_batch.filter_batch(v1_spec_info_filtered=True)
             if not self.running_batch.is_empty():
-                self.running_batch.prepare_for_decode()
+                try:
+                    self.running_batch.prepare_for_decode()
+                except ValueError as exc:
+                    if (
+                        self.running_batch.has_router_replay()
+                        and self._is_router_replay_error(exc)
+                    ):
+                        self.running_batch = self._abort_router_replay_running_batch(
+                            self.running_batch, exc
+                        )
+                    else:
+                        raise
+                if self.running_batch.is_empty():
+                    new_batch.decoding_reqs = []
+                    self.running_batch = ScheduleBatch(
+                        reqs=[], batch_is_full=self.running_batch.batch_is_full
+                    )
+                    return new_batch
                 new_batch.mix_with_running(self.running_batch)
                 new_batch.decoding_reqs = self.running_batch.reqs
             self.running_batch = ScheduleBatch(
@@ -2621,7 +2762,12 @@ class Scheduler(
             return batch
 
         # Update batch tensors
-        batch.prepare_for_decode()
+        try:
+            batch.prepare_for_decode()
+        except ValueError as exc:
+            if batch.has_router_replay() and self._is_router_replay_error(exc):
+                return self._abort_router_replay_running_batch(batch, exc)
+            raise
         return batch
 
     def record_batch_in_overlap(self, model_worker_batch: ModelWorkerBatch):

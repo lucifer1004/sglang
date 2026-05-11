@@ -294,6 +294,9 @@ class Engine(EngineScoreMixin, EngineBase):
         custom_logit_processor: Optional[Union[List[str], str]] = None,
         return_hidden_states: bool = False,
         return_routed_experts: bool = False,
+        routed_experts: Optional[
+            Union[List[List[List[int]]], List[List[List[List[int]]]]]
+        ] = None,
         stream: bool = False,
         bootstrap_host: Optional[Union[List[str], str]] = None,
         bootstrap_port: Optional[Union[List[int], int]] = None,
@@ -330,6 +333,7 @@ class Engine(EngineScoreMixin, EngineBase):
             custom_logit_processor=custom_logit_processor,
             return_hidden_states=return_hidden_states,
             return_routed_experts=return_routed_experts,
+            routed_experts=routed_experts,
             stream=stream,
             bootstrap_host=bootstrap_host,
             bootstrap_port=bootstrap_port,
@@ -384,6 +388,9 @@ class Engine(EngineScoreMixin, EngineBase):
         custom_logit_processor: Optional[Union[List[str], str]] = None,
         return_hidden_states: bool = False,
         return_routed_experts: bool = False,
+        routed_experts: Optional[
+            Union[List[List[List[int]]], List[List[List[List[int]]]]]
+        ] = None,
         stream: bool = False,
         bootstrap_host: Optional[Union[List[str], str]] = None,
         bootstrap_port: Optional[Union[List[int], int]] = None,
@@ -419,6 +426,7 @@ class Engine(EngineScoreMixin, EngineBase):
             lora_path=lora_path,
             return_hidden_states=return_hidden_states,
             return_routed_experts=return_routed_experts,
+            routed_experts=routed_experts,
             stream=stream,
             custom_logit_processor=custom_logit_processor,
             bootstrap_host=bootstrap_host,

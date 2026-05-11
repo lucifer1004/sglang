@@ -65,6 +65,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     compute_local_num_token_non_padded,
     enable_num_token_non_padded,
 )
+from sglang.srt.model_executor.forward_batch_context import set_current_forward_batch
 from sglang.srt.model_executor.input_buffers import ForwardInputBuffers
 from sglang.srt.multiplex.pdmux_context import get_current_stream_idx, get_stream_groups
 from sglang.srt.utils import (
@@ -157,6 +158,10 @@ class DecodeInputBuffers(ForwardInputBuffers):
     pp_proxy_tensors: Optional[Dict[str, torch.Tensor]]
     ngram_embedding_info: Optional["NgramEmbeddingInfo"]
     input_ids_grams: List[torch.Tensor]
+    router_replay_topk_ids: torch.Tensor
+    router_replay_mask: torch.Tensor
+    router_replay_local_topk_ids: torch.Tensor
+    router_replay_local_mask: torch.Tensor
     scale_seq_factor: int = 1
 
     @classmethod
@@ -180,6 +185,8 @@ class DecodeInputBuffers(ForwardInputBuffers):
         enable_mamba_track: bool,
         prepare_n_gram_inputs: bool,
         scale_seq_factor: int,
+        router_replay_num_layers: int = 0,
+        router_replay_top_k: int = 0,
         kv_mirror_imitated_layers: Optional[List[int]] = None,
         kv_mirror_tensor_size: Optional[int] = None,
         ne_token_table: Optional[torch.Tensor] = None,
@@ -207,6 +214,25 @@ class DecodeInputBuffers(ForwardInputBuffers):
                 (max_num_token, vocab_size),
                 dtype=torch.float,
             )
+            router_replay_global_num_token = (
+                max_num_token * dp_size if require_mlp_tp_gather else max_num_token
+            )
+            router_replay_topk_ids = torch.zeros(
+                (
+                    router_replay_global_num_token,
+                    router_replay_num_layers,
+                    router_replay_top_k,
+                ),
+                dtype=torch.int32,
+            )
+            router_replay_mask = torch.zeros(
+                (router_replay_global_num_token,), dtype=torch.bool
+            )
+            router_replay_local_topk_ids = torch.zeros(
+                (max_num_token, router_replay_num_layers, router_replay_top_k),
+                dtype=torch.int32,
+            )
+            router_replay_local_mask = torch.zeros((max_num_token,), dtype=torch.bool)
             mamba_track_indices = (
                 torch.zeros((max_bs,), dtype=torch.int64)
                 if enable_mamba_track
@@ -290,6 +316,10 @@ class DecodeInputBuffers(ForwardInputBuffers):
             pp_proxy_tensors=pp_proxy_tensors,
             ngram_embedding_info=ngram_embedding_info,
             input_ids_grams=input_ids_grams,
+            router_replay_topk_ids=router_replay_topk_ids,
+            router_replay_mask=router_replay_mask,
+            router_replay_local_topk_ids=router_replay_local_topk_ids,
+            router_replay_local_mask=router_replay_local_mask,
             scale_seq_factor=scale_seq_factor,
         )
 
@@ -409,12 +439,90 @@ class DecodeInputBuffers(ForwardInputBuffers):
 
         # Batch all GPU copies, grouped by dtype pair.
         _grouped_foreach_copy_(dsts, srcs)
+        static_num_token = bs * num_tokens_per_bs
+        if require_gathered_buffer:
+            copy_router_replay_to_cuda_graph_buffers(
+                dst_topk_ids=self.router_replay_local_topk_ids,
+                dst_mask=self.router_replay_local_mask,
+                src_topk_ids=forward_batch.router_replay_topk_ids,
+                src_mask=forward_batch.router_replay_mask,
+                raw_num_token=raw_num_token,
+                static_num_token=static_num_token,
+            )
+
+            from sglang.srt.layers.dp_attention import dp_gather_partial
+
+            global_static_num_token = static_num_token * self.global_num_tokens_gpu.numel()
+            old_global_num_tokens_gpu = forward_batch.global_num_tokens_gpu
+            old_dp_padding_mode = forward_batch.dp_padding_mode
+            old_dp_local_start_pos = forward_batch.dp_local_start_pos
+            old_dp_local_num_tokens = forward_batch.dp_local_num_tokens
+            try:
+                forward_batch.global_num_tokens_gpu = self.global_num_tokens_gpu
+                forward_batch.dp_padding_mode = (
+                    DpPaddingMode.get_default_mode_in_cuda_graph()
+                )
+                forward_batch.dp_local_start_pos = None
+                forward_batch.dp_local_num_tokens = None
+                dp_gather_partial(
+                    self.router_replay_topk_ids[:global_static_num_token],
+                    self.router_replay_local_topk_ids[:static_num_token],
+                    forward_batch,
+                )
+                global_mask_i32 = torch.empty(
+                    (global_static_num_token,),
+                    dtype=torch.int32,
+                    device=self.router_replay_mask.device,
+                )
+                dp_gather_partial(
+                    global_mask_i32,
+                    self.router_replay_local_mask[:static_num_token].to(torch.int32),
+                    forward_batch,
+                )
+                self.router_replay_mask[:global_static_num_token].copy_(
+                    global_mask_i32.to(torch.bool)
+                )
+            finally:
+                forward_batch.global_num_tokens_gpu = old_global_num_tokens_gpu
+                forward_batch.dp_padding_mode = old_dp_padding_mode
+                forward_batch.dp_local_start_pos = old_dp_local_start_pos
+                forward_batch.dp_local_num_tokens = old_dp_local_num_tokens
+            if self.router_replay_mask.shape[0] > global_static_num_token:
+                self.router_replay_mask[global_static_num_token:].fill_(False)
+        else:
+            copy_router_replay_to_cuda_graph_buffers(
+                dst_topk_ids=self.router_replay_topk_ids,
+                dst_mask=self.router_replay_mask,
+                src_topk_ids=forward_batch.router_replay_topk_ids,
+                src_mask=forward_batch.router_replay_mask,
+                raw_num_token=raw_num_token,
+                static_num_token=static_num_token,
+            )
 
         # CPU tensor copy (cannot be batched with GPU tensors).
         if forward_batch.seq_lens_cpu is not None:
             if bs != raw_bs:
                 self.seq_lens_cpu.fill_(seq_len_fill_value)
             self.seq_lens_cpu[:raw_bs].copy_(forward_batch.seq_lens_cpu)
+
+
+def copy_router_replay_to_cuda_graph_buffers(
+    *,
+    dst_topk_ids: torch.Tensor,
+    dst_mask: torch.Tensor,
+    src_topk_ids: Optional[torch.Tensor],
+    src_mask: Optional[torch.Tensor],
+    raw_num_token: int,
+    static_num_token: int,
+) -> None:
+    if src_topk_ids is not None:
+        dst_topk_ids[:raw_num_token].copy_(src_topk_ids)
+    if src_mask is not None:
+        dst_mask[:raw_num_token].copy_(src_mask)
+    else:
+        dst_mask[:raw_num_token].fill_(False)
+    if static_num_token > raw_num_token:
+        dst_mask[raw_num_token:static_num_token].fill_(False)
 
 
 # Detect whether the current forward pass is in capture mode
@@ -730,6 +838,16 @@ class CudaGraphRunner:
             enable_mamba_track=enable_mamba_track,
             prepare_n_gram_inputs=self.model_runner.server_args.prepare_n_gram_inputs,
             scale_seq_factor=self.scale_seq_factor,
+            router_replay_num_layers=getattr(
+                self.model_runner.model_config.hf_text_config,
+                "num_hidden_layers",
+                0,
+            ),
+            router_replay_top_k=getattr(
+                self.model_runner.model_config.hf_text_config,
+                "num_experts_per_tok",
+                0,
+            ),
             kv_mirror_imitated_layers=kv_mirror_imitated_layers,
             kv_mirror_tensor_size=kv_mirror_tensor_size,
             ne_token_table=(
@@ -766,6 +884,9 @@ class CudaGraphRunner:
         return torch.int64
 
     def can_run(self, forward_batch: ForwardBatch):
+        if self.require_mlp_sync and forward_batch.router_replay_topk_ids is not None:
+            return False
+
         if self.require_mlp_tp_gather:
             cuda_graph_bs = (
                 max(forward_batch.global_num_tokens_cpu) // self.num_tokens_per_bs
@@ -1031,6 +1152,8 @@ class CudaGraphRunner:
             assert self.enable_pdmux
             attn_backend = self.model_runner.decode_attn_backend_group[stream_idx]
 
+        router_replay_num_tokens = global_dp_buffer_len or num_tokens
+
         forward_batch = ForwardBatch(
             forward_mode=self.capture_forward_mode,
             batch_size=bs,
@@ -1060,6 +1183,10 @@ class CudaGraphRunner:
             spec_info=spec_info,
             capture_hidden_mode=self.capture_hidden_mode,
             num_token_non_padded=buffers.num_token_non_padded,
+            router_replay_topk_ids=buffers.router_replay_topk_ids[
+                :router_replay_num_tokens
+            ],
+            router_replay_mask=buffers.router_replay_mask[:router_replay_num_tokens],
             global_forward_mode=self.capture_forward_mode,
             lora_ids=lora_ids,
         )
@@ -1115,12 +1242,13 @@ class CudaGraphRunner:
                     {k: v.clone() for k, v in pp_proxy_tensors.tensors.items()}
                 )
 
-            logits_output_or_pp_proxy_tensors = forward(
-                input_ids,
-                forward_batch.positions,
-                forward_batch,
-                **kwargs,
-            )
+            with set_current_forward_batch(forward_batch):
+                logits_output_or_pp_proxy_tensors = forward(
+                    input_ids,
+                    forward_batch.positions,
+                    forward_batch,
+                    **kwargs,
+                )
             return logits_output_or_pp_proxy_tensors
 
         self.deepep_adapter.capture(is_extend_in_batch=False)

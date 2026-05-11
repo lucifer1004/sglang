@@ -122,6 +122,159 @@ def _compute_pad_value(hash: int) -> int:
     return MM_PAD_SHIFT_VALUE + (hash % (1 << 30))
 
 
+def validate_router_replay_experts(
+    routed_experts: Any,
+    *,
+    num_layers: int,
+    num_experts_per_tok: int,
+    num_logical_routed_experts: int,
+    min_router_seq_len: int = 0,
+    rid: Optional[str] = None,
+) -> Optional[torch.Tensor]:
+    if routed_experts is None:
+        return None
+
+    req_msg = f" for request {rid}" if rid is not None else ""
+    try:
+        tensor = torch.as_tensor(routed_experts)
+    except Exception as exc:
+        raise ValueError(f"Invalid routed_experts{req_msg}: {exc}") from exc
+
+    if tensor.dim() != 3:
+        raise ValueError(
+            f"Invalid routed_experts{req_msg}: expected rank-3 tensor "
+            "[router_seq_len, num_layers, num_experts_per_tok], "
+            f"got shape {tuple(tensor.shape)}."
+        )
+    if tensor.shape[1] != num_layers:
+        raise ValueError(
+            f"Invalid routed_experts{req_msg}: num_layers mismatch, "
+            f"expected {num_layers}, got {tensor.shape[1]}."
+        )
+    if tensor.shape[2] != num_experts_per_tok:
+        raise ValueError(
+            f"Invalid routed_experts{req_msg}: num_experts_per_tok mismatch, "
+            f"expected {num_experts_per_tok}, got {tensor.shape[2]}."
+        )
+    if tensor.shape[0] < min_router_seq_len:
+        raise ValueError(
+            f"Invalid routed_experts{req_msg}: router replay trace is too short, "
+            f"expected at least {min_router_seq_len} token positions, "
+            f"got {tensor.shape[0]}."
+        )
+
+    tensor = tensor.to(device="cpu", dtype=torch.int32)
+    if tensor.numel() > 0:
+        min_id = int(tensor.min().item())
+        max_id = int(tensor.max().item())
+        if min_id < 0 or max_id >= num_logical_routed_experts:
+            raise ValueError(
+                f"Invalid routed_experts{req_msg}: expert id out of range "
+                f"[0, {num_logical_routed_experts}); min={min_id}, max={max_id}."
+            )
+
+    return tensor
+
+
+def _has_router_replay(req: Any) -> bool:
+    return getattr(req, "router_replay_experts", None) is not None
+
+
+def _check_router_replay_batch_consistency(reqs: List[Any]) -> bool:
+    replay_flags = [_has_router_replay(req) for req in reqs]
+    if any(replay_flags) and not all(replay_flags):
+        raise ValueError("Cannot mix router replay requests with non-replay requests.")
+    return any(replay_flags)
+
+
+def _router_replay_short_trace_error(
+    req: Any, start: int, end: int, router_seq_len: int
+) -> ValueError:
+    rid = getattr(req, "rid", None)
+    req_msg = f" for request {rid}" if rid is not None else ""
+    return ValueError(
+        f"router replay trace{req_msg} is too short: need token positions "
+        f"[{start}:{end}), but trace length is {router_seq_len}."
+    )
+
+
+def _is_router_replay_decode_overrun(req: Any, trace_pos: int) -> bool:
+    sampling_params = getattr(req, "sampling_params", None)
+    max_new_tokens = getattr(sampling_params, "max_new_tokens", None)
+    origin_input_ids = getattr(req, "origin_input_ids", None)
+    if max_new_tokens is None or origin_input_ids is None:
+        return False
+
+    max_forward_trace_len = len(origin_input_ids) + max(max_new_tokens - 1, 0)
+    return trace_pos >= max_forward_trace_len
+
+
+def build_router_replay_extend_batch(
+    reqs: List[Any],
+    logical_prefix_lens: List[int],
+    device: Union[str, torch.device],
+) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+    if not _check_router_replay_batch_consistency(reqs):
+        return None, None
+
+    slices = []
+    for req, logical_prefix_len in zip(reqs, logical_prefix_lens):
+        trace = req.router_replay_experts
+        start = logical_prefix_len
+        end = logical_prefix_len + req.extend_input_len
+        if end > trace.shape[0]:
+            raise _router_replay_short_trace_error(req, start, end, trace.shape[0])
+        slices.append(trace[start:end])
+
+    if len(slices) == 0:
+        return None, None
+    if sum(s.shape[0] for s in slices) == 0:
+        ref = reqs[0].router_replay_experts
+        topk_ids = torch.empty((0, ref.shape[1], ref.shape[2]), dtype=torch.int32)
+    else:
+        topk_ids = torch.cat(slices, dim=0)
+    topk_ids = topk_ids.to(device=device, non_blocking=True)
+    mask = torch.ones((topk_ids.shape[0],), dtype=torch.bool, device=device)
+    return topk_ids, mask
+
+
+def build_router_replay_decode_batch(
+    reqs: List[Any],
+    device: Union[str, torch.device],
+    trace_positions: Optional[List[int]] = None,
+) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+    if not _check_router_replay_batch_consistency(reqs):
+        return None, None
+    if trace_positions is not None and len(trace_positions) != len(reqs):
+        raise ValueError(
+            "router replay decode trace_positions length must match request count."
+        )
+
+    slices = []
+    masks = []
+    for i, req in enumerate(reqs):
+        trace = req.router_replay_experts
+        trace_pos = (
+            trace_positions[i] if trace_positions is not None else req.seqlen - 1
+        )
+        if trace_pos >= trace.shape[0]:
+            if _is_router_replay_decode_overrun(req, trace_pos):
+                slices.append(torch.zeros_like(trace[:1]))
+                masks.append(False)
+                continue
+            raise _router_replay_short_trace_error(
+                req, trace_pos, trace_pos + 1, trace.shape[0]
+            )
+        slices.append(trace[trace_pos : trace_pos + 1])
+        masks.append(True)
+
+    if len(slices) == 0:
+        return None, None
+    topk_ids = torch.cat(slices, dim=0).to(device=device, non_blocking=True)
+    mask = torch.tensor(masks, dtype=torch.bool, device=device)
+    return topk_ids, mask
+
+
 class BaseFinishReason:
     def __init__(self, is_error: bool = False):
         self.is_error = is_error
@@ -763,6 +916,7 @@ class Req:
         "require_reasoning": False,
         "reasoning_tokens": 0,
         "return_hidden_states_before_norm": False,
+        "router_replay_experts": None,
     }
 
     def __init__(
@@ -785,6 +939,7 @@ class Req:
         require_reasoning: bool = False,
         return_hidden_states: bool = False,
         return_routed_experts: bool = False,
+        router_replay_experts: Optional[torch.Tensor] = None,
         eos_token_ids: Optional[Set[int]] = None,
         bootstrap_host: Optional[str] = None,
         bootstrap_port: Optional[int] = None,
@@ -857,6 +1012,7 @@ class Req:
         self.custom_logit_processor = custom_logit_processor
         self.return_hidden_states = return_hidden_states
         self.return_routed_experts = return_routed_experts
+        self.router_replay_experts = router_replay_experts
 
         # extra key for classifying the request (e.g. cache_salt)
         if lora_id is not None:
@@ -1585,6 +1741,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # Whether to return routed experts
     return_routed_experts: bool = False
 
+    # MoE router replay tensors aligned to current forward rows.
+    router_replay_topk_ids: Optional[torch.Tensor] = None
+    router_replay_mask: Optional[torch.Tensor] = None
+
     # Whether this batch is prefill-only (no token generation needed)
     is_prefill_only: bool = False
 
@@ -1648,6 +1808,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     def is_dllm(self):
         return self.dllm_config is not None
+
+    def has_router_replay(self) -> bool:
+        return any(_has_router_replay(req) for req in self.reqs)
 
     def prepare_encoder_info_extend(self, input_ids: List[int], seq_lens: List[int]):
         self.encoder_lens_cpu = []
@@ -1940,6 +2103,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if self.model_config.is_encoder_decoder:
             self.prepare_encoder_info_extend(input_ids, seq_lens)
 
+        self.router_replay_topk_ids, self.router_replay_mask = (
+            build_router_replay_extend_batch(
+                reqs, logical_prefix_lens=logical_prefix_lens, device=self.device
+            )
+        )
+
         # Build sampling info
         self.sampling_info = SamplingBatchInfo.from_schedule_batch(
             self,
@@ -2138,6 +2307,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.orig_seq_lens = torch.empty(0, dtype=torch.int32, device=self.device)
         self.out_cache_loc = torch.empty(0, dtype=torch.int64, device=self.device)
         self.req_pool_indices = torch.empty(0, dtype=torch.int32, device=self.device)
+        self.router_replay_topk_ids = None
+        self.router_replay_mask = None
         self.seq_lens_sum = 0
         self.extend_num_tokens = 0
         self.sampling_info = SamplingBatchInfo.from_schedule_batch(
@@ -2201,6 +2372,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # Update fields
         self.input_ids = self.output_ids
         self.output_ids = None
+        trace_positions = (self.seq_lens_cpu // scale).tolist()
+        self.router_replay_topk_ids, self.router_replay_mask = (
+            build_router_replay_decode_batch(
+                self.reqs, device=self.device, trace_positions=trace_positions
+            )
+        )
 
         self.oe_context = OverEncodingContext.from_decode(
             self.reqs, self.enable_overlap, self.device
@@ -2338,6 +2515,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.mamba_track_indices = None
         self.mamba_track_mask = None
         self.mamba_track_seqlens = None
+        self.router_replay_topk_ids = None
+        self.router_replay_mask = None
         self.return_logprob = any(req.return_logprob for req in self.reqs)
         if self.return_logprob:
             self.top_logprobs_nums = [self.top_logprobs_nums[i] for i in keep_indices]
@@ -2400,6 +2579,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.has_stream |= other.has_stream
         self.has_grammar |= other.has_grammar
         self.return_hidden_states |= other.return_hidden_states
+        self.router_replay_topk_ids = None
+        self.router_replay_mask = None
 
         if self.spec_info:
             self.spec_info.merge_batch(other.spec_info)
@@ -2452,6 +2633,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             extend_seq_lens=extend_seq_lens,
             extend_prefix_lens=extend_prefix_lens,
             extend_logprob_start_lens=extend_logprob_start_lens,
+            router_replay_topk_ids=self.router_replay_topk_ids,
+            router_replay_mask=self.router_replay_mask,
             multimodal_inputs=self.multimodal_inputs,
             encoder_cached=self.encoder_cached,
             encoder_lens=self.encoder_lens,
@@ -2508,6 +2691,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             can_run_dp_cuda_graph=self.can_run_dp_cuda_graph,
             is_extend_in_batch=self.is_extend_in_batch,
             is_prefill_only=self.is_prefill_only,
+            router_replay_topk_ids=self.router_replay_topk_ids,
+            router_replay_mask=self.router_replay_mask,
             seq_lens_cpu=self.seq_lens_cpu,
             enable_overlap=self.enable_overlap,
         )
@@ -2563,6 +2748,8 @@ class ModelWorkerBatch:
     extend_prefix_lens: Optional[List[int]]
     extend_logprob_start_lens: Optional[List[int]]
     extend_input_logprob_token_ids: Optional[torch.Tensor]
+    router_replay_topk_ids: Optional[torch.Tensor]
+    router_replay_mask: Optional[torch.Tensor]
 
     # For multimodal
     multimodal_inputs: Optional[List[MultimodalInputs]]

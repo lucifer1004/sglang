@@ -856,6 +856,14 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
                     "Please set `--enable-return-hidden-states` to enable this feature."
                 )
             if (
+                obj.routed_experts is not None
+                and not self.server_args.enable_moe_router_replay
+            ):
+                raise ValueError(
+                    "The server is not configured to enable MoE router replay. "
+                    "Please set `--enable-moe-router-replay` to enable this feature."
+                )
+            if (
                 obj.custom_logit_processor
                 and not self.server_args.enable_custom_logit_processor
             ):
@@ -974,6 +982,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
                 require_reasoning=obj.require_reasoning,
                 return_hidden_states=obj.return_hidden_states,
                 return_routed_experts=obj.return_routed_experts,
+                router_replay_experts=obj.routed_experts,
                 routed_dp_rank=obj.routed_dp_rank,
                 disagg_prefill_dp_rank=obj.disagg_prefill_dp_rank,
                 priority=obj.priority,

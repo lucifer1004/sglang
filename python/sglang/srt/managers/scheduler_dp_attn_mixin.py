@@ -33,6 +33,7 @@ class MLPSyncBatchInfo:
     is_extend_in_batch: bool
     local_can_run_tbo: bool
     local_forward_mode: int
+    has_router_replay: bool = False
 
     # some gathered elements
     tp0_info: torch.Tensor = None
@@ -51,6 +52,7 @@ class MLPSyncBatchInfo:
                 int(self.is_extend_in_batch),
                 int(self.local_can_run_tbo),
                 self.local_forward_mode,
+                int(self.has_router_replay),
             ],
             device=device,
             dtype=dtype,
@@ -65,6 +67,7 @@ class MLPSyncBatchInfo:
                 0,  # is_extend_in_batch
                 1,  # local_can_run_tbo
                 ForwardMode.IDLE.value,  # local_forward_mode
+                0,  # has_router_replay
             ],
             device=device,
             dtype=dtype,
@@ -73,7 +76,7 @@ class MLPSyncBatchInfo:
     def all_gather(self, device, group: torch.distributed.ProcessGroup):
         local_info_tensor = self._get_local_tensor(device=device)
         global_info_tensor = torch.empty(
-            (self.dp_size, self.tp_size * self.cp_size, 6),
+            (self.dp_size, self.tp_size * self.cp_size, 7),
             dtype=torch.int64,
             device=device,
         )
@@ -89,7 +92,7 @@ class MLPSyncBatchInfo:
             tp_active_ranks = get_tp_group().active_ranks
 
         # Set fallback values for inactive ranks
-        tp_info = global_info_tensor.view(self.dp_size * self.tp_size * self.cp_size, 6)
+        tp_info = global_info_tensor.view(self.dp_size * self.tp_size * self.cp_size, 7)
         tp_info[tp_active_ranks == 0] = self._get_fallback_tensor(device=device)
 
         tp0_info = global_info_tensor[:, 0, :]
@@ -100,8 +103,28 @@ class MLPSyncBatchInfo:
         self.global_num_tokens_for_logprob = cpu_data[:, 1].tolist()
         self.can_cuda_graph = bool(tp0_info[:, 2].min().item())
         self.is_extend_in_batch = bool(tp0_info[:, 3].max().item())
+        self.has_router_replay = bool(tp0_info[:, 6].max().item())
         if _ENABLE_METRICS_DP_ATTENTION:
             self.dp_cooperation_info = DPCooperationInfo.create(tp0_info[:, 5].tolist())
+
+
+def _ensure_router_replay_gather_inputs(batch: ScheduleBatch, num_tokens: int):
+    if batch.router_replay_topk_ids is not None:
+        return
+
+    cfg = batch.model_config.hf_text_config
+    batch.router_replay_topk_ids = torch.zeros(
+        (
+            num_tokens,
+            getattr(cfg, "num_hidden_layers"),
+            getattr(cfg, "num_experts_per_tok"),
+        ),
+        dtype=torch.int32,
+        device=batch.device,
+    )
+    batch.router_replay_mask = torch.zeros(
+        (num_tokens,), dtype=torch.bool, device=batch.device
+    )
 
 
 def _update_gather_batch(
@@ -126,6 +149,9 @@ def _update_gather_batch(
 
     # Check forward mode for cuda graph
     batch.can_run_dp_cuda_graph = mlp_sync_info.can_cuda_graph
+
+    if require_mlp_tp_gather and mlp_sync_info.has_router_replay:
+        _ensure_router_replay_gather_inputs(batch, mlp_sync_info.num_tokens)
 
 
 def prepare_mlp_sync_batch_raw(
@@ -172,6 +198,13 @@ def prepare_mlp_sync_batch_raw(
     is_extend_in_batch = local_batch.forward_mode.is_extend() if local_batch else False
     if local_batch is not None:
         local_batch.is_extend_in_batch = is_extend_in_batch
+    has_router_replay = (
+        local_batch is not None
+        and (
+            local_batch.router_replay_topk_ids is not None
+            or local_batch.has_router_replay()
+        )
+    )
 
     tbo_preparer = TboDPAttentionPreparer()
     if len(offload_tags) == 0 and (
@@ -196,6 +229,7 @@ def prepare_mlp_sync_batch_raw(
         is_extend_in_batch=is_extend_in_batch,
         local_can_run_tbo=local_can_run_tbo,
         local_forward_mode=local_forward_mode,
+        has_router_replay=has_router_replay,
     )
 
     if not skip_all_gather:

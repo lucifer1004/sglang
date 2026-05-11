@@ -336,6 +336,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     extend_logprob_start_lens_cpu: Optional[List[int]] = None
     extend_input_logprob_token_ids_gpu: Optional[torch.Tensor] = None
 
+    # For MoE router replay
+    router_replay_topk_ids: Optional[torch.Tensor] = None
+    router_replay_mask: Optional[torch.Tensor] = None
+
     # For split prefill
     # intermediate values for split prefill
     hidden_states: torch.Tensor = None
@@ -468,6 +472,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             all_extend_in_batch=batch.all_extend_in_batch,
             can_run_dp_cuda_graph=batch.can_run_dp_cuda_graph,
             global_forward_mode=batch.global_forward_mode,
+            router_replay_topk_ids=batch.router_replay_topk_ids,
+            router_replay_mask=batch.router_replay_mask,
             is_prefill_only=batch.is_prefill_only,
             lora_ids=batch.lora_ids,
             sampling_info=batch.sampling_info,
@@ -919,6 +925,20 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         global_num_tokens_pinned = torch.tensor(global_num_tokens, pin_memory=True)
         self.global_num_tokens_gpu.copy_(global_num_tokens_pinned, non_blocking=True)
 
+        if self.router_replay_topk_ids is not None:
+            from sglang.srt.layers.dp_attention import dp_gather_partial
+
+            gathered_topk_ids = self.router_replay_topk_ids.new_empty(
+                (self.global_dp_buffer_len, *self.router_replay_topk_ids.shape[1:])
+            )
+            dp_gather_partial(gathered_topk_ids, self.router_replay_topk_ids, self)
+            self.router_replay_topk_ids = gathered_topk_ids
+
+            replay_mask_i32 = self.router_replay_mask.to(torch.int32)
+            gathered_mask_i32 = replay_mask_i32.new_empty((self.global_dp_buffer_len,))
+            dp_gather_partial(gathered_mask_i32, replay_mask_i32, self)
+            self.router_replay_mask = gathered_mask_i32.to(torch.bool)
+
         TboForwardBatchPreparer.prepare(
             batch=self, is_draft_worker=model_runner.is_draft_worker
         )
@@ -968,6 +988,14 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         if self.mamba_track_seqlens is not None:
             self.mamba_track_seqlens = self._pad_tensor_to_size(
                 self.mamba_track_seqlens, bs
+            )
+        if self.router_replay_topk_ids is not None:
+            self.router_replay_topk_ids = self._pad_tensor_to_size(
+                self.router_replay_topk_ids, num_tokens
+            )
+        if self.router_replay_mask is not None:
+            self.router_replay_mask = self._pad_tensor_to_size(
+                self.router_replay_mask, num_tokens, value=0
             )
 
         oe_context = getattr(self, "oe_context", None)
