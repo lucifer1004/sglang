@@ -894,13 +894,15 @@ def _resolve_local_or_cached_file(model_name_or_path, filename, revision=None):
 
 
 def _fix_v5_tokenizer_components(tokenizer, model_name_or_path, revision=None):
-    """Fix pre_tokenizer/decoder when a v5 tokenizer class overwrites them.
+    """Fix backend components when a v5 tokenizer class overwrites them.
 
     In transformers v5, some tokenizer classes (e.g. LlamaTokenizer) have a
-    custom __init__ that rebuilds the pre_tokenizer and decoder from scratch
+    custom __init__ that rebuilds backend components from scratch
     with class-specific components, discarding the originals from tokenizer.json.
     This breaks models that specify LlamaTokenizerFast but actually use a
     different tokenizer architecture (e.g. DeepSeek-V3.2 uses ByteLevel).
+    It also breaks remote-code tokenizers whose class passes vocab/merges into
+    PreTrainedTokenizerFast: the resulting BPE backend can lose its merges.
 
     Detects the mismatch by comparing against the raw tokenizer.json and
     restores the original components when they differ.
@@ -924,21 +926,34 @@ def _fix_v5_tokenizer_components(tokenizer, model_name_or_path, revision=None):
         )
         return
 
-    raw_pre = type(raw.pre_tokenizer).__name__ if raw.pre_tokenizer else None
-    loaded_pre = type(backend.pre_tokenizer).__name__ if backend.pre_tokenizer else None
+    def _component_changed(loaded, expected):
+        if loaded is None or expected is None:
+            return loaded is not expected
+        return repr(loaded) != repr(expected)
 
-    if raw_pre and loaded_pre and raw_pre != loaded_pre:
+    restored = []
+    for attr in ("model", "normalizer", "pre_tokenizer", "post_processor", "decoder"):
+        loaded_component = getattr(backend, attr, None)
+        raw_component = getattr(raw, attr, None)
+        if not _component_changed(loaded_component, raw_component):
+            continue
+        try:
+            setattr(backend, attr, raw_component)
+            restored.append(attr)
+        except Exception as e:
+            logger.debug(
+                "_fix_v5_tokenizer_components: could not restore %s for %s: %s",
+                attr,
+                model_name_or_path,
+                e,
+            )
+
+    if restored:
         logger.info(
-            "Fixing v5 tokenizer component mismatch for %s: "
-            "pre_tokenizer %s -> %s, decoder %s -> %s",
+            "Restored v5 tokenizer backend components for %s from tokenizer.json: %s",
             model_name_or_path,
-            loaded_pre,
-            raw_pre,
-            type(backend.decoder).__name__ if backend.decoder else None,
-            type(raw.decoder).__name__ if raw.decoder else None,
+            ", ".join(restored),
         )
-        backend.pre_tokenizer = raw.pre_tokenizer
-        backend.decoder = raw.decoder
 
 
 def _fix_v5_add_bos_eos_token(tokenizer, model_name_or_path, revision=None):
