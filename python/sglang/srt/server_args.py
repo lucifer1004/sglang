@@ -6308,8 +6308,10 @@ class ServerArgs:
                 "Configure routed experts output storage. Supports 'dummy://' "
                 "for benchmark-only dropping after TokenizerManager receives "
                 "the tensor, and redis:// or rediss:// DSNs for storing raw "
-                "tensor bytes remotely and returning a key. Unset keeps the "
-                "existing base64 response."
+                "tensor bytes remotely and returning a key. Also supports "
+                "mooncake:// DSNs with Mooncake store configuration in the "
+                "query string or MOONCAKE_* environment variables. Unset keeps "
+                "the existing base64 response."
             ),
         )
         parser.add_argument(

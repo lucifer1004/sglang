@@ -27,6 +27,36 @@ The `/generate` endpoint accepts the following parameters in JSON format. For de
 | return_hidden_states       | `Union[List[bool], bool] = False`                                            | Whether to return hidden states.                                                                                                                                |
 | return_routed_experts      | `bool = False`                                                               | Whether to return routed experts for MoE models. Requires `--enable-return-routed-experts` server flag. Returns base64-encoded int32 expert IDs as a flattened array with logical shape `[num_tokens, num_layers, top_k]`. |
 
+### Routed Experts Store DSN
+
+By default, `return_routed_experts` returns a base64-encoded int32 tensor in the response. To avoid returning the full payload inline, start the server with `--routed-experts-store-dsn` and SGLang will store the raw tensor bytes remotely and return a metadata object with the key, dtype, shape, and byte size.
+
+Supported DSN schemes:
+
+- `dummy://`: keeps the routed experts data path enabled, drops the payload in `TokenizerManager`, and returns a small marker object for benchmarking.
+- `redis://` or `rediss://`: stores raw tensor bytes in Redis. The Redis DB can be selected with the path, and `prefix`, `ttl`, or `ttl_sec` can be passed in the query string.
+- `mooncake://`: stores raw tensor bytes in Mooncake Store. Configuration can be passed in the query string or through `MOONCAKE_*` environment variables.
+
+Redis example:
+
+```bash
+python -m sglang.launch_server \
+  --model-path <MODEL> \
+  --enable-return-routed-experts \
+  --routed-experts-store-dsn 'redis://127.0.0.1:6379/0?prefix=sglang:routed_experts&ttl=3600'
+```
+
+Mooncake example:
+
+```bash
+python -m sglang.launch_server \
+  --model-path <MODEL> \
+  --enable-return-routed-experts \
+  --routed-experts-store-dsn 'mooncake://localhost:17913?metadata_server=http://127.0.0.1:8080/metadata&master_server=127.0.0.1:50051&global_segment_size=4gb&local_buffer_size=16mb&protocol=tcp&device=&prefix=sglang:routed_experts&replica_num=1'
+```
+
+For `mooncake://`, the DSN host is used as the Mooncake local hostname when `local_hostname` is not set. Supported query keys are `local_hostname` or `client_hostname`, `metadata_server` or `metadata`, `master_server`, `master_server_addr`, or `master_server_address`, `global_segment_size`, `local_buffer_size`, `protocol`, `device`, `device_name`, or `rdma_devices`, `prefix`, `replica_num`, `enable_ssd_offload`, and `ssd_offload_path`. If a query key is omitted, SGLang falls back to the corresponding `MOONCAKE_LOCAL_HOSTNAME`, `LOCAL_HOSTNAME`, `MOONCAKE_TE_META_DATA_SERVER`, `MOONCAKE_MASTER`, `MOONCAKE_GLOBAL_SEGMENT_SIZE`, `MOONCAKE_PROTOCOL`, and `MOONCAKE_DEVICE` environment variables where applicable.
+
 ## Sampling parameters
 
 The object is defined at `sampling_params.py::SamplingParams`. You can also read the source code to find more arguments and docs.

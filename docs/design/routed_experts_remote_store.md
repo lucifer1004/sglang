@@ -489,14 +489,21 @@ TTL：
 建议启动配置：
 
 ```text
---routed-experts-store-dsn mooncake://default?config=/path/to/mooncake_config.json&namespace=sglang
+--routed-experts-store-dsn mooncake://localhost:17913?metadata_server=http://127.0.0.1:8080/metadata&master_server=127.0.0.1:50051&global_segment_size=4gb&local_buffer_size=16mb&protocol=tcp&device=&prefix=sglang:routed_experts&replica_num=1
 ```
 
-如果不使用配置文件，也可以通过 query 参数传入 Mooncake 初始化所需字段：
+也可以通过环境变量提供 Mooncake 初始化所需字段，并在 DSN 中只覆盖需要变化的部分：
 
 ```text
---routed-experts-store-dsn mooncake://default?master_server_address=...&metadata_server=...&protocol=rdma&device_name=...
+MOONCAKE_MASTER=127.0.0.1:50051
+MOONCAKE_TE_META_DATA_SERVER=http://127.0.0.1:8080/metadata
+MOONCAKE_GLOBAL_SEGMENT_SIZE=4gb
+MOONCAKE_PROTOCOL=tcp
+MOONCAKE_DEVICE=
+--routed-experts-store-dsn mooncake://localhost:17913?prefix=sglang:routed_experts
 ```
+
+当前 simple path 支持的 Mooncake query keys：`local_hostname`/`client_hostname`、`metadata_server`/`metadata`、`master_server`/`master_server_addr`/`master_server_address`、`global_segment_size`、`local_buffer_size`、`protocol`、`device`/`device_name`/`rdma_devices`、`prefix`、`replica_num`、`enable_ssd_offload`、`ssd_offload_path`。DSN host 会在未显式设置 `local_hostname` 时作为 Mooncake local hostname。
 
 ## Server Arguments
 

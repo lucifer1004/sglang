@@ -453,6 +453,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--keep-mm-feature-on-device` | Keep multimodal feature tensors on device after processing to save D2H copy. | `False` | bool flag (set to enable) |
 | `--enable-return-hidden-states` | Enable returning hidden states with responses. | `False` | bool flag (set to enable) |
 | `--enable-return-routed-experts` | Enable returning routed experts of each layer with responses. | `False` | bool flag (set to enable) |
+| `--routed-experts-store-dsn` | Configure routed experts output storage. Supports `dummy://`, `redis://`, `rediss://`, and `mooncake://` DSNs. Unset keeps the existing base64 response. | `None` | Type: str |
 | `--scheduler-recv-interval` | The interval to poll requests in scheduler. Can be set to >1 to reduce the overhead of this. | `1` | Type: int |
 | `--numa-node` | Sets the numa node for the subprocesses. i-th element corresponds to i-th subprocess. | `None` | List[int] |
 | `--enable-deterministic-inference` | Enable deterministic inference mode with batch invariant ops. | `False` | bool flag (set to enable) |

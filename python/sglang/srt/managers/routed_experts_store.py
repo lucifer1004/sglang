@@ -11,8 +11,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import uuid
+import os
 import socket
+import uuid
 from abc import ABC, abstractmethod
 from typing import Any, Dict, Optional
 from urllib.parse import parse_qs, urlparse
@@ -213,6 +214,161 @@ class RedisRoutedExpertsStore(RoutedExpertsStore):
         return response
 
 
+def _query_value(query, names, default=None):
+    for name in names:
+        values = query.get(name)
+        if values:
+            return values[0]
+    return default
+
+
+def _parse_bool(value) -> bool:
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _parse_size(value) -> int:
+    if isinstance(value, int):
+        return value
+    text = str(value).strip().lower()
+    multipliers = {
+        "k": 1024,
+        "kb": 1024,
+        "m": 1024**2,
+        "mb": 1024**2,
+        "g": 1024**3,
+        "gb": 1024**3,
+    }
+    for suffix, multiplier in sorted(
+        multipliers.items(), key=lambda item: len(item[0]), reverse=True
+    ):
+        if text.endswith(suffix):
+            return int(text[: -len(suffix)]) * multiplier
+    return int(text)
+
+
+class MooncakeRoutedExpertsStore(RoutedExpertsStore):
+    def __init__(self, dsn: str):
+        try:
+            from mooncake.store import MooncakeDistributedStore, ReplicateConfig
+        except ImportError as exc:
+            raise ImportError(
+                "mooncake:// routed experts backend requires the Mooncake "
+                "Python package."
+            ) from exc
+
+        parsed = urlparse(dsn)
+        query = parse_qs(parsed.query)
+        self.prefix = _query_value(query, ("prefix",), "sglang:routed_experts").strip(
+            ":"
+        )
+        self.replica_num = int(_query_value(query, ("replica_num",), 1))
+        self._replicate_config_cls = ReplicateConfig
+
+        local_hostname = _query_value(
+            query,
+            ("local_hostname", "client_hostname"),
+            parsed.netloc
+            or os.getenv("MOONCAKE_LOCAL_HOSTNAME")
+            or os.getenv("LOCAL_HOSTNAME")
+            or "localhost",
+        )
+        metadata_server = _query_value(
+            query,
+            ("metadata_server", "metadata"),
+            os.getenv("MOONCAKE_TE_META_DATA_SERVER") or "P2PHANDSHAKE",
+        )
+        global_segment_size = _parse_size(
+            _query_value(
+                query,
+                ("global_segment_size",),
+                os.getenv("MOONCAKE_GLOBAL_SEGMENT_SIZE") or "4gb",
+            )
+        )
+        local_buffer_size = _parse_size(
+            _query_value(query, ("local_buffer_size",), 16 * 1024 * 1024)
+        )
+        protocol = _query_value(
+            query, ("protocol",), os.getenv("MOONCAKE_PROTOCOL") or "tcp"
+        )
+        device_name = _query_value(
+            query,
+            ("device", "device_name", "rdma_devices"),
+            os.getenv("MOONCAKE_DEVICE") or "",
+        )
+        master_server_addr = _query_value(
+            query,
+            ("master_server", "master_server_addr", "master_server_address"),
+            os.getenv("MOONCAKE_MASTER"),
+        )
+        if not master_server_addr:
+            raise ValueError(
+                "mooncake:// routed experts backend requires a master server. "
+                "Set MOONCAKE_MASTER or pass master_server=<host:port> in the DSN."
+            )
+
+        enable_ssd_offload = _parse_bool(
+            _query_value(query, ("enable_ssd_offload",), False)
+        )
+        ssd_offload_path = _query_value(query, ("ssd_offload_path",), "")
+
+        self.store = MooncakeDistributedStore()
+        ret_code = self.store.setup(
+            local_hostname,
+            metadata_server,
+            global_segment_size,
+            local_buffer_size,
+            protocol,
+            device_name,
+            master_server_addr,
+            None,
+            enable_ssd_offload,
+            ssd_offload_path,
+        )
+        if ret_code != 0:
+            raise RuntimeError(
+                f"Failed to setup Mooncake routed experts store: {ret_code}"
+            )
+
+    def put(self, value) -> Dict[str, Any]:
+        if value is None:
+            return {
+                "format": "remote",
+                "backend": "mooncake",
+                "key": None,
+                "encoding": None,
+                **summarize_routed_experts_value(value),
+            }
+
+        if not (hasattr(value, "detach") and hasattr(value, "numel")):
+            raise TypeError(
+                "Mooncake routed experts backend currently expects a tensor value, "
+                f"got {type(value).__name__}."
+            )
+
+        tensor = value.detach().cpu().contiguous()
+        payload = tensor.numpy().tobytes()
+        key = f"{self.prefix}:{uuid.uuid4().hex}"
+        config = self._replicate_config_cls()
+        config.replica_num = self.replica_num
+        ret_code = self.store.put(key, payload, config)
+        if ret_code != 0:
+            raise RuntimeError(
+                f"Failed to put routed experts into Mooncake: {ret_code}"
+            )
+
+        return {
+            "format": "remote",
+            "backend": "mooncake",
+            "key": key,
+            "encoding": "raw_tensor_bytes",
+            "schema_version": 1,
+            "replica_num": self.replica_num,
+            **summarize_routed_experts_value(tensor),
+        }
+
+
 def create_routed_experts_store(dsn: Optional[str]) -> Optional[RoutedExpertsStore]:
     if not dsn:
         return None
@@ -222,8 +378,10 @@ def create_routed_experts_store(dsn: Optional[str]) -> Optional[RoutedExpertsSto
         return DummyRoutedExpertsStore()
     if scheme in ("redis", "rediss"):
         return RedisRoutedExpertsStore(dsn)
+    if scheme == "mooncake":
+        return MooncakeRoutedExpertsStore(dsn)
 
     raise ValueError(
         f"Unsupported routed experts store DSN scheme: {scheme!r}. "
-        "Supported schemes are dummy://, redis:// and rediss://."
+        "Supported schemes are dummy://, redis://, rediss:// and mooncake://."
     )
