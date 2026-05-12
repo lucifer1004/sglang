@@ -3,7 +3,10 @@
 
 from typing import Any
 
-from sglang.srt.layers.rotary_embedding.base import RotaryEmbedding
+from sglang.srt.layers.rotary_embedding.base import (
+    LinearScalingRotaryEmbedding,
+    RotaryEmbedding,
+)
 from sglang.srt.layers.rotary_embedding.factory import get_rope, get_rope_wrapper
 from sglang.srt.layers.rotary_embedding.mrope import (
     Ernie4_5_VLRotaryEmbedding,
@@ -28,6 +31,7 @@ except Exception:  # pragma: no cover - typing/runtime compatibility shim
 
 __all__ = [
     "RotaryEmbedding",
+    "LinearScalingRotaryEmbedding",
     "get_rope",
     "get_rope_wrapper",
     "MRotaryEmbedding",

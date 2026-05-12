@@ -39,6 +39,36 @@ from sglang.utils import is_in_ci
 
 logger = logging.getLogger(__name__)
 
+MIMO_V2_MODEL_ARCHS = (
+    "MiMoV2ForCausalLM",
+    "MiMoV2FlashForCausalLM",
+)
+MIMO_V2_MULTIMODAL_ARCHS = ("MiMoV2ForCausalLM",)
+
+
+def get_mimo_v2_fused_qkv_expected_tp_size(hf_config):
+    layout = getattr(hf_config, "attention_projection_layout", None)
+    if layout is None:
+        return None
+    if layout != "fused_qkv":
+        raise ValueError(
+            "MiMoV2 hf_config has unsupported "
+            f"attention_projection_layout={layout!r}; expected 'fused_qkv' "
+            "or unset."
+        )
+
+    num_key_value_heads = getattr(hf_config, "num_key_value_heads", None)
+    text_config = getattr(hf_config, "text_config", None)
+    if num_key_value_heads is None and text_config is not None:
+        num_key_value_heads = getattr(text_config, "num_key_value_heads", None)
+    if num_key_value_heads is None:
+        raise ValueError(
+            "MiMoV2 hf_config has attention_projection_layout='fused_qkv' "
+            "but num_key_value_heads is missing; this value is required to "
+            "derive the fused qkv_proj TP size."
+        )
+    return num_key_value_heads
+
 
 class AttentionArch(IntEnum):
     MLA = auto()
@@ -180,10 +210,17 @@ class ModelConfig:
         self.is_generation = is_generation_model(
             self.hf_config.architectures, is_embedding
         )
-        has_multimodal_subconfig = (
-            self.hf_config is not self.hf_text_config
-            or hasattr(self.hf_config, "vision_config")
-            or hasattr(self.hf_config, "audio_config")
+        # The vision_config/audio_config attribute heuristic is only applied when
+        # the transformers backend is explicitly requested. Some text-only models
+        # (e.g. xai-org/grok-2 with model_type="git") would otherwise be
+        # false-positively detected because their HF config auto-populates a
+        # `vision_config` in __post_init__.
+        has_multimodal_subconfig = self.hf_config is not self.hf_text_config or (
+            self.model_impl == ModelImpl.TRANSFORMERS
+            and (
+                hasattr(self.hf_config, "vision_config")
+                or hasattr(self.hf_config, "audio_config")
+            )
         )
         self.is_multimodal = enable_multimodal and (
             is_multimodal_model(self.hf_config.architectures)
@@ -196,8 +233,18 @@ class ModelConfig:
         self.is_image_understandable_model = enable_multimodal and hasattr(
             self.hf_config, "vision_config"
         )
-        self.is_audio_understandable_model = enable_multimodal and hasattr(
-            self.hf_config, "audio_config"
+
+        # Models expose audio_config at different nesting levels:
+        #   - top-level audio_config: e.g. Qwen2Audio
+        #   - thinker_config.audio_config: Qwen3-Omni, Qwen3-ASR (nested thinker arch)
+        #   - sound_config: Nemotron AVLM with Parakeet audio encoder
+        #   - is_audio_model(): Whisper, Qwen3-ASR (architecture-based fallback)
+        # TODO: Handle this more robustly by standardizing the config structure in the future
+        self.is_audio_understandable_model = enable_multimodal and (
+            hasattr(self.hf_config, "audio_config")
+            or hasattr(getattr(self.hf_config, "thinker_config", None), "audio_config")
+            or getattr(self.hf_config, "sound_config", None) is not None
+            or is_audio_model(self.hf_config.architectures)
         )
 
         self.is_multimodal_chunked_prefill_supported = (
@@ -232,6 +279,8 @@ class ModelConfig:
 
         # Cache attributes
         self.hf_eos_token_id = self._get_hf_eos_token_id()
+        # Set by scheduler when reasoning_parser is enabled
+        self.think_end_id: Optional[int] = None
 
         # multimodal
         self.image_token_id = getattr(
@@ -326,10 +375,7 @@ class ModelConfig:
 
         if is_draft_model and self.hf_config.architectures[0] == "MiMoForCausalLM":
             self.hf_config.architectures[0] = "MiMoMTP"
-        if (
-            is_draft_model
-            and self.hf_config.architectures[0] == "MiMoV2FlashForCausalLM"
-        ):
+        if is_draft_model and self.hf_config.architectures[0] in MIMO_V2_MODEL_ARCHS:
             self.hf_config.architectures[0] = "MiMoV2MTP"
         if is_draft_model and self.hf_config.architectures[0] == "Step3p5ForCausalLM":
             self.hf_config.architectures[0] = "Step3p5MTP"
@@ -364,6 +410,10 @@ class ModelConfig:
             self.hf_config.architectures[0] = "NemotronHForCausalLMMTP"
             self.hf_config.num_nextn_predict_layers = 1
 
+        if is_draft_model and self.hf_config.architectures[0] == "HYV3ForCausalLM":
+            self.hf_config.architectures[0] = "HYV3ForCausalLMNextN"
+            self.hf_config.num_nextn_predict_layers = 1
+
     def _derive_hybrid_model(self):
         # Use self.context_len after it has been initialized to prevent using context_len which may be None.
         self.is_hybrid_swa = (
@@ -379,10 +429,33 @@ class ModelConfig:
                 )
             )
 
+        self.has_attention_sinks = self._detect_attention_sinks()
+
         self.is_hybrid_swa_compress = self.hf_config.architectures[0] in [
-            "MiMoV2FlashForCausalLM",
+            *MIMO_V2_MODEL_ARCHS,
             "MiMoV2MTP",
+            "Gemma4ForCausalLM",
+            "Gemma4ForConditionalGeneration",
         ]
+
+    def _detect_attention_sinks(self) -> bool:
+        """Check whether the model uses learned attention sinks.
+
+        Attention sinks are per-head scalars added to the softmax denominator
+        to compensate for evicted KV-cache entries under sliding-window
+        attention.  Not every hybrid-SWA model uses them.
+        """
+        archs = self.hf_config.architectures or []
+        # GptOss always creates sinks unconditionally.
+        if "GptOssForCausalLM" in archs:
+            return True
+
+        # MiMoV2 creates sinks only when the config flags are set.
+        if any(a in archs for a in (*MIMO_V2_MODEL_ARCHS, "MiMoV2MTP")):
+            return getattr(
+                self.hf_text_config, "add_swa_attention_sink_bias", False
+            ) or getattr(self.hf_text_config, "add_full_attention_sink_bias", False)
+        return False
 
     def _derive_context_length(self, context_length: int):
         is_draft_model = self.is_draft_model
@@ -439,7 +512,7 @@ class ModelConfig:
         self.swa_v_head_dim = getattr(
             self.hf_text_config,
             "swa_v_head_dim",
-            self.v_head_dim,
+            self.swa_head_dim,
         )
         # FIXME: temporary special judge for MLA architecture
         if (
@@ -453,7 +526,10 @@ class ModelConfig:
             or "LongcatFlashForCausalLMNextN" in self.hf_config.architectures
             or "DotsVLMForCausalLM" in self.hf_config.architectures
             or "MistralLarge3ForCausalLM" in self.hf_config.architectures
-            or "PixtralForConditionalGeneration" in self.hf_config.architectures
+            or (
+                "PixtralForConditionalGeneration" in self.hf_config.architectures
+                and getattr(self.hf_text_config, "kv_lora_rank", None) is not None
+            )
             or "MistralLarge3ForCausalLMEagle" in self.hf_config.architectures
             or "KimiK25ForConditionalGeneration" in self.hf_config.architectures
         ):
@@ -571,6 +647,12 @@ class ModelConfig:
         self.num_key_value_heads = getattr(
             self.hf_text_config, "num_key_value_heads", None
         )
+        self.first_k_dense_replace = getattr(
+            self.hf_text_config, "first_k_dense_replace", None
+        )
+        self.full_attention_interval = getattr(
+            self.hf_text_config, "full_attention_interval", None
+        )
 
         # for Dbrx and MPT models
         if self.hf_config.model_type in ["dbrx", "mpt"]:
@@ -581,6 +663,10 @@ class ModelConfig:
         if self.num_key_value_heads is None:
             self.num_key_value_heads = self.num_attention_heads
         self.hidden_size = self.hf_text_config.hidden_size
+        hc_mult = getattr(self.hf_text_config, "hc_mult", 1)
+        self.spec_hidden_size = (
+            self.hidden_size * hc_mult if hc_mult > 1 else self.hidden_size
+        )
         self.num_hidden_layers = self.hf_text_config.num_hidden_layers
         self.num_attention_layers = self.num_hidden_layers
         if "LongcatFlashForCausalLM" in self.hf_config.architectures:
@@ -1061,8 +1147,10 @@ class ModelConfig:
                     f"supported in ROCm."
                 )
             if self.quantization not in optimized_quantization_methods:
-                # Don't warn for MXFP4 on SM100 since it has optimized kernels
-                if not (self.quantization == "mxfp4" and is_sm100_supported()):
+                # Don't warn for MXFP4/MXFP8 on SM100 since they have optimized kernels
+                if not (
+                    self.quantization in ["mxfp4", "mxfp8"] and is_sm100_supported()
+                ):
                     logger.warning(
                         "%s quantization is not fully "
                         "optimized yet. The speed can be slower than "
@@ -1307,6 +1395,7 @@ multimodal_model_archs = [
     "Ernie4_5_VLMoeForConditionalGeneration",
     "Gemma3ForConditionalGeneration",
     "Gemma3nForConditionalGeneration",
+    "Gemma4ForConditionalGeneration",
     "Glm4vForConditionalGeneration",
     "Glm4vMoeForConditionalGeneration",
     "GlmOcrForConditionalGeneration",
@@ -1321,12 +1410,15 @@ multimodal_model_archs = [
     "LlavaVidForCausalLM",
     "Lfm2VlForConditionalGeneration",
     "LightOnOCRForConditionalGeneration",
+    *MIMO_V2_MULTIMODAL_ARCHS,
     "MiniCPMO",
     "MiniCPMV",
     "Mistral3ForConditionalGeneration",
     "MultiModalityCausalLM",
     "MllamaForConditionalGeneration",
+    "MossVLForConditionalGeneration",
     "NemotronH_Nano_VL_V2",
+    "NemotronH_Nano_Omni_Reasoning_V3",
     "PixtralForConditionalGeneration",
     "Qwen2AudioForConditionalGeneration",
     "Qwen2VLForConditionalGeneration",
@@ -1335,12 +1427,14 @@ multimodal_model_archs = [
     "Qwen3VLMoeForConditionalGeneration",
     "Qwen3_5ForConditionalGeneration",
     "Qwen3_5MoeForConditionalGeneration",
+    "Qwen3ASRForConditionalGeneration",
     "Qwen3OmniMoeForConditionalGeneration",
     "KimiVLForConditionalGeneration",
     "InternVLChatModel",
     "InternS1ForConditionalGeneration",
     "InternS1ProForConditionalGeneration",
     "Phi4MMForCausalLM",
+    "VoxtralForConditionalGeneration",
     "WhisperForConditionalGeneration",
     "Step3VLForConditionalGeneration",
     "POINTSV15ChatModel",
@@ -1382,6 +1476,7 @@ def is_multimodal_model(model_architectures: List[str]):
 def is_audio_model(model_architectures: List[str]):
     models = [
         "WhisperForConditionalGeneration",
+        "Qwen3ASRForConditionalGeneration",
     ]
     return any(model in model_architectures for model in models)
 
@@ -1390,6 +1485,7 @@ def is_encoder_decoder_model(model_architectures: List[str]):
     models = [
         "WhisperForConditionalGeneration",
         "MllamaForConditionalGeneration",
+        "MossVLForConditionalGeneration",
     ]
     return any(model in model_architectures for model in models)
 
@@ -1405,6 +1501,7 @@ def is_multimodal_chunked_prefill_supported(model_architectures: List[str]):
         "Grok1AForCausalLM",
         "LlavaLlamaForCausalLM",
         "MllamaForConditionalGeneration",
+        "MossVLForConditionalGeneration",
         "CLIPModel",
     ]
     if any(multi_model_arch in unsupported for multi_model_arch in model_architectures):
@@ -1418,6 +1515,17 @@ def is_piecewise_cuda_graph_disabled_model(model_architectures: List[str]):
         arch in piecewise_cuda_graph_disabled_model_archs
         for arch in model_architectures
     )
+
+
+# SequenceClassification models that use CrossEncodingPooler
+_cross_encoding_pooler_archs = [
+    "BertForSequenceClassification",
+    "XLMRobertaForSequenceClassification",
+]
+
+
+def is_cross_encoding_pooler_model(model_architectures: List[str]) -> bool:
+    return any(arch in _cross_encoding_pooler_archs for arch in model_architectures)
 
 
 def yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:
@@ -1448,10 +1556,12 @@ def is_hybrid_swa_model(model_architectures: List[str]):
     hybrid_swa_archs = {
         "Llama4ForConditionalGeneration",
         "GptOssForCausalLM",
-        "MiMoV2FlashForCausalLM",
+        *MIMO_V2_MODEL_ARCHS,
         "MiMoV2MTP",
         "Step3p5ForCausalLM",
         "Step3p5MTP",
+        "Gemma4ForCausalLM",
+        "Gemma4ForConditionalGeneration",
     }
     return any(arch in hybrid_swa_archs for arch in model_architectures)
 
@@ -1469,14 +1579,14 @@ def get_hybrid_layer_ids(
             i for i in range(num_hidden_layers) if (i + 1) % 4 == 0
         ]
     elif "GptOssForCausalLM" in model_architectures:
-        layer_types = getattr(hf_text_config, "layer_types", None)
+        layer_types = getattr(hf_text_config, "layer_types", [])
         swa_attention_layer_ids = [
             i for i, x in enumerate(layer_types) if x == "sliding_attention"
         ]
         full_attention_layer_ids = [
             i for i, x in enumerate(layer_types) if x == "full_attention"
         ]
-    elif "MiMoV2FlashForCausalLM" in model_architectures:
+    elif any(arch in MIMO_V2_MODEL_ARCHS for arch in model_architectures):
         hybrid_layer_pattern = getattr(hf_text_config, "hybrid_layer_pattern", None)
         swa_attention_layer_ids = [
             i for i in range(num_hidden_layers) if hybrid_layer_pattern[i] == 1
@@ -1502,6 +1612,17 @@ def get_hybrid_layer_ids(
     elif "Step3p5MTP" in model_architectures:
         swa_attention_layer_ids = [0]
         full_attention_layer_ids = []
+    elif (
+        "Gemma4ForCausalLM" in model_architectures
+        or "Gemma4ForConditionalGeneration" in model_architectures
+    ):
+        layer_types = getattr(hf_text_config, "layer_types", [])
+        swa_attention_layer_ids = [
+            i for i, x in enumerate(layer_types) if x == "sliding_attention"
+        ]
+        full_attention_layer_ids = [
+            i for i, x in enumerate(layer_types) if x == "full_attention"
+        ]
     else:
         swa_attention_layer_ids = None
         full_attention_layer_ids = None

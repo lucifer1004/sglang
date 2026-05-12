@@ -41,9 +41,9 @@ from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
     _apply_rotary_emb,
     apply_flashinfer_rope_qk_inplace,
 )
+from sglang.multimodal_gen.runtime.managers.layerwise_offload import OffloadableDiTMixin
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
 from sglang.multimodal_gen.runtime.platforms import current_platform
-from sglang.multimodal_gen.runtime.utils.layerwise_offload import OffloadableDiTMixin
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 try:
@@ -943,7 +943,8 @@ class ZImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
         x = list(unified.unbind(dim=0))
         x = self.unpatchify(x, x_size, patch_size, f_patch_size)
 
-        return -x[0]
+        # Keep batch dim so output shape matches input (e.g. rollout/scheduler expect same ndim).
+        return -torch.stack(x)
 
 
 EntryClass = ZImageTransformer2DModel

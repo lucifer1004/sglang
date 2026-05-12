@@ -214,7 +214,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
         created = int(time.time())
 
         # State tracking for streaming
-        stream_buffers = {}
+        stream_offsets = {}
         n_prev_tokens = {}
         prompt_token_ids_cache = {}  # Cache prompt token ids per index
 
@@ -250,9 +250,10 @@ class OpenAIServingCompletion(OpenAIServingBase):
                 hidden_states[index] = content["meta_info"].get("hidden_states", None)
                 routed_experts[index] = content["meta_info"].get("routed_experts", None)
 
-                stream_buffer = stream_buffers.get(index, "")
+                is_first_chunk = index not in stream_offsets
+                offset = stream_offsets.get(index, 0)
                 # Handle echo for first chunk
-                if not stream_buffer:  # The first chunk
+                if is_first_chunk:  # The first chunk
                     if request.echo:
                         echo_text = self._get_echo_text(request, index)
                         text = echo_text + text
@@ -267,7 +268,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
                 logprobs = None
                 if request.logprobs is not None:
                     # The first chunk and echo is enabled.
-                    if not stream_buffer and request.echo:
+                    if is_first_chunk and request.echo:
                         input_token_logprobs = content["meta_info"][
                             "input_token_logprobs"
                         ]
@@ -284,29 +285,45 @@ class OpenAIServingCompletion(OpenAIServingBase):
                         n_prev_token < total_output_logprobs
                         or input_token_logprobs is not None
                     ):
+                        output_token_logprobs = content["meta_info"][
+                            "output_token_logprobs"
+                        ]
+                        output_top_logprobs = content["meta_info"].get(
+                            "output_top_logprobs", []
+                        )
+                        if (
+                            not self.tokenizer_manager.server_args.incremental_streaming_output
+                        ):
+                            output_token_logprobs = output_token_logprobs[
+                                n_prev_token:total_output_logprobs
+                            ]
+                            output_top_logprobs = output_top_logprobs[
+                                n_prev_token:total_output_logprobs
+                            ]
                         logprobs = to_openai_style_logprobs(
                             input_token_logprobs=input_token_logprobs,
                             input_top_logprobs=input_top_logprobs,
-                            output_token_logprobs=content["meta_info"][
-                                "output_token_logprobs"
-                            ][n_prev_token:total_output_logprobs],
-                            output_top_logprobs=content["meta_info"].get(
-                                "output_top_logprobs", []
-                            )[n_prev_token:total_output_logprobs],
+                            output_token_logprobs=output_token_logprobs,
+                            output_top_logprobs=output_top_logprobs,
                         )
                     n_prev_tokens[index] = total_output_logprobs
 
                 # Generate delta
-                delta = text[len(stream_buffer) :]
-                stream_buffers[index] = stream_buffer + delta
+                delta = text[offset:]
+                stream_offsets[index] = len(content["text"])
                 finish_reason = content["meta_info"].get("finish_reason", None)
                 finish_reason_type = finish_reason["type"] if finish_reason else None
 
-                # If the abort is from scheduler.
-                if finish_reason_type == "abort":
-                    code = finish_reason.get(
-                        "status_code", HTTPStatus.INTERNAL_SERVER_ERROR
-                    )
+                # Abort with an explicit error status_code is a system error
+                # (timeout, OOM, validation): emit a streaming error chunk.
+                # A graceful abort (no status_code, e.g. user-initiated via
+                # /abort_request or session lifecycle cleanup) falls through
+                # to the normal chunk path, matching the non-stream behavior
+                # in tokenizer_manager._handle_abort_finish_reason.
+                if finish_reason_type == "abort" and isinstance(
+                    finish_reason.get("status_code"), HTTPStatus
+                ):
+                    code = finish_reason["status_code"]
                     error = self.create_streaming_error_response(
                         finish_reason.get("message", "Generation aborted."),
                         code.name,

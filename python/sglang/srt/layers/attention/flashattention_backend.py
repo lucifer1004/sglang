@@ -23,6 +23,11 @@ if TYPE_CHECKING:
 from sgl_kernel import merge_state_v2
 from sgl_kernel.flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
 
+from sglang.jit_kernel.flash_attention import (
+    flash_attn_varlen_func,
+    flash_attn_with_kvcache,
+)
+
 
 @dataclass
 class FlashAttentionMetadata:
@@ -46,6 +51,10 @@ class FlashAttentionMetadata:
     window_size: tuple = (-1, -1)
     # Page table, the index of KV Cache Tables/Blocks
     page_table: torch.Tensor = None
+    # Page table for Sliding Window Attention
+    swa_page_table: torch.Tensor = None
+    # Precomputed FA3 scheduler metadata (avoids per-layer prepare_varlen_num_blocks)
+    scheduler_metadata: torch.Tensor = None
 
     # Encoder metadata
     # Cumulative sequence lengths for encoder key
@@ -360,16 +369,85 @@ class FlashAttentionBackend(AttentionBackend):
             self.sliding_window_size is not None and self.sliding_window_size > -1
         )
 
-        self.scale_seq_factor = (
-            getattr(model_runner.model_config.hf_config, "scale_seq_times", 0) + 1
+        # Select version
+        self.fa_impl_ver = fa_impl_ver
+        if self.fa_impl_ver == 3:
+            from sgl_kernel.flash_attn import (
+                flash_attn_varlen_func,
+                flash_attn_with_kvcache,
+                get_scheduler_metadata,
+            )
+
+            self._get_scheduler_metadata = get_scheduler_metadata
+        elif self.fa_impl_ver == 4:
+            from sglang.jit_kernel.flash_attention_v4 import (
+                flash_attn_varlen_func,
+                flash_attn_with_kvcache,
+            )
+
+            self._get_scheduler_metadata = None
+        else:
+            raise ValueError(f"Invalid version: {self.fa_impl_ver=}")
+
+        self.flash_attn_varlen_func = flash_attn_varlen_func
+        self.flash_attn_with_kvcache = flash_attn_with_kvcache
+
+        # Store head info for precomputing FA3 scheduler metadata
+        self.head_dim = model_runner.model_config.head_dim
+        self.num_attention_heads = (
+            model_runner.model_config.hf_text_config.num_attention_heads
+            // model_runner.tp_size
         )
-        self.scale_seq_metadata = {}
+        self.num_kv_heads = model_runner.model_config.get_num_kv_heads(
+            model_runner.tp_size
+        )
+        _softcapping = getattr(
+            model_runner.model_config.hf_text_config, "attn_logit_softcapping", None
+        )
+        self.has_softcap = _softcapping is not None and _softcapping > 0.0
 
         # If num_splits == 0, we use a heuristic to automatically determine the number of splits.
         # We set nums splits to 1 if deterministic inference is enabled.
         # See https://thinkingmachines.ai/blog/defeating-nondeterminism-in-llm-inference/ for more details.
         self.num_splits = (
             1 if model_runner.server_args.enable_deterministic_inference else 0
+        )
+
+        # In embedding mode with no chunked prefill and radix cache disabled,
+        # skip KV cache write and use flash_attn_varlen_func with raw K/V
+        # instead of flash_attn_with_kvcache, bypassing paged KV cache entirely.
+        server_args = model_runner.server_args
+        self.fa_skip_kv_cache = (
+            server_args.is_embedding
+            and server_args.chunked_prefill_size == -1
+            and server_args.disable_radix_cache
+        )
+
+    def _compute_scheduler_metadata(
+        self, batch_size, max_seq_len_k, cache_seqlens, cu_seqlens_q
+    ):
+        """Compute FA3 scheduler metadata for decode.
+
+        Returns the scheduler_metadata tensor, or None if not applicable.
+        """
+        if self._get_scheduler_metadata is None or self.use_mla:
+            return None
+        # Always use window_size=(-1, -1) because scheduler_metadata is only
+        # consumed by non-SWA layers (SWA layers skip it in forward_decode).
+        return self._get_scheduler_metadata(
+            batch_size=batch_size,
+            max_seqlen_q=1,
+            max_seqlen_k=max_seq_len_k,
+            num_heads=self.num_attention_heads,
+            num_heads_k=self.num_kv_heads,
+            headdim=self.head_dim,
+            cache_seqlens=cache_seqlens,
+            qkv_dtype=self.kv_cache_dtype,
+            cu_seqlens_q=cu_seqlens_q,
+            page_size=self.page_size,
+            causal=True,
+            has_softcap=self.has_softcap,
+            num_splits=self.num_splits,
         )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
@@ -464,6 +542,14 @@ class FlashAttentionBackend(AttentionBackend):
                 metadata.page_table = forward_batch.req_to_token_pool.req_to_token[
                     forward_batch.req_pool_indices, : metadata.max_seq_len_k
                 ]
+                # Precompute FA3 scheduler metadata to avoid per-layer
+                # prepare_varlen_num_blocks kernel calls
+                metadata.scheduler_metadata = self._compute_scheduler_metadata(
+                    batch_size,
+                    metadata.max_seq_len_k,
+                    metadata.cache_seqlens_int32,
+                    metadata.cu_seqlens_q,
+                )
             # TODO: we need to test this part for llama 4 eagle case
             self._init_local_attn_metadata(forward_batch, metadata, device)
         elif (
@@ -720,7 +806,14 @@ class FlashAttentionBackend(AttentionBackend):
     ):
         if k is not None:
             assert v is not None
-            if save_kv_cache:
+
+            is_cp_mode = (
+                forward_batch.forward_mode.is_context_parallel_extend()
+                and forward_batch.attn_cp_metadata is not None
+                and self.attn_cp_size > 1
+            )
+
+            if save_kv_cache and not is_cp_mode and not self.fa_skip_kv_cache:
                 cache_loc = (
                     forward_batch.out_cache_loc
                     if not layer.is_cross_attention
@@ -786,12 +879,17 @@ class FlashAttentionBackend(AttentionBackend):
             and not is_hybrid_swa
         )
 
-        # For fa3 interface version compatibility, we put new fields into conditional keyword args
         kwargs = {}
         if self.fa_impl_ver != 3:
             kwargs["ver"] = self.fa_impl_ver
         if sinks is not None:
             kwargs["sinks"] = sinks
+
+        _fa_out = (
+            forward_batch._attn_output.view(-1, layer.tp_q_head_num, layer.v_head_dim)
+            if getattr(forward_batch, "_attn_output", None) is not None
+            else None
+        )
 
         # Get the appropriate page table based on whether we're using local attention
         if use_local_attn:
@@ -838,25 +936,90 @@ class FlashAttentionBackend(AttentionBackend):
                 cu_seqlens_k = metadata.encoder_cu_seqlens_k
                 window_size = (-1, -1)
 
-            result = flash_attn_with_kvcache(
-                q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
-                k_cache=key_cache,
-                v_cache=value_cache,
-                page_table=page_table,
-                cache_seqlens=cache_seqlens,
-                cu_seqlens_q=cu_seqlens_q,
-                cu_seqlens_k_new=cu_seqlens_k if not use_local_attn else None,
-                max_seqlen_q=max_seqlen_q,
-                softmax_scale=layer.scaling,
-                causal=False if use_cascade_attn else causal,
-                window_size=window_size,
-                softcap=layer.logit_cap,
-                k_descale=k_descale,
-                v_descale=v_descale,
-                return_softmax_lse=use_cascade_attn,
-                num_splits=self.num_splits,
-                **kwargs,
-            )
+            if (
+                forward_batch.forward_mode.is_context_parallel_extend()
+                and forward_batch.attn_cp_metadata is not None
+                and self.attn_cp_size > 1
+            ):
+
+                def _fa_cp_attn(
+                    q_chunk, cu_seqlens_q_cp, cache_seqlens_cp, max_seqlen_q_cp
+                ):
+                    return flash_attn_with_kvcache(
+                        q=q_chunk,
+                        k_cache=key_cache,
+                        v_cache=value_cache,
+                        page_table=page_table,
+                        cache_seqlens=cache_seqlens_cp,
+                        cu_seqlens_q=cu_seqlens_q_cp,
+                        cu_seqlens_k_new=cu_seqlens_k if not use_local_attn else None,
+                        max_seqlen_q=max_seqlen_q_cp,
+                        softmax_scale=layer.scaling,
+                        causal=False if use_cascade_attn else causal,
+                        window_size=window_size,
+                        softcap=layer.logit_cap,
+                        k_descale=k_descale,
+                        v_descale=v_descale,
+                        return_softmax_lse=use_cascade_attn,
+                        num_splits=self.num_splits,
+                        ver=self.fa_impl_ver,
+                        **kwargs,
+                    )
+
+                result = cp_attn_forward_extend(
+                    forward_batch,
+                    q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+                    self.device,
+                    _fa_cp_attn,
+                )
+            elif self.fa_skip_kv_cache:
+                # Embedding mode: skip KV cache read and use raw K/V tensors
+                # directly via flash_attn_varlen_func. The KV cache write is
+                # also skipped (guarded above). This eliminates store_kvcache
+                # and prepare_varlen_num_blocks overhead per layer.
+                assert k is not None, "fa_skip_kv_cache requires k to be provided"
+                assert k_descale is None and v_descale is None, (
+                    "fa_skip_kv_cache uses raw K/V tensors, "
+                    "FP8 KV cache descaling is not supported in this mode"
+                )
+                result = flash_attn_varlen_func(
+                    q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+                    k=k.view(-1, layer.tp_k_head_num, layer.head_dim),
+                    v=v.view(-1, layer.tp_v_head_num, layer.v_head_dim),
+                    cu_seqlens_q=cu_seqlens_q,
+                    cu_seqlens_k=cu_seqlens_q,
+                    max_seqlen_q=max_seqlen_q,
+                    max_seqlen_k=max_seqlen_q,
+                    softmax_scale=layer.scaling,
+                    causal=causal,
+                    window_size=window_size,
+                    softcap=layer.logit_cap,
+                    num_splits=self.num_splits,
+                    out=_fa_out,
+                    **kwargs,
+                )
+            else:
+                result = flash_attn_with_kvcache(
+                    q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+                    k_cache=key_cache,
+                    v_cache=value_cache,
+                    page_table=page_table,
+                    cache_seqlens=cache_seqlens,
+                    cu_seqlens_q=cu_seqlens_q,
+                    cu_seqlens_k_new=cu_seqlens_k if not use_local_attn else None,
+                    max_seqlen_q=max_seqlen_q,
+                    softmax_scale=layer.scaling,
+                    causal=False if use_cascade_attn else causal,
+                    window_size=window_size,
+                    softcap=layer.logit_cap,
+                    k_descale=k_descale,
+                    v_descale=v_descale,
+                    return_softmax_lse=use_cascade_attn,
+                    num_splits=self.num_splits,
+                    out=_fa_out,
+                    ver=self.fa_impl_ver,
+                    **kwargs,
+                )
 
             if use_cascade_attn:
                 o, softmax_lse, *rest = result
@@ -882,6 +1045,7 @@ class FlashAttentionBackend(AttentionBackend):
                     v_descale=v_descale,
                     return_softmax_lse=True,
                     num_splits=self.num_splits,
+                    ver=self.fa_impl_ver,
                     **kwargs,
                 )
                 o, _ = merge_state_v2_wrapper(
@@ -921,6 +1085,8 @@ class FlashAttentionBackend(AttentionBackend):
                         softmax_scale=layer.scaling,
                         causal=False,
                         return_softmax_lse=True,
+                        out=_fa_out,
+                        ver=self.fa_impl_ver,
                         **kwargs,
                     )
                 else:
@@ -946,6 +1112,8 @@ class FlashAttentionBackend(AttentionBackend):
                         softmax_scale=layer.scaling,
                         causal=True,
                         return_softmax_lse=forward_batch.mha_return_lse,
+                        out=_fa_out,
+                        ver=self.fa_impl_ver,
                         **kwargs,
                     )
                 if forward_batch.mha_return_lse:
@@ -954,7 +1122,7 @@ class FlashAttentionBackend(AttentionBackend):
                     return output, lse
                 return output
             else:
-                assert self.fa_impl_ver in [3], "Only FA3 support here"
+                assert self.fa_impl_ver == 3, "Only FA3 support here"
                 # Do absorbed multi-latent attention
                 kv_cache = forward_batch.token_to_kv_pool.get_key_buffer(
                     layer.layer_id
@@ -997,6 +1165,7 @@ class FlashAttentionBackend(AttentionBackend):
                     v_descale=v_descale,
                     return_softmax_lse=use_cascade_attn,
                     num_splits=self.num_splits,
+                    ver=self.fa_impl_ver,
                 )
                 if use_cascade_attn:
                     o, softmax_lse, *rest = result
@@ -1019,6 +1188,7 @@ class FlashAttentionBackend(AttentionBackend):
                             v_descale=v_descale,
                             return_softmax_lse=True,
                             num_splits=self.num_splits,
+                            ver=self.fa_impl_ver,
                         )
                     )
                     o, _ = merge_state_v2_wrapper(
@@ -1099,6 +1269,12 @@ class FlashAttentionBackend(AttentionBackend):
         if sinks is not None:
             kwargs["sinks"] = sinks
 
+        _fa_out = (
+            forward_batch._attn_output.view(-1, layer.tp_q_head_num, layer.v_head_dim)
+            if getattr(forward_batch, "_attn_output", None) is not None
+            else None
+        )
+
         k_descale, v_descale = None, None
         # only use kv scaling if: 1) fp8 kv is explicitly enabled, 2) RadixAttention
         # has corresponding quantization method so that layer.k_scale is not None,
@@ -1142,6 +1318,7 @@ class FlashAttentionBackend(AttentionBackend):
                     k_descale=k_descale,
                     v_descale=v_descale,
                     num_splits=self.num_splits,
+                    ver=self.fa_impl_ver,
                     **kwargs,
                 )
             elif use_local_attn:
@@ -1162,6 +1339,7 @@ class FlashAttentionBackend(AttentionBackend):
                     k_descale=k_descale,
                     v_descale=v_descale,
                     num_splits=self.num_splits,
+                    ver=self.fa_impl_ver,
                     **kwargs,
                 )
             else:
@@ -1174,6 +1352,15 @@ class FlashAttentionBackend(AttentionBackend):
                 )
 
                 # Default: single-token self-attention
+                # Use precomputed scheduler_metadata when available and applicable.
+                # scheduler_metadata is only valid for non-SWA, non-cascade decode.
+                sched_meta = None
+                if (
+                    metadata.scheduler_metadata is not None
+                    and not is_swa_layer
+                    and not use_cascade_attn
+                ):
+                    sched_meta = metadata.scheduler_metadata
                 result = flash_attn_with_kvcache(
                     q=q_reshaped,
                     k_cache=key_cache,
@@ -1190,6 +1377,9 @@ class FlashAttentionBackend(AttentionBackend):
                     v_descale=v_descale,
                     return_softmax_lse=use_cascade_attn,
                     num_splits=self.num_splits,
+                    out=_fa_out,
+                    ver=self.fa_impl_ver,
+                    scheduler_metadata=sched_meta,
                     **kwargs,
                 )
                 if use_cascade_attn:
@@ -1212,6 +1402,7 @@ class FlashAttentionBackend(AttentionBackend):
                             v_descale=v_descale,
                             return_softmax_lse=True,
                             num_splits=self.num_splits,
+                            ver=self.fa_impl_ver,
                             **kwargs,
                         )
                     )
@@ -1268,6 +1459,7 @@ class FlashAttentionBackend(AttentionBackend):
                 v_descale=v_descale,
                 return_softmax_lse=use_cascade_attn,  # softmax_lse is needed for merge states
                 num_splits=self.num_splits,
+                ver=self.fa_impl_ver,
             )
             if use_cascade_attn:
                 o, softmax_lse, *rest = result
@@ -1289,6 +1481,7 @@ class FlashAttentionBackend(AttentionBackend):
                     v_descale=v_descale,
                     return_softmax_lse=True,
                     num_splits=self.num_splits,
+                    ver=self.fa_impl_ver,
                 )
                 o, _ = merge_state_v2(
                     o,
@@ -1331,6 +1524,16 @@ class FlashAttentionBackend(AttentionBackend):
                 0, self.max_context_len, self.page_size, device=self.device
             ),
         }
+        # Pre-allocate scheduler_metadata buffer for CUDA graph
+        # Size: 1 (semaphore) + round_up(max_bs, 4) * 4 (causal decode vectors)
+        if self._get_scheduler_metadata is not None and not self.use_mla:
+            b_rounded = ((max_bs + 3) // 4) * 4
+            self._sched_meta_buf = torch.zeros(
+                1 + b_rounded * 4, dtype=torch.int32, device=self.device
+            )
+        else:
+            self._sched_meta_buf = None
+
         # Only allocate local attention buffers if local attention is enabled
         # This prevents OOM errors when local attention is not being used
         if self.attention_chunk_size is not None:
@@ -1703,6 +1906,20 @@ class FlashAttentionBackend(AttentionBackend):
                 if self.attention_chunk_size is not None:
                     self._update_local_attn_metadata_for_capture(metadata, batch_size)
 
+                # Compute scheduler_metadata into pre-allocated buffer for CUDA graph capture
+                if self._sched_meta_buf is not None:
+                    sched = self._compute_scheduler_metadata(
+                        batch_size,
+                        max(metadata.max_seq_len_k, 1),
+                        metadata.cache_seqlens_int32,
+                        metadata.cu_seqlens_q,
+                    )
+                    if sched is not None:
+                        n = sched.shape[0]
+                        self._sched_meta_buf[:n] = sched
+                        self._sched_meta_buf[n:] = 0
+                        metadata.scheduler_metadata = self._sched_meta_buf[:n]
+
         elif forward_mode.is_target_verify():
             if spec_info is None and self.scale_seq_factor > 1:
                 # scale_seq decode: seq_lens already includes the scale increment
@@ -1997,6 +2214,23 @@ class FlashAttentionBackend(AttentionBackend):
                     metadata,
                     bs,
                 )
+
+                # Recompute scheduler_metadata into pre-allocated buffer
+                if (
+                    self._sched_meta_buf is not None
+                    and metadata.scheduler_metadata is not None
+                ):
+                    sched = self._compute_scheduler_metadata(
+                        bs,
+                        metadata.max_seq_len_k,
+                        metadata.cache_seqlens_int32,
+                        metadata.cu_seqlens_q,
+                    )
+                    if sched is not None:
+                        n = sched.shape[0]
+                        self._sched_meta_buf[:n] = sched
+                        self._sched_meta_buf[n:] = 0
+
         elif forward_mode.is_target_verify():
             if spec_info is None and self.scale_seq_factor > 1:
                 # scale_seq decode replay
@@ -2136,14 +2370,14 @@ class FlashAttentionBackend(AttentionBackend):
             metadata.cu_seqlens_k[1:].copy_(
                 torch.cumsum(metadata.cache_seqlens_int32, dim=0, dtype=torch.int32)
             )
-            accept_length = spec_info.accept_length[:bs]
-            if spec_info.accept_length_cpu:
-                metadata.max_seq_len_q = max(spec_info.accept_length_cpu) + 1
+            extend_lens = spec_info.num_accepted_tokens[:bs]
+            if spec_info.num_accepted_tokens_cpu:
+                metadata.max_seq_len_q = max(spec_info.num_accepted_tokens_cpu)
             else:
                 metadata.max_seq_len_q = 1
 
             metadata.cu_seqlens_q[1:].copy_(
-                torch.cumsum(accept_length, dim=0, dtype=torch.int32)
+                torch.cumsum(extend_lens, dim=0, dtype=torch.int32)
             )
 
             max_seq_pages = (
