@@ -212,18 +212,56 @@ class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
         else:
             return 0, forward_batch.out_cache_loc.shape[0]
 
+    def _get_local_out_cache_loc_and_device_range(
+        self, forward_batch, can_run_graph, cuda_graph_batch
+    ):
+        if is_dp_attention_enabled():
+            local_start_pos, local_num_tokens = get_dp_local_info(forward_batch)
+            out_cache_local_start_pos = int(local_start_pos.item())
+            local_num_tokens = int(local_num_tokens.item())
+            out_cache_loc_len = forward_batch.out_cache_loc.shape[0]
+
+            # CUDA graph pads the device buffer by DP rank, while out_cache_loc is
+            # indexed by the actual local token span.
+            if can_run_graph:
+                device_local_start_pos = get_attention_dp_rank() * cuda_graph_batch
+            else:
+                device_local_start_pos = out_cache_local_start_pos
+
+            out_cache_local_end_pos = out_cache_local_start_pos + local_num_tokens
+            if out_cache_local_end_pos <= out_cache_loc_len:
+                out_cache_loc = forward_batch.out_cache_loc[
+                    out_cache_local_start_pos:out_cache_local_end_pos
+                ]
+            else:
+                out_cache_loc = forward_batch.out_cache_loc[:local_num_tokens]
+        else:
+            device_local_start_pos = 0
+            out_cache_loc = forward_batch.out_cache_loc
+
+        sync_num_tokens = out_cache_loc.shape[0]
+        device_local_end_pos = device_local_start_pos + sync_num_tokens
+        return out_cache_loc, device_local_start_pos, device_local_end_pos
+
     def _sync_fwd_experts_buffer_DtoH(
         self,
         forward_batch: ForwardBatch,
         can_run_graph: bool,
         cuda_graph_batch: int,
     ):
-        local_start_pos, local_end_pos = self._get_local_range(
+        (
+            out_cache_loc,
+            device_local_start_pos,
+            device_local_end_pos,
+        ) = self._get_local_out_cache_loc_and_device_range(
             forward_batch, can_run_graph, cuda_graph_batch
         )
-        out_cache_loc_cpu = forward_batch.out_cache_loc.cpu()
+        if out_cache_loc.shape[0] == 0:
+            return
+        # FIXME: sync explicitly here, overlap scheduler breaks here.
+        out_cache_loc_cpu = out_cache_loc.cpu()
         self.host_cache.buffer[out_cache_loc_cpu] = self.device_cache.buffer[
-            local_start_pos:local_end_pos, :, : self.num_experts_per_tok
+            device_local_start_pos:device_local_end_pos, :, : self.num_experts_per_tok
         ].cpu()
 
     def _prepare_routed_experts_output(
@@ -232,13 +270,19 @@ class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
         can_run_graph: bool,
         cuda_graph_batch: int,
     ) -> RoutedExpertsOutput:
-        local_start_pos, local_end_pos = self._get_local_range(
+        (
+            out_cache_loc,
+            device_local_start_pos,
+            device_local_end_pos,
+        ) = self._get_local_out_cache_loc_and_device_range(
             forward_batch, can_run_graph, cuda_graph_batch
         )
         return RoutedExpertsOutput(
-            out_cache_loc=forward_batch.out_cache_loc,
+            out_cache_loc=out_cache_loc,
             routed_experts=self.device_cache.buffer[
-                local_start_pos:local_end_pos, :, : self.num_experts_per_tok
+                device_local_start_pos:device_local_end_pos,
+                :,
+                : self.num_experts_per_tok,
             ],
             host_cache=self.host_cache,
         )

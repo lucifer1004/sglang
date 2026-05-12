@@ -99,7 +99,7 @@ def process_routed_experts_from_ret(
         ChatCompletionRequest,
         CompletionRequest,
     ],
-) -> Optional[str]:
+) -> Optional[Union[str, Dict[str, Any]]]:
     """Process routed experts from a ret item in non-streaming response."""
     if not getattr(request, "return_routed_experts", False):
         return None

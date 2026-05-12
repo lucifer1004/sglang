@@ -117,6 +117,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
         self.decode_status = LimitedCapacityDict(capacity=DETOKENIZER_MAX_STATES)
         self.disable_tokenizer_batch_decode = server_args.disable_tokenizer_batch_decode
         self.is_tool_call_parser_gpt_oss = server_args.tool_call_parser == "gpt-oss"
+        self.routed_experts_store_dsn = server_args.routed_experts_store_dsn
 
         self.soft_watchdog = Watchdog.create(
             debug_name="DetokenizerManager",
@@ -348,7 +349,11 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             if len(recv_obj.rids) > 0
             else []
         )
-        routed_experts = self._b64_encode_per_request(recv_obj.routed_experts)
+        routed_experts = (
+            recv_obj.routed_experts
+            if self.routed_experts_store_dsn
+            else self._b64_encode_per_request(recv_obj.routed_experts)
+        )
         return BatchStrOutput(
             rids=recv_obj.rids,
             http_worker_ipcs=recv_obj.http_worker_ipcs,

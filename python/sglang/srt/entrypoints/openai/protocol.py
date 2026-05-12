@@ -340,7 +340,7 @@ class SglExt(BaseModel):
     should be added as fields here rather than directly on the choice object.
     """
 
-    routed_experts: Optional[str] = None
+    routed_experts: Optional[Union[str, Dict[str, Any]]] = None
     cached_tokens_details: Optional[CachedTokensDetails] = None
 
     @model_serializer(mode="wrap")
