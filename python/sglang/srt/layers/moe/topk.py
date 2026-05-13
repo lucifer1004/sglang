@@ -1240,10 +1240,6 @@ def _apply_router_replay_from_forward_batch(
         if (
             last_q_indices is None
             or last_q_indices.shape[0] != topk_ids.shape[0]
-            or (
-                last_q_indices.numel() > 0
-                and int(last_q_indices.max().item()) >= forced_ids.shape[0]
-            )
         ):
             raise ValueError(
                 "router replay forced ids cannot be aligned to current TopK rows; "

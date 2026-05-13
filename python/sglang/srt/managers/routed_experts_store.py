@@ -54,6 +54,11 @@ class RoutedExpertsStore(ABC):
     def put(self, value) -> Dict[str, Any]:
         raise NotImplementedError()
 
+    def get(self, ref: Dict[str, Any]) -> bytes:
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support reading routed experts."
+        )
+
 
 class DummyRoutedExpertsStore(RoutedExpertsStore):
     def put(self, value) -> Dict[str, Any]:
@@ -89,6 +94,9 @@ class _RedisRespClient:
 
     def setex(self, key: str, ttl_sec: int, value: bytes):
         self._execute("SETEX", key, str(ttl_sec), value)
+
+    def get(self, key: str):
+        return self._execute("GET", key)
 
     def close(self):
         self.sock.close()
@@ -250,6 +258,15 @@ class RedisRoutedExpertsStore(RoutedExpertsStore):
         if self.ttl_sec is not None:
             response["ttl_sec"] = self.ttl_sec
         return response
+
+    def get(self, ref: Dict[str, Any]) -> bytes:
+        key = ref.get("key")
+        if not key:
+            raise ValueError(f"Redis routed experts reference is missing key: {ref}")
+        payload = self.client.get(key)
+        if payload is None:
+            raise KeyError(f"Redis routed experts key was not found: {key}")
+        return payload
 
 
 def _query_value(query, names, default=None):

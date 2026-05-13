@@ -168,7 +168,7 @@ def validate_router_replay_experts(
         )
 
     tensor = tensor.to(device="cpu", dtype=torch.int32)
-    if tensor.numel() > 0:
+    if tensor.numel() > 0 and not getattr(tensor, "_sglang_router_replay_trusted", False):
         if bool((tensor < -1).any()):
             min_id = int(tensor.min().item())
             raise ValueError(

@@ -183,7 +183,12 @@ class GenerateReqInput(BaseReq):
     # Single request: [router_seq_len, num_layers, top_k]
     # Batch request: [batch, router_seq_len, num_layers, top_k]
     routed_experts: Optional[
-        Union[List[List[List[int]]], List[List[List[List[int]]]]]
+        Union[
+            Dict[str, Any],
+            List[Union[Dict[str, Any], List[List[List[int]]]]],
+            List[List[List[int]]],
+            List[List[List[List[int]]]],
+        ]
     ] = None
     # Force the generated decode token sequence after each forward has run.
     # Single request: [max_new_tokens]

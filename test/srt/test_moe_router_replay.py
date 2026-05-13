@@ -1,5 +1,7 @@
 import types
+import base64
 
+import numpy as np
 import pytest
 import torch
 
@@ -190,6 +192,48 @@ def test_tokenizer_forced_decode_tokens_reject_max_new_tokens_mismatch():
 
     with pytest.raises(ValueError, match="length must match"):
         TokenizerManager._validate_one_request(tokenizer_manager, req, req.input_ids)
+
+
+def test_tokenizer_resolves_remote_masked_router_replay_payload():
+    values = make_trace(num_tokens=3, num_layers=2, top_k=2).numpy()
+    valid_mask = np.array(
+        [[1, 1], [1, 0], [0, 0]],
+        dtype=np.uint8,
+    )
+
+    class Store:
+        def get(self, ref):
+            assert ref["key"] == "trace-key"
+            return values.tobytes()
+
+    tokenizer_manager = TokenizerManager.__new__(TokenizerManager)
+    tokenizer_manager.routed_experts_store = Store()
+    payload = {
+        "format": "remote_masked_dense",
+        "values": {
+            "format": "remote",
+            "backend": "redis",
+            "key": "trace-key",
+            "encoding": "raw_tensor_bytes",
+            "shape": list(values.shape),
+            "dtype": "int32",
+        },
+        "shape": list(values.shape),
+        "dtype": "int32",
+        "valid_mask": base64.b64encode(valid_mask.tobytes()).decode("ascii"),
+        "valid_mask_shape": list(valid_mask.shape),
+    }
+
+    resolved = TokenizerManager._resolve_router_replay_experts(
+        tokenizer_manager, payload
+    )
+
+    assert resolved.dtype == torch.int32
+    assert resolved.shape == values.shape
+    assert resolved._sglang_router_replay_trusted
+    assert torch.equal(resolved[0, 0], torch.tensor(values[0, 0], dtype=torch.int32))
+    assert resolved[1, 1].tolist() == [-1, -1]
+    assert resolved[2, 0].tolist() == [-1, -1]
 
 
 def test_scheduler_forced_decode_tokens_override_after_sampling():
