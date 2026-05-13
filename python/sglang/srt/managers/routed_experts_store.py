@@ -36,6 +36,16 @@ def summarize_routed_experts_value(value) -> Dict[str, Any]:
             "byte_size": sum(part["byte_size"] for part in parts),
             "num_parts": len(parts),
         }
+    if isinstance(value, dict):
+        parts = {
+            key: summarize_routed_experts_value(item) for key, item in value.items()
+        }
+        return {
+            "shape": parts.get("values", {}).get("shape"),
+            "dtype": parts.get("values", {}).get("dtype"),
+            "byte_size": sum(part["byte_size"] for part in parts.values()),
+            "parts": parts,
+        }
     return {"shape": None, "dtype": type(value).__name__, "byte_size": 0}
 
 
@@ -186,6 +196,24 @@ class RedisRoutedExpertsStore(RoutedExpertsStore):
                 "encoding": None,
                 **summarize_routed_experts_value(value),
             }
+
+        if isinstance(value, dict):
+            if "values" not in value:
+                raise TypeError(
+                    "Redis routed experts backend expects sparse payloads to "
+                    "contain a 'values' tensor."
+                )
+            summary = summarize_routed_experts_value(value)
+            values_ref = self.put(value["values"])
+            response = {
+                **value,
+                "values": values_ref,
+                "format": "remote_masked_dense",
+                "backend": "redis",
+                "schema_version": 2,
+                "remote_summary": summary,
+            }
+            return response
 
         if not (hasattr(value, "detach") and hasattr(value, "numel")):
             raise TypeError(

@@ -80,6 +80,7 @@ from sglang.srt.layers.welmv4_op import (
     mmq_style_norm_after_attn,
     mmq_style_router_linear,
 )
+from sglang.srt.model_executor.forward_batch_context import get_current_forward_batch
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.welm_perf_opt import (
@@ -197,6 +198,49 @@ def _welm_kv_mirror_pp_key(layer_idx: int, suffix: str) -> str:
 
 def _empty_welm_kv_mirror_states() -> Dict[int, Tuple[torch.Tensor, torch.Tensor]]:
     return {}
+
+
+def _set_welm_custom_last_prefill_cache_loc(forward_batch: ForwardBatch) -> None:
+    custom_last_index = getattr(forward_batch, "custom_last_index", None)
+    if custom_last_index is None:
+        custom_last_index = torch.cumsum(forward_batch.extend_seq_lens, dim=0) - 1
+        forward_batch.custom_last_index = custom_last_index
+
+    out_cache_loc = getattr(forward_batch, "out_cache_loc", None)
+    if out_cache_loc is not None:
+        forward_batch.custom_last_cache_loc = out_cache_loc[custom_last_index]
+    else:
+        req_to_token_pool = getattr(forward_batch, "req_to_token_pool", None)
+        req_pool_indices = getattr(forward_batch, "req_pool_indices", None)
+        active_batch_indices = getattr(
+            forward_batch, "kv_mirror_active_batch_indices", None
+        )
+        if active_batch_indices is None:
+            active_batch_indices = torch.arange(
+                custom_last_index.numel(),
+                dtype=torch.long,
+                device=custom_last_index.device,
+            )
+        if (
+            req_to_token_pool is not None
+            and req_pool_indices is not None
+            and getattr(forward_batch, "seq_lens", None) is not None
+        ):
+            last_token_positions = forward_batch.seq_lens.to(dtype=torch.int64) - 1
+            last_token_positions = torch.clamp(last_token_positions, min=0)
+            forward_batch.custom_last_cache_loc = req_to_token_pool.req_to_token[
+                req_pool_indices[active_batch_indices],
+                last_token_positions[active_batch_indices],
+            ]
+
+    context_forward_batch = get_current_forward_batch()
+    if context_forward_batch is not None and context_forward_batch is not forward_batch:
+        context_forward_batch.custom_last_index = forward_batch.custom_last_index
+        if hasattr(forward_batch, "custom_last_cache_loc"):
+            context_forward_batch.custom_last_cache_loc = (
+                forward_batch.custom_last_cache_loc
+            )
+            context_forward_batch.out_cache_loc = forward_batch.custom_last_cache_loc
 
 
 def _get_welm_kv_mirror_states(
@@ -318,6 +362,7 @@ def _welm_init_kv_mirror_last_q_indices(forward_batch: ForwardBatch) -> bool:
     forward_batch.custom_last_index = last_q_indices
     forward_batch.kv_mirror_active_batch_indices = active_batch_indices
     forward_batch.kv_mirror_output_size = output_size
+    _set_welm_custom_last_prefill_cache_loc(forward_batch)
     return True
 
 

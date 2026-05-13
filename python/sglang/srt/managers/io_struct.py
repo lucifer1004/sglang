@@ -1177,11 +1177,10 @@ class BatchTokenIDOutput(BaseBatchReq, SpeculativeDecodingMetricsMixin):
     # Hidden states
     output_hidden_states: List[List[float]]
 
-    # Per-request routed experts (input + output tokens), shape
-    # (token, layer, top_k). DetokenizerManager encodes to base64 into
-    # BatchStrOutput; on the skip_tokenizer_init path the scheduler sends this
-    # straight to TokenizerManager, which encodes on demand.
-    routed_experts: List[Optional[torch.Tensor]]
+    # Per-request routed experts (input + output tokens). The common dense
+    # tensor shape is (token, layer, top_k). KV-mirror prefill can return a
+    # masked-dense dict because some layer-token routes are intentionally absent.
+    routed_experts: List[Optional[Union[torch.Tensor, Dict[str, Any]]]]
 
     # The information of placeholder tokens (e.g., image token)
     # idx is the index of the token in the prompt after expansion.
@@ -1241,10 +1240,9 @@ class BatchStrOutput(BaseBatchReq, SpeculativeDecodingMetricsMixin):
     # Hidden states
     output_hidden_states: List[List[float]]
 
-    # Per-request routed experts, base64-encoded by DetokenizerManager off the
-    # tokenizer hot path. Underlying tensor shape is (token, layer, top_k);
-    # see BatchTokenIDOutput.routed_experts.
-    routed_experts: List[Optional[str]]
+    # Per-request routed experts, encoded by DetokenizerManager off the tokenizer
+    # hot path. Dense payloads are base64 strings; masked-dense payloads are dicts.
+    routed_experts: List[Optional[Union[str, Dict[str, Any]]]]
 
     # The information of placeholder tokens (e.g., image token)
     # idx is the index of the token in the prompt after expansion.

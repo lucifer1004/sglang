@@ -21,7 +21,6 @@ from collections import OrderedDict, defaultdict
 from typing import Dict, List, Optional, Tuple, Union
 
 import psutil
-import pybase64
 import setproctitle
 import torch
 import zmq
@@ -333,12 +332,12 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
         """
         if data_list is None:
             return None
+        from sglang.srt.layers.moe.routed_experts_capturer import (
+            encode_routed_experts_payload,
+        )
+
         return [
-            (
-                pybase64.b64encode(item.numpy().tobytes()).decode("utf-8")
-                if item is not None
-                else None
-            )
+            encode_routed_experts_payload(item) if item is not None else None
             for item in data_list
         ]
 

@@ -32,7 +32,6 @@ from http import HTTPStatus
 from typing import Any, Awaitable, Dict, List, Optional, Tuple, Union
 
 import fastapi
-import pybase64
 import torch
 import uvloop
 import zmq
@@ -1761,16 +1760,14 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 val = recv_obj.routed_experts[i]
                 if val is not None:
                     if self.routed_experts_store is not None:
-                        if not isinstance(val, torch.Tensor):
-                            raise TypeError(
-                                "routed_experts remote store expects tensor values "
-                                f"before serialization, got {type(val).__name__}."
-                            )
                         val = self.routed_experts_store.put(val)
                     # BatchStrOutput can be pre-encoded by the detokenizer;
                     # BatchTokenIDOutput (skip_tokenizer_init) bypasses it.
-                    if isinstance(val, torch.Tensor):
-                        val = pybase64.b64encode(val.numpy().tobytes()).decode("utf-8")
+                    from sglang.srt.layers.moe.routed_experts_capturer import (
+                        encode_routed_experts_payload,
+                    )
+
+                    val = encode_routed_experts_payload(val)
                     meta_info["routed_experts"] = val
             if getattr(recv_obj, "customized_info", None):
                 for k, v in recv_obj.customized_info.items():
