@@ -13,6 +13,7 @@ Tolerances: atol=2e-2 (bf16 has ~0.0078 per-ULP precision).
 """
 
 import unittest
+from types import SimpleNamespace
 
 import torch
 
@@ -28,7 +29,10 @@ from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.models.welmv4 import (
     _pack_welm_kv_mirror_states,
     _unpack_welm_kv_mirror_states,
+    _welm_init_kv_mirror_last_q_indices,
     _welm_kv_mirror_pp_key,
+    _welm_scatter_kv_mirror_rows,
+    _welm_select_kv_mirror_rows,
 )
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.test.test_utils import CustomTestCase
@@ -52,6 +56,60 @@ NUM_Q_HEADS = 24
 NUM_K_HEADS = 2
 QK_ROPE_HEAD_DIM = 64
 RMS_NORM_EPS = 1e-5
+
+
+class TestWelmKvMirrorLastQSelection(CustomTestCase):
+    def test_middle_chunk_has_no_active_final_q(self):
+        forward_batch = SimpleNamespace(
+            extend_seq_lens=torch.tensor([4, 4], dtype=torch.int32),
+            welm_kv_mirror_last_q_indices=torch.empty(0, dtype=torch.long),
+            welm_kv_mirror_active_batch_indices=torch.empty(0, dtype=torch.long),
+            welm_kv_mirror_output_size=2,
+        )
+
+        first_contract = _welm_init_kv_mirror_last_q_indices(forward_batch)
+        self.assertTrue(first_contract)
+
+        token_states = torch.arange(8 * 2, dtype=torch.float32).view(8, 2)
+        selected = _welm_select_kv_mirror_rows(
+            token_states, forward_batch, first_contract=first_contract
+        )
+        self.assertEqual(tuple(selected.shape), (0, 2))
+
+        scattered = _welm_scatter_kv_mirror_rows(selected, forward_batch)
+        self.assertEqual(tuple(scattered.shape), (2, 2))
+        torch.testing.assert_close(scattered, torch.zeros(2, 2))
+
+    def test_uses_scheduler_supplied_final_q_indices(self):
+        forward_batch = SimpleNamespace(
+            extend_seq_lens=torch.tensor([4, 4, 4], dtype=torch.int32),
+            welm_kv_mirror_last_q_indices=torch.tensor([7], dtype=torch.long),
+            welm_kv_mirror_active_batch_indices=torch.tensor([1], dtype=torch.long),
+            welm_kv_mirror_output_size=3,
+        )
+
+        first_contract = _welm_init_kv_mirror_last_q_indices(forward_batch)
+        self.assertTrue(first_contract)
+        self.assertEqual(forward_batch.custom_last_index.tolist(), [7])
+
+        token_states = torch.arange(12 * 2, dtype=torch.float32).view(12, 2)
+        selected = _welm_select_kv_mirror_rows(
+            token_states, forward_batch, first_contract=first_contract
+        )
+        torch.testing.assert_close(selected, token_states[[7]])
+
+        scattered = _welm_scatter_kv_mirror_rows(selected, forward_batch)
+        self.assertEqual(tuple(scattered.shape), (3, 2))
+        torch.testing.assert_close(scattered[1], token_states[7])
+        torch.testing.assert_close(scattered[0], torch.zeros(2))
+        torch.testing.assert_close(scattered[2], torch.zeros(2))
+
+        next_contract = _welm_init_kv_mirror_last_q_indices(forward_batch)
+        self.assertFalse(next_contract)
+        selected_again = _welm_select_kv_mirror_rows(
+            scattered, forward_batch, first_contract=next_contract
+        )
+        torch.testing.assert_close(selected_again, token_states[[7]])
 
 num_tokens_list = [127]
 
@@ -549,6 +607,25 @@ class TestWelmV4InplaceRotaryEmbedding(CustomTestCase):
         torch.testing.assert_close(
             q_fused_heads[bs:], q_orig_heads[bs:], atol=0, rtol=0
         )
+
+    def test_empty_query_with_last_index(self):
+        ref, fused = self._make_ref_and_fused()
+        num_tokens = 64
+        positions = torch.randint(
+            0, 4096, (num_tokens,), device=DEVICE, dtype=torch.int64
+        )
+        q = torch.empty(0, NUM_Q_HEADS * HEAD_DIM, device=DEVICE, dtype=DTYPE)
+        k = torch.randn(num_tokens, NUM_K_HEADS * HEAD_DIM, device=DEVICE, dtype=DTYPE)
+        last_index = torch.empty(0, device=DEVICE, dtype=torch.int64)
+
+        k_ref = self._ref_rope_on_tail(ref, positions, k.clone(), NUM_K_HEADS)
+        q_fused = q.clone()
+        k_fused = k.clone()
+
+        fused.forward_cuda(positions, q_fused, k_fused, last_index=last_index)
+
+        self.assertEqual(tuple(q_fused.shape), (0, NUM_Q_HEADS * HEAD_DIM))
+        torch.testing.assert_close(k_fused, k_ref, atol=ATOL, rtol=RTOL)
 
 
 if __name__ == "__main__":

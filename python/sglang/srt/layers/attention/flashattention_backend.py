@@ -697,8 +697,13 @@ class FlashAttentionBackend(AttentionBackend):
                 forward_batch.req_pool_indices, : metadata.max_seq_len_k
             ]
             if forward_batch.enable_welm_kv_mirror_opt:
+                mirror_num_queries = batch_size
+                if forward_batch.welm_kv_mirror_last_q_indices is not None:
+                    mirror_num_queries = (
+                        forward_batch.welm_kv_mirror_last_q_indices.numel()
+                    )
                 metadata.mirror_cu_seqlens_q = torch.arange(
-                    0, batch_size + 1, dtype=torch.int32, device=device
+                    0, mirror_num_queries + 1, dtype=torch.int32, device=device
                 )
 
             if (
@@ -911,6 +916,18 @@ class FlashAttentionBackend(AttentionBackend):
             cache_seqlens = metadata.cache_seqlens_int32
             max_seqlen_q = metadata.mirror_max_seq_len_q
             cu_seqlens_k = metadata.cu_seqlens_k
+            active_indices = getattr(
+                forward_batch, "kv_mirror_active_batch_indices", None
+            )
+            if (
+                active_indices is not None
+                and active_indices.numel() != metadata.page_table.shape[0]
+            ):
+                page_table = page_table[active_indices]
+                cache_seqlens = cache_seqlens[active_indices]
+                cu_seqlens_k = torch.nn.functional.pad(
+                    torch.cumsum(cache_seqlens, dim=0, dtype=torch.int32), (1, 0)
+                )
         else:
             page_table = metadata.page_table
             cu_seqlens_q = metadata.cu_seqlens_q

@@ -334,6 +334,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     extend_seq_lens_cpu: Optional[List[int]] = None
     extend_logprob_start_lens_cpu: Optional[List[int]] = None
     extend_input_logprob_token_ids_gpu: Optional[torch.Tensor] = None
+    welm_kv_mirror_last_q_indices: Optional[torch.Tensor] = None
+    welm_kv_mirror_active_batch_indices: Optional[torch.Tensor] = None
+    welm_kv_mirror_output_size: Optional[int] = None
 
     # For MoE router replay
     router_replay_topk_ids: Optional[torch.Tensor] = None
@@ -592,6 +595,18 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             ret.extend_prefix_lens_cpu = batch.extend_prefix_lens
             ret.extend_seq_lens_cpu = batch.extend_seq_lens
             ret.extend_logprob_start_lens_cpu = batch.extend_logprob_start_lens
+            if batch.welm_kv_mirror_last_q_indices is not None:
+                ret.welm_kv_mirror_last_q_indices = torch.tensor(
+                    batch.welm_kv_mirror_last_q_indices,
+                    dtype=torch.long,
+                    device=device,
+                )
+                ret.welm_kv_mirror_active_batch_indices = torch.tensor(
+                    batch.welm_kv_mirror_active_batch_indices,
+                    dtype=torch.long,
+                    device=device,
+                )
+                ret.welm_kv_mirror_output_size = batch.welm_kv_mirror_output_size
 
         if model_runner.use_ngram_embedding:
             ret._init_ngram_embedding_info(batch, model_runner, device)

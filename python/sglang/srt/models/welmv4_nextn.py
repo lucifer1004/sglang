@@ -23,6 +23,8 @@ from sglang.srt.models.welmv4 import (
     WelmV4FusedRMSNorm,
     WeLMV4MoeForCausalLM,
     _get_welm_kv_mirror_states,
+    _welm_init_kv_mirror_last_q_indices,
+    _welm_select_kv_mirror_rows,
 )
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix, is_cuda, is_npu
@@ -188,11 +190,13 @@ class WeLMV4ModelNextN(nn.Module):
                 main_hidden_states is not None
                 and hidden_states.shape[0] != main_hidden_states.shape[0]
             ):
-                if not hasattr(forward_batch, "custom_last_index"):
-                    forward_batch.custom_last_index = (
-                        torch.cumsum(forward_batch.extend_seq_lens, dim=0) - 1
-                    )
-                hidden_states = hidden_states[forward_batch.custom_last_index]
+                _welm_init_kv_mirror_last_q_indices(forward_batch)
+                first_contract = (
+                    hidden_states.shape[0] != forward_batch.kv_mirror_output_size
+                )
+                hidden_states = _welm_select_kv_mirror_rows(
+                    hidden_states, forward_batch, first_contract=first_contract
+                )
 
         if hidden_states.shape[0] > 0:
             enorm_output = self.enorm(hidden_states)

@@ -795,8 +795,10 @@ class WelmV4InplaceRotaryEmbedding(RotaryEmbedding):
         fused_set_kv_buffer_arg: Optional[FusedSetKVBufferArg] = None,
         last_index: Optional[torch.Tensor] = None,
     ):
-        query = query.view(query.shape[0], -1, self.head_size)
-        key = key.view(key.shape[0], -1, self.head_size)
+        query_num_heads = query.shape[-1] // self.head_size
+        key_num_heads = key.shape[-1] // self.head_size
+        query = query.view(query.shape[0], query_num_heads, self.head_size)
+        key = key.view(key.shape[0], key_num_heads, self.head_size)
         N = positions.shape[0]
         num_sms = min(N, self.num_sms)
         num_stages = 4

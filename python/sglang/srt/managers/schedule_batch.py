@@ -2797,10 +2797,18 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         scale = self._get_scale_seq_factor()
         if self.forward_mode.is_decode_or_idle() and scale <= 1:
             extend_seq_lens = extend_prefix_lens = extend_logprob_start_lens = None
+            welm_kv_mirror_last_q_indices = None
+            welm_kv_mirror_active_batch_indices = None
+            welm_kv_mirror_output_size = None
         else:
             extend_seq_lens = self.extend_lens
             extend_prefix_lens = self.prefix_lens
             extend_logprob_start_lens = self.extend_logprob_start_lens
+            (
+                welm_kv_mirror_last_q_indices,
+                welm_kv_mirror_active_batch_indices,
+                welm_kv_mirror_output_size,
+            ) = self._get_welm_kv_mirror_last_q_indices()
 
         if self.sampling_info:
             if self.has_grammar:
@@ -2835,6 +2843,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             extend_seq_lens=extend_seq_lens,
             extend_prefix_lens=extend_prefix_lens,
             extend_logprob_start_lens=extend_logprob_start_lens,
+            welm_kv_mirror_last_q_indices=welm_kv_mirror_last_q_indices,
+            welm_kv_mirror_active_batch_indices=welm_kv_mirror_active_batch_indices,
+            welm_kv_mirror_output_size=welm_kv_mirror_output_size,
             router_replay_topk_ids=self.router_replay_topk_ids,
             router_replay_mask=self.router_replay_mask,
             multimodal_inputs=self.multimodal_inputs,
@@ -2880,6 +2891,29 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             oe_context=self.oe_context,
             scale_seq_factor=scale,
         )
+
+    def _get_welm_kv_mirror_last_q_indices(
+        self,
+    ) -> Tuple[Optional[List[int]], Optional[List[int]], Optional[int]]:
+        if not self.extend_lens:
+            return None, None, None
+
+        last_q_indices: List[int] = []
+        active_batch_indices: List[int] = []
+        offset = 0
+        for batch_idx, (req, extend_len) in enumerate(zip(self.reqs, self.extend_lens)):
+            # In overlap scheduling, output_ids can already contain the unresolved
+            # future token for this forward. That token is not part of fill_ids yet,
+            # so compare against the sequence length before the future slot.
+            committed_seq_len = len(req.origin_input_ids) + max(
+                len(req.output_ids) - 1, 0
+            )
+            if extend_len > 0 and len(req.fill_ids) >= committed_seq_len:
+                last_q_indices.append(offset + extend_len - 1)
+                active_batch_indices.append(batch_idx)
+            offset += extend_len
+
+        return last_q_indices, active_batch_indices, len(self.reqs)
 
     def copy(self):
         # Only contain fields that will be used by process_batch_result
@@ -3015,6 +3049,9 @@ class ModelWorkerBatch:
     extend_seq_lens: Optional[List[int]]
     extend_prefix_lens: Optional[List[int]]
     extend_logprob_start_lens: Optional[List[int]]
+    welm_kv_mirror_last_q_indices: Optional[List[int]]
+    welm_kv_mirror_active_batch_indices: Optional[List[int]]
+    welm_kv_mirror_output_size: Optional[int]
     extend_input_logprob_token_ids: Optional[torch.Tensor]
     router_replay_topk_ids: Optional[torch.Tensor]
     router_replay_mask: Optional[torch.Tensor]

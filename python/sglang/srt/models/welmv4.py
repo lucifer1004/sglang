@@ -298,6 +298,81 @@ def _welm_should_contract_kv_mirror(forward_batch: ForwardBatch) -> bool:
     )
 
 
+def _welm_init_kv_mirror_last_q_indices(forward_batch: ForwardBatch) -> bool:
+    if hasattr(forward_batch, "custom_last_index"):
+        return False
+
+    last_q_indices = getattr(forward_batch, "welm_kv_mirror_last_q_indices", None)
+    if last_q_indices is None:
+        last_q_indices = torch.cumsum(forward_batch.extend_seq_lens, dim=0) - 1
+        active_batch_indices = torch.arange(
+            last_q_indices.numel(),
+            dtype=torch.long,
+            device=last_q_indices.device,
+        )
+        output_size = int(last_q_indices.numel())
+    else:
+        active_batch_indices = forward_batch.welm_kv_mirror_active_batch_indices
+        output_size = forward_batch.welm_kv_mirror_output_size
+
+    forward_batch.custom_last_index = last_q_indices
+    forward_batch.kv_mirror_active_batch_indices = active_batch_indices
+    forward_batch.kv_mirror_output_size = output_size
+    return True
+
+
+def _welm_select_kv_mirror_rows(
+    tensor: torch.Tensor, forward_batch: ForwardBatch, *, first_contract: bool
+) -> torch.Tensor:
+    if first_contract:
+        return tensor[forward_batch.custom_last_index]
+    return tensor[forward_batch.kv_mirror_active_batch_indices]
+
+
+def _welm_scatter_kv_mirror_rows(
+    tensor: torch.Tensor, forward_batch: ForwardBatch
+) -> torch.Tensor:
+    output_size = getattr(forward_batch, "kv_mirror_output_size", None)
+    active_indices = getattr(forward_batch, "kv_mirror_active_batch_indices", None)
+    if (
+        output_size is None
+        or active_indices is None
+        or active_indices.numel() == output_size
+    ):
+        return tensor
+
+    output = tensor.new_zeros((output_size, *tensor.shape[1:]))
+    if active_indices.numel() > 0:
+        output[active_indices] = tensor
+    return output
+
+
+def _welm_kv_mirror_has_no_active_q(forward_batch: ForwardBatch) -> bool:
+    active_indices = getattr(forward_batch, "kv_mirror_active_batch_indices", None)
+    return active_indices is not None and active_indices.numel() == 0
+
+
+def _welm_prepare_kv_mirror_logits_states(
+    hidden_states: torch.Tensor,
+    aux_hidden_states: Optional[List[torch.Tensor]],
+    forward_batch: ForwardBatch,
+) -> Tuple[torch.Tensor, Optional[List[torch.Tensor]]]:
+    if not _welm_kv_mirror_has_no_active_q(forward_batch):
+        return hidden_states, aux_hidden_states
+
+    output_size = getattr(forward_batch, "kv_mirror_output_size", None)
+    if output_size is None or hidden_states.shape[0] == output_size:
+        return hidden_states, aux_hidden_states
+
+    hidden_states = hidden_states.new_zeros((output_size, hidden_states.shape[-1]))
+    if aux_hidden_states is not None:
+        aux_hidden_states = [
+            hidden.new_zeros((output_size, hidden.shape[-1]))
+            for hidden in aux_hidden_states
+        ]
+    return hidden_states, aux_hidden_states
+
+
 def _get_kv_mirror_pair_maps(
     kv_mirror_layers: List[int],
     kv_mirror_imitated_layers: List[int],
@@ -536,14 +611,14 @@ class MirrorQProjection(BaseWelmQkvProjection):
         kv_mirror_states: Dict[int, Tuple[torch.Tensor, torch.Tensor]],
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         project_hidden_states = hidden_states
-        if (
-            _welm_should_contract_kv_mirror(forward_batch)
-            and not hasattr(forward_batch, "custom_last_index")
-        ):
-            forward_batch.custom_last_index = (
-                torch.cumsum(forward_batch.extend_seq_lens, dim=0) - 1
+        if _welm_should_contract_kv_mirror(forward_batch):
+            _welm_init_kv_mirror_last_q_indices(forward_batch)
+            first_contract = (
+                hidden_states.shape[0] != forward_batch.kv_mirror_output_size
             )
-            project_hidden_states = hidden_states[forward_batch.custom_last_index]
+            project_hidden_states = _welm_select_kv_mirror_rows(
+                hidden_states, forward_batch, first_contract=first_contract
+            )
 
         kv_activation = kv_mirror_states.pop(self.imitated_layer_idx, None)
         if kv_activation is None:
@@ -576,13 +651,14 @@ class NextnMirrorQProjection(BaseWelmQkvProjection):
             return q, k, v, hidden_states
 
         project_hidden_states = hidden_states
-        if _welm_should_contract_kv_mirror(forward_batch) and not hasattr(
-            forward_batch, "custom_last_index"
-        ):
-            forward_batch.custom_last_index = (
-                torch.cumsum(forward_batch.extend_seq_lens, dim=0) - 1
+        if _welm_should_contract_kv_mirror(forward_batch):
+            _welm_init_kv_mirror_last_q_indices(forward_batch)
+            first_contract = (
+                hidden_states.shape[0] != forward_batch.kv_mirror_output_size
             )
-            project_hidden_states = hidden_states[forward_batch.custom_last_index]
+            project_hidden_states = _welm_select_kv_mirror_rows(
+                hidden_states, forward_batch, first_contract=first_contract
+            )
 
         kv_activation = kv_mirror_states.pop(self.imitated_layer_idx, None)
         if kv_activation is None:
@@ -1433,7 +1509,10 @@ class Qwen2MoeAttention(nn.Module):
         attn_kwargs = {}
         if self.attn_sink is not None:
             attn_kwargs["sinks"] = self.attn_sink
-        attn_output = self.attn(q, k, v, forward_batch, **attn_kwargs)
+        if q.shape[0] == 0:
+            attn_output = q.new_empty((0, self.num_heads * self.head_dim))
+        else:
+            attn_output = self.attn(q, k, v, forward_batch, **attn_kwargs)
         if dump_this_layer:
             _welm_dump_tensor(f"{dump_prefix}.attn_output", attn_output)
         if self.gated_self_attention_headwise:
@@ -1452,6 +1531,11 @@ class Qwen2MoeAttention(nn.Module):
                 _welm_dump_tensor(f"{dump_prefix}.gated_attn_output", attn_output)
 
         output, _ = self.o_proj(attn_output)
+        if (
+            _welm_should_contract_kv_mirror(forward_batch)
+            and self.kv_mirror_layer_idx in self.kv_mirror_layers
+        ):
+            output = _welm_scatter_kv_mirror_rows(output, forward_batch)
         if dump_this_layer:
             _welm_dump_tensor(
                 f"model.layers.{self.layer_idx}.attn.mixer.o_proj_out", output
@@ -1677,7 +1761,11 @@ class Qwen2MoeDecoderLayer(nn.Module):
             _welm_should_contract_kv_mirror(forward_batch)
             and self.layer_id == self.kv_mirror_layers[-1]
         ):
-            residual = residual[forward_batch.custom_last_index]
+            first_contract = residual.shape[0] != forward_batch.kv_mirror_output_size
+            residual = _welm_select_kv_mirror_rows(
+                residual, forward_batch, first_contract=first_contract
+            )
+            residual = _welm_scatter_kv_mirror_rows(residual, forward_batch)
             if is_dp_attention_enabled():
                 from sglang.srt.layers.dp_attention import (
                     get_attention_dp_rank,
@@ -2116,6 +2204,15 @@ class Qwen2MoeModel(nn.Module):
                     )
                 with get_global_expert_distribution_recorder().with_current_layer(i):
                     layer = self.layers[i]
+                    if (
+                        _welm_should_contract_kv_mirror(forward_batch)
+                        and i in layer.kv_mirror_layers
+                    ):
+                        if i == layer.kv_mirror_layers[-1]:
+                            _welm_init_kv_mirror_last_q_indices(forward_batch)
+                        if _welm_kv_mirror_has_no_active_q(forward_batch):
+                            kv_mirror_states = _empty_welm_kv_mirror_states()
+                            continue
                     hidden_states, residual, kv_mirror_states = layer(
                         positions,
                         hidden_states,
@@ -2281,6 +2378,14 @@ class WeLMV4MoeForCausalLM(nn.Module):
                     forward_batch.extend_num_tokens = (
                         forward_batch.extend_num_tokens // scale
                     )
+
+            if (
+                forward_batch.enable_welm_kv_mirror_opt
+                and forward_batch.forward_mode.is_extend_without_speculative()
+            ):
+                hidden_states, aux_hidden_states = _welm_prepare_kv_mirror_logits_states(
+                    hidden_states, aux_hidden_states, forward_batch
+                )
 
             logits_output = self.logits_processor(
                 input_ids, hidden_states, self.lm_head, forward_batch, aux_hidden_states
