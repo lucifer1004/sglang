@@ -201,6 +201,50 @@ def test_scheduler_forced_decode_tokens_override_after_sampling():
     assert token_id == 3
 
 
+def test_scheduler_forced_decode_tokens_patch_batch_output_ids_tensor():
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    req0 = types.SimpleNamespace(output_ids=[], forced_decode_token_ids=[7, 8])
+    req1 = types.SimpleNamespace(output_ids=[3], forced_decode_token_ids=[9, 10])
+    scheduler = types.SimpleNamespace(enable_overlap=False)
+    batch = types.SimpleNamespace(
+        output_ids=torch.tensor([99, 88, 77], dtype=torch.int64, device=device)
+    )
+
+    updates = [
+        (0, req0, SchedulerOutputProcessorMixin.get_forced_decode_token_id(None, req0)),
+        (1, req1, SchedulerOutputProcessorMixin.get_forced_decode_token_id(None, req1)),
+    ]
+    SchedulerOutputProcessorMixin.maybe_patch_batch_output_ids_with_forced_tokens(
+        scheduler, batch, updates
+    )
+
+    assert batch.output_ids.tolist() == [7, 10, 77]
+
+
+def test_scheduler_forced_decode_tokens_patch_overlap_future_map():
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    req0 = types.SimpleNamespace(output_ids=[], forced_decode_token_ids=[7])
+    req1 = types.SimpleNamespace(output_ids=[3], forced_decode_token_ids=[9, 10])
+    future_map = types.SimpleNamespace(
+        token_ids_buf=torch.full((8,), -1, dtype=torch.int64, device=device)
+    )
+    scheduler = types.SimpleNamespace(enable_overlap=True, future_map=future_map)
+    batch = types.SimpleNamespace(
+        output_ids=torch.tensor([-2, -5, -6], dtype=torch.int64, device=device)
+    )
+
+    updates = [
+        (0, req0, SchedulerOutputProcessorMixin.get_forced_decode_token_id(None, req0)),
+        (1, req1, SchedulerOutputProcessorMixin.get_forced_decode_token_id(None, req1)),
+    ]
+    SchedulerOutputProcessorMixin.maybe_patch_batch_output_ids_with_forced_tokens(
+        scheduler, batch, updates
+    )
+
+    assert batch.output_ids.tolist() == [-2, -5, -6]
+    assert future_map.token_ids_buf[[2, 5]].tolist() == [7, 10]
+
+
 def test_tokenizer_rejects_router_replay_without_server_flag():
     trace = make_trace(num_tokens=2).tolist()
     req = GenerateReqInput(

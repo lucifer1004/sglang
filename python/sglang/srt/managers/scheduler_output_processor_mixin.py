@@ -130,16 +130,65 @@ class SchedulerOutputProcessorMixin:
                     elem = elem.copy()
                 req.customized_info[k].append(elem)
 
-    def maybe_apply_forced_decode_token(self: Scheduler, req: Req, next_token_id):
+    def get_forced_decode_token_id(self: Scheduler, req: Req):
         forced_decode_token_ids = getattr(req, "forced_decode_token_ids", None)
         if forced_decode_token_ids is None:
-            return next_token_id
-        if isinstance(next_token_id, list):
-            return next_token_id
+            return None
         output_pos = len(req.output_ids)
         if output_pos >= len(forced_decode_token_ids):
-            return next_token_id
+            return None
         return int(forced_decode_token_ids[output_pos])
+
+    def maybe_apply_forced_decode_token(self: Scheduler, req: Req, next_token_id):
+        if isinstance(next_token_id, list):
+            return next_token_id
+        forced_token_id = SchedulerOutputProcessorMixin.get_forced_decode_token_id(
+            self, req
+        )
+        return next_token_id if forced_token_id is None else forced_token_id
+
+    def maybe_patch_batch_output_ids_with_forced_tokens(
+        self: Scheduler,
+        batch: ScheduleBatch,
+        forced_decode_updates: List[Tuple[int, Req, int]],
+    ):
+        if not forced_decode_updates:
+            return
+        if batch.output_ids is None or not isinstance(batch.output_ids, torch.Tensor):
+            return
+
+        device = batch.output_ids.device
+        indices = [index for index, _, _ in forced_decode_updates]
+        forced_values = torch.tensor(
+            [token_id for _, _, token_id in forced_decode_updates],
+            dtype=torch.int64,
+            device=device,
+        )
+        covers_entire_batch = len(indices) == batch.output_ids.shape[0] and all(
+            index == i for i, index in enumerate(indices)
+        )
+        if getattr(self, "enable_overlap", False):
+            future_map = getattr(self, "future_map", None)
+            if future_map is not None:
+                # In overlap scheduling, batch.output_ids holds negative future
+                # indices. The next forward resolves those indices through
+                # future_map.token_ids_buf, so patch the future map in-place.
+                if covers_entire_batch:
+                    future_indices = -batch.output_ids
+                else:
+                    forced_indices = torch.tensor(
+                        indices, dtype=torch.int64, device=device
+                    )
+                    future_indices = -batch.output_ids.index_select(0, forced_indices)
+                future_map.token_ids_buf.index_copy_(0, future_indices, forced_values)
+                return
+
+        if covers_entire_batch:
+            batch.output_ids.copy_(forced_values)
+            return
+
+        forced_indices = torch.tensor(indices, dtype=torch.int64, device=device)
+        batch.output_ids.index_copy_(0, forced_indices, forced_values)
 
     def process_batch_result_prefill(
         self: Scheduler,
@@ -196,6 +245,7 @@ class SchedulerOutputProcessorMixin:
             # Check finish conditions
             logprob_pt = 0
 
+            forced_decode_updates = []
             for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
                 if req.finished() or req.is_retracted:
                     # decode req in mixed batch or retracted req
@@ -203,9 +253,10 @@ class SchedulerOutputProcessorMixin:
 
                 if req.is_chunked <= 0:
                     req.time_stats.set_prefill_finished_time()
-                    next_token_id = self.maybe_apply_forced_decode_token(
-                        req, next_token_id
-                    )
+                    forced_token_id = self.get_forced_decode_token_id(req)
+                    if forced_token_id is not None:
+                        next_token_id = forced_token_id
+                        forced_decode_updates.append((i, req, forced_token_id))
                     next_token_ids[i] = next_token_id
 
                     # req output_ids are set here
@@ -304,6 +355,10 @@ class SchedulerOutputProcessorMixin:
                             logprob_pt += num_input_logprobs
 
                     req.time_stats.set_last_chunked_prefill_finish_time()
+
+            self.maybe_patch_batch_output_ids_with_forced_tokens(
+                batch, forced_decode_updates
+            )
 
         else:  # embedding or reward model
             if result.copy_done is not None:
@@ -467,6 +522,7 @@ class SchedulerOutputProcessorMixin:
         # in the verify phase. Non-spec and V2 handle them here in post-processing.
         is_spec_v1 = not batch.spec_algorithm.is_none() and not batch.is_spec_v2
 
+        forced_decode_updates = []
         for i, req in enumerate(batch.reqs):
             req: Req
 
@@ -493,9 +549,10 @@ class SchedulerOutputProcessorMixin:
             next_token_id = next_token_ids[i]
             new_accepted_len = 1
             if batch.spec_algorithm.is_none():
-                next_token_id = self.maybe_apply_forced_decode_token(
-                    req, next_token_id
-                )
+                forced_token_id = self.get_forced_decode_token_id(req)
+                if forced_token_id is not None:
+                    next_token_id = forced_token_id
+                    forced_decode_updates.append((i, req, forced_token_id))
                 next_token_ids[i] = next_token_id
                 req.output_ids.append(next_token_id)
             else:
@@ -568,6 +625,9 @@ class SchedulerOutputProcessorMixin:
                 req.grammar.finished = req.finished()
 
         self.stream_output(batch.reqs, batch.return_logprob)
+        self.maybe_patch_batch_output_ids_with_forced_tokens(
+            batch, forced_decode_updates
+        )
         self.token_to_kv_pool_allocator.free_group_end()
 
         self.forward_ct_decode = (self.forward_ct_decode + 1) % (1 << 30)

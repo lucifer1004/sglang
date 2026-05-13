@@ -93,9 +93,9 @@ concurrency=64
 decode_tokens=5
 forced-pass-2-cache-hot.cached_token_sum=12491
 unforced-capture-cache-hot.cached_token_sum=12491
-forced_request_throughput_median=195.38124997670874 req/s
-unforced_request_throughput_median=194.23374966573 req/s
-forced_to_unforced_request_throughput_ratio=1.0059078317385808
+forced_request_throughput_median=201.7433743936976 req/s
+unforced_request_throughput_median=198.8548076017352 req/s
+forced_to_unforced_request_throughput_ratio=1.0145260093371622
 ```
 
 This passes the default `0.98` throughput-ratio threshold.
