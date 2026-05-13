@@ -57,6 +57,22 @@ if is_cuda():
 logger = logging.getLogger(__name__)
 
 
+def _update_ngram_buffer_after_decode(
+    input_ids: torch.Tensor,
+    input_ids_buffer: torch.Tensor,
+    extend_lens: List[int],
+    buffer_size: int,
+) -> None:
+    pt = 0
+    for bid, extend_len in enumerate(extend_lens):
+        if extend_len == 0:
+            continue
+        segment = input_ids[pt : pt + extend_len]
+        buffer = input_ids_buffer[bid * buffer_size : (bid + 1) * buffer_size]
+        buffer.copy_(torch.cat((buffer, segment))[-buffer_size:])
+        pt += extend_len
+
+
 @dataclass
 class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
     draft_token: torch.Tensor
@@ -645,6 +661,7 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
     seq_lens_for_draft_extend: torch.Tensor = None
     seq_lens_for_draft_extend_cpu: torch.Tensor = None
     req_pool_indices_for_draft_extend: torch.Tensor = None
+    mirrored_kv_indices: torch.Tensor = None
 
     # Inputs for V2 overlap worker
     future_indices: Optional[FutureIndices] = None
@@ -727,6 +744,24 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
         batch.input_ids = self.verified_id
         batch.extend_lens = [x + 1 for x in batch.spec_info.accept_length_cpu]
         batch.extend_num_tokens = sum(batch.extend_lens)
+        if self.mirrored_kv_indices is not None:
+            if self.mirrored_kv_indices.numel() == batch.extend_num_tokens:
+                pass
+            elif batch.extend_num_tokens == len(batch.extend_lens):
+                accepted_counts = self.accept_length.to(torch.long) + 1
+                last_accepted_offsets = torch.cumsum(accepted_counts, dim=0) - 1
+                self.mirrored_kv_indices = self.mirrored_kv_indices[
+                    last_accepted_offsets
+                ]
+            elif self.mirrored_kv_indices.numel() > batch.extend_num_tokens:
+                self.mirrored_kv_indices = self.mirrored_kv_indices[
+                    -batch.extend_num_tokens :
+                ]
+            else:
+                raise ValueError(
+                    "mirrored_kv_indices is shorter than draft extend tokens: "
+                    f"{self.mirrored_kv_indices.numel()} < {batch.extend_num_tokens}"
+                )
         batch.seq_lens = batch.spec_info.seq_lens_for_draft_extend
         batch.seq_lens_cpu = batch.spec_info.seq_lens_for_draft_extend_cpu
         batch.req_pool_indices = batch.spec_info.req_pool_indices_for_draft_extend
@@ -756,7 +791,6 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
             for idx in range(num_grams):
                 n = idx + 2
                 n_gram = torch.empty_like(batch.input_ids, dtype=torch.int64)
-                update_buffer = idx == num_grams - 1
                 prc_custom_ops.assign_ngram_input_ids_draft_extend_after_decode(
                     batch.input_ids,
                     buffer,
@@ -764,9 +798,15 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
                     accept_length,
                     n,
                     buffer_size,
-                    update_buffer,
+                    False,
                 )
                 batch.n_gram_input_ids.set_gram(n, n_gram)
+            _update_ngram_buffer_after_decode(
+                batch.input_ids,
+                buffer,
+                batch.extend_lens,
+                buffer_size,
+            )
 
     def generate_attn_arg_prefill(
         self,

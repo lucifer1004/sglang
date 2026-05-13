@@ -457,18 +457,22 @@ class LogitsProcessor(nn.Module):
                 input_ids, hidden_states, lm_head, logits_metadata, multi_item_delimiter
             )
 
+        kv_mirror_pruned = logits_metadata.enable_kv_mirror and (
+            logits_metadata.forward_mode.is_extend_without_speculative()
+            or logits_metadata.scale_seq_factor > 1
+            or (
+                logits_metadata.forward_mode.is_draft_extend()
+                and logits_metadata.extend_seq_lens is not None
+                and hidden_states.shape[0] == logits_metadata.extend_seq_lens.numel()
+            )
+        )
+
         # Get the last hidden states and last logits for the next token prediction
         if (
             logits_metadata.forward_mode.is_decode_or_idle()
             or logits_metadata.forward_mode.is_target_verify()
             or logits_metadata.forward_mode.is_draft_extend_v2()
-            or (
-                logits_metadata.enable_kv_mirror
-                and (
-                    logits_metadata.forward_mode.is_extend_without_speculative()
-                    or logits_metadata.scale_seq_factor > 1
-                )
-            )
+            or kv_mirror_pruned
         ):
             pruned_states = hidden_states
             if aux_hidden_states is not None:
@@ -610,10 +614,7 @@ class LogitsProcessor(nn.Module):
         # When KV mirror is active in extend mode, hidden_states have already
         # been subsampled to the last token per request. There are no
         # intermediate-token logits available for input logprobs.
-        kv_mirror_extend = logits_metadata.enable_kv_mirror and (
-            logits_metadata.forward_mode.is_extend_without_speculative()
-            or logits_metadata.scale_seq_factor > 1
-        )
+        kv_mirror_extend = kv_mirror_pruned
 
         if not logits_metadata.extend_return_logprob or kv_mirror_extend:
             # Compute logits for both input and sampled tokens.

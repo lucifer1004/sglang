@@ -1033,6 +1033,13 @@ class Qwen2MoeAttention(nn.Module):
     ) -> torch.Tensor:
         dump_this_layer = _welm_should_dump_layer(self.layer_idx)
         dump_prefix = f"model.layers.{self.layer_idx}.self_attn"
+        is_kv_mirror_consumer_layer = (
+            self.kv_mirror_layer_idx in self.kv_mirror_layers
+        )
+        is_mtp_mirror_layer = (
+            self.kv_mirror_layer_idx in LayerManager.num_nextn_predict_layer_idx
+        )
+        use_mirrored_kv_last_index = False
         if self.kv_mirror_layer_idx in self.kv_mirror_imitated_layers:
             if hasattr(self, "qkv_proj_weight"):
                 qkv = F.linear(hidden_states, self.qkv_proj_weight, self.qkv_proj_bias)
@@ -1052,30 +1059,34 @@ class Qwen2MoeAttention(nn.Module):
             else:
                 qkv, _ = self.qkv_proj(hidden_states)
                 q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        elif self.kv_mirror_layer_idx in self.kv_mirror_layers:
-            if (
-                self.kv_mirror_layer_idx in LayerManager.num_nextn_predict_layer_idx
-                and not forward_batch.forward_mode.is_extend_without_speculative()
-            ):
-                qkv, _ = self.qkv_proj(hidden_states)
-                q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-            else:
-                mirror_layer_number = self.kv_mirror_imitated_layers[
-                    self.kv_mirror_layers.index(self.kv_mirror_layer_idx)
-                ]
-                if (
-                    forward_batch.enable_kv_mirror
-                    and forward_batch.forward_mode.is_extend_without_speculative()
-                    and not hasattr(forward_batch, "custom_last_index")
-                ):
+        elif is_kv_mirror_consumer_layer:
+            mirror_layer_number = self.kv_mirror_imitated_layers[
+                self.kv_mirror_layers.index(self.kv_mirror_layer_idx)
+            ]
+            use_mirrored_kv_last_index = forward_batch.enable_kv_mirror and (
+                forward_batch.forward_mode.is_extend_without_speculative()
+                or (
+                    is_mtp_mirror_layer
+                    and forward_batch.forward_mode.is_draft_extend()
+                )
+            )
+            if use_mirrored_kv_last_index:
+                if not hasattr(forward_batch, "custom_last_index"):
                     forward_batch.custom_last_index = (
                         torch.cumsum(forward_batch.extend_seq_lens, dim=0) - 1
                     )
+                if hidden_states.shape[0] != forward_batch.custom_last_index.numel():
                     hidden_states = hidden_states[forward_batch.custom_last_index]
-                k, v = KVMirrorManager.get_kv_activation(
-                    mirror_layer_number, clear=self.need_clear_kv_cache
-                )
-                q = F.linear(hidden_states, self.qkv_proj_weight, self.qkv_proj_bias)
+            k, v = KVMirrorManager.get_kv_activation(
+                mirror_layer_number, clear=self.need_clear_kv_cache
+            )
+            mirrored_kv_indices = getattr(
+                forward_batch.spec_info, "mirrored_kv_indices", None
+            )
+            if is_mtp_mirror_layer and mirrored_kv_indices is not None:
+                k = k[mirrored_kv_indices]
+                v = v[mirrored_kv_indices]
+            q = F.linear(hidden_states, self.qkv_proj_weight, self.qkv_proj_bias)
         else:
             qkv, _ = self.qkv_proj(hidden_states)
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
@@ -1111,11 +1122,7 @@ class Qwen2MoeAttention(nn.Module):
 
         qk_nope_head_dim = self.head_dim - self.qk_rope_head_dim
         if qk_nope_head_dim > 0:
-            if (
-                forward_batch.enable_kv_mirror
-                and forward_batch.forward_mode.is_extend_without_speculative()
-                and self.kv_mirror_layer_idx in self.kv_mirror_layers
-            ):
+            if use_mirrored_kv_last_index:
                 self.rotary_emb.forward_cuda(
                     positions, q, k, last_index=forward_batch.custom_last_index
                 )
@@ -1132,7 +1139,9 @@ class Qwen2MoeAttention(nn.Module):
         attn_kwargs = {}
         if self.attn_sink is not None:
             attn_kwargs["sinks"] = self.attn_sink
-        attn_output = self.attn(q, k, v, forward_batch, **attn_kwargs)
+        attn_output = self.attn(
+            q, k, v, forward_batch, save_kv_cache=True, **attn_kwargs
+        )
         if dump_this_layer:
             _welm_dump_tensor(f"{dump_prefix}.attn_output", attn_output)
         if self.gated_self_attention_headwise:

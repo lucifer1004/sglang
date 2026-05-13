@@ -178,24 +178,24 @@ class WeLMV4ModelNextN(nn.Module):
 
         _dump_tensor("model.mtp.0.embedding", hidden_states)
 
-        if (
-            forward_batch.enable_kv_mirror
-            and forward_batch.forward_mode.is_extend_without_speculative()
-        ):
-            main_hidden_states = forward_batch.spec_info.hidden_states
-            if (
-                main_hidden_states is not None
-                and hidden_states.shape[0] != main_hidden_states.shape[0]
-            ):
-                if not hasattr(forward_batch, "custom_last_index"):
-                    forward_batch.custom_last_index = (
-                        torch.cumsum(forward_batch.extend_seq_lens, dim=0) - 1
-                    )
+        main_hidden_states = forward_batch.spec_info.hidden_states
+        use_mirrored_kv_last_index = forward_batch.enable_kv_mirror and (
+            forward_batch.forward_mode.is_extend_without_speculative()
+            or forward_batch.forward_mode.is_draft_extend()
+        )
+        if use_mirrored_kv_last_index and main_hidden_states is not None:
+            if not hasattr(forward_batch, "custom_last_index"):
+                forward_batch.custom_last_index = (
+                    torch.cumsum(forward_batch.extend_seq_lens, dim=0) - 1
+                )
+            if hidden_states.shape[0] != forward_batch.custom_last_index.numel():
                 hidden_states = hidden_states[forward_batch.custom_last_index]
+            if main_hidden_states.shape[0] != forward_batch.custom_last_index.numel():
+                main_hidden_states = main_hidden_states[forward_batch.custom_last_index]
 
         if hidden_states.shape[0] > 0:
             enorm_output = self.enorm(hidden_states)
-            hnorm_output = self.hnorm(forward_batch.spec_info.hidden_states)
+            hnorm_output = self.hnorm(main_hidden_states)
             _dump_tensor("model.mtp.0.enorm", enorm_output)
             _dump_tensor("model.mtp.0.hnorm", hnorm_output)
             hidden_states = self.eh_proj(
