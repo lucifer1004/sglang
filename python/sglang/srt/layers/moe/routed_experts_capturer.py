@@ -799,10 +799,12 @@ def _b64_encode_tensor(tensor: torch.Tensor) -> str:
 def encode_routed_experts_payload(value: Any) -> Any:
     if isinstance(value, torch.Tensor):
         return _b64_encode_tensor(value)
+    if isinstance(value, (list, tuple)):
+        return [encode_routed_experts_payload(item) for item in value]
     if isinstance(value, dict):
         return {
             key: encode_routed_experts_payload(item)
-            if isinstance(item, (dict, torch.Tensor))
+            if isinstance(item, (dict, list, tuple, torch.Tensor))
             else item
             for key, item in value.items()
         }

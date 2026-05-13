@@ -197,6 +197,16 @@ class RedisRoutedExpertsStore(RoutedExpertsStore):
                 **summarize_routed_experts_value(value),
             }
 
+        if isinstance(value, (list, tuple)):
+            summary = summarize_routed_experts_value(value)
+            return {
+                "format": "remote_list",
+                "backend": "redis",
+                "schema_version": 3,
+                "items": [self.put(item) for item in value],
+                "remote_summary": summary,
+            }
+
         if isinstance(value, dict):
             if "values" not in value:
                 raise TypeError(
