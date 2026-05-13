@@ -12,6 +12,7 @@ from sglang.srt.layers.moe.routed_experts_capturer import (
 )
 from sglang.srt.layers.moe.topk import (
     TopKConfig,
+    _apply_router_replay_from_forward_batch,
     apply_router_replay_topk_override,
     fused_topk_torch_native,
 )
@@ -369,6 +370,35 @@ def test_validate_router_replay_experts_rejects_bad_shapes_and_ids(trace, match)
         )
 
 
+def test_validate_router_replay_experts_allows_kv_mirror_masked_layers():
+    trace = make_trace(num_tokens=2, num_layers=3, top_k=2)
+    trace[:, 1, :] = -1
+
+    out = validate_router_replay_experts(
+        trace,
+        num_layers=3,
+        num_experts_per_tok=2,
+        num_logical_routed_experts=10_000_000,
+        rid="req-kv-mirror",
+    )
+
+    assert torch.equal(out, trace)
+
+
+def test_validate_router_replay_experts_rejects_negative_ids_below_mask_value():
+    trace = make_trace(num_tokens=2, num_layers=3, top_k=2)
+    trace[0, 1, 0] = -2
+
+    with pytest.raises(ValueError, match="-1 for masked layers"):
+        validate_router_replay_experts(
+            trace,
+            num_layers=3,
+            num_experts_per_tok=2,
+            num_logical_routed_experts=10_000_000,
+            rid="req-negative",
+        )
+
+
 def test_build_router_replay_extend_batch_uses_logical_offsets():
     trace = make_trace(num_tokens=5)
     req = make_req("prefill", trace, extend_input_len=2)
@@ -593,6 +623,89 @@ def test_topk_override_gathers_sigmoid_weights_without_renormalize():
     expected = router_logits.sigmoid().gather(1, forced_ids.long())
     assert torch.equal(out_ids, forced_ids)
     torch.testing.assert_close(out_weights, expected)
+
+
+def test_router_replay_topk_override_skips_kv_mirror_masked_layer_rows():
+    router_logits = torch.tensor(
+        [[1.0, 4.0, 2.0, 3.0], [5.0, 1.0, 4.0, 0.0]], dtype=torch.float32
+    )
+    hidden_states = torch.ones((2, 4), dtype=torch.float32)
+    topk_config = TopKConfig(top_k=2, renormalize=True, scoring_func="softmax")
+    topk_weights, topk_ids = fused_topk_torch_native(
+        hidden_states, router_logits, topk=2, renormalize=True
+    )
+    replay_topk_ids = torch.tensor(
+        [
+            [[0, 2], [-1, -1]],
+            [[1, 3], [2, 0]],
+        ],
+        dtype=torch.int32,
+    )
+    forward_batch = types.SimpleNamespace(
+        router_replay_topk_ids=replay_topk_ids,
+        router_replay_mask=torch.tensor([True, True]),
+    )
+
+    with set_current_forward_batch(forward_batch):
+        layer0_weights, layer0_ids = _apply_router_replay_from_forward_batch(
+            router_logits=router_logits,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            topk_config=topk_config,
+            layer_id=0,
+        )
+        layer1_weights, layer1_ids = _apply_router_replay_from_forward_batch(
+            router_logits=router_logits,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            topk_config=topk_config,
+            layer_id=1,
+        )
+
+    assert torch.equal(layer0_ids, replay_topk_ids[:, 0, :].to(layer0_ids.dtype))
+    assert torch.equal(layer1_ids[0], topk_ids[0])
+    assert torch.equal(layer1_ids[1], replay_topk_ids[1, 1, :].to(layer1_ids.dtype))
+    torch.testing.assert_close(layer1_weights[0], topk_weights[0])
+
+
+def test_router_replay_topk_override_contracts_prefill_to_kv_mirror_last_q():
+    router_logits = torch.tensor(
+        [[1.0, 4.0, 2.0, 3.0], [5.0, 1.0, 4.0, 0.0]], dtype=torch.float32
+    )
+    hidden_states = torch.ones((2, 4), dtype=torch.float32)
+    topk_config = TopKConfig(top_k=2, renormalize=True, scoring_func="softmax")
+    topk_weights, topk_ids = fused_topk_torch_native(
+        hidden_states, router_logits, topk=2, renormalize=True
+    )
+    replay_topk_ids = torch.tensor(
+        [
+            [[0, 1]],
+            [[1, 2]],
+            [[2, 3]],
+            [[3, 0]],
+            [[0, 2]],
+        ],
+        dtype=torch.int32,
+    )
+    forward_batch = types.SimpleNamespace(
+        router_replay_topk_ids=replay_topk_ids,
+        router_replay_mask=torch.ones((5,), dtype=torch.bool),
+        custom_last_index=torch.tensor([1, 4], dtype=torch.long),
+    )
+
+    with set_current_forward_batch(forward_batch):
+        out_weights, out_ids = _apply_router_replay_from_forward_batch(
+            router_logits=router_logits,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            topk_config=topk_config,
+            layer_id=0,
+        )
+
+    assert torch.equal(out_ids, replay_topk_ids[[1, 4], 0, :].to(out_ids.dtype))
+    expected_scores = router_logits.softmax(dim=-1).gather(1, out_ids.long())
+    expected_scores = expected_scores / expected_scores.sum(dim=-1, keepdim=True)
+    torch.testing.assert_close(out_weights, expected_scores.to(out_weights.dtype))
 
 
 def test_cuda_graph_replay_copy_clears_padding_mask():

@@ -1231,6 +1231,29 @@ def _apply_router_replay_from_forward_batch(
 
     forced_ids = forward_batch.router_replay_topk_ids[:, layer_id, :]
     mask = forward_batch.router_replay_mask
+    if forced_ids.shape[0] != topk_ids.shape[0]:
+        last_q_indices = getattr(forward_batch, "custom_last_index", None)
+        if last_q_indices is None:
+            last_q_indices = getattr(
+                forward_batch, "welm_kv_mirror_last_q_indices", None
+            )
+        if (
+            last_q_indices is None
+            or last_q_indices.shape[0] != topk_ids.shape[0]
+            or (
+                last_q_indices.numel() > 0
+                and int(last_q_indices.max().item()) >= forced_ids.shape[0]
+            )
+        ):
+            raise ValueError(
+                "router replay forced ids cannot be aligned to current TopK rows; "
+                f"forced_ids={tuple(forced_ids.shape)}, "
+                f"topk_ids={tuple(topk_ids.shape)}."
+            )
+        forced_ids = forced_ids[last_q_indices]
+        mask = mask[last_q_indices]
+    mask = mask & forced_ids.ge(0).all(dim=1)
+    forced_ids = torch.where(forced_ids.ge(0), forced_ids, torch.zeros_like(forced_ids))
     return apply_router_replay_topk_override(
         router_logits=router_logits,
         topk_weights=topk_weights,

@@ -169,9 +169,27 @@ def validate_router_replay_experts(
 
     tensor = tensor.to(device="cpu", dtype=torch.int32)
     if tensor.numel() > 0:
-        min_id = int(tensor.min().item())
-        max_id = int(tensor.max().item())
-        if min_id < 0 or max_id >= num_logical_routed_experts:
+        if bool((tensor < -1).any()):
+            min_id = int(tensor.min().item())
+            raise ValueError(
+                f"Invalid routed_experts{req_msg}: expert id out of range "
+                f"[0, {num_logical_routed_experts}) or -1 for masked layers; "
+                f"min={min_id}."
+            )
+        invalid_mask = tensor < 0
+        partially_masked = invalid_mask.any(dim=2) & ~invalid_mask.all(dim=2)
+        if bool(partially_masked.any()):
+            raise ValueError(
+                f"Invalid routed_experts{req_msg}: expert id out of range; "
+                "-1 mask values must cover all experts for a token/layer."
+            )
+        valid_tensor = tensor[tensor >= 0]
+        if valid_tensor.numel() > 0:
+            min_id = int(valid_tensor.min().item())
+            max_id = int(valid_tensor.max().item())
+        else:
+            min_id = max_id = -1
+        if valid_tensor.numel() > 0 and max_id >= num_logical_routed_experts:
             raise ValueError(
                 f"Invalid routed_experts{req_msg}: expert id out of range "
                 f"[0, {num_logical_routed_experts}); min={min_id}, max={max_id}."
