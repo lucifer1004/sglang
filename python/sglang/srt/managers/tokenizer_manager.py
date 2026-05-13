@@ -841,6 +841,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     f"model's context length ({self.context_len} tokens)."
                 )
 
+        if isinstance(obj, GenerateReqInput):
+            TokenizerManager._validate_forced_decode_token_ids(self, obj)
+
         # Validate total tokens (input + max_new_tokens)
         max_new_tokens = obj.sampling_params.get("max_new_tokens")
         if (
@@ -868,18 +871,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 )
                 raise ValueError(error_msg)
 
-        # Validate embedding requests
-        if isinstance(obj, EmbeddingReqInput) and self.is_generation:
-            raise ValueError(
-                "This model does not appear to be an embedding model by default. "
-                "Please add `--is-embedding` when launching the server or try another model."
-            )
-
-        # Validate Matryoshka embeddings
-        if isinstance(obj, EmbeddingReqInput):
-            self._validate_for_matryoshka_dim(obj)
-
-        # Validate custom logit processor
         if isinstance(obj, GenerateReqInput):
             if (
                 obj.return_hidden_states
@@ -905,6 +896,56 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     "The server is not configured to enable custom logit processor. "
                     "Please set `--enable-custom-logit-processor` to enable this feature."
                 )
+
+        # Validate embedding requests
+        if isinstance(obj, EmbeddingReqInput) and self.is_generation:
+            raise ValueError(
+                "This model does not appear to be an embedding model by default. "
+                "Please add `--is-embedding` when launching the server or try another model."
+            )
+
+        # Validate Matryoshka embeddings
+        if isinstance(obj, EmbeddingReqInput):
+            self._validate_for_matryoshka_dim(obj)
+
+    def _validate_forced_decode_token_ids(self, obj: GenerateReqInput) -> None:
+        forced_ids = obj.forced_decode_token_ids
+        if forced_ids is None:
+            return
+        if not isinstance(forced_ids, list) or not forced_ids:
+            raise ValueError("forced_decode_token_ids should be a non-empty list.")
+        if any(isinstance(item, list) for item in forced_ids):
+            raise ValueError(
+                "Single generate requests should provide forced_decode_token_ids "
+                "as a flat list of token ids."
+            )
+        normalized_ids = []
+        for token_id in forced_ids:
+            if not isinstance(token_id, int):
+                raise ValueError(
+                    "forced_decode_token_ids should contain integer token ids."
+                )
+            if token_id < 0 or token_id >= self.model_config.vocab_size:
+                raise ValueError(
+                    "forced_decode_token_ids contains token id "
+                    f"{token_id}, outside valid range [0, {self.model_config.vocab_size})."
+                )
+            normalized_ids.append(int(token_id))
+        obj.forced_decode_token_ids = normalized_ids
+
+        max_new_tokens = obj.sampling_params.get("max_new_tokens")
+        if max_new_tokens is None:
+            obj.sampling_params["max_new_tokens"] = len(normalized_ids)
+        elif int(max_new_tokens) != len(normalized_ids):
+            raise ValueError(
+                "forced_decode_token_ids length must match sampling_params.max_new_tokens "
+                f"when both are provided. Got {len(normalized_ids)} forced ids and "
+                f"max_new_tokens={max_new_tokens}."
+            )
+        if obj.return_logprob:
+            raise ValueError(
+                "forced_decode_token_ids does not support return_logprob yet."
+            )
 
     def _validate_mm_limits(
         self, obj: Union[GenerateReqInput, EmbeddingReqInput]
@@ -1026,6 +1067,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 return_hidden_states=obj.return_hidden_states,
                 return_routed_experts=obj.return_routed_experts,
                 router_replay_experts=obj.routed_experts,
+                forced_decode_token_ids=obj.forced_decode_token_ids,
                 routed_dp_rank=obj.routed_dp_rank,
                 disagg_prefill_dp_rank=obj.disagg_prefill_dp_rank,
                 priority=obj.priority,

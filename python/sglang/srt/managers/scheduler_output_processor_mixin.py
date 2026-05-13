@@ -130,6 +130,17 @@ class SchedulerOutputProcessorMixin:
                     elem = elem.copy()
                 req.customized_info[k].append(elem)
 
+    def maybe_apply_forced_decode_token(self: Scheduler, req: Req, next_token_id):
+        forced_decode_token_ids = getattr(req, "forced_decode_token_ids", None)
+        if forced_decode_token_ids is None:
+            return next_token_id
+        if isinstance(next_token_id, list):
+            return next_token_id
+        output_pos = len(req.output_ids)
+        if output_pos >= len(forced_decode_token_ids):
+            return next_token_id
+        return int(forced_decode_token_ids[output_pos])
+
     def process_batch_result_prefill(
         self: Scheduler,
         batch: ScheduleBatch,
@@ -192,6 +203,10 @@ class SchedulerOutputProcessorMixin:
 
                 if req.is_chunked <= 0:
                     req.time_stats.set_prefill_finished_time()
+                    next_token_id = self.maybe_apply_forced_decode_token(
+                        req, next_token_id
+                    )
+                    next_token_ids[i] = next_token_id
 
                     # req output_ids are set here
                     req.output_ids.append(next_token_id)
@@ -478,6 +493,10 @@ class SchedulerOutputProcessorMixin:
             next_token_id = next_token_ids[i]
             new_accepted_len = 1
             if batch.spec_algorithm.is_none():
+                next_token_id = self.maybe_apply_forced_decode_token(
+                    req, next_token_id
+                )
+                next_token_ids[i] = next_token_id
                 req.output_ids.append(next_token_id)
             else:
                 req.output_ids.extend(next_token_id)

@@ -19,6 +19,9 @@ from sglang.srt.managers.scheduler_dp_attn_mixin import (
     MLPSyncBatchInfo,
     _update_gather_batch,
 )
+from sglang.srt.managers.scheduler_output_processor_mixin import (
+    SchedulerOutputProcessorMixin,
+)
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.model_executor.cuda_graph_runner import (
     DecodeInputBuffers,
@@ -90,6 +93,78 @@ def test_generate_req_input_slices_batch_routed_experts_per_item():
     assert not req.is_single
     assert req[0].routed_experts == traces[0]
     assert req[1].routed_experts == traces[1]
+
+
+def test_generate_req_input_slices_batch_forced_decode_tokens_per_item():
+    forced = [[10, 11, 12], [20, 21, 22]]
+    req = GenerateReqInput(
+        input_ids=[[1, 2], [3, 4]],
+        sampling_params={"max_new_tokens": 3},
+        forced_decode_token_ids=forced,
+    )
+
+    req.normalize_batch_and_arguments()
+
+    assert not req.is_single
+    assert req[0].forced_decode_token_ids == forced[0]
+    assert req[1].forced_decode_token_ids == forced[1]
+
+
+def test_tokenizer_forced_decode_tokens_fill_max_new_tokens():
+    req = GenerateReqInput(
+        input_ids=[1, 2],
+        sampling_params={},
+        forced_decode_token_ids=[10, 11, 12],
+    )
+    tokenizer_manager = types.SimpleNamespace(
+        context_len=16,
+        num_reserved_tokens=0,
+        validate_total_tokens=True,
+        model_config=types.SimpleNamespace(vocab_size=100),
+        server_args=types.SimpleNamespace(
+            allow_auto_truncate=False,
+            enable_return_hidden_states=False,
+            enable_moe_router_replay=False,
+            enable_custom_logit_processor=False,
+        ),
+    )
+
+    TokenizerManager._validate_one_request(tokenizer_manager, req, req.input_ids)
+
+    assert req.sampling_params["max_new_tokens"] == 3
+
+
+def test_tokenizer_forced_decode_tokens_reject_max_new_tokens_mismatch():
+    req = GenerateReqInput(
+        input_ids=[1, 2],
+        sampling_params={"max_new_tokens": 2},
+        forced_decode_token_ids=[10, 11, 12],
+    )
+    tokenizer_manager = types.SimpleNamespace(
+        context_len=16,
+        num_reserved_tokens=0,
+        validate_total_tokens=True,
+        model_config=types.SimpleNamespace(vocab_size=100),
+        server_args=types.SimpleNamespace(
+            allow_auto_truncate=False,
+            enable_return_hidden_states=False,
+            enable_moe_router_replay=False,
+            enable_custom_logit_processor=False,
+        ),
+    )
+
+    with pytest.raises(ValueError, match="length must match"):
+        TokenizerManager._validate_one_request(tokenizer_manager, req, req.input_ids)
+
+
+def test_scheduler_forced_decode_tokens_override_after_sampling():
+    req = types.SimpleNamespace(output_ids=[10, 11], forced_decode_token_ids=[1, 2, 3])
+
+    token_id = SchedulerOutputProcessorMixin.maybe_apply_forced_decode_token(
+        None, req, 99
+    )
+
+    assert token_id == 3
 
 
 def test_tokenizer_rejects_router_replay_without_server_flag():

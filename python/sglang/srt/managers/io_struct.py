@@ -185,6 +185,10 @@ class GenerateReqInput(BaseReq):
     routed_experts: Optional[
         Union[List[List[List[int]]], List[List[List[List[int]]]]]
     ] = None
+    # Force the generated decode token sequence after each forward has run.
+    # Single request: [max_new_tokens]
+    # Batch request: [batch, max_new_tokens]
+    forced_decode_token_ids: Optional[Union[List[int], List[List[int]]]] = None
 
     # The modalities of the image data [image, multi-images, video]
     modalities: Optional[List[str]] = None
@@ -374,6 +378,8 @@ class GenerateReqInput(BaseReq):
                 self.input_embeds = [self.input_embeds]
             if self.routed_experts is not None:
                 self.routed_experts = [self.routed_experts]
+            if self.forced_decode_token_ids is not None:
+                self.forced_decode_token_ids = [self.forced_decode_token_ids]
 
     def _normalize_single_inputs(self):
         """Normalize inputs for a single example."""
@@ -408,6 +414,7 @@ class GenerateReqInput(BaseReq):
         self._normalize_audio_data(num)
         self._normalize_sampling_params(num)
         self._normalize_routed_experts(num)
+        self._normalize_forced_decode_token_ids(num)
         self._normalize_logprob_params(num)
         self._normalize_custom_logit_processor(num)
         self._normalize_bootstrap_params(num)
@@ -532,6 +539,31 @@ class GenerateReqInput(BaseReq):
             )
 
         self.routed_experts = self.routed_experts * self.parallel_sample_num
+
+    def _normalize_forced_decode_token_ids(self, num):
+        """Normalize forced decode token ids for batch processing."""
+        if self.forced_decode_token_ids is None:
+            return
+        if not isinstance(self.forced_decode_token_ids, list):
+            raise ValueError("forced_decode_token_ids should be a list.")
+        if not self.forced_decode_token_ids:
+            raise ValueError("forced_decode_token_ids should not be empty.")
+        if not isinstance(self.forced_decode_token_ids[0], list):
+            raise ValueError(
+                "Batch generate requests must provide forced_decode_token_ids "
+                "as a list of per-request token-id lists."
+            )
+        if len(self.forced_decode_token_ids) != self.batch_size:
+            raise ValueError(
+                "The length of forced_decode_token_ids should be equal to the "
+                "batch size."
+            )
+        if any(item is None or len(item) == 0 for item in self.forced_decode_token_ids):
+            raise ValueError("Each forced_decode_token_ids item should be non-empty.")
+
+        self.forced_decode_token_ids = (
+            self.forced_decode_token_ids * self.parallel_sample_num
+        )
 
     def _normalize_rid(self, num):
         """Normalize request IDs for batch processing."""
@@ -688,6 +720,11 @@ class GenerateReqInput(BaseReq):
             routed_experts=(
                 self.routed_experts[i] if self.routed_experts is not None else None
             ),
+            forced_decode_token_ids=(
+                self.forced_decode_token_ids[i]
+                if self.forced_decode_token_ids is not None
+                else None
+            ),
             modalities=self.modalities[i] if self.modalities else None,
             session_params=self.session_params,
             lora_path=self.lora_path[i] if self.lora_path is not None else None,
@@ -767,6 +804,8 @@ class TokenizedGenerateReqInput(BaseReq):
     routed_experts_start_len: int = 0
     # Replay-specific routed experts, still in structured request-list form.
     router_replay_experts: Optional[Union[List[List[List[int]]], torch.Tensor]] = None
+    # Request-provided decode token ids to use after each forward has executed.
+    forced_decode_token_ids: Optional[List[int]] = None
 
     # The input embeds
     input_embeds: Optional[Union[List[List[List[float]]], List[List[float]]]] = None

@@ -233,6 +233,7 @@ class Session:
             require_reasoning=req.require_reasoning,
             return_hidden_states=req.return_hidden_states,
             return_routed_experts=req.return_routed_experts,
+            forced_decode_token_ids=req.forced_decode_token_ids,
             priority=req.priority,
             routing_key=req.routing_key,
             extra_key=req.extra_key,

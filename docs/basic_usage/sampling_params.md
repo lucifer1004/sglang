@@ -26,6 +26,7 @@ The `/generate` endpoint accepts the following parameters in JSON format. For de
 | custom_logit_processor     | `Optional[Union[List[Optional[str]], str]] = None`                           | Custom logit processor for advanced sampling control. Must be a serialized instance of `CustomLogitProcessor` using its `to_str()` method. For usage see below. |
 | return_hidden_states       | `Union[List[bool], bool] = False`                                            | Whether to return hidden states.                                                                                                                                |
 | return_routed_experts      | `bool = False`                                                               | Whether to return routed experts for MoE models. Requires `--enable-return-routed-experts` server flag. Returns base64-encoded int32 expert IDs as a flattened array with logical shape `[num_tokens, num_layers, top_k]`. |
+| forced_decode_token_ids    | `Optional[Union[List[int], List[List[int]]]] = None`                         | Force the generated decode token IDs after each forward has run. Intended for WeLM v4 80A3 benchmarking on `/generate`; `max_new_tokens` must match the forced sequence length. |
 
 ### Routed Experts Store DSN
 

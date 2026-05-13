@@ -61,7 +61,7 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
 from sglang.srt.managers.embed_types import PositionalEmbeds
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
-from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
+from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, MatchPrefixParams
 from sglang.srt.mem_cache.chunk_cache import SWAChunkCache
 from sglang.srt.mem_cache.common import (
     alloc_for_decode,
@@ -963,6 +963,7 @@ class Req:
         return_hidden_states: bool = False,
         return_routed_experts: bool = False,
         router_replay_experts: Optional[torch.Tensor] = None,
+        forced_decode_token_ids: Optional[List[int]] = None,
         eos_token_ids: Optional[Set[int]] = None,
         bootstrap_host: Optional[str] = None,
         bootstrap_port: Optional[int] = None,
@@ -1044,6 +1045,7 @@ class Req:
         self.return_hidden_states = return_hidden_states
         self.return_routed_experts = return_routed_experts
         self.router_replay_experts = router_replay_experts
+        self.forced_decode_token_ids = forced_decode_token_ids
 
         # extra key for classifying the request (e.g. cache_salt)
         if lora_id is not None:
@@ -1397,12 +1399,11 @@ class Req:
 
         if tree_cache is not None:
             match_result = tree_cache.match_prefix(
-                key=RadixKey(token_ids=token_ids, extra_key=self.extra_key),
-                **(
-                    {"req": self, "cow_mamba": True}
-                    if isinstance(tree_cache, MambaRadixCache)
-                    else {}
-                ),
+                MatchPrefixParams(
+                    key=RadixKey(token_ids=token_ids, extra_key=self.extra_key),
+                    req=self if isinstance(tree_cache, MambaRadixCache) else None,
+                    cow_mamba=isinstance(tree_cache, MambaRadixCache),
+                )
             )
             (
                 self.prefix_indices,
