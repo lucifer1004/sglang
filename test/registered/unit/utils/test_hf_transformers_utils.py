@@ -3,7 +3,7 @@ from tokenizers.decoders import ByteLevel as ByteLevelDecoder
 from tokenizers.models import BPE
 from tokenizers.pre_tokenizers import ByteLevel as ByteLevelPreTokenizer
 
-from sglang.srt.utils import hf_transformers_utils
+from sglang.srt.utils.hf_transformers import tokenizer as hf_tokenizer
 
 
 class FakeFastTokenizer:
@@ -24,7 +24,7 @@ def test_fix_v5_tokenizer_components_restores_bpe_model_from_tokenizer_json(
     assert broken_backend.encode("ab").ids == [0, 1]
 
     tokenizer = FakeFastTokenizer(broken_backend)
-    hf_transformers_utils._fix_v5_tokenizer_components(tokenizer, str(tmp_path))
+    hf_tokenizer._fix_v5_tokenizer_components(tokenizer, str(tmp_path))
 
     assert tokenizer._tokenizer.encode("ab").ids == [2]
     assert repr(tokenizer._tokenizer.pre_tokenizer) == repr(good_backend.pre_tokenizer)
