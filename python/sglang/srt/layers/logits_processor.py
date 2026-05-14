@@ -881,9 +881,9 @@ class LogitsProcessor(nn.Module):
 
         # Restore the full-pruned lm_head batch_info after chunk iteration.
         if hasattr(lm_head, "reset_lm_head_pass"):
-            assert hasattr(
-                lm_head, "set_lm_head_pass"
-            ), "lm_head must have set_lm_head_pass method and reset_lm_head_pass method at the same time"
+            assert hasattr(lm_head, "set_lm_head_pass"), (
+                "lm_head must have set_lm_head_pass method and reset_lm_head_pass method at the same time"
+            )
             lm_head.reset_lm_head_pass()
 
         # Concatenate the results
@@ -1188,18 +1188,18 @@ class LogitsProcessor(nn.Module):
                 multi_item_delimiter_indices,
             )
 
+        kv_mirror_pruned = logits_metadata.enable_welm_kv_mirror_opt and (
+            logits_metadata.forward_mode.is_extend_without_speculative()
+            or logits_metadata.scale_seq_factor > 1
+            or logits_metadata.forward_mode.is_draft_extend()
+        )
+
         # Get the last hidden states and last logits for the next token prediction
         if (
             logits_metadata.forward_mode.is_decode_or_idle()
             or logits_metadata.forward_mode.is_target_verify()
             or logits_metadata.forward_mode.is_draft_extend_v2()
-            or (
-                logits_metadata.enable_welm_kv_mirror_opt
-                and (
-                    logits_metadata.forward_mode.is_extend_without_speculative()
-                    or logits_metadata.scale_seq_factor > 1
-                )
-            )
+            or kv_mirror_pruned
         ):
             pruned_states = hidden_states
             if aux_hidden_states is not None:
@@ -1338,12 +1338,10 @@ class LogitsProcessor(nn.Module):
 
         del hidden_states
 
-        # KV mirror extend keeps only the final logical state per request for
-        # logits, so full input-token logprobs are unavailable in this mode.
-        kv_mirror_extend = logits_metadata.enable_welm_kv_mirror_opt and (
-            logits_metadata.forward_mode.is_extend_without_speculative()
-            or logits_metadata.scale_seq_factor > 1
-        )
+        # When KV mirror is active in extend mode, hidden_states have already
+        # been subsampled to the last token per request. There are no
+        # intermediate-token logits available for input logprobs.
+        kv_mirror_extend = kv_mirror_pruned
 
         if not logits_metadata.extend_return_logprob or kv_mirror_extend:
             # Compute logits for both input and sampled tokens.
@@ -2040,9 +2038,9 @@ def fused_softcap(full_logits, final_logit_softcapping):
         row_stride = ncols
     else:
         assert full_logits.ndim == 2, "non-contiguous softcap requires 2D tensor"
-        assert (
-            full_logits.stride(1) == 1
-        ), "non-contiguous softcap requires contiguous columns"
+        assert full_logits.stride(1) == 1, (
+            "non-contiguous softcap requires contiguous columns"
+        )
         nrows, ncols = full_logits.shape
         row_stride = full_logits.stride(0)
 

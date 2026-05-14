@@ -5,6 +5,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
+import prc_custom_ops
 
 from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
 from sglang.srt.distributed import get_tp_group
@@ -54,6 +55,22 @@ if is_cuda() or is_musa():
     )
 
 logger = logging.getLogger(__name__)
+
+
+def _update_ngram_buffer_after_decode(
+    input_ids: torch.Tensor,
+    input_ids_buffer: torch.Tensor,
+    extend_lens: List[int],
+    buffer_size: int,
+) -> None:
+    pt = 0
+    for bid, extend_len in enumerate(extend_lens):
+        if extend_len == 0:
+            continue
+        segment = input_ids[pt : pt + extend_len]
+        buffer = input_ids_buffer[bid * buffer_size : (bid + 1) * buffer_size]
+        buffer.copy_(torch.cat((buffer, segment))[-buffer_size:])
+        pt += extend_len
 
 
 @dataclass
@@ -151,6 +168,28 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             batch.out_cache_loc,
             bs,
         )
+        if (
+            batch.oe_context is not None
+            and batch.oe_context.input_ids_buffer is not None
+        ):
+            n_gram_tensors = [
+                torch.empty_like(self.draft_token)
+                for _ in batch.oe_context.input_ids_grams
+            ]
+            for idx, gram_tensor in enumerate(n_gram_tensors):
+                n = idx + 2
+                prc_custom_ops.build_ngram_with_target_verify(
+                    gram_tensor,
+                    batch.oe_context.input_ids_buffer,
+                    self.draft_token,
+                    self.custom_mask,
+                    self.positions,
+                    batch.seq_lens,
+                    n,
+                    self.draft_token_num,
+                    batch.oe_context.buffer_size,
+                )
+                batch.oe_context.set_gram(n, gram_tensor)
 
         if get_global_server_args().enable_mamba_extra_buffer():
             batch.mamba_track_indices = torch.tensor(
@@ -435,9 +474,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                     try:
                         req.grammar.accept_token(id)
                     except ValueError as e:
-                        logger.info(
-                            f"{i=}, {req=}\n" f"{accept_index=}\n" f"{predict=}\n"
-                        )
+                        logger.info(f"{i=}, {req=}\n{accept_index=}\n{predict=}\n")
                         raise e
                     req.check_finished()
                 if req.finished():
@@ -561,6 +598,8 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 seq_lens_for_draft_extend=batch.seq_lens,
                 seq_lens_for_draft_extend_cpu=batch.seq_lens_cpu,
                 req_pool_indices_for_draft_extend=batch.req_pool_indices,
+                mirrored_kv_indices=accept_index,
+                model_specific_states=logits_output.model_specific_states,
             )
 
             return EagleVerifyOutput(
@@ -621,6 +660,9 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 unfinished_num_accepted_drafts = num_accepted_drafts[
                     unfinished_index_device
                 ]
+                if batch.oe_context is not None:
+                    batch.oe_context.filter_buffer(unfinished_index_device)
+
                 draft_input = EagleDraftInput(
                     hidden_states=batch.spec_info.hidden_states[
                         unfinished_accept_index
@@ -635,6 +677,8 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                     req_pool_indices_for_draft_extend=batch.req_pool_indices[
                         unfinished_index_device
                     ],
+                    mirrored_kv_indices=unfinished_accept_index,
+                    model_specific_states=logits_output.model_specific_states,
                 )
             else:
                 draft_input = EagleDraftInput.create_idle_input(
@@ -689,6 +733,7 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
     seq_lens_for_draft_extend: torch.Tensor = None
     seq_lens_for_draft_extend_cpu: torch.Tensor = None
     req_pool_indices_for_draft_extend: torch.Tensor = None
+    mirrored_kv_indices: torch.Tensor = None
 
     # Inputs for V2 overlap worker
     future_indices: Optional[FutureIndices] = None
@@ -759,6 +804,24 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
         batch.input_ids = self.verified_id
         batch.extend_lens = batch.spec_info.num_accepted_tokens_cpu
         batch.extend_num_tokens = sum(batch.extend_lens)
+        if self.mirrored_kv_indices is not None:
+            if self.mirrored_kv_indices.numel() == batch.extend_num_tokens:
+                pass
+            elif batch.extend_num_tokens == len(batch.extend_lens):
+                accepted_counts = self.num_accepted_tokens.to(torch.long)
+                last_accepted_offsets = torch.cumsum(accepted_counts, dim=0) - 1
+                self.mirrored_kv_indices = self.mirrored_kv_indices[
+                    last_accepted_offsets
+                ]
+            elif self.mirrored_kv_indices.numel() > batch.extend_num_tokens:
+                self.mirrored_kv_indices = self.mirrored_kv_indices[
+                    -batch.extend_num_tokens :
+                ]
+            else:
+                raise ValueError(
+                    "mirrored_kv_indices is shorter than draft extend tokens: "
+                    f"{self.mirrored_kv_indices.numel()} < {batch.extend_num_tokens}"
+                )
         batch.seq_lens = batch.spec_info.seq_lens_for_draft_extend
         batch.seq_lens_cpu = batch.spec_info.seq_lens_for_draft_extend_cpu
         batch.req_pool_indices = batch.spec_info.req_pool_indices_for_draft_extend
@@ -777,6 +840,33 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
             self.verified_id,
             next_power_of_2(max(speculative_num_steps + 1, len(batch.seq_lens))),
         )
+        batch.input_ids = batch.input_ids.to(torch.int64)
+        if (
+            batch.oe_context is not None
+            and batch.oe_context.input_ids_buffer is not None
+        ):
+            buffer = batch.oe_context.input_ids_buffer
+            buffer_size = batch.oe_context.buffer_size
+            num_accepted_tokens = self.num_accepted_tokens.to(torch.int32)
+            for idx in range(len(batch.oe_context.input_ids_grams)):
+                n = idx + 2
+                n_gram = torch.empty_like(batch.input_ids, dtype=torch.int64)
+                prc_custom_ops.assign_ngram_input_ids_draft_extend_after_decode(
+                    batch.input_ids,
+                    buffer,
+                    n_gram,
+                    num_accepted_tokens,
+                    n,
+                    buffer_size,
+                    False,
+                )
+                batch.oe_context.set_gram(n, n_gram)
+            _update_ngram_buffer_after_decode(
+                batch.input_ids,
+                buffer,
+                batch.extend_lens,
+                buffer_size,
+            )
 
     def generate_attn_arg_prefill(
         self,

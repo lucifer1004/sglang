@@ -2920,6 +2920,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         active_batch_indices: List[int] = []
         offset = 0
         for batch_idx, (req, extend_len) in enumerate(zip(self.reqs, self.extend_lens)):
+            if self.forward_mode.is_draft_extend():
+                if extend_len > 0:
+                    last_q_indices.append(offset + extend_len - 1)
+                    active_batch_indices.append(batch_idx)
+                offset += extend_len
+                continue
+
             # In overlap scheduling, output_ids can already contain the unresolved
             # future token for this forward. That token is not part of fill_ids yet,
             # so compare against the sequence length before the future slot.
@@ -2931,7 +2938,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 active_batch_indices.append(batch_idx)
             offset += extend_len
 
-        return last_q_indices, active_batch_indices, len(self.reqs)
+        return last_q_indices, active_batch_indices, len(self.extend_lens)
 
     def copy(self):
         # Only contain fields that will be used by process_batch_result

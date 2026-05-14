@@ -352,6 +352,9 @@ class FlashAttentionBackend(AttentionBackend):
             model_runner.server_args.speculative_num_draft_tokens
         )
         self.speculative_step_id = speculative_step_id
+        self.scale_seq_factor = (
+            getattr(model_runner.model_config.hf_config, "scale_seq_times", 0) + 1
+        )
 
         self.fa_impl_ver = fa_impl_ver
 

@@ -24,7 +24,9 @@ from sglang.srt.models.welmv4 import (
     WeLMV4MoeForCausalLM,
     _get_welm_kv_mirror_states,
     _welm_init_kv_mirror_last_q_indices,
+    _welm_prepare_kv_mirror_logits_states,
     _welm_select_kv_mirror_rows,
+    _welm_should_contract_kv_mirror,
 )
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix, is_cuda, is_npu
@@ -144,7 +146,9 @@ class WeLMV4ModelNextN(nn.Module):
 
         _dump_tensor("model.mtp.0.input_ids", input_ids)
         _dump_tensor("model.mtp.0.positions", positions)
-        _dump_tensor("model.mtp.0.main_hidden_in", forward_batch.spec_info.hidden_states)
+        _dump_tensor(
+            "model.mtp.0.main_hidden_in", forward_batch.spec_info.hidden_states
+        )
 
         if input_embeds is None:
             hidden_states = self.embed_tokens(input_ids)
@@ -181,26 +185,30 @@ class WeLMV4ModelNextN(nn.Module):
 
         _dump_tensor("model.mtp.0.embedding", hidden_states)
 
+        main_hidden_states = forward_batch.spec_info.hidden_states
         if (
-            forward_batch.enable_welm_kv_mirror_opt
-            and forward_batch.forward_mode.is_extend_without_speculative()
+            _welm_should_contract_kv_mirror(forward_batch)
+            and main_hidden_states is not None
         ):
-            main_hidden_states = forward_batch.spec_info.hidden_states
-            if (
-                main_hidden_states is not None
-                and hidden_states.shape[0] != main_hidden_states.shape[0]
-            ):
-                _welm_init_kv_mirror_last_q_indices(forward_batch)
-                first_contract = (
-                    hidden_states.shape[0] != forward_batch.kv_mirror_output_size
-                )
-                hidden_states = _welm_select_kv_mirror_rows(
-                    hidden_states, forward_batch, first_contract=first_contract
-                )
+            _welm_init_kv_mirror_last_q_indices(forward_batch)
+            first_contract = (
+                hidden_states.shape[0] != forward_batch.kv_mirror_output_size
+            )
+            hidden_states = _welm_select_kv_mirror_rows(
+                hidden_states, forward_batch, first_contract=first_contract
+            )
+            main_first_contract = (
+                main_hidden_states.shape[0] != forward_batch.kv_mirror_output_size
+            )
+            main_hidden_states = _welm_select_kv_mirror_rows(
+                main_hidden_states,
+                forward_batch,
+                first_contract=main_first_contract,
+            )
 
         if hidden_states.shape[0] > 0:
             enorm_output = self.enorm(hidden_states)
-            hnorm_output = self.hnorm(forward_batch.spec_info.hidden_states)
+            hnorm_output = self.hnorm(main_hidden_states)
             _dump_tensor("model.mtp.0.enorm", enorm_output)
             _dump_tensor("model.mtp.0.hnorm", hnorm_output)
             hidden_states = self.eh_proj(
@@ -242,7 +250,6 @@ class WeLMV4ModelNextN(nn.Module):
 
 
 class WeLMV4MoeForCausalLMNextN(WeLMV4MoeForCausalLM):
-
     def __init__(
         self,
         config: PretrainedConfig,
@@ -270,6 +277,10 @@ class WeLMV4MoeForCausalLMNextN(WeLMV4MoeForCausalLM):
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         hidden_states = self.model(input_ids, positions, forward_batch)
+        if _welm_should_contract_kv_mirror(forward_batch):
+            hidden_states, _ = _welm_prepare_kv_mirror_logits_states(
+                hidden_states, None, forward_batch
+            )
         logits_output = self.logits_processor(
             input_ids, hidden_states, self.lm_head, forward_batch
         )

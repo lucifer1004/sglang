@@ -503,12 +503,17 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             dimensions=batch.dimensions,
             return_hidden_states_before_norm=batch.return_hidden_states_before_norm,
             return_pooled_hidden_states=batch.return_pooled_hidden_states,
+            model_specific_states=getattr(
+                batch.spec_info, "model_specific_states", None
+            ),
             oe_context=batch.oe_context,
             scale_seq_factor=batch.scale_seq_factor,
             rids=[req.rid for req in batch.reqs],
         )
         device = model_runner.device
-        ret.enable_welm_kv_mirror_opt = model_runner.server_args.enable_welm_kv_mirror_opt
+        ret.enable_welm_kv_mirror_opt = (
+            model_runner.server_args.enable_welm_kv_mirror_opt
+        )
 
         if batch.extend_input_logprob_token_ids is not None:
             ret.extend_input_logprob_token_ids_gpu = (
@@ -1025,10 +1030,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             )
 
         oe_context = getattr(self, "oe_context", None)
-        if (
-            oe_context is not None
-            and oe_context.input_ids_grams is not None
-        ):
+        if oe_context is not None and oe_context.input_ids_grams is not None:
             oe_context.input_ids_grams = [
                 self._pad_tensor_to_size(gram, num_tokens)
                 for gram in oe_context.input_ids_grams

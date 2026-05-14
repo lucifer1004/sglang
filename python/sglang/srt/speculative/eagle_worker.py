@@ -87,7 +87,6 @@ logger = logging.getLogger(__name__)
 
 
 class EAGLEWorker(TpModelWorker):
-
     def __init__(
         self,
         server_args: ServerArgs,
@@ -154,8 +153,10 @@ class EAGLEWorker(TpModelWorker):
         else:
             ctx = empty_context()
         with (
-            ctx
-        ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
+            ctx,
+            speculative_moe_backend_context(),
+            speculative_moe_a2a_backend_context(),
+        ):
             super().__init__(
                 server_args=server_args,
                 gpu_id=gpu_id,
@@ -200,6 +201,13 @@ class EAGLEWorker(TpModelWorker):
             # Share the embedding and lm_head
             self.draft_model_runner.model.set_embed_and_head(embed, head)
 
+        if self._is_welmv4_mtp_draft_model():
+            if self.topk != 1:
+                raise ValueError(
+                    "WeLMV4 MTP speculative decoding currently supports "
+                    "speculative_eagle_topk=1 only."
+                )
+
         # Init attention backend and cuda graphs
         self.draft_model_runner.server_args.disable_cuda_graph = (
             backup_disable_cuda_graph
@@ -216,9 +224,11 @@ class EAGLEWorker(TpModelWorker):
             self.eagle_use_aux_hidden_state = eagle_config.get(
                 "use_aux_hidden_state", True
             )
-        with self.draft_tp_context(
-            self.draft_model_runner.tp_group
-        ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
+        with (
+            self.draft_tp_context(self.draft_model_runner.tp_group),
+            speculative_moe_backend_context(),
+            speculative_moe_a2a_backend_context(),
+        ):
             self.init_attention_backend()
             self.init_cuda_graphs()
             if self.adaptive_controller is not None:
@@ -290,7 +300,12 @@ class EAGLEWorker(TpModelWorker):
             )
 
         # Capture extend
-        if self.draft_extend_attn_backend and not _is_npu:
+        skip_draft_extend_cuda_graph = self._is_welmv4_mtp_draft_model()
+        if (
+            self.draft_extend_attn_backend
+            and not _is_npu
+            and not skip_draft_extend_cuda_graph
+        ):
             tic = time.perf_counter()
             before_mem = get_available_gpu_memory(self.device, self.gpu_id)
             logger.info(
@@ -302,6 +317,11 @@ class EAGLEWorker(TpModelWorker):
             after_mem = get_available_gpu_memory(self.device, self.gpu_id)
             logger.info(
                 f"Capture draft extend cuda graph end. Time elapsed: {time.perf_counter() - tic:.2f} s. mem usage={(before_mem - after_mem):.2f} GB. avail mem={after_mem:.2f} GB."
+            )
+        elif self.draft_extend_attn_backend and skip_draft_extend_cuda_graph:
+            logger.info(
+                "Skip draft extend cuda graph for WeLMV4 MTP; its mirror-KV "
+                "path uses main-model activations from the current verify step."
             )
 
     def apply_runtime_state(self, state: SpecRuntimeState):
@@ -432,6 +452,12 @@ class EAGLEWorker(TpModelWorker):
     def draft_model_runner(self):
         return self.model_runner
 
+    def _is_welmv4_mtp_draft_model(self) -> bool:
+        architectures = getattr(
+            self.draft_model_runner.model_config.hf_config, "architectures", []
+        )
+        return bool(architectures and architectures[0] == "WeLMV4MoeForCausalLMNextN")
+
     def forward_batch_generation(self, batch: ScheduleBatch) -> GenerationBatchResult:
         """Run speculative decoding forward.
 
@@ -451,9 +477,11 @@ class EAGLEWorker(TpModelWorker):
                 seq_lens_cpu,
                 can_run_cuda_graph,
             ) = self.forward_target_extend(batch)
-            with self.draft_tp_context(
-                self.draft_model_runner.tp_group
-            ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
+            with (
+                self.draft_tp_context(self.draft_model_runner.tp_group),
+                speculative_moe_backend_context(),
+                speculative_moe_a2a_backend_context(),
+            ):
                 self.forward_draft_extend(
                     batch,
                     logits_output.hidden_states,
@@ -471,9 +499,11 @@ class EAGLEWorker(TpModelWorker):
         else:
             set_time_batch(batch.reqs, "set_spec_draft_start_time", trace_only=True)
 
-            with self.draft_tp_context(
-                self.draft_model_runner.tp_group
-            ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
+            with (
+                self.draft_tp_context(self.draft_model_runner.tp_group),
+                speculative_moe_backend_context(),
+                speculative_moe_a2a_backend_context(),
+            ):
                 spec_info = self.draft(batch)
 
             set_time_batch(batch.reqs, "set_spec_draft_end_time", trace_only=True)
@@ -492,9 +522,11 @@ class EAGLEWorker(TpModelWorker):
                 batch.reqs, "set_spec_draft_extend_start_time", trace_only=True
             )
 
-            with self.draft_tp_context(
-                self.draft_model_runner.tp_group
-            ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
+            with (
+                self.draft_tp_context(self.draft_model_runner.tp_group),
+                speculative_moe_backend_context(),
+                speculative_moe_a2a_backend_context(),
+            ):
                 # NOTE: We should use `check_forward_draft_extend_after_decode`
                 # when DP attention is enabled, but it is slow. Skip it for now.
                 if (
@@ -913,10 +945,20 @@ class EAGLEWorker(TpModelWorker):
                 spec_info.retrieve_next_token.shape
             ).cpu()
 
-        # Forward
-        batch_result = self.target_worker.forward_batch_generation(
-            model_worker_batch, is_verify=True
-        )
+        # Forward. WeLMV4 MTP consumes Python-side mirror-KV activations from
+        # the target verify pass, so replaying a captured target CUDA graph
+        # cannot be used here.
+        target_graph_runner = None
+        if self._is_welmv4_mtp_draft_model():
+            target_graph_runner = self.target_worker.model_runner.graph_runner
+            self.target_worker.model_runner.graph_runner = None
+        try:
+            batch_result = self.target_worker.forward_batch_generation(
+                model_worker_batch, is_verify=True
+            )
+        finally:
+            if self._is_welmv4_mtp_draft_model():
+                self.target_worker.model_runner.graph_runner = target_graph_runner
         logits_output, can_run_cuda_graph = (
             batch_result.logits_output,
             batch_result.can_run_cuda_graph,
@@ -952,7 +994,10 @@ class EAGLEWorker(TpModelWorker):
             self.page_size,
             vocab_mask,
         )
-
+        if self._is_welmv4_mtp_draft_model():
+            if res.draft_input.mirrored_kv_indices is None:
+                res.draft_input.mirrored_kv_indices = res.accepted_indices
+            res.draft_input.model_specific_states = logits_output.model_specific_states
         # Post process based on verified outputs.
         # Pick indices that we care (accepted)
         logits_output.next_token_logits = logits_output.next_token_logits[
