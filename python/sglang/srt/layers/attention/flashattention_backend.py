@@ -1273,11 +1273,10 @@ class FlashAttentionBackend(AttentionBackend):
         # Calculate window size (can be moved to metadata if layer properties don't change)
         # we don't do layer.sliding_window_size - 1 since in model.get_attention_sliding_window_size() we already - 1
         # here is two side inclusive
-        window_size = (
-            (layer.sliding_window_size, 0)
-            if layer.sliding_window_size is not None and layer.sliding_window_size > -1
-            else (-1, -1)
+        is_swa_layer = (
+            layer.sliding_window_size is not None and layer.sliding_window_size > -1
         )
+        window_size = (layer.sliding_window_size, 0) if is_swa_layer else (-1, -1)
         causal = True
         if layer.is_cross_attention or layer.attn_type == AttentionType.ENCODER_ONLY:
             causal = False
