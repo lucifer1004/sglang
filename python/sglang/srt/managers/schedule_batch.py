@@ -2943,7 +2943,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     def copy(self):
         # Only contain fields that will be used by process_batch_result
         return ScheduleBatch(
-            reqs=self.reqs,
+            # Snapshot the reqs list. The disagg-decode overlap loop keeps
+            # this copy in result_queue while a later iteration may call
+            # `running_batch.merge_batch(new_prebuilt_batch)`, which extends
+            # `running_batch.reqs` in place. If we shared the list here,
+            # `process_batch_result_decode` would later iterate over reqs that
+            # were not part of this forward and crash with IndexError on
+            # `next_token_ids[i]` (scheduler_output_processor_mixin.py:549).
+            reqs=list(self.reqs),
             req_to_token_pool=self.req_to_token_pool,
             req_pool_indices=self.req_pool_indices,
             model_config=self.model_config,
