@@ -284,8 +284,10 @@ class EAGLEWorker(TpModelWorker):
             "cuda": EAGLEDraftCudaGraphRunner,
             "musa": EAGLEDraftCudaGraphRunner,
         }
+        skip_welmv4_mtp_cuda_graph = self._is_welmv4_mtp_draft_model()
+
         # Capture draft
-        if self.speculative_num_steps > 1:
+        if self.speculative_num_steps > 1 and not skip_welmv4_mtp_cuda_graph:
             tic = time.perf_counter()
             before_mem = get_available_gpu_memory(self.device, self.gpu_id)
             logger.info(
@@ -298,9 +300,14 @@ class EAGLEWorker(TpModelWorker):
             logger.info(
                 f"Capture draft cuda graph end. Time elapsed: {time.perf_counter() - tic:.2f} s. mem usage={(before_mem - after_mem):.2f} GB. avail mem={after_mem:.2f} GB."
             )
+        elif self.speculative_num_steps > 1 and skip_welmv4_mtp_cuda_graph:
+            logger.info(
+                "Skip draft cuda graph for WeLMV4 MTP; recursive draft decode "
+                "reuses base-position MTP KV cache without appending draft KV."
+            )
 
         # Capture extend
-        skip_draft_extend_cuda_graph = self._is_welmv4_mtp_draft_model()
+        skip_draft_extend_cuda_graph = skip_welmv4_mtp_cuda_graph
         if (
             self.draft_extend_attn_backend
             and not _is_npu
@@ -457,6 +464,103 @@ class EAGLEWorker(TpModelWorker):
             self.draft_model_runner.model_config.hf_config, "architectures", []
         )
         return bool(architectures and architectures[0] == "WeLMV4MoeForCausalLMNextN")
+
+    def _get_welmv4_mtp_base_positions(
+        self, forward_batch: ForwardBatch
+    ) -> torch.Tensor:
+        custom_last_index = getattr(forward_batch, "custom_last_index", None)
+        if custom_last_index is not None:
+            return forward_batch.positions[custom_last_index].clone()
+
+        if forward_batch.extend_seq_lens is not None:
+            last_query_indices = torch.cumsum(
+                forward_batch.extend_seq_lens, dim=0
+            ) - 1
+            return forward_batch.positions[last_query_indices].clone()
+
+        return (forward_batch.seq_lens - 1).to(forward_batch.positions.dtype)
+
+    def _init_welmv4_mtp_base_kv_decode_metadata(
+        self, forward_batch: ForwardBatch
+    ) -> None:
+        attn_backend = (
+            self.draft_model_runner.decode_attn_backend
+            if self.draft_model_runner.server_args.enable_pdmux
+            else self.draft_model_runner.attn_backend
+        )
+        spec_info_backup = forward_batch.spec_info
+        forward_batch.spec_info = None
+        try:
+            attn_backend.init_forward_metadata(forward_batch)
+        finally:
+            forward_batch.spec_info = spec_info_backup
+        forward_batch.attn_backend = attn_backend
+
+    def _forward_welmv4_mtp_base_kv_decode(
+        self, forward_batch: ForwardBatch
+    ) -> LogitsProcessorOutput:
+        graph_runner_backup = self.draft_model_runner.graph_runner
+        had_base_kv_attr = hasattr(forward_batch, "welm_mtp_use_base_kv_cache")
+        base_kv_attr_backup = getattr(
+            forward_batch, "welm_mtp_use_base_kv_cache", None
+        )
+        # Recursive WeLMV4 MTP draft decode reads base KV instead of appending
+        # speculative KV, so it cannot use the normal draft-decode graph runner.
+        forward_batch.welm_mtp_use_base_kv_cache = True
+        self.draft_model_runner.graph_runner = None
+        try:
+            return self.draft_model_runner.forward(
+                forward_batch, skip_attn_backend_init=True
+            ).logits_output
+        finally:
+            self.draft_model_runner.graph_runner = graph_runner_backup
+            if had_base_kv_attr:
+                forward_batch.welm_mtp_use_base_kv_cache = base_kv_attr_backup
+            else:
+                delattr(forward_batch, "welm_mtp_use_base_kv_cache")
+
+    def _prepare_welmv4_mtp_draft_decode_oe_context(
+        self,
+        forward_batch: ForwardBatch,
+        input_ids: torch.Tensor,
+        draft_oe_buffer: Optional[torch.Tensor],
+    ) -> Optional[torch.Tensor]:
+        oe_context = getattr(forward_batch, "oe_context", None)
+        if oe_context is None or oe_context.input_ids_buffer is None:
+            return draft_oe_buffer
+
+        batch_size = input_ids.numel()
+        buffer_size = oe_context.buffer_size
+        if draft_oe_buffer is None:
+            buffer_batch_size = oe_context.input_ids_buffer.numel() // buffer_size
+            if buffer_batch_size < batch_size:
+                raise RuntimeError(
+                    "WeLMV4 MTP draft OE buffer is smaller than the draft batch: "
+                    f"{buffer_batch_size=} {batch_size=}"
+                )
+            draft_oe_buffer = oe_context.input_ids_buffer.view(
+                buffer_batch_size, buffer_size
+            )[:batch_size].clone()
+        elif draft_oe_buffer.shape[0] != batch_size:
+            if draft_oe_buffer.shape[0] < batch_size:
+                raise RuntimeError(
+                    "WeLMV4 MTP local draft OE buffer is smaller than the draft batch: "
+                    f"buffer_batch_size={draft_oe_buffer.shape[0]} {batch_size=}"
+                )
+            draft_oe_buffer = draft_oe_buffer[:batch_size]
+
+        for idx in range(len(oe_context.input_ids_grams)):
+            n = idx + 2
+            if n - 1 <= buffer_size:
+                ngram = draft_oe_buffer[:, -(n - 1)].contiguous()
+            else:
+                ngram = input_ids.new_zeros((batch_size,), dtype=torch.int64)
+            oe_context.set_gram(n, ngram.to(dtype=torch.int64))
+
+        input_ids_column = input_ids.to(dtype=draft_oe_buffer.dtype).view(batch_size, 1)
+        if buffer_size == 1:
+            return input_ids_column
+        return torch.cat([draft_oe_buffer[:, 1:], input_ids_column], dim=1)
 
     def forward_batch_generation(self, batch: ScheduleBatch) -> GenerationBatchResult:
         """Run speculative decoding forward.
@@ -783,6 +887,7 @@ class EAGLEWorker(TpModelWorker):
             if (
                 not forward_batch.forward_mode.is_idle()
                 and self.speculative_num_steps > 1
+                and not self._is_welmv4_mtp_draft_model()
             ):
                 # Skip attention backend init for idle mode or 1-step draft
                 self.draft_attn_backend.init_forward_metadata(forward_batch)
@@ -848,6 +953,17 @@ class EAGLEWorker(TpModelWorker):
 
         if self.hot_token_id is not None:
             topk_index = self.hot_token_id[topk_index]
+        is_welmv4_mtp = self._is_welmv4_mtp_draft_model()
+        welmv4_mtp_base_positions = None
+        welmv4_mtp_draft_oe_buffer = None
+        if is_welmv4_mtp and not forward_batch.forward_mode.is_idle():
+            if self.topk != 1:
+                raise RuntimeError("WeLMV4 MTP recursive draft decode requires topk=1.")
+            welmv4_mtp_base_positions = spec_info.welm_mtp_base_positions
+            if welmv4_mtp_base_positions is None:
+                welmv4_mtp_base_positions = (
+                    forward_batch.seq_lens - 1
+                ).to(forward_batch.positions.dtype)
         # TODO: We only need self.speculative_num_steps - 1 cache loc
         out_cache_loc = out_cache_loc.reshape(
             forward_batch.batch_size, self.topk, self.speculative_num_steps
@@ -890,14 +1006,28 @@ class EAGLEWorker(TpModelWorker):
             if step_cache_loc.numel() != input_ids.numel():
                 step_cache_loc = step_cache_loc[: input_ids.numel()]
             forward_batch.out_cache_loc = step_cache_loc
-            forward_batch.positions = step_positions.add(1)
-            forward_batch.attn_backend = self.draft_attn_backend.attn_backends[i]
+            if is_welmv4_mtp:
+                forward_batch.positions = welmv4_mtp_base_positions[
+                    : input_ids.numel()
+                ].to(dtype=step_positions.dtype)
+                welmv4_mtp_draft_oe_buffer = (
+                    self._prepare_welmv4_mtp_draft_decode_oe_context(
+                        forward_batch, input_ids, welmv4_mtp_draft_oe_buffer
+                    )
+                )
+                self._init_welmv4_mtp_base_kv_decode_metadata(forward_batch)
+            else:
+                forward_batch.positions = step_positions.add(1)
+                forward_batch.attn_backend = self.draft_attn_backend.attn_backends[i]
             spec_info.hidden_states = hidden_states
 
             # Run forward
-            logits_output = self.draft_model_runner.forward(
-                forward_batch, skip_attn_backend_init=True
-            ).logits_output
+            if is_welmv4_mtp:
+                logits_output = self._forward_welmv4_mtp_base_kv_decode(forward_batch)
+            else:
+                logits_output = self.draft_model_runner.forward(
+                    forward_batch, skip_attn_backend_init=True
+                ).logits_output
             maybe_detect_nan(logits_output.next_token_logits, f"draft_forward step {i}")
             probs = torch.softmax(logits_output.next_token_logits, dim=-1)
             topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
@@ -1148,7 +1278,7 @@ class EAGLEWorker(TpModelWorker):
         maybe_detect_nan(logits_output.next_token_logits, "draft_extend_for_prefill")
         assert isinstance(forward_batch.spec_info, EagleDraftInput)
         assert forward_batch.spec_info is batch.spec_info
-        self.capture_for_decode(logits_output, forward_batch.spec_info)
+        self.capture_for_decode(logits_output, forward_batch.spec_info, forward_batch)
 
     def forward_draft_extend_after_decode(self, batch: ScheduleBatch):
         assert isinstance(batch.spec_info, EagleDraftInput)
@@ -1228,7 +1358,9 @@ class EAGLEWorker(TpModelWorker):
             logits_output = self.draft_model_runner.forward(
                 forward_batch, skip_attn_backend_init=True
             ).logits_output
-            self.capture_for_decode(logits_output, forward_batch.spec_info)
+            self.capture_for_decode(
+                logits_output, forward_batch.spec_info, forward_batch
+            )
 
         maybe_detect_nan(
             logits_output.next_token_logits,
@@ -1248,11 +1380,18 @@ class EAGLEWorker(TpModelWorker):
         batch.return_logprob = return_logprob_backup
 
     def capture_for_decode(
-        self, logits_output: LogitsProcessorOutput, draft_input: EagleDraftInput
+        self,
+        logits_output: LogitsProcessorOutput,
+        draft_input: EagleDraftInput,
+        forward_batch: Optional[ForwardBatch] = None,
     ):
         probs = torch.softmax(logits_output.next_token_logits, dim=-1)
         draft_input.topk_p, draft_input.topk_index = fast_topk(probs, self.topk, dim=-1)
         draft_input.hidden_states = logits_output.hidden_states
+        if self._is_welmv4_mtp_draft_model() and forward_batch is not None:
+            draft_input.welm_mtp_base_positions = self._get_welmv4_mtp_base_positions(
+                forward_batch
+            )
 
     def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
         monkey_patch_torch_reductions()

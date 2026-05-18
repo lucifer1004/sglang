@@ -734,6 +734,9 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
     seq_lens_for_draft_extend_cpu: torch.Tensor = None
     req_pool_indices_for_draft_extend: torch.Tensor = None
     mirrored_kv_indices: torch.Tensor = None
+    # WeLMV4 MTP recursive draft-decode state. Later draft steps reuse the same
+    # base KV cache row/position instead of appending speculative MTP KV.
+    welm_mtp_base_positions: torch.Tensor = None
 
     # Inputs for V2 overlap worker
     future_indices: Optional[FutureIndices] = None
@@ -920,12 +923,20 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
             self.topk_index = self.topk_index[: len(new_indices)]
             self.hidden_states = self.hidden_states[: len(new_indices)]
             self.verified_id = self.verified_id[: len(new_indices)]
+            if self.welm_mtp_base_positions is not None:
+                self.welm_mtp_base_positions = self.welm_mtp_base_positions[
+                    : len(new_indices)
+                ]
         else:
             # in some cases(e.g draft_extend), we have not filtered the batch by `unfinished_index`
             self.topk_p = self.topk_p[new_indices]
             self.topk_index = self.topk_index[new_indices]
             self.hidden_states = self.hidden_states[new_indices]
             self.verified_id = self.verified_id[new_indices]
+            if self.welm_mtp_base_positions is not None:
+                self.welm_mtp_base_positions = self.welm_mtp_base_positions[
+                    new_indices
+                ]
 
     def merge_batch(self, spec_info: "EagleDraftInput"):
         if self.future_indices is not None:
@@ -942,6 +953,7 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
             self.verified_id = spec_info.verified_id
             self.topk_p = spec_info.topk_p
             self.topk_index = spec_info.topk_index
+            self.welm_mtp_base_positions = spec_info.welm_mtp_base_positions
             return
         if spec_info.hidden_states is None:
             return
@@ -951,6 +963,16 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
         self.verified_id = torch.cat([self.verified_id, spec_info.verified_id], axis=0)
         self.topk_p = torch.cat([self.topk_p, spec_info.topk_p])
         self.topk_index = torch.cat([self.topk_index, spec_info.topk_index])
+        if (
+            self.welm_mtp_base_positions is not None
+            and spec_info.welm_mtp_base_positions is not None
+        ):
+            self.welm_mtp_base_positions = torch.cat(
+                [self.welm_mtp_base_positions, spec_info.welm_mtp_base_positions],
+                axis=0,
+            )
+        else:
+            self.welm_mtp_base_positions = None
 
 
 @dataclass

@@ -343,6 +343,13 @@ def _welm_should_contract_kv_mirror(forward_batch: ForwardBatch) -> bool:
     )
 
 
+def _welm_mtp_uses_base_kv_cache(forward_batch: ForwardBatch) -> bool:
+    return (
+        forward_batch.forward_mode.is_decode()
+        and getattr(forward_batch, "welm_mtp_use_base_kv_cache", False)
+    )
+
+
 def _welm_init_kv_mirror_last_q_indices(forward_batch: ForwardBatch) -> bool:
     if hasattr(forward_batch, "custom_last_index"):
         return False
@@ -470,6 +477,11 @@ def _get_kv_mirror_pair_maps(
     return mirror_to_imitated, imitated_to_mirror
 
 
+WelmQkvProjectionOutput = Tuple[
+    torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], torch.Tensor
+]
+
+
 class BaseWelmQkvProjection(nn.Module):
     def __init__(
         self,
@@ -541,7 +553,8 @@ class BaseWelmQkvProjection(nn.Module):
         attn: "Qwen2MoeAttention",
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        kv_mirror_states: Dict[int, Tuple[torch.Tensor, torch.Tensor]],
+    ) -> WelmQkvProjectionOutput:
         raise NotImplementedError
 
     def _apply_qkv(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -643,7 +656,7 @@ class StandardQkvProjection(BaseWelmQkvProjection):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
         kv_mirror_states: Dict[int, Tuple[torch.Tensor, torch.Tensor]],
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> WelmQkvProjectionOutput:
         qkv = self._apply_qkv(hidden_states)
         q, k, v = self._split_qkv(attn, qkv)
         return q, k, v, hidden_states
@@ -660,7 +673,7 @@ class ImitateQkvKvProjection(BaseWelmQkvProjection):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
         kv_mirror_states: Dict[int, Tuple[torch.Tensor, torch.Tensor]],
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> WelmQkvProjectionOutput:
         qkv = self._apply_qkv(hidden_states)
         q, k, v, mirror_k, mirror_v = qkv.split(
             [attn.q_size, attn.kv_size, attn.kv_size, attn.kv_size, attn.kv_size],
@@ -681,7 +694,7 @@ class MirrorQProjection(BaseWelmQkvProjection):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
         kv_mirror_states: Dict[int, Tuple[torch.Tensor, torch.Tensor]],
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> WelmQkvProjectionOutput:
         project_hidden_states = hidden_states
         if _welm_should_contract_kv_mirror(forward_batch):
             _welm_init_kv_mirror_last_q_indices(forward_batch)
@@ -716,15 +729,25 @@ class NextnMirrorQProjection(BaseWelmQkvProjection):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
         kv_mirror_states: Dict[int, Tuple[torch.Tensor, torch.Tensor]],
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        use_mirrored_kv = (
-            forward_batch.forward_mode.is_extend_without_speculative()
-            or forward_batch.forward_mode.is_draft_extend()
-        )
-        if not use_mirrored_kv:
+    ) -> WelmQkvProjectionOutput:
+        if forward_batch.forward_mode.is_idle():
+            # Idle batches carry no mirrored activations and do not write cache.
             qkv = self._apply_qkv(hidden_states)
             q, k, v = self._split_qkv(attn, qkv)
             return q, k, v, hidden_states
+
+        q_weight = self.weight[: attn.q_size, :]
+        q_bias = None if self.bias is None else self.bias[: attn.q_size]
+        if _welm_mtp_uses_base_kv_cache(forward_batch):
+            # Recursive MTP draft steps reuse the committed/base KV cache that was
+            # populated from mirrored main-model KV, so this layer only computes Q.
+            q = F.linear(hidden_states, q_weight, q_bias)
+            return q, None, None, hidden_states
+
+        if forward_batch.forward_mode.is_decode():
+            raise RuntimeError(
+                "WeLMV4 MTP draft decode must reuse the base mirrored-KV cache."
+            )
 
         project_hidden_states = hidden_states
         if _welm_should_contract_kv_mirror(forward_batch):
@@ -754,8 +777,6 @@ class NextnMirrorQProjection(BaseWelmQkvProjection):
             v = v[mirrored_kv_indices]
         if attn.need_clear_kv_cache:
             kv_mirror_states.clear()
-        q_weight = self.weight[: attn.q_size, :]
-        q_bias = None if self.bias is None else self.bias[: attn.q_size]
         q = F.linear(project_hidden_states, q_weight, q_bias)
         return q, k, v, project_hidden_states
 
@@ -1551,14 +1572,30 @@ class Qwen2MoeAttention(nn.Module):
         q, k, v, hidden_states = self.qkv_proj.forward(
             self, hidden_states, forward_batch, kv_mirror_states
         )
+        use_mtp_base_kv_cache = _welm_mtp_uses_base_kv_cache(forward_batch)
+        if (k is None) != (v is None):
+            raise RuntimeError(
+                "WeLMV4 attention expects K/V to be both present or both absent."
+            )
+        has_kv = k is not None
+        if not has_kv:
+            if not (use_mtp_base_kv_cache and self.is_nextn):
+                raise RuntimeError(
+                    "WeLMV4 q-only attention is only valid for MTP base-KV draft decode."
+                )
+        elif use_mtp_base_kv_cache and self.is_nextn:
+            raise RuntimeError(
+                "WeLMV4 MTP base-KV draft decode expects q-only mirror layers."
+            )
         if dump_this_layer:
             _welm_dump_tensor(f"{dump_prefix}.positions", positions)
             _welm_dump_tensor(f"{dump_prefix}.q_pre_rope", q)
-            _welm_dump_tensor(f"{dump_prefix}.k_pre_rope", k)
-            _welm_dump_tensor(f"{dump_prefix}.v", v)
+            if has_kv:
+                _welm_dump_tensor(f"{dump_prefix}.k_pre_rope", k)
+                _welm_dump_tensor(f"{dump_prefix}.v", v)
 
         q_shape = q.shape
-        k_shape = k.shape
+        k_shape = k.shape if has_kv else None
 
         q_by_head = q.view(*q.shape[:-1], q.shape[-1] // self.head_dim, self.head_dim)
         if self.qk_norm:
@@ -1567,35 +1604,52 @@ class Qwen2MoeAttention(nn.Module):
             _welm_dump_tensor(f"{dump_prefix}.q_after_norm", q_by_head.view(q.shape))
         q = q_by_head.view(q.shape)
 
-        k_by_head = k.view(*k.shape[:-1], k.shape[-1] // self.head_dim, self.head_dim)
-        # for welmv4, qk_norm is false and only_k_norm is true
-        # fuse: implement a high precision and fused k_norm
-        if self.qk_norm or self.only_k_norm:
-            k_by_head = mmq_style_k_rms_norm(
-                k_by_head.contiguous(), self.k_norm.weight, self.k_norm.eps
+        if has_kv:
+            k_by_head = k.view(
+                *k.shape[:-1], k.shape[-1] // self.head_dim, self.head_dim
             )
-        if dump_this_layer:
-            _welm_dump_tensor(f"{dump_prefix}.k_after_norm", k_by_head.view(k.shape))
-        k = k_by_head.view(k.shape)
+            # for welmv4, qk_norm is false and only_k_norm is true
+            # fuse: implement a high precision and fused k_norm
+            if self.qk_norm or self.only_k_norm:
+                k_by_head = mmq_style_k_rms_norm(
+                    k_by_head.contiguous(), self.k_norm.weight, self.k_norm.eps
+                )
+            if dump_this_layer:
+                _welm_dump_tensor(
+                    f"{dump_prefix}.k_after_norm", k_by_head.view(k.shape)
+                )
+            k = k_by_head.view(k.shape)
 
         qk_nope_head_dim = self.head_dim - self.qk_rope_head_dim
+        k_for_rope = k
+        if not has_kv:
+            # RotaryEmbedding rotates Q/K together. In the base-KV MTP path K/V
+            # already live in the cache, so this temporary K only lets us rotate Q.
+            k_for_rope = q.new_empty((q.shape[0], self.kv_size))
         if qk_nope_head_dim > 0:
             if (
                 _welm_should_contract_kv_mirror(forward_batch)
                 and self.kv_mirror_layer_idx in self.kv_mirror_layers
             ):
                 self.rotary_emb.forward_cuda(
-                    positions, q, k, last_index=forward_batch.custom_last_index
+                    positions,
+                    q,
+                    k_for_rope,
+                    last_index=forward_batch.custom_last_index,
                 )
             else:
-                self.rotary_emb.forward_cuda(positions, q, k)
+                self.rotary_emb.forward_cuda(positions, q, k_for_rope)
             q = q.view(q_shape)
-            k = k.view(k_shape)
+            if has_kv:
+                k = k_for_rope.view(k_shape)
         else:
-            q, k = self.rotary_emb(positions, q, k)
+            q, k_for_rope = self.rotary_emb(positions, q, k_for_rope)
+            if has_kv:
+                k = k_for_rope
         if dump_this_layer:
             _welm_dump_tensor(f"{dump_prefix}.q_post_rope", q)
-            _welm_dump_tensor(f"{dump_prefix}.k_post_rope", k)
+            if has_kv:
+                _welm_dump_tensor(f"{dump_prefix}.k_post_rope", k)
 
         attn_kwargs = {}
         if self.attn_sink is not None:
@@ -1604,7 +1658,7 @@ class Qwen2MoeAttention(nn.Module):
             attn_output = q.new_empty((0, self.num_heads * self.head_dim))
         else:
             attn_output = self.attn(
-                q, k, v, forward_batch, save_kv_cache=True, **attn_kwargs
+                q, k, v, forward_batch, save_kv_cache=has_kv, **attn_kwargs
             )
         if dump_this_layer:
             _welm_dump_tensor(f"{dump_prefix}.attn_output", attn_output)

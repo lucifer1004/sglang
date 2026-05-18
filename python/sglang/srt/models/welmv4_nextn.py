@@ -142,7 +142,7 @@ class WeLMV4ModelNextN(nn.Module):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
 
         _dump_tensor("model.mtp.0.input_ids", input_ids)
         _dump_tensor("model.mtp.0.positions", positions)
@@ -234,6 +234,7 @@ class WeLMV4ModelNextN(nn.Module):
                 _dump_tensor(f"model.mtp.0.decoder.{layer_idx}.hidden", hidden_states)
                 _dump_tensor(f"model.mtp.0.decoder.{layer_idx}.residual", residual)
 
+        hidden_states_for_next_mtp = None
         if not forward_batch.forward_mode.is_idle():
             if residual is not None:
                 if final_experts_output is not None:
@@ -242,11 +243,15 @@ class WeLMV4ModelNextN(nn.Module):
                         hidden_states = hidden_states + final_shared_output.float()
                 else:
                     hidden_states = hidden_states.float() + residual.float()
-            hidden_states = hidden_states.to(self.shared_head.norm.weight.dtype)
-            _dump_tensor("model.mtp.0.decoder.0.output", hidden_states)
-            hidden_states, _ = self.shared_head.norm(hidden_states)
+            # MMQ feeds the MTP layer output before apply_ln_f into the next
+            # recursive MTP step; shared_head.norm is only for logits.
+            hidden_states_for_next_mtp = hidden_states.to(
+                self.shared_head.norm.weight.dtype
+            )
+            _dump_tensor("model.mtp.0.decoder.0.output", hidden_states_for_next_mtp)
+            hidden_states, _ = self.shared_head.norm(hidden_states_for_next_mtp)
         _dump_tensor("model.mtp.0.ln_f", hidden_states)
-        return hidden_states
+        return hidden_states, hidden_states_for_next_mtp
 
 
 class WeLMV4MoeForCausalLMNextN(WeLMV4MoeForCausalLM):
@@ -276,13 +281,24 @@ class WeLMV4MoeForCausalLMNextN(WeLMV4MoeForCausalLM):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        hidden_states = self.model(input_ids, positions, forward_batch)
+        hidden_states, hidden_states_for_next_mtp = self.model(
+            input_ids, positions, forward_batch
+        )
+        aux_hidden_states = (
+            [hidden_states_for_next_mtp]
+            if hidden_states_for_next_mtp is not None
+            else None
+        )
         if _welm_should_contract_kv_mirror(forward_batch):
-            hidden_states, _ = _welm_prepare_kv_mirror_logits_states(
-                hidden_states, None, forward_batch
+            hidden_states, aux_hidden_states = _welm_prepare_kv_mirror_logits_states(
+                hidden_states, aux_hidden_states, forward_batch
             )
         logits_output = self.logits_processor(
-            input_ids, hidden_states, self.lm_head, forward_batch
+            input_ids,
+            hidden_states,
+            self.lm_head,
+            forward_batch,
+            aux_hidden_states,
         )
         _dump_tensor("model.mtp.0.logits", logits_output.next_token_logits)
         return logits_output
