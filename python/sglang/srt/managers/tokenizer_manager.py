@@ -2176,6 +2176,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         token_logprobs_idx: List[int],
         decode_to_text: bool,
     ):
+        if isinstance(token_logprobs_val, torch.Tensor):
+            token_logprobs_val = token_logprobs_val.tolist()
+        if isinstance(token_logprobs_idx, torch.Tensor):
+            token_logprobs_idx = token_logprobs_idx.tolist()
+
         if not decode_to_text:
             return [
                 (logprob, token_id, None)
@@ -2200,7 +2205,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # We should batch all top-k tokens in all positions.
         ret = []
         for i in range(len(token_logprobs_val)):
-            if token_logprobs_val[i]:
+            if token_logprobs_val[i] is not None and len(token_logprobs_val[i]) > 0:
                 ret.append(
                     self.detokenize_logprob_tokens(
                         token_logprobs_val[i], token_logprobs_idx[i], decode_to_text
