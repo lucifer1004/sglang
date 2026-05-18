@@ -83,7 +83,7 @@ echo "Environment name: ${ENV_NAME}"
 echo "Venv path: ${VENV_PATH}"
 echo "Logs: ${LOG_DIR}"
 
-run_logged create-venv "${UV}" venv --relocatable --seed --clear --python "${PYTHON_VERSION}" "${VENV_PATH}"
+run_logged create-venv "${UV}" venv --relocatable --seed --clear --managed-python --python "${PYTHON_VERSION}" "${VENV_PATH}"
 
 REQ_DIR="$(mktemp -d)"
 REQ_FILE="${REQ_DIR}/sglang-runtime-requirements.txt"
@@ -159,15 +159,22 @@ restore_pyproject
 run_logged pip-check "${UV}" pip check --python "${VENV_PYTHON}"
 run_logged install-verify "${VENV_PYTHON}" - <<'PY'
 from importlib.metadata import version
+import pathlib
+import sysconfig
 
 import sglang
 import torch
 
+include_dir = pathlib.Path(sysconfig.get_config_var("INCLUDEPY"))
+python_h = include_dir / "Python.h"
+if not python_h.is_file():
+    raise SystemExit(f"Python.h not found at {python_h}")
 cuda_python = version("cuda-python")
 if not cuda_python.startswith("12."):
     raise SystemExit(f"cuda-python must be 12.x, got {cuda_python}")
 if not str(torch.version.cuda).startswith("12."):
     raise SystemExit(f"torch CUDA runtime must be 12.x, got {torch.version.cuda}")
+print(f"python_include={include_dir}")
 print(f"sglang={version('sglang')}")
 print(f"torch={torch.__version__}, torch_cuda={torch.version.cuda}")
 print(f"cuda-python={cuda_python}")
