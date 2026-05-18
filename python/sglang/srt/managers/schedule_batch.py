@@ -1754,6 +1754,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     tbo_split_seq_index: Optional[int] = None
     global_forward_mode: Optional[ForwardMode] = None
 
+    # HiSparse: assigned by the scheduler when hisparse is enabled and the
+    # batch contains requests promoted from the hisparse staging queue
+    # (see Scheduler.update_running_batch). Defaults to None so that
+    # release_req() can safely guard with `is not None` even on batches that
+    # never went through the hisparse code path.
+    hisparse_coordinator: Optional["HiSparseCoordinator"] = None
+
     # For mamba state tracking
     mamba_track_indices: Optional[torch.Tensor] = None
     mamba_track_mask: Optional[torch.Tensor] = None
