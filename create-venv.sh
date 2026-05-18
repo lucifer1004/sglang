@@ -44,6 +44,59 @@ run_logged() {
     "$@" 2>&1 | tee "${LOG_DIR}/${name}.log"
 }
 
+embed_managed_python() {
+    local venv_path="$1"
+    local venv_python="${venv_path}/bin/python"
+    local base_prefix
+    local python_exe_name
+
+    base_prefix="$("${venv_python}" - <<'PY'
+import sys
+print(sys.base_prefix)
+PY
+)"
+    python_exe_name="$("${venv_python}" - <<'PY'
+import sys
+print(f"python{sys.version_info.major}.{sys.version_info.minor}")
+PY
+)"
+
+    rm -rf "${venv_path}/.python"
+    mkdir -p "${venv_path}/.python"
+    cp -a "${base_prefix}/." "${venv_path}/.python/"
+
+    "${venv_python}" - <<'PY' "${venv_path}/.python"
+import pathlib
+import sys
+
+embedded_prefix = pathlib.Path(sys.argv[1]).resolve()
+for path in (embedded_prefix / "lib").glob("python*/_sysconfigdata*.py"):
+    text = path.read_text()
+    marker = "build_time_vars = {"
+    if "_sglang_embedded_prefix" in text or marker not in text:
+        continue
+    text = text.replace(
+        marker,
+        "import pathlib as _sglang_pathlib\n"
+        "_sglang_embedded_prefix = _sglang_pathlib.Path(__file__).resolve().parents[2]\n"
+        + marker,
+        1,
+    )
+    text += (
+        "\n_sglang_include = str(_sglang_embedded_prefix / 'include' / "
+        "('python' + build_time_vars.get('LDVERSION', build_time_vars.get('VERSION', ''))))\n"
+        "for _sglang_key in ('INCLUDEPY', 'CONFINCLUDEPY'):\n"
+        "    if _sglang_key in build_time_vars:\n"
+        "        build_time_vars[_sglang_key] = _sglang_include\n"
+    )
+    path.write_text(text)
+PY
+
+    ln -sfn "../.python/bin/${python_exe_name}" "${venv_path}/bin/python"
+    ln -sfn python "${venv_path}/bin/python3"
+    ln -sfn python "${venv_path}/bin/${python_exe_name}"
+}
+
 VENV_PARENT="$(dirname "${VENV_PATH}")"
 mkdir -p "${VENV_PARENT}"
 VENV_PATH="$(cd "${VENV_PARENT}" && pwd)/$(basename "${VENV_PATH}")"
@@ -84,6 +137,7 @@ echo "Venv path: ${VENV_PATH}"
 echo "Logs: ${LOG_DIR}"
 
 run_logged create-venv "${UV}" venv --relocatable --seed --clear --managed-python --python "${PYTHON_VERSION}" "${VENV_PATH}"
+run_logged embed-managed-python embed_managed_python "${VENV_PATH}"
 
 REQ_DIR="$(mktemp -d)"
 REQ_FILE="${REQ_DIR}/sglang-runtime-requirements.txt"
