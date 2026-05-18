@@ -265,11 +265,8 @@ class ModelConfig:
         ):
             self.hf_config.architectures[0] = "LongcatFlashForCausalLMNextN"
             self.hf_config.num_hidden_layers = self.hf_config.num_nextn_predict_layers
-            
-        if (
-            is_draft_model
-            and self.hf_config.architectures[0] == "WeLMV4MoeForCausalLM"
-        ):
+
+        if is_draft_model and self.hf_config.architectures[0] == "WeLMV4MoeForCausalLM":
             self.hf_config.architectures[0] = "WeLMV4MoeForCausalLMNextN"
             self.hf_config.num_hidden_layers = self.hf_config.num_nextn_predict_layers
 
@@ -957,6 +954,7 @@ multimodal_model_archs = [
     "InternS1ForConditionalGeneration",
     "Phi4MMForCausalLM",
     "Step3VLForConditionalGeneration",
+    "WeLMV4VLMForConditionalGeneration",
     "POINTSV15ChatModel",
     "DotsVLMForCausalLM",
     "DotsOCRForCausalLM",
@@ -1005,6 +1003,7 @@ def is_multimodal_chunked_prefill_supported(model_architectures: List[str]):
         "LlavaLlamaForCausalLM",
         "MllamaForConditionalGeneration",
         "CLIPModel",
+        "WeLMV4VLMForConditionalGeneration",
     ]
     if any(multi_model_arch in unsupported for multi_model_arch in model_architectures):
         return False

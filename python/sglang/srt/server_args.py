@@ -942,7 +942,10 @@ class ServerArgs:
 
         hf_config = self.get_hf_config()
         model_arch = hf_config.architectures[0]
-        if model_arch in ["WeLMV4MoeForCausalLM"]:
+        if model_arch in [
+            "WeLMV4MoeForCausalLM",
+            "WeLMV4VLMForConditionalGeneration",
+        ]:
             self.prepare_n_gram_inputs = True
         if model_arch in ["DeepseekV3ForCausalLM"]:
             if is_deepseek_nsa(hf_config):

@@ -232,9 +232,7 @@ class LayerManager:
                 imitated_qkv_proj_bias is not None
             )
 
-            mirror_weight_data = mirror_qkv_proj_weight[
-                : mirror_layer_attn.q_size, :
-            ]
+            mirror_weight_data = mirror_qkv_proj_weight[: mirror_layer_attn.q_size, :]
             imitated_weight_data = torch.concat(
                 [
                     imitated_qkv_proj_weight,
@@ -257,9 +255,7 @@ class LayerManager:
                 imitated_layer_attn.qkv_proj_weight = imitated_weight_data.clone()
 
             if mirror_qkv_proj_bias is not None:
-                mirror_bias_data = mirror_qkv_proj_bias[
-                    : mirror_layer_attn.q_size
-                ]
+                mirror_bias_data = mirror_qkv_proj_bias[: mirror_layer_attn.q_size]
                 imitated_bias_data = torch.concat(
                     [
                         imitated_qkv_proj_bias,
@@ -267,12 +263,18 @@ class LayerManager:
                     ],
                     dim=0,
                 )
-                if hasattr(mirror_layer_attn, "qkv_proj_bias") and mirror_layer_attn.qkv_proj_bias is not None:
+                if (
+                    hasattr(mirror_layer_attn, "qkv_proj_bias")
+                    and mirror_layer_attn.qkv_proj_bias is not None
+                ):
                     mirror_layer_attn.qkv_proj_bias.copy_(mirror_bias_data)
                 else:
                     mirror_layer_attn.qkv_proj_bias = mirror_bias_data.clone()
 
-                if hasattr(imitated_layer_attn, "qkv_proj_bias") and imitated_layer_attn.qkv_proj_bias is not None:
+                if (
+                    hasattr(imitated_layer_attn, "qkv_proj_bias")
+                    and imitated_layer_attn.qkv_proj_bias is not None
+                ):
                     imitated_layer_attn.qkv_proj_bias.copy_(imitated_bias_data)
                 else:
                     imitated_layer_attn.qkv_proj_bias = imitated_bias_data.clone()
@@ -333,7 +335,9 @@ class Qwen2MoeMLP(nn.Module):
         if self.swiglu_clamp_limit is not None and self.swiglu_clamp_limit > 0:
             d = gate_up.shape[-1] // 2
             gate = F.silu(gate_up[..., :d]).clamp_(max=self.swiglu_clamp_limit)
-            up = gate_up[..., d:].clamp(min=-self.swiglu_clamp_limit, max=self.swiglu_clamp_limit)
+            up = gate_up[..., d:].clamp(
+                min=-self.swiglu_clamp_limit, max=self.swiglu_clamp_limit
+            )
             x = gate * up
         else:
             x = self.act_fn(gate_up)
@@ -414,13 +418,17 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 f"the number of experts {config.num_experts}."
             )
 
-        moe_clamp_limits = getattr(config, "moe_expert_swiglu_clamp_limit_layerwise", [])
+        moe_clamp_limits = getattr(
+            config, "moe_expert_swiglu_clamp_limit_layerwise", []
+        )
         moe_clamp_limit = (
             moe_clamp_limits[layer_id]
             if layer_id < len(moe_clamp_limits) and moe_clamp_limits[layer_id] > 0
             else None
         )
-        shared_clamp_limits = getattr(config, "shared_expert_swiglu_clamp_limit_layerwise", [])
+        shared_clamp_limits = getattr(
+            config, "shared_expert_swiglu_clamp_limit_layerwise", []
+        )
         shared_clamp_limit = (
             shared_clamp_limits[layer_id]
             if layer_id < len(shared_clamp_limits) and shared_clamp_limits[layer_id] > 0
@@ -1730,6 +1738,7 @@ class Qwen2MoeModel(nn.Module):
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
+        skip_oe_fusion: bool = False,
     ) -> Union[torch.Tensor, PPProxyTensors]:
         _welm_start_dump_pass()
         if self.pp_group.is_first_rank:
@@ -1740,7 +1749,11 @@ class Qwen2MoeModel(nn.Module):
             if _welm_dump_enabled():
                 _welm_dump_tensor("model.embed_tokens.output", hidden_states)
 
-            if len(self.oe_grams) > 0 and forward_batch.n_gram_input_ids is not None:
+            if (
+                len(self.oe_grams) > 0
+                and not skip_oe_fusion
+                and forward_batch.n_gram_input_ids is not None
+            ):
                 hidden_states = self._compute_oe_embedding(
                     input_ids, forward_batch, hidden_states
                 )
@@ -1880,6 +1893,7 @@ class WeLMV4MoeForCausalLM(nn.Module):
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
+        skip_oe_fusion: bool = False,
     ) -> torch.Tensor:
         model_output = self.model(
             input_ids,
@@ -1887,6 +1901,7 @@ class WeLMV4MoeForCausalLM(nn.Module):
             forward_batch,
             input_embeds,
             pp_proxy_tensors=pp_proxy_tensors,
+            skip_oe_fusion=skip_oe_fusion,
         )
         aux_hidden_states = None
         if isinstance(model_output, tuple):
