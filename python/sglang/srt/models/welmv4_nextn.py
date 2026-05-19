@@ -22,6 +22,7 @@ from sglang.srt.models.welmv4 import (
     WelmV4FusedRMSNorm,
     WeLMV4MoeForCausalLM,
     hash_input_ids_vectorized,
+    welm_use_previous_precision,
 )
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix, is_cuda, is_npu
@@ -127,8 +128,10 @@ class WeLMV4ModelNextN(nn.Module):
         )
 
         self.shared_head = nn.Module()
-        self.shared_head.norm = WelmV4FusedRMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
+        self.shared_head.norm = (
+            RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            if welm_use_previous_precision()
+            else WelmV4FusedRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         )
 
     def forward(
@@ -221,17 +224,25 @@ class WeLMV4ModelNextN(nn.Module):
 
         if not forward_batch.forward_mode.is_idle():
             if residual is not None:
-                if final_experts_output is not None:
+                if welm_use_previous_precision():
+                    hidden_states, _ = self.shared_head.norm(hidden_states, residual)
+                elif final_experts_output is not None:
                     hidden_states = final_experts_output.float() + residual.float()
                     if final_shared_output is not None:
                         hidden_states = hidden_states + final_shared_output.float()
+                    hidden_states = hidden_states.to(self.shared_head.norm.weight.dtype)
+                    _dump_tensor("model.mtp.0.decoder.0.output", hidden_states)
+                    hidden_states, _ = self.shared_head.norm(hidden_states)
                 else:
                     hidden_states = hidden_states.float() + residual.float()
-                hidden_states = hidden_states.to(self.shared_head.norm.weight.dtype)
-                _dump_tensor("model.mtp.0.decoder.0.output", hidden_states)
-                hidden_states, _ = self.shared_head.norm(hidden_states)
+                    hidden_states = hidden_states.to(self.shared_head.norm.weight.dtype)
+                    _dump_tensor("model.mtp.0.decoder.0.output", hidden_states)
+                    hidden_states, _ = self.shared_head.norm(hidden_states)
             else:
-                hidden_states, _ = self.shared_head.norm(hidden_states)
+                norm_output = self.shared_head.norm(hidden_states)
+                hidden_states = (
+                    norm_output[0] if isinstance(norm_output, tuple) else norm_output
+                )
         _dump_tensor("model.mtp.0.ln_f", hidden_states)
         return hidden_states
 

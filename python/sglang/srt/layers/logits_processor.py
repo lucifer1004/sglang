@@ -40,6 +40,7 @@ from sglang.srt.layers.dp_attention import (
     get_dp_dtype,
     get_dp_hidden_size,
 )
+from sglang.srt.layers.welmv4_op import welm_use_previous_precision
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
@@ -335,6 +336,7 @@ class LogitsProcessor(nn.Module):
         self.logprobs_chunk_size = envs.SGLANG_LOGITS_PROCESSER_CHUNK_SIZE.value
         self.use_flash_attn_style_input_logprobs = (
             getattr(config, "model_type", None) == "welmv4_moe"
+            and not welm_use_previous_precision()
         )
 
     def compute_logprobs_for_multi_item_scoring(
@@ -909,6 +911,7 @@ class LogitsProcessor(nn.Module):
     ) -> bool:
         return (
             self.use_flash_attn_style_input_logprobs
+            and not welm_use_previous_precision()
             and not logits_metadata.extend_return_top_logprob
             and not logits_metadata.extend_token_ids_logprob
             and not logits_metadata.temp_scaled_logprobs

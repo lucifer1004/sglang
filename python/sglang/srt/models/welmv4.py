@@ -44,6 +44,7 @@ from sglang.srt.layers.dp_attention import (
     get_attention_tp_size,
     is_dp_attention_enabled,
 )
+from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
@@ -76,6 +77,7 @@ from sglang.srt.layers.welmv4_op import (
     mmq_style_k_rms_norm,
     mmq_style_norm_after_attn,
     mmq_style_router_linear,
+    welm_use_previous_precision,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
@@ -362,7 +364,8 @@ def expert_bias_routing(
         scores = torch.sigmoid(gating_output).type_as(gating_output)
 
     if (
-        scores.is_cuda
+        not welm_use_previous_precision()
+        and scores.is_cuda
         and scores.dtype == torch.float32
         and expert_bias.dtype == torch.float32
     ):
@@ -473,8 +476,9 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("experts", prefix),
             swiglu_clamp_limit=moe_clamp_limit,
-            apply_router_weight_on_swiglu=get_bool_env_var(
-                "SGLANG_WELMV4_MMQ_SCORE_ON_SWIGLU", "false"
+            apply_router_weight_on_swiglu=(
+                not welm_use_previous_precision()
+                and get_bool_env_var("SGLANG_WELMV4_MMQ_SCORE_ON_SWIGLU", "false")
             ),
         )
 
@@ -529,7 +533,10 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 shared_output = (
                     F.sigmoid(self.shared_expert_gate(hidden_states)) * shared_output
                 )
-        router_logits = mmq_style_router_linear(hidden_states, self.gate.weight)
+        if welm_use_previous_precision():
+            router_logits = F.linear(hidden_states_fp32, self.gate.weight)
+        else:
+            router_logits = mmq_style_router_linear(hidden_states, self.gate.weight)
         if dump_this_layer:
             _welm_dump_tensor(f"{dump_prefix}.router.logits", router_logits)
             router_scores = (
@@ -890,11 +897,14 @@ class Qwen2MoeAttention(nn.Module):
         self.only_k_norm = k_norm
         self.use_o_norm = o_norm
         self.total_layer_num = total_layer_num
-        self.o_norm = (
-            WelmV4FusedRMSNorm(self.hidden_size, eps=rms_norm_eps)
-            if self.use_o_norm
-            else None
-        )
+        if self.use_o_norm:
+            self.o_norm = (
+                RMSNorm(self.hidden_size)
+                if welm_use_previous_precision()
+                else WelmV4FusedRMSNorm(self.hidden_size, eps=rms_norm_eps)
+            )
+        else:
+            self.o_norm = None
 
         self.q_norm = (
             WelmV4FusedRMSNorm(self.head_dim, eps=rms_norm_eps)
@@ -1121,9 +1131,12 @@ class Qwen2MoeAttention(nn.Module):
 
         k_by_head = k.view(*k.shape[:-1], k.shape[-1] // self.head_dim, self.head_dim)
         if self.k_norm is not None:
-            k_by_head = mmq_style_k_rms_norm(
-                k_by_head.contiguous(), self.k_norm.weight, self.k_norm.eps
-            )
+            if welm_use_previous_precision():
+                k_by_head, _ = self.k_norm(k_by_head)
+            else:
+                k_by_head = mmq_style_k_rms_norm(
+                    k_by_head.contiguous(), self.k_norm.weight, self.k_norm.eps
+                )
         if dump_this_layer:
             _welm_dump_tensor(f"{dump_prefix}.k_after_norm", k_by_head.view(k.shape))
         k = k_by_head.view(k.shape)
@@ -1173,7 +1186,10 @@ class Qwen2MoeAttention(nn.Module):
                 f"model.layers.{self.layer_idx}.attn.mixer.o_proj_out", output
             )
         if self.o_norm is not None and not skip_o_norm:
-            output, _ = self.o_norm(output)
+            if welm_use_previous_precision():
+                output = self.o_norm(output)
+            else:
+                output, _ = self.o_norm(output)
             if dump_this_layer:
                 _welm_dump_tensor(
                     f"model.layers.{self.layer_idx}.attn.mixer.o_norm_out", output
@@ -1307,10 +1323,15 @@ class Qwen2MoeDecoderLayer(nn.Module):
                 quant_config=quant_config,
                 prefix=add_prefix("mlp", prefix),
             )
-        self.input_layernorm = WelmV4CommunicatorRMSNorm(
+        decoder_layernorm_cls = (
+            WelmV4FusedRMSNorm
+            if welm_use_previous_precision()
+            else WelmV4CommunicatorRMSNorm
+        )
+        self.input_layernorm = decoder_layernorm_cls(
             config.hidden_size, eps=config.rms_norm_eps
         )
-        self.post_attention_layernorm = WelmV4CommunicatorRMSNorm(
+        self.post_attention_layernorm = decoder_layernorm_cls(
             config.hidden_size, eps=config.rms_norm_eps
         )
         self.final_mlp_experts_output: Optional[torch.Tensor] = None
@@ -1331,6 +1352,7 @@ class Qwen2MoeDecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        use_previous_precision = welm_use_previous_precision()
         dump_this_layer = _welm_should_dump_layer(self.layer_id)
         if dump_this_layer:
             _welm_dump_tensor(f"model.layers.{self.layer_id}.__input__.0", hidden_states)
@@ -1338,7 +1360,17 @@ class Qwen2MoeDecoderLayer(nn.Module):
             self.ppln and self.layer_id not in self.prenorm_layer_idx
         )
         use_dp_layer_communicator = is_dp_attention_enabled()
-        if use_dp_layer_communicator:
+        if use_previous_precision:
+            hidden_states, residual = self.input_layernorm(
+                hidden_states,
+                residual,
+                residual_after_layernorm=residual_after_layernorm,
+            )
+            if residual_after_layernorm:
+                residual = hidden_states.clone().to(
+                    dtype=hidden_states.dtype, device=hidden_states.device
+                )
+        elif use_dp_layer_communicator:
             hidden_states, residual = self.layer_communicator.prepare_attn(
                 hidden_states, residual, forward_batch
             )
@@ -1366,7 +1398,11 @@ class Qwen2MoeDecoderLayer(nn.Module):
             )
             if residual is not None:
                 _welm_dump_tensor(f"model.layers.{self.layer_id}.attn.mixer.1", residual)
-        use_mmq_norm_after_attn = residual_after_layernorm and self.self_attn.use_o_norm
+        use_mmq_norm_after_attn = (
+            not use_previous_precision
+            and residual_after_layernorm
+            and self.self_attn.use_o_norm
+        )
         if hidden_states.shape[0] != 0:
             hidden_states = self.self_attn(
                 positions=positions,
@@ -1380,7 +1416,7 @@ class Qwen2MoeDecoderLayer(nn.Module):
             and self.layer_id == self.kv_mirror_layers[-1]
         ):
             residual = residual[forward_batch.custom_last_index]
-            if is_dp_attention_enabled():
+            if is_dp_attention_enabled() and not use_previous_precision:
                 from sglang.srt.layers.dp_attention import (
                     get_attention_dp_rank,
                     set_dp_buffer_len,
@@ -1452,7 +1488,7 @@ class Qwen2MoeDecoderLayer(nn.Module):
                     )
                     hidden_states_fp32 = hidden_states.to(torch.float32)
         else:
-            if use_dp_layer_communicator:
+            if use_dp_layer_communicator and not use_previous_precision:
                 hidden_states, residual = self.layer_communicator.prepare_mlp(
                     hidden_states, residual, forward_batch
                 )
@@ -1488,9 +1524,14 @@ class Qwen2MoeDecoderLayer(nn.Module):
             hidden_states_fp32,
             forward_batch,
             use_reduce_scatter,
-            return_components=dump_this_layer or self.is_final_layer,
+            return_components=(
+                dump_this_layer
+                if use_previous_precision
+                else dump_this_layer or self.is_final_layer
+            ),
             skip_component_output=(
-                self.is_final_layer
+                not use_previous_precision
+                and self.is_final_layer
                 and residual is not None
                 and not dump_this_layer
                 and getattr(self.mlp, "tp_size", 1) == 1
@@ -1504,12 +1545,12 @@ class Qwen2MoeDecoderLayer(nn.Module):
         else:
             hidden_states = mlp_output
 
-        if use_dp_layer_communicator:
+        if use_dp_layer_communicator and not use_previous_precision:
             hidden_states, residual = self.layer_communicator.postprocess_layer(
                 hidden_states, residual, forward_batch
             )
 
-        if self.is_final_layer:
+        if self.is_final_layer and not use_previous_precision:
             self.final_mlp_experts_output = experts_output
             self.final_mlp_shared_output = shared_output
         if dump_this_layer:
@@ -1634,8 +1675,10 @@ class Qwen2MoeModel(nn.Module):
             prefix=add_prefix("layers", prefix),
         )
         if self.pp_group.is_last_rank:
-            self.norm = WelmV4FusedRMSNorm(
-                config.hidden_size, eps=config.rms_norm_eps
+            self.norm = (
+                RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+                if welm_use_previous_precision()
+                else WelmV4FusedRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
             )
         else:
             self.norm = PPMissingLayer(return_tuple=True)
@@ -1769,6 +1812,8 @@ class Qwen2MoeModel(nn.Module):
             residual = pp_proxy_tensors["residual"]
 
         aux_hidden_states = []
+        use_previous_precision = welm_use_previous_precision()
+        pre_norm_hidden_states = None
         if forward_batch.can_run_tbo:
             hidden_states, residual = model_forward_maybe_tbo(
                 layers=self.layers,
@@ -1800,9 +1845,13 @@ class Qwen2MoeModel(nn.Module):
                 }
             )
         else:
-            pre_norm_hidden_states = None
             if hidden_states.shape[0] != 0:
-                if residual is None:
+                if use_previous_precision:
+                    if residual is None:
+                        hidden_states = self.norm(hidden_states)
+                    else:
+                        hidden_states, _ = self.norm(hidden_states, residual)
+                elif residual is None:
                     pre_norm_hidden_states = hidden_states
                     hidden_states, _ = self.norm(hidden_states)
                 else:
@@ -1841,7 +1890,8 @@ class Qwen2MoeModel(nn.Module):
                         )
 
         if (
-            len(aux_hidden_states) == 0
+            not use_previous_precision
+            and len(aux_hidden_states) == 0
             and forward_batch.capture_hidden_mode.need_capture()
             and pre_norm_hidden_states is not None
         ):
