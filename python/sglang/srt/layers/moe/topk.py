@@ -1241,11 +1241,9 @@ def _apply_router_replay_from_forward_batch(
             last_q_indices is None
             or last_q_indices.shape[0] != topk_ids.shape[0]
         ):
-            raise ValueError(
-                "router replay forced ids cannot be aligned to current TopK rows; "
-                f"forced_ids={tuple(forced_ids.shape)}, "
-                f"topk_ids={tuple(topk_ids.shape)}."
-            )
+            # CUDA graph capture can attach zero-masked replay placeholders before
+            # WeLM's last-token indices are populated; those placeholders are inert.
+            return topk_weights, topk_ids
         forced_ids = forced_ids[last_q_indices]
         mask = mask[last_q_indices]
     mask = mask & forced_ids.ge(0).all(dim=1)

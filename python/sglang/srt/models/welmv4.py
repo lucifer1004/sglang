@@ -35,6 +35,9 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
+from sglang.srt.distributed.communication_op import (
+    attention_tensor_model_parallel_all_reduce,
+)
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.activation import SiluAndMul
@@ -44,6 +47,7 @@ from sglang.srt.layers.communicator import (
     ScatterMode,
 )
 from sglang.srt.layers.dp_attention import (
+    get_attention_dp_size,
     get_attention_tp_rank,
     get_attention_tp_size,
     is_dp_attention_enabled,
@@ -1351,6 +1355,9 @@ class Qwen2MoeAttention(nn.Module):
 
         attn_tp_rank = get_attention_tp_rank()
         attn_tp_size = get_attention_tp_size()
+        self.attn_tp_size = attn_tp_size
+        self.attn_tp_rank = attn_tp_rank
+        self.attn_dp_size = get_attention_dp_size() if is_dp_attention_enabled() else 1
 
         self.total_num_heads = num_heads
         assert self.total_num_heads % attn_tp_size == 0
@@ -1688,7 +1695,19 @@ class Qwen2MoeAttention(nn.Module):
                 f"model.layers.{self.layer_idx}.attn.mixer.o_proj_out", output
             )
         if self.use_o_norm and not skip_o_norm:
-            output = self.o_norm(output)
+            need_attn_tp_reduce_for_o_norm = (
+                is_dp_attention_enabled()
+                and self.attn_tp_size > 1
+                and self.attn_dp_size > 1
+                and output.shape[0] != 0
+            )
+            if need_attn_tp_reduce_for_o_norm:
+                output = attention_tensor_model_parallel_all_reduce(output)
+            output, _ = self.o_norm(output)
+            if need_attn_tp_reduce_for_o_norm and self.attn_tp_rank != 0:
+                # prepare_mlp reduces across attn-TP again; keep the full value
+                # only on rank 0 so the later reduce does not double count it.
+                output = torch.zeros_like(output)
             if dump_this_layer:
                 _welm_dump_tensor(
                     f"model.layers.{self.layer_idx}.attn.mixer.o_norm_out", output
@@ -1901,7 +1920,16 @@ class Qwen2MoeDecoderLayer(nn.Module):
             residual = hidden_states.clone().to(
                 dtype=hidden_states.dtype, device=hidden_states.device
             )
-        use_mmq_norm_after_attn = residual_after_layernorm and self.self_attn.use_o_norm
+        use_mmq_norm_after_attn = (
+            residual_after_layernorm
+            and self.self_attn.use_o_norm
+            and not (
+                # The fused path would run o_norm on attn-TP partial sums.
+                is_dp_attention_enabled()
+                and self.attn_tp_size > 1
+                and self.self_attn.attn_dp_size > 1
+            )
+        )
         if hidden_states.shape[0] != 0:
             hidden_states = self.self_attn(
                 positions=positions,
@@ -1988,7 +2016,6 @@ class Qwen2MoeDecoderLayer(nn.Module):
             ):
                 from sglang.srt.layers.dp_attention import (
                     dp_gather_partial,
-                    get_attention_dp_size,
                     get_global_dp_buffer,
                 )
 
