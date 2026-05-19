@@ -1357,7 +1357,6 @@ class Qwen2MoeAttention(nn.Module):
         attn_tp_size = get_attention_tp_size()
         self.attn_tp_size = attn_tp_size
         self.attn_tp_rank = attn_tp_rank
-        self.attn_dp_size = get_attention_dp_size() if is_dp_attention_enabled() else 1
 
         self.total_num_heads = num_heads
         assert self.total_num_heads % attn_tp_size == 0
@@ -1460,6 +1459,9 @@ class Qwen2MoeAttention(nn.Module):
             tp_size=attn_tp_size,
             reduce_results=not is_dp_attention_enabled(),
             prefix=add_prefix("o_proj", prefix),
+        )
+        self.o_norm_needs_attn_tp_reduce = (
+            self.use_o_norm and not self.o_proj.reduce_results and self.attn_tp_size > 1
         )
         if rope_scaling is None:
             rope_scaling = {"type": "linear", "factor": 1 / self.compress}
@@ -1696,15 +1698,13 @@ class Qwen2MoeAttention(nn.Module):
             )
         if self.use_o_norm and not skip_o_norm:
             need_attn_tp_reduce_for_o_norm = (
-                is_dp_attention_enabled()
-                and self.attn_tp_size > 1
-                and self.attn_dp_size > 1
+                self.o_norm_needs_attn_tp_reduce
                 and output.shape[0] != 0
             )
             if need_attn_tp_reduce_for_o_norm:
                 output = attention_tensor_model_parallel_all_reduce(output)
             output, _ = self.o_norm(output)
-            if need_attn_tp_reduce_for_o_norm and self.attn_tp_rank != 0:
+            if self.o_norm_needs_attn_tp_reduce and self.attn_tp_rank != 0:
                 # prepare_mlp reduces across attn-TP again; keep the full value
                 # only on rank 0 so the later reduce does not double count it.
                 output = torch.zeros_like(output)
@@ -1810,9 +1810,6 @@ class Qwen2MoeDecoderLayer(nn.Module):
         self.layer_id = layer_id
         self.is_nextn = is_nextn
         self.is_final_layer = layer_id == total_layer_num - 1 or is_nextn
-
-        self.attn_tp_size = get_attention_tp_size()
-        self.attn_tp_rank = get_attention_tp_rank()
 
         # Qwen2MoE all layers are sparse (include nextn layers)
         self.is_layer_sparse = True
@@ -1923,12 +1920,8 @@ class Qwen2MoeDecoderLayer(nn.Module):
         use_mmq_norm_after_attn = (
             residual_after_layernorm
             and self.self_attn.use_o_norm
-            and not (
-                # The fused path would run o_norm on attn-TP partial sums.
-                is_dp_attention_enabled()
-                and self.attn_tp_size > 1
-                and self.self_attn.attn_dp_size > 1
-            )
+            # The fused path would run o_norm on attn-TP partial sums.
+            and not self.self_attn.o_norm_needs_attn_tp_reduce
         )
         if hidden_states.shape[0] != 0:
             hidden_states = self.self_attn(
@@ -2011,7 +2004,7 @@ class Qwen2MoeDecoderLayer(nn.Module):
             )
             if (
                 is_dp_attention_enabled()
-                and self.attn_tp_size == 1
+                and self.self_attn.attn_tp_size == 1
                 and self.layer_scatter_modes.mlp_mode == ScatterMode.FULL
             ):
                 from sglang.srt.layers.dp_attention import (
