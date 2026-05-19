@@ -1,0 +1,6 @@
+[submodule "3rdparty/sr"]
+	path = 3rdparty/sr
+	url = https://github.com/reyoung/sr.git
+[submodule "3rdparty/jfs-fast-get"]
+	path = 3rdparty/jfs-fast-get
+	url = https://git.woa.com/wxg-odyssey/rl-infra/jfs-fast-get.git
