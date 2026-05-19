@@ -1,3 +1,4 @@
+import os
 from typing import Optional
 
 import torch
@@ -7,6 +8,15 @@ from torch import nn
 
 from sglang.srt.custom_op import CustomOp
 from sglang.srt.layers.rotary_embedding import FusedSetKVBufferArg, RotaryEmbedding
+
+
+def welm_use_previous_precision() -> bool:
+    return os.getenv("WELM_USE_PREVIOUS_PRECISION", "0").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
 
 
 def _get_num_sms(multiplier: int = 1) -> int:
@@ -248,11 +258,21 @@ def mmq_style_expert_bias_topk(
 
 
 @triton.jit
-def _do_rms_norm(hidden, gamma, cols: int, eps: tl.constexpr):
-    hidden = hidden.to(gamma.dtype).to(tl.float32)
+def _do_rms_norm(
+    hidden,
+    gamma,
+    cols: int,
+    eps: tl.constexpr,
+    USE_PREVIOUS_PRECISION: tl.constexpr,
+):
+    if not USE_PREVIOUS_PRECISION:
+        hidden = hidden.to(gamma.dtype).to(tl.float32)
     inv_rms = tl.math.rsqrt(tl.sum(hidden * hidden, axis=-1) / cols + eps)
     out = hidden * inv_rms
-    out *= gamma
+    if USE_PREVIOUS_PRECISION:
+        out *= gamma.to(hidden.dtype)
+    else:
+        out *= gamma
     return out
 
 
@@ -405,6 +425,7 @@ def rms_norm_kernel(  # pylint: disable=too-many-arguments,too-many-locals
     residual_after_layernorm: tl.constexpr,
     NUM_SMS: tl.constexpr,  # pylint: disable=invalid-name
     BLOCK_SIZE: tl.constexpr,  # pylint: disable=invalid-name
+    USE_PREVIOUS_PRECISION: tl.constexpr,
 ):
     row_start = tl.program_id(0)
     cols_off = tl.arange(0, BLOCK_SIZE)
@@ -432,7 +453,7 @@ def rms_norm_kernel(  # pylint: disable=too-many-arguments,too-many-locals
                 mask=mask,
             )
 
-        out = _do_rms_norm(h, gamma_shm, cols, eps)
+        out = _do_rms_norm(h, gamma_shm, cols, eps, USE_PREVIOUS_PRECISION)
         if out_copy_ptr is not None:
             tl.store(out_copy_ptr + output_offs, out, mask=mask)
 
@@ -462,10 +483,16 @@ class WelmV4FusedRMSNorm(CustomOp):
         output_dtype: Optional[torch.dtype] = None,
     ):
         assert x.dim() in [2, 3]
-        output = torch.empty_like(x, dtype=output_dtype or x.dtype)
+        use_previous_precision = welm_use_previous_precision()
+        output = torch.empty_like(
+            x, dtype=x.dtype if use_previous_precision else output_dtype or x.dtype
+        )
         fp32_out = None
         out_residual = None
-        if residual_after_layernorm:
+        if use_previous_precision:
+            if residual is not None or residual_after_layernorm:
+                out_residual = torch.empty_like(x)
+        elif residual_after_layernorm:
             out_residual = torch.empty_like(x)
         elif residual is not None:
             out_residual = torch.empty_like(residual)
@@ -505,6 +532,7 @@ class WelmV4FusedRMSNorm(CustomOp):
             residual_after_layernorm,
             num_sms,
             block_size,
+            use_previous_precision,
         )
         if out_residual is None:
             out_residual = x
@@ -546,7 +574,7 @@ def mmq_style_shared_experts_add_residual_rms_norm_kernel(
 
         hidden_state = experts_output + shared_output
         hidden_state = hidden_state + residual
-        out = _do_rms_norm(hidden_state, gamma_shm, cols, eps)
+        out = _do_rms_norm(hidden_state, gamma_shm, cols, eps, False)
         tl.store(out_ptr + offs, out.to(output_dtype), mask=mask)
 
 

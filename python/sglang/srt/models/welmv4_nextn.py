@@ -27,6 +27,7 @@ from sglang.srt.models.welmv4 import (
     _welm_prepare_kv_mirror_logits_states,
     _welm_select_kv_mirror_rows,
     _welm_should_contract_kv_mirror,
+    welm_use_previous_precision,
 )
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix, is_cuda, is_npu
@@ -132,8 +133,10 @@ class WeLMV4ModelNextN(nn.Module):
         )
 
         self.shared_head = nn.Module()
-        self.shared_head.norm = WelmV4FusedRMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
+        self.shared_head.norm = (
+            RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            if welm_use_previous_precision()
+            else WelmV4FusedRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         )
 
     def forward(
@@ -237,19 +240,33 @@ class WeLMV4ModelNextN(nn.Module):
         hidden_states_for_next_mtp = None
         if not forward_batch.forward_mode.is_idle():
             if residual is not None:
-                if final_experts_output is not None:
+                if welm_use_previous_precision():
+                    hidden_states_for_next_mtp = (
+                        hidden_states.float() + residual.float()
+                    ).to(self.shared_head.norm.weight.dtype)
+                    hidden_states, _ = self.shared_head.norm(hidden_states, residual)
+                elif final_experts_output is not None:
                     hidden_states = final_experts_output.float() + residual.float()
                     if final_shared_output is not None:
                         hidden_states = hidden_states + final_shared_output.float()
                 else:
                     hidden_states = hidden_states.float() + residual.float()
-            # MMQ feeds the MTP layer output before apply_ln_f into the next
-            # recursive MTP step; shared_head.norm is only for logits.
-            hidden_states_for_next_mtp = hidden_states.to(
-                self.shared_head.norm.weight.dtype
-            )
+                if hidden_states_for_next_mtp is None:
+                    # MMQ feeds the MTP layer output before apply_ln_f into the next
+                    # recursive MTP step; shared_head.norm is only for logits.
+                    hidden_states_for_next_mtp = hidden_states.to(
+                        self.shared_head.norm.weight.dtype
+                    )
+                    hidden_states, _ = self.shared_head.norm(hidden_states_for_next_mtp)
+            else:
+                hidden_states_for_next_mtp = hidden_states.to(
+                    self.shared_head.norm.weight.dtype
+                )
+                norm_output = self.shared_head.norm(hidden_states_for_next_mtp)
+                hidden_states = (
+                    norm_output[0] if isinstance(norm_output, tuple) else norm_output
+                )
             _dump_tensor("model.mtp.0.decoder.0.output", hidden_states_for_next_mtp)
-            hidden_states, _ = self.shared_head.norm(hidden_states_for_next_mtp)
         _dump_tensor("model.mtp.0.ln_f", hidden_states)
         return hidden_states, hidden_states_for_next_mtp
 
