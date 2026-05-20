@@ -55,7 +55,7 @@ SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
 RUN --mount=type=cache,target=/var/cache/apt \
     apt-get update && \
-    apt-get install -y --no-install-recommends \
+    apt-get install -y \
         bash \
         build-essential \
         ca-certificates \
@@ -97,6 +97,7 @@ RUN --mount=type=cache,target=/var/cache/apt \
         bzip2 \
         dstat \
         htop && \
+    cd /var/lib/pcp/pmns && /usr/lib/pcp/pmns/Rebuild && \
     rm -rf /var/lib/apt/lists/*
 
 COPY --from=go-builder /out/sr /usr/local/bin/sr
