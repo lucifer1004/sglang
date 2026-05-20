@@ -32,7 +32,7 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.models.welmv4 import WeLMV4MoeForCausalLM
-from sglang.srt.utils import add_prefix
+from sglang.srt.utils import add_prefix, print_warning_once
 
 # When set to a truthy value, the vision encoder runs data-parallel: each
 # tensor-parallel rank computes the full attention / MLP / projector locally
@@ -45,6 +45,17 @@ from sglang.srt.utils import add_prefix
 # vision encoder. The flag has no effect on the LLM decoder path.
 _VISION_DP_ENV_VAR = "SGLANG_VLM_VISION_DATA_PARALLEL"
 
+# Maximum number of vision-encoder patch tokens processed in a single
+# forward pass through the 27-layer vision transformer. **Disabled by
+# default** to preserve the original "concat all images and forward once"
+# behaviour byte-for-byte; set this env to a positive integer (e.g.
+# ``262144`` = one 4096x4096 image) to opt in to per-image splitting,
+# which is a numerically-equivalent transformation that bounds peak HBM
+# for high-resolution / many-image requests. The same value is reused as
+# the chunk size for the patch-embed unfold/GEMM step.
+_VISION_MAX_PATCHES_ENV_VAR = "SGLANG_VLM_VISION_MAX_PATCHES"
+_VISION_MAX_PATCHES_DISABLED = 0
+
 
 def _vision_uses_data_parallel() -> bool:
     return os.getenv(_VISION_DP_ENV_VAR, "0").strip().lower() in {
@@ -53,6 +64,30 @@ def _vision_uses_data_parallel() -> bool:
         "on",
         "yes",
     }
+
+
+def _read_positive_int_env(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        v = int(raw)
+    except ValueError:
+        return default
+    return v if v > 0 else default
+
+
+def _vision_max_patches() -> int:
+    """Soft cap on the number of patch tokens processed per encoder pass.
+
+    Returns ``0`` when the env is unset, signalling "no chunking; preserve
+    the original concat-then-forward behaviour exactly". A positive value
+    enables per-image splitting in the encoder loop and the patch-embed
+    unfold/GEMM step.
+    """
+    return _read_positive_int_env(
+        _VISION_MAX_PATCHES_ENV_VAR, _VISION_MAX_PATCHES_DISABLED
+    )
 
 
 def _vision_dp_tp_kwargs() -> dict:
@@ -80,13 +115,12 @@ def _patch_embed_forward_matmul(
     k_w: int,
     in_channels: int,
     hidden_size: int,
+    chunk_size: Optional[int] = None,
 ) -> torch.Tensor:
     x = x.view(-1, in_channels, k_t, k_h, k_w).to(dtype=weight.dtype)
     n = x.shape[0]
-    unfolded = x.unfold(2, k_t, k_t).unfold(3, k_h, k_h).unfold(4, k_w, k_w)
-    unfolded = unfolded.permute(0, 2, 3, 4, 1, 5, 6, 7).reshape(
-        n, -1, in_channels * k_t * k_h * k_w
-    )
+    weight2d = weight.reshape(hidden_size, -1)
+
     # The bias is added AFTER the GEMM, NOT through cuBLAS's fused fp32
     # epilogue. The WeLMV4 training stack computes the GEMM and the bias
     # add as two separate bf16 ops (``out = gemm(x, w); out = out + b``),
@@ -95,9 +129,36 @@ def _patch_embed_forward_matmul(
     # once in fp32, producing slightly different outputs. We mirror the
     # training-side two-round semantics so inference outputs stay aligned
     # with training.
-    out = F.linear(unfolded, weight.reshape(hidden_size, -1), None)
-    if bias is not None:
-        out = out + bias
+
+    if chunk_size is None:
+        chunk_size = _vision_max_patches()
+    # ``chunk_size <= 0`` or ``chunk_size >= n`` => single-shot path
+    # (preserves the original behaviour byte-for-byte).
+    if chunk_size <= 0 or chunk_size >= n:
+        unfolded = x.unfold(2, k_t, k_t).unfold(3, k_h, k_h).unfold(4, k_w, k_w)
+        unfolded = unfolded.permute(0, 2, 3, 4, 1, 5, 6, 7).reshape(
+            n, -1, in_channels * k_t * k_h * k_w
+        )
+        out = F.linear(unfolded, weight2d, None)
+        if bias is not None:
+            out = out + bias
+        return out
+
+    # Match the (n, 1, hidden_size) shape produced by the single-shot
+    # path's reshape so callers see the same layout regardless of
+    # ``chunk_size``.
+    out = x.new_empty((n, 1, hidden_size))
+    for s in range(0, n, chunk_size):
+        e = min(n, s + chunk_size)
+        seg = x[s:e]
+        unfolded = seg.unfold(2, k_t, k_t).unfold(3, k_h, k_h).unfold(4, k_w, k_w)
+        unfolded = unfolded.permute(0, 2, 3, 4, 1, 5, 6, 7).reshape(
+            e - s, -1, in_channels * k_t * k_h * k_w
+        )
+        out_seg = F.linear(unfolded, weight2d, None)
+        if bias is not None:
+            out_seg = out_seg + bias
+        out[s:e] = out_seg
     return out
 
 
@@ -429,6 +490,33 @@ class WeLMV4VisionEncoder(nn.Module):
         seq_lens_t = torch.tensor(seq_lens, device=self.device, dtype=torch.int32)
         return F.pad(seq_lens_t.cumsum(dim=0, dtype=torch.int32), (1, 0), value=0)
 
+    @staticmethod
+    def _split_groups_by_image(
+        boundaries: List[int], max_patches: int
+    ) -> List[Tuple[int, int]]:
+        """Split ``cu_seqlens`` boundaries into encoder micro-batches.
+
+        Returned ranges are ``(boundary_start, boundary_end)`` indices into
+        ``boundaries`` such that each group covers a contiguous set of
+        per-image segments and has ``boundaries[end] - boundaries[start]``
+        patches; we never split inside a single image (which would break
+        per-image self-attention).
+        """
+        groups: List[Tuple[int, int]] = []
+        if len(boundaries) <= 1:
+            return groups
+        start = 0
+        for i in range(1, len(boundaries)):
+            # Try to keep this segment in the current group.
+            if boundaries[i] - boundaries[start] <= max_patches or i - 1 == start:
+                continue
+            # The segment ending at ``i`` would push over the cap; close the
+            # group at ``i - 1`` and start a new group from there.
+            groups.append((start, i - 1))
+            start = i - 1
+        groups.append((start, len(boundaries) - 1))
+        return groups
+
     def forward(
         self, pixel_values: torch.Tensor, grid_thw: torch.Tensor
     ) -> torch.Tensor:
@@ -446,10 +534,61 @@ class WeLMV4VisionEncoder(nn.Module):
         cos = torch.cat([cos, cos], dim=-1)
         sin = torch.cat([sin, sin], dim=-1)
 
-        for block in self.blocks:
-            hidden_states = block(
-                hidden_states, cu_seqlens=cu_seqlens, position_embeddings=(cos, sin)
+        max_patches = _vision_max_patches()
+        total = hidden_states.shape[0]
+        # Cheap fast-path: small enough to fit in one shot, or the cap is
+        # effectively unlimited. Preserves byte-for-byte the prior behaviour.
+        if max_patches <= 0 or total <= max_patches:
+            for block in self.blocks:
+                hidden_states = block(
+                    hidden_states,
+                    cu_seqlens=cu_seqlens,
+                    position_embeddings=(cos, sin),
+                )
+            return hidden_states
+
+        # ``.tolist()`` triggers a one-shot GPU->CPU sync so we can drive
+        # the per-image grouping in pure Python. This is a host-bound code
+        # path (already does Python-level iteration over ``self.blocks``)
+        # so the sync is effectively free; just be aware that this rules
+        # the chunked branch out of any cuda-graph capture region.
+        boundaries: List[int] = cu_seqlens.tolist()
+        groups = self._split_groups_by_image(boundaries, max_patches)
+        # A single image whose patch count itself exceeds the cap cannot
+        # be split safely (self-attention is per-image). It will end up
+        # alone in its own group via ``_split_groups_by_image``; warn so
+        # the user can either lower input resolution or raise the cap.
+        # Note: only triggers when the batch's total patch count > cap
+        # (otherwise we take the fast-path above and never look at single
+        # image sizes).
+        max_single_image = max(
+            boundaries[i + 1] - boundaries[i] for i in range(len(boundaries) - 1)
+        )
+        if max_single_image > max_patches:
+            print_warning_once(
+                "WeLMV4 vision encoder: a single image has "
+                f"{max_single_image} patches, exceeding "
+                f"SGLANG_VLM_VISION_MAX_PATCHES={max_patches}. Self-attention "
+                "is per-image, so this image is processed in one shot. "
+                "Lower the input resolution (e.g. via processor max_pixels) "
+                "or raise SGLANG_VLM_VISION_MAX_PATCHES if memory allows."
             )
+
+        for g_start, g_end in groups:
+            tok_start = boundaries[g_start]
+            tok_end = boundaries[g_end]
+            # ``cu_seqlens`` is already int32 on ``hidden_states.device``;
+            # subtraction by a Python int preserves dtype/device, so no
+            # extra ``.to()``/``.contiguous()`` is needed here.
+            sub_cu = cu_seqlens[g_start : g_end + 1] - boundaries[g_start]
+            sub_cos = cos[tok_start:tok_end]
+            sub_sin = sin[tok_start:tok_end]
+            h = hidden_states[tok_start:tok_end]
+            for block in self.blocks:
+                h = block(h, cu_seqlens=sub_cu, position_embeddings=(sub_cos, sub_sin))
+            # In-place copy so we reuse the pre-allocated buffer rather
+            # than holding both old and new activations in memory.
+            hidden_states[tok_start:tok_end] = h
         return hidden_states
 
 
@@ -531,6 +670,13 @@ class WeLMV4VLMForConditionalGeneration(WeLMV4MoeForCausalLM):
         )
 
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
+        # Note: peak-memory control for high-resolution / many-image
+        # batches is delegated to ``WeLMV4VisionEncoder.forward`` which
+        # splits the concatenated input along image boundaries when the
+        # total patch count exceeds ``SGLANG_VLM_VISION_MAX_PATCHES``.
+        # That means we can keep the simple concat-then-forward path here
+        # without giving up the OOM mitigation - and we keep the original
+        # byte-for-byte numerics for callers that don't trigger chunking.
         pixel_values = torch.cat([item.feature for item in items], dim=0)
         image_grid_thw = torch.cat([item.image_grid_thw for item in items], dim=0)
         image_embeds = self.vision_encoder(pixel_values, image_grid_thw)
