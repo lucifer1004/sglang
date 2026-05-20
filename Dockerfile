@@ -277,6 +277,31 @@ PY
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv pip install --python "${VENV_PATH}/bin/python" -r /tmp/sglang-runtime-requirements.txt
 
+COPY sgl-model-gateway /sgl-workspace/sgl-model-gateway
+
+RUN --mount=type=cache,target=/root/.cache/uv \
+    --mount=type=cache,target=/root/.cargo/registry \
+    --mount=type=cache,target=/root/.cargo/git \
+    --mount=type=cache,target=/sgl-workspace/sgl-model-gateway/target \
+    uv pip install --python "${VENV_PATH}/bin/python" maturin && \
+    cd /sgl-workspace/sgl-model-gateway/bindings/python && \
+    ulimit -n 65536 && \
+    "${VENV_PATH}/bin/python" -m maturin build \
+        --release \
+        --features vendored-openssl \
+        --out dist && \
+    uv pip install --python "${VENV_PATH}/bin/python" dist/*.whl && \
+    "${VENV_PATH}/bin/python" - <<'PY'
+from importlib.metadata import version
+
+import sglang_router
+import sglang_router.launch_router
+import sglang_router.sglang_router_rs
+
+print(f"sglang-router={version('sglang-router')}")
+print(f"sglang_router_module={sglang_router.__file__}")
+PY
+
 COPY README.md LICENSE /sgl-workspace/
 COPY python /sgl-workspace/python
 COPY proto /sgl-workspace/proto
