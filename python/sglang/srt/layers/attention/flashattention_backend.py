@@ -57,7 +57,7 @@ def _is_welm_v4_model(model_config) -> bool:
 def _get_welm_v4_num_splits() -> int:
     env_value = os.getenv(_WELM_V4_NUM_SPLITS_ENV)
     if env_value is None or not env_value.strip():
-        return 1
+        return 0
     try:
         num_splits = int(env_value)
     except ValueError as exc:
@@ -448,8 +448,8 @@ class FlashAttentionBackend(AttentionBackend):
         self.has_softcap = _softcapping is not None and _softcapping > 0.0
 
         # If num_splits == 0, we use a heuristic to automatically determine the number of splits.
-        # We set num_splits to 1 for deterministic inference. WeLM v4 defaults to 1 because the
-        # heuristic split path can occasionally trigger CUDA illegal memory access in serving.
+        # We set num_splits to 1 for deterministic inference. WeLM v4 defaults to 0 to use
+        # the heuristic split path.
         # Set SGLANG_WELMV4_FLASH_ATTENTION_NUM_SPLITS to override the WeLM v4 value.
         # See https://thinkingmachines.ai/blog/defeating-nondeterminism-in-llm-inference/ for more details.
         if model_runner.server_args.enable_deterministic_inference:
