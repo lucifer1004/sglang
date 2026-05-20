@@ -433,6 +433,10 @@ def _welm_kv_mirror_has_no_active_q(forward_batch: ForwardBatch) -> bool:
     return active_indices is not None and active_indices.numel() == 0
 
 
+def _welm_kv_mirror_should_run_dummy_q(forward_batch: ForwardBatch) -> bool:
+    return is_dp_attention_enabled() and _welm_kv_mirror_has_no_active_q(forward_batch)
+
+
 def _welm_prepare_kv_mirror_logits_states(
     hidden_states: torch.Tensor,
     aux_hidden_states: Optional[List[torch.Tensor]],
@@ -442,7 +446,12 @@ def _welm_prepare_kv_mirror_logits_states(
         return hidden_states, aux_hidden_states
 
     output_size = getattr(forward_batch, "kv_mirror_output_size", None)
-    if output_size is None or hidden_states.shape[0] == output_size:
+    if output_size is None:
+        return hidden_states, aux_hidden_states
+    if (
+        not _welm_kv_mirror_should_run_dummy_q(forward_batch)
+        and hidden_states.shape[0] == output_size
+    ):
         return hidden_states, aux_hidden_states
 
     hidden_states = hidden_states.new_zeros((output_size, hidden_states.shape[-1]))
@@ -1684,7 +1693,7 @@ class Qwen2MoeAttention(nn.Module):
             )
         if dump_this_layer:
             _welm_dump_tensor(f"{dump_prefix}.attn_output", attn_output)
-        if self.gated_self_attention_headwise:
+        if self.gated_self_attention_headwise and attn_output.shape[0] != 0:
             attn_shape = attn_output.shape
             gate = self.gate_proj(hidden_states)[0].unsqueeze(
                 -1
@@ -2436,7 +2445,10 @@ class Qwen2MoeModel(nn.Module):
                     ):
                         if i == layer.kv_mirror_layers[-1]:
                             _welm_init_kv_mirror_last_q_indices(forward_batch)
-                        if _welm_kv_mirror_has_no_active_q(forward_batch):
+                        if (
+                            _welm_kv_mirror_has_no_active_q(forward_batch)
+                            and not _welm_kv_mirror_should_run_dummy_q(forward_batch)
+                        ):
                             kv_mirror_states = _empty_welm_kv_mirror_states()
                             continue
                     hidden_states, residual, kv_mirror_states = layer(

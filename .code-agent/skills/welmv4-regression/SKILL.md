@@ -33,7 +33,7 @@ Run all four rows before declaring the branch fully regressed:
    - dirty-prefix test
    - regression test
 
-2. AttnDP=4 + TP=4
+2. AttnDP=2 + TP=4 + EP=4
    - smoke test
    - dirty-prefix test
    - regression test
@@ -82,7 +82,7 @@ gpu-lease run --count 4 --wait -- bash -lc '
 '
 ```
 
-### AttnDP=4 + TP=4
+### AttnDP=2 + TP=4 + EP=4
 
 ```bash
 gpu-lease run --count 4 --wait -- bash -lc '
@@ -93,7 +93,7 @@ gpu-lease run --count 4 --wait -- bash -lc '
   export HOST=127.0.0.1
   export PORT=18083
   export TP_SIZE=4
-  export DP_SIZE=4
+  export DP_SIZE=2
   export EP_SIZE=4
   export REGRESSION_TOLERANCE=1e-5
   export EXTRA_SERVER_ARGS="--enforce-disable-flashinfer-allreduce-fusion --cuda-graph-max-bs 16"
@@ -107,7 +107,7 @@ gpu-lease run --count 4 --wait -- bash -lc '
   bash ./smoke_test.sh "${HOST}" "${PORT}"
   /home/josephyu/.local/bin/uv run --active -p /home/josephyu/sglang/.venv \
     python ./dirty_prefix_test.py --server-url "http://${HOST}:${PORT}" --model welmv4 --use-known-bad-seeds
-  WELMV4_REGRESSION_BASELINE_PREFIX=regression_baseline_attndp_ep \
+  WELMV4_REGRESSION_BASELINE_PREFIX=regression_baseline_attndp2_tp4_ep4 \
     /home/josephyu/.local/bin/uv run --active -p /home/josephyu/sglang/.venv \
     python ./regression_test.py test --server-url "http://${HOST}:${PORT}" --model welmv4 \
     --tolerance "${REGRESSION_TOLERANCE}" --routed-dp-size "${DP_SIZE}"
