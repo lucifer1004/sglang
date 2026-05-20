@@ -88,9 +88,9 @@ from sglang.srt.utils import flatten_nested_list
 from sglang.srt.utils.common import ceil_align, is_npu
 from sglang.srt.utils.cuda_ipc_transport_utils import CudaIpcTensorTransportProxy
 from sglang.srt.utils.over_encoding_utils import (
-    assign_ngram_buffer,
     assign_ngram_input_ids_draft_extend,
     filter_buffer,
+    update_ngram_buffer_from_segments,
 )
 
 _is_npu = is_npu()
@@ -826,7 +826,7 @@ class OverEncodingContext:
     # ------------------------------------------------------------------
 
     def merge_buffer(self, other: "OverEncodingContext"):
-        """Merge input_ids_buffer from *other* into this instance."""
+        """Merge over-encoding state from *other* into this instance."""
         if (
             self.input_ids_buffer is not None
             and other.input_ids_buffer is not None
@@ -834,6 +834,23 @@ class OverEncodingContext:
             self.input_ids_buffer = torch.cat(
                 [self.input_ids_buffer, other.input_ids_buffer]
             )
+        if len(self.input_ids_grams) != len(other.input_ids_grams):
+            raise ValueError(
+                "Cannot merge OverEncodingContext with different n-gram levels: "
+                f"{len(self.input_ids_grams)} vs {len(other.input_ids_grams)}."
+            )
+
+        merged_grams = []
+        for idx, (lhs, rhs) in enumerate(
+            zip(self.input_ids_grams, other.input_ids_grams)
+        ):
+            if lhs is None or rhs is None:
+                raise ValueError(
+                    "Cannot merge OverEncodingContext with missing n-gram "
+                    f"state at level {idx}: {lhs is None} vs {rhs is None}."
+                )
+            merged_grams.append(torch.cat([lhs, rhs]))
+        self.input_ids_grams = merged_grams
 
     def filter_buffer(self, unfinished_index_device: torch.Tensor):
         if self.input_ids_buffer is not None and not self.filtered:
@@ -849,7 +866,6 @@ class OverEncodingContext:
         self,
         input_ids: torch.Tensor,
         extend_lens: List[int],
-        seq_lens: torch.Tensor,
     ):
         for idx, gram_tensor in enumerate(self.input_ids_grams):
             if gram_tensor is None:
@@ -861,13 +877,22 @@ class OverEncodingContext:
                 idx + 2,
             )
 
-        buffer = torch.empty(
-            seq_lens.numel() * self.buffer_size,
-            device=input_ids.device,
-            dtype=input_ids.dtype,
+        if self.input_ids_buffer is None:
+            return
+
+        expected_buffer_size = len(extend_lens) * self.buffer_size
+        if self.input_ids_buffer.numel() != expected_buffer_size:
+            raise ValueError(
+                "OverEncodingContext input_ids_buffer size does not match "
+                "draft-extend batch size: "
+                f"{self.input_ids_buffer.numel()} vs {expected_buffer_size}."
+            )
+        update_ngram_buffer_from_segments(
+            input_ids,
+            self.input_ids_buffer,
+            extend_lens,
+            self.buffer_size,
         )
-        assign_ngram_buffer(input_ids, buffer, seq_lens, self.buffer_size)
-        self.input_ids_buffer = buffer
 
     # ------------------------------------------------------------------
     # Accessors

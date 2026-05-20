@@ -46,6 +46,7 @@ from sglang.srt.speculative.spec_utils import (
     get_target_cache_loc,
 )
 from sglang.srt.utils import is_cuda, is_musa, next_power_of_2
+from sglang.srt.utils.over_encoding_utils import update_ngram_buffer_from_segments
 
 if is_cuda() or is_musa():
     from sgl_kernel import (
@@ -55,22 +56,6 @@ if is_cuda() or is_musa():
     )
 
 logger = logging.getLogger(__name__)
-
-
-def _update_ngram_buffer_after_decode(
-    input_ids: torch.Tensor,
-    input_ids_buffer: torch.Tensor,
-    extend_lens: List[int],
-    buffer_size: int,
-) -> None:
-    pt = 0
-    for bid, extend_len in enumerate(extend_lens):
-        if extend_len == 0:
-            continue
-        segment = input_ids[pt : pt + extend_len]
-        buffer = input_ids_buffer[bid * buffer_size : (bid + 1) * buffer_size]
-        buffer.copy_(torch.cat((buffer, segment))[-buffer_size:])
-        pt += extend_len
 
 
 @dataclass
@@ -770,7 +755,6 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
             batch.oe_context.refresh_for_draft_extend(
                 batch.input_ids,
                 batch.extend_lens,
-                batch.seq_lens,
             )
 
     @classmethod
@@ -864,7 +848,7 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
                     False,
                 )
                 batch.oe_context.set_gram(n, n_gram)
-            _update_ngram_buffer_after_decode(
+            update_ngram_buffer_from_segments(
                 batch.input_ids,
                 buffer,
                 batch.extend_lens,

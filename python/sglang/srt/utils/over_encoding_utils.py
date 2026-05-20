@@ -130,6 +130,22 @@ def assign_ngram_buffer(
     )
 
 
+def update_ngram_buffer_from_segments(
+    input_ids: torch.Tensor,
+    input_ids_buffer: torch.Tensor,
+    extend_lens: List[int],
+    buffer_size: int,
+):
+    pt = 0
+    for bid, extend_len in enumerate(extend_lens):
+        if extend_len == 0:
+            continue
+        segment = input_ids[pt : pt + extend_len]
+        buffer = input_ids_buffer[bid * buffer_size : (bid + 1) * buffer_size]
+        buffer.copy_(torch.cat((buffer, segment))[-buffer_size:])
+        pt += extend_len
+
+
 @triton.jit
 def assign_buffer_kernel(
     buffer: torch.Tensor,

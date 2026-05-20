@@ -827,6 +827,28 @@ class WelmV4InplaceRotaryEmbedding(RotaryEmbedding):
         key_num_heads = key.shape[-1] // self.head_size
         query = query.view(query.shape[0], query_num_heads, self.head_size)
         key = key.view(key.shape[0], key_num_heads, self.head_size)
+        if last_index is not None:
+            if query.shape[0] != last_index.numel():
+                raise ValueError(
+                    "WelmV4InplaceRotaryEmbedding expects contracted Q rows "
+                    "when last_index is provided; got "
+                    f"query_tokens={query.shape[0]}, "
+                    f"last_index_tokens={last_index.numel()}."
+                )
+            if key.shape[0] == last_index.numel():
+                # Some draft-extend KV-mirror paths already contract K to the
+                # same selected rows as Q. The Triton kernel loops over
+                # positions and always writes K, so pass the contracted
+                # positions in this case instead of the full extend positions.
+                positions = positions[last_index]
+                last_index = None
+            elif key.shape[0] != positions.shape[0]:
+                raise ValueError(
+                    "WelmV4InplaceRotaryEmbedding expects K rows to be either "
+                    "full positions length or contracted last_index length; got "
+                    f"key_tokens={key.shape[0]}, positions={positions.shape[0]}, "
+                    f"last_index_tokens={last_index.numel()}."
+                )
         N = positions.shape[0]
         num_sms = min(N, self.num_sms)
         num_stages = 4

@@ -209,6 +209,12 @@ class WeLMV4ModelNextN(nn.Module):
                 first_contract=main_first_contract,
             )
 
+        if hidden_states.shape[0] == 0:
+            # KV-mirror contraction can select no active rows for this draft
+            # extend chunk. Avoid running zero-token decoder kernels; the caller
+            # scatters this empty result back to the logical batch shape.
+            return hidden_states, hidden_states
+
         if hidden_states.shape[0] > 0:
             enorm_output = self.enorm(hidden_states)
             hnorm_output = self.hnorm(main_hidden_states)
