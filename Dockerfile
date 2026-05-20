@@ -59,11 +59,34 @@ RUN --mount=type=cache,target=/var/cache/apt \
         bash \
         build-essential \
         ca-certificates \
+        cmake \
         curl \
         git \
         libibverbs-dev \
+        libasio-dev \
+        libboost-all-dev \
+        libcurl4-openssl-dev \
+        libgflags-dev \
+        libgoogle-glog-dev \
+        libgrpc++-dev \
+        libgrpc-dev \
+        libgtest-dev \
+        libhiredis-dev \
+        libjsoncpp-dev \
+        libmsgpack-dev \
+        libnuma-dev \
         libnuma1 \
+        libprotobuf-dev \
+        libssl-dev \
+        libunwind-dev \
+        liburing-dev \
+        libxxhash-dev \
+        libyaml-cpp-dev \
+        ninja-build \
+        patchelf \
+        pkg-config \
         protobuf-compiler \
+        protobuf-compiler-grpc \
         python3 \
         python3-dev \
         unzip \
@@ -175,6 +198,54 @@ RUN mkdir -p /src/tccl && cd /src/tccl && \
     test -s /usr/local/tccl/lib/plugin/libnccl-profiler-inspector.so && \
     test -s /usr/local/tccl/lib/plugin/libnccl-tuner-astralNet.so && \
     cd / && rm -rf /src/tccl
+
+COPY 3rdparty/Mooncake /sgl-workspace/3rdparty/Mooncake
+
+RUN --mount=type=cache,target=/root/.cache/pip \
+    --mount=type=cache,target=/root/.cache/uv \
+    cd /sgl-workspace/3rdparty/Mooncake && \
+    if [ ! -f extern/pybind11/CMakeLists.txt ]; then \
+        rm -rf extern/pybind11 && \
+        git clone --depth=1 --branch stable https://github.com/pybind/pybind11.git extern/pybind11; \
+    fi && \
+    if [ ! -f extern/yalantinglibs/CMakeLists.txt ]; then \
+        rm -rf extern/yalantinglibs && \
+        git clone --depth=1 --branch v0.5.7 https://github.com/alibaba/yalantinglibs.git extern/yalantinglibs; \
+    fi && \
+    cmake -S extern/yalantinglibs -B extern/yalantinglibs/build \
+        -DBUILD_EXAMPLES=OFF \
+        -DBUILD_BENCHMARK=OFF \
+        -DBUILD_UNIT_TESTS=OFF && \
+    cmake --build extern/yalantinglibs/build -j"$(nproc)" && \
+    cmake --install extern/yalantinglibs/build && \
+    if [ -f /usr/local/cuda/lib64/stubs/libcuda.so ] && [ ! -e /usr/local/cuda/lib64/stubs/libcuda.so.1 ]; then \
+        ln -s libcuda.so /usr/local/cuda/lib64/stubs/libcuda.so.1; \
+    fi && \
+    export LIBRARY_PATH="/usr/local/cuda/lib64/stubs:${LIBRARY_PATH:-}" && \
+    export LD_LIBRARY_PATH="/usr/local/cuda/lib64/stubs:${LD_LIBRARY_PATH}" && \
+    cmake -S . -B build \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_LIBRARY_PATH=/usr/local/cuda/lib64/stubs \
+        -DPython3_EXECUTABLE="${VENV_PATH}/bin/python" \
+        -DBUILD_BENCHMARK=OFF \
+        -DBUILD_UNIT_TESTS=OFF \
+        -DUSE_CUDA=ON \
+        -DWITH_EP=OFF \
+        -DWITH_STORE_RUST=OFF && \
+    cmake --build build -j"$(nproc)" && \
+    PYTHON_VERSION="${PYTHON_VERSION}" ./scripts/build_wheel.sh "${PYTHON_VERSION}" dist && \
+    uv pip install --python "${VENV_PATH}/bin/python" mooncake-wheel/dist/*.whl && \
+    LD_LIBRARY_PATH="/usr/local/cuda/lib64/stubs:${LD_LIBRARY_PATH}" "${VENV_PATH}/bin/python" - <<'PY' && \
+    rm -rf build extern/yalantinglibs/build mooncake-wheel/build mooncake-wheel/dist mooncake-wheel/repaired_wheels_*
+from importlib.metadata import version
+
+import mooncake
+import mooncake.engine
+
+print(f"mooncake-transfer-engine={version('mooncake-transfer-engine')}")
+print(f"mooncake_module={mooncake.__file__}")
+print(f"mooncake_engine={mooncake.engine.__file__}")
+PY
 
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv pip install --python "${VENV_PATH}/bin/python" \

@@ -4,3 +4,6 @@
 [submodule "3rdparty/jfs-fast-get"]
 	path = 3rdparty/jfs-fast-get
 	url = https://git.woa.com/wxg-odyssey/rl-infra/jfs-fast-get.git
+[submodule "3rdparty/Mooncake"]
+	path = 3rdparty/Mooncake
+	url = https://git.woa.com/wxg-odyssey/rl-infra/Mooncake.git
