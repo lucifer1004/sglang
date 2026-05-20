@@ -396,6 +396,36 @@ class MooncakeRoutedExpertsStore(RoutedExpertsStore):
                 **summarize_routed_experts_value(value),
             }
 
+        if isinstance(value, (list, tuple)):
+            summary = summarize_routed_experts_value(value)
+            return {
+                "format": "remote_list",
+                "backend": "mooncake",
+                "schema_version": 3,
+                "items": [self.put(item) for item in value],
+                "remote_summary": summary,
+            }
+
+        if isinstance(value, dict):
+            if "values" not in value:
+                raise TypeError(
+                    "Mooncake routed experts backend expects sparse payloads to "
+                    "contain a 'values' tensor."
+                )
+            summary = summarize_routed_experts_value(value)
+            response = {
+                **value,
+                "values": self.put(value["values"]),
+                "format": "remote_masked_dense",
+                "backend": "mooncake",
+                "schema_version": 2,
+                "remote_summary": summary,
+            }
+            valid_mask = value.get("valid_mask")
+            if hasattr(valid_mask, "detach") and hasattr(valid_mask, "numel"):
+                response["valid_mask"] = self.put(valid_mask)
+            return response
+
         if not (hasattr(value, "detach") and hasattr(value, "numel")):
             raise TypeError(
                 "Mooncake routed experts backend currently expects a tensor value, "
@@ -422,6 +452,15 @@ class MooncakeRoutedExpertsStore(RoutedExpertsStore):
             "replica_num": self.replica_num,
             **summarize_routed_experts_value(tensor),
         }
+
+    def get(self, ref: Dict[str, Any]) -> bytes:
+        key = ref.get("key")
+        if not key:
+            raise ValueError(f"Mooncake routed experts reference is missing key: {ref}")
+        payload = self.store.get(key)
+        if payload == b"":
+            raise KeyError(f"Mooncake routed experts key was not found: {key}")
+        return payload
 
 
 def create_routed_experts_store(dsn: Optional[str]) -> Optional[RoutedExpertsStore]:
