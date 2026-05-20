@@ -82,6 +82,7 @@ RUN --mount=type=cache,target=/var/cache/apt \
         liburing-dev \
         libxxhash-dev \
         libyaml-cpp-dev \
+        libzstd-dev \
         ninja-build \
         patchelf \
         pkg-config \
