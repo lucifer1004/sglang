@@ -40,6 +40,7 @@ ARG SGLANG_VERSION=0.0.0.dev0
 ENV DEBIAN_FRONTEND=noninteractive \
     VIRTUAL_ENV=${VENV_PATH} \
     PATH="${VENV_PATH}/bin:${PATH}" \
+    LD_LIBRARY_PATH="/usr/local/tccl/lib:/usr/local/cuda/lib64" \
     NCCL_IB_TC=160 \
     NCCL_SOCKET_IFNAME=bond1 \
     NCCL_IB_HCA=mlx5_bond_1,mlx5_bond_2,mlx5_bond_3,mlx5_bond_4,mlx5_bond_5,mlx5_bond_6,mlx5_bond_7,mlx5_bond_8 \
@@ -167,9 +168,12 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 RUN mkdir -p /src/tccl && cd /src/tccl && \
     wget -O tccl_install.py \
         https://mirrors.tencent.com/repository/generic/TCCL/NV/tccl_install.py && \
-    "${VENV_PATH}/bin/python" tccl_install.py -v "${TCCL_VERSION}" --compile --skip_check 2>&1 | tee /tmp/tccl_install.log && \
+    "${VENV_PATH}/bin/python" tccl_install.py -v "${TCCL_VERSION}" --install_mode compile_install --skip_check --clean 2>&1 | tee /tmp/tccl_install.log && \
     ! grep -q "TCCL Install.*ERROR" /tmp/tccl_install.log && \
-    grep -q "Compilation succeeded" /tmp/tccl_install.log && \
+    grep -q "Successfully installed" /tmp/tccl_install.log && \
+    test -s /usr/local/tccl/lib/libtccl.so.2 && \
+    test -s /usr/local/tccl/lib/plugin/libnccl-profiler-inspector.so && \
+    test -s /usr/local/tccl/lib/plugin/libnccl-tuner-astralNet.so && \
     cd / && rm -rf /src/tccl
 
 RUN --mount=type=cache,target=/root/.cache/uv \
