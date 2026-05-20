@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
@@ -27,6 +28,43 @@ from sglang.jit_kernel.flash_attention import (
     flash_attn_varlen_func,
     flash_attn_with_kvcache,
 )
+
+_WELM_V4_MODEL_TYPES = {"welmv4_moe"}
+_WELM_V4_ARCHITECTURES = {
+    "WeLMV4MoeForCausalLM",
+    "WeLMV4MoeForCausalLMNextN",
+}
+_WELM_V4_NUM_SPLITS_ENV = "SGLANG_WELMV4_FLASH_ATTENTION_NUM_SPLITS"
+
+
+def _is_welm_v4_model(model_config) -> bool:
+    hf_config = getattr(model_config, "hf_config", None)
+    hf_text_config = getattr(model_config, "hf_text_config", None)
+    model_type = getattr(hf_config, "model_type", None) or getattr(
+        hf_text_config, "model_type", None
+    )
+    if model_type in _WELM_V4_MODEL_TYPES:
+        return True
+
+    architectures = getattr(hf_config, "architectures", None) or getattr(
+        hf_text_config, "architectures", None
+    )
+    return bool(
+        architectures and any(arch in _WELM_V4_ARCHITECTURES for arch in architectures)
+    )
+
+
+def _get_welm_v4_num_splits() -> int:
+    env_value = os.getenv(_WELM_V4_NUM_SPLITS_ENV)
+    if env_value is None or not env_value.strip():
+        return 1
+    try:
+        num_splits = int(env_value)
+    except ValueError as exc:
+        raise ValueError(f"{_WELM_V4_NUM_SPLITS_ENV} must be an integer.") from exc
+    if num_splits < 0:
+        raise ValueError(f"{_WELM_V4_NUM_SPLITS_ENV} must be non-negative.")
+    return num_splits
 
 
 @dataclass
@@ -410,11 +448,16 @@ class FlashAttentionBackend(AttentionBackend):
         self.has_softcap = _softcapping is not None and _softcapping > 0.0
 
         # If num_splits == 0, we use a heuristic to automatically determine the number of splits.
-        # We set nums splits to 1 if deterministic inference is enabled.
+        # We set num_splits to 1 for deterministic inference. WeLM v4 defaults to 1 because the
+        # heuristic split path can occasionally trigger CUDA illegal memory access in serving.
+        # Set SGLANG_WELMV4_FLASH_ATTENTION_NUM_SPLITS to override the WeLM v4 value.
         # See https://thinkingmachines.ai/blog/defeating-nondeterminism-in-llm-inference/ for more details.
-        self.num_splits = (
-            1 if model_runner.server_args.enable_deterministic_inference else 0
-        )
+        if model_runner.server_args.enable_deterministic_inference:
+            self.num_splits = 1
+        elif _is_welm_v4_model(model_runner.model_config):
+            self.num_splits = _get_welm_v4_num_splits()
+        else:
+            self.num_splits = 0
 
         # In embedding mode with no chunked prefill and radix cache disabled,
         # skip KV cache write and use flash_attn_varlen_func with raw K/V
