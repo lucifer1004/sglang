@@ -979,6 +979,7 @@ class Req:
         "customized_info": None,
         "spec_acceptance_histogram": None,
         "require_reasoning": False,
+        "_is_reasoning_over": False,
         "reasoning_tokens": 0,
         "return_hidden_states_before_norm": False,
         "router_replay_experts": None,
@@ -1076,6 +1077,12 @@ class Req:
                 except Exception:
                     pass
             setattr(self, key, value)
+
+        # Require reasoning for the request.
+        self.require_reasoning = require_reasoning
+        # State indicating whether the reasoning phase has finished.
+        self._is_reasoning_over = False
+        self.reasoning_tokens = 0
 
         # Sampling info
         if isinstance(sampling_params.custom_params, dict):
@@ -1710,6 +1717,20 @@ class Req:
         self.to_finish = FINISH_ABORT(
             error_msg, HTTPStatus.BAD_REQUEST, "BadRequestError"
         )
+
+    def update_reasoning_tokens(self, token_id, think_end_id):
+        if self._is_reasoning_over:
+            return
+
+        if not isinstance(token_id, list):
+            token_id = [token_id]
+
+        try:
+            end_pos = token_id.index(think_end_id)
+            self.reasoning_tokens += end_pos + 1
+            self._is_reasoning_over = True
+        except ValueError:
+            self.reasoning_tokens += len(token_id)
 
     def __repr__(self):
         return (
