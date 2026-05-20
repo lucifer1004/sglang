@@ -3000,6 +3000,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             router_replay_mask=self.router_replay_mask,
             seq_lens_cpu=self.seq_lens_cpu,
             enable_overlap=self.enable_overlap,
+            prefill_stats=self.prefill_stats,
+            dp_cooperation_info=self.dp_cooperation_info,
         )
 
     def maybe_evict_swa(self):
