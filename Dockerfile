@@ -10,14 +10,17 @@ COPY 3rdparty/sr/go.mod /go-build/sr/go.mod
 COPY 3rdparty/jfs-fast-get/go.mod 3rdparty/jfs-fast-get/go.sum /go-build/jfs-fast-get/
 COPY 3rdparty/jfs-fast-get/third_party/juicefs/go.mod 3rdparty/jfs-fast-get/third_party/juicefs/go.sum /go-build/jfs-fast-get/third_party/juicefs/
 COPY 3rdparty/jfs-fast-get/third_party/gosigar/go.mod /go-build/jfs-fast-get/third_party/gosigar/go.mod
+COPY 3rdparty/remote-exec/go.mod 3rdparty/remote-exec/go.sum /go-build/remote-exec/
 
 RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
     cd /go-build/sr && go mod download && \
-    cd /go-build/jfs-fast-get && go mod download
+    cd /go-build/jfs-fast-get && go mod download && \
+    cd /go-build/remote-exec && go mod download
 
 COPY 3rdparty/sr /go-build/sr
 COPY 3rdparty/jfs-fast-get /go-build/jfs-fast-get
+COPY 3rdparty/remote-exec /go-build/remote-exec
 
 RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
@@ -26,7 +29,10 @@ RUN --mount=type=cache,target=/go/pkg/mod \
         go build -trimpath -ldflags="-s -w" -o /out/sr . && \
     cd /go-build/jfs-fast-get && \
     CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
-        go build -trimpath -ldflags="-s -w" -o /out/jfs-fast-get ./cmd/jfs-fast-get
+        go build -trimpath -ldflags="-s -w" -o /out/jfs-fast-get ./cmd/jfs-fast-get && \
+    cd /go-build/remote-exec && \
+    CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
+        go build -trimpath -ldflags="-s -w" -o /out/remote-exec .
 
 FROM nvidia/cuda:12.9.1-cudnn-devel-ubuntu24.04
 
@@ -102,6 +108,7 @@ RUN --mount=type=cache,target=/var/cache/apt \
 
 COPY --from=go-builder /out/sr /usr/local/bin/sr
 COPY --from=go-builder /out/jfs-fast-get /usr/local/bin/jfs-fast-get
+COPY --from=go-builder /out/remote-exec /usr/local/bin/remote-exec
 
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
         | sh -s -- -y --no-modify-path --profile minimal

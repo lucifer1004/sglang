@@ -7,3 +7,6 @@
 [submodule "3rdparty/Mooncake"]
 	path = 3rdparty/Mooncake
 	url = https://git.woa.com/wxg-odyssey/rl-infra/Mooncake.git
+[submodule "3rdparty/remote-exec"]
+	path = 3rdparty/remote-exec
+	url = https://git.woa.com/wxg-odyssey/rl-infra/remote-exec.git
