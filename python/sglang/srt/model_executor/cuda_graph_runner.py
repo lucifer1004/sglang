@@ -1575,6 +1575,24 @@ class CudaGraphRunner:
                     if output.next_token_logits is not None
                     else None
                 )
+            model_specific_states = output.model_specific_states
+            if model_specific_states is not None:
+                model_specific_states = dict(model_specific_states)
+                kv_mirror_states = model_specific_states.get("welm_kv_mirror_states")
+                if isinstance(kv_mirror_states, dict):
+                    model_specific_states["welm_kv_mirror_states"] = {
+                        layer_idx: tuple(
+                            tensor[: self.raw_num_token]
+                            if (
+                                isinstance(tensor, torch.Tensor)
+                                and tensor.shape
+                                and tensor.shape[0] >= self.raw_num_token
+                            )
+                            else tensor
+                            for tensor in tensors
+                        )
+                        for layer_idx, tensors in kv_mirror_states.items()
+                    }
 
             return LogitsProcessorOutput(
                 next_token_logits=next_token_logits,
@@ -1584,6 +1602,7 @@ class CudaGraphRunner:
                     if output.hidden_states is not None
                     else None
                 ),
+                model_specific_states=model_specific_states,
                 customized_info=output.customized_info,
             )
         else:

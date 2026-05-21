@@ -8,6 +8,7 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
+from sglang.jit_kernel.ngram_ops import build_ngram_with_target_verify
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.layers.dp_attention import (
     get_attention_tp_group,
@@ -259,6 +260,28 @@ class EagleVerifyInputV2Mixin:
                 draft_token_num=self.draft_token_num,
                 device=device,
             )
+            if (
+                batch.oe_context is not None
+                and batch.oe_context.input_ids_buffer is not None
+            ):
+                n_gram_tensors = [
+                    torch.empty_like(self.draft_token)
+                    for _ in batch.oe_context.input_ids_grams
+                ]
+                for idx, gram_tensor in enumerate(n_gram_tensors):
+                    n = idx + 2
+                    build_ngram_with_target_verify(
+                        gram_tensor,
+                        batch.oe_context.input_ids_buffer,
+                        self.draft_token,
+                        self.custom_mask,
+                        self.positions,
+                        batch.seq_lens,
+                        n,
+                        self.draft_token_num,
+                        batch.oe_context.buffer_size,
+                    )
+                    batch.oe_context.set_gram(n, gram_tensor)
 
             # Set mamba_track_indices for mamba prefix-cache state tracking
             if get_global_server_args().enable_mamba_extra_buffer():
