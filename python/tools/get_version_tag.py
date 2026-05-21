@@ -93,12 +93,22 @@ def get_latest_version_tag_describe() -> str:
     Uses PEP 440 version ordering so that stable releases sort above
     pre-release tags (e.g., v0.5.10 > v0.5.10rc0).
 
+    When the highest tag is itself a post-release (`.postN`), describe
+    against the highest non-post tag instead. setuptools-scm's
+    "post-release" version scheme appends `.post{distance}` to the base
+    tag, and PEP 440 forbids two `.post` segments on a single version
+    (e.g., `0.5.10.post1.post174` is invalid). Stripping back to the
+    bare release tag produces a valid `0.5.10.post{distance}+g{hash}`
+    that is also monotonically larger than the prior `.postN` release
+    (since `distance` covers all commits from `v0.5.10` to HEAD,
+    including the ones leading up to the post tag).
+
     The highest tag may live on a release branch and not be a direct
     ancestor of HEAD (e.g., main diverged before the release tag was
     created). In that case, we compute the commit distance from the
     merge-base and build the describe string manually.
     """
-    tag = get_latest_version_tag()
+    tag = get_latest_non_post_version_tag() or get_latest_version_tag()
     if not tag:
         print("WARNING: No version tags (v*.*.*) found in repo", file=sys.stderr)
         return ""
@@ -143,6 +153,32 @@ def get_latest_version_tag() -> str:
         return ""
     tag_list = sorted(tags_raw.splitlines(), key=parse_version_tuple, reverse=True)
     return tag_list[0] if tag_list else ""
+
+
+def get_latest_non_post_version_tag() -> str:
+    """Return the highest non-post version tag, or empty string.
+
+    A "non-post" tag is one whose PEP 440 form does not include a
+    `.postN` suffix (i.e. a bare release like `v0.5.10` or a pre-release
+    like `v0.5.10rc0`). Used as the describe base when the absolute
+    latest tag is itself a `.postN` release, since the "post-release"
+    version scheme cannot stack two `.post` segments.
+    """
+    tags_raw = run_git("tag", "--list", "v*.*.*")
+    if not tags_raw:
+        return ""
+    candidates = [t for t in tags_raw.splitlines() if not _is_post_version_tag(t)]
+    if not candidates:
+        return ""
+    candidates.sort(key=parse_version_tuple, reverse=True)
+    return candidates[0]
+
+
+def _is_post_version_tag(tag: str) -> bool:
+    """Return True if `tag` parses as a `.postN` release."""
+    v = tag.lstrip("v")
+    m = re.match(r"^(\d+)\.(\d+)\.(\d+)(?:\.?(rc|post)(\d+))?$", v)
+    return bool(m and m.group(4) == "post")
 
 
 def main() -> None:
