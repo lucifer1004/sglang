@@ -5,8 +5,11 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
-import prc_custom_ops
 
+from sglang.jit_kernel.ngram_ops import (
+    assign_ngram_input_ids_draft_extend_after_decode,
+    build_ngram_with_target_verify,
+)
 from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.environ import envs
@@ -163,7 +166,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             ]
             for idx, gram_tensor in enumerate(n_gram_tensors):
                 n = idx + 2
-                prc_custom_ops.build_ngram_with_target_verify(
+                build_ngram_with_target_verify(
                     gram_tensor,
                     batch.oe_context.input_ids_buffer,
                     self.draft_token,
@@ -838,7 +841,7 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
             for idx in range(len(batch.oe_context.input_ids_grams)):
                 n = idx + 2
                 n_gram = torch.empty_like(batch.input_ids, dtype=torch.int64)
-                prc_custom_ops.assign_ngram_input_ids_draft_extend_after_decode(
+                assign_ngram_input_ids_draft_extend_after_decode(
                     batch.input_ids,
                     buffer,
                     n_gram,
