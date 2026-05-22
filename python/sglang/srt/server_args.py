@@ -3945,12 +3945,21 @@ class ServerArgs:
                     "Debug mode for CUDA graph is enabled via breakable CUDA graph. "
                     "All operations will run eagerly through the graph capture/replay path."
                 )
-        # FP8 W_o GEMM requires Blackwell (sm100+). Auto-disable on Hopper.
-        if is_cuda() and envs.SGLANG_OPT_FP8_WO_A_GEMM.get() and get_device_sm() < 100:
+        # FP8 W_o GEMM uses DeepGEMM layouts unavailable on Hopper and SM120.
+        if (
+            is_cuda()
+            and envs.SGLANG_OPT_FP8_WO_A_GEMM.get()
+            and (get_device_sm() < 100 or is_sm120_supported())
+        ):
             if envs.SGLANG_OPT_FP8_WO_A_GEMM.is_set():
+                reason = (
+                    "SM120 does not support the required DeepGEMM SF transformation"
+                    if is_sm120_supported()
+                    else "requires sm100+ (Blackwell)"
+                )
                 logger.warning(
-                    "Disabling SGLANG_OPT_FP8_WO_A_GEMM: requires sm100+ (Blackwell), "
-                    "detected sm%d.",
+                    "Disabling SGLANG_OPT_FP8_WO_A_GEMM: %s, detected sm%d.",
+                    reason,
                     get_device_sm(),
                 )
             envs.SGLANG_OPT_FP8_WO_A_GEMM.set(False)

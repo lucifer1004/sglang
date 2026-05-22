@@ -460,7 +460,11 @@ class C4IndexerBackendMixin:
                 indexer_metadata.c4_page_size,
                 raw_indices,
             )
-        elif envs.SGLANG_OPT_USE_TOPK_V2.get() and raw_indices is None:
+        elif (
+            envs.SGLANG_OPT_USE_TOPK_V2.get()
+            and raw_indices is None
+            and indexer_metadata.topk_metadata.numel() > 0
+        ):
             topk_transform_512_v2(
                 logits,
                 indexer_metadata.c4_seq_lens,
