@@ -2346,6 +2346,13 @@ class Scheduler(
         return RpcReqOutput(success, "" if not exec else str(exec))
 
     def abort_request(self, recv_req: AbortReq):
+        # [DIAG] log abort entry
+        _running_rids = [r.rid for r in self.running_batch.reqs] if self.running_batch else []
+        _waiting_ct = len(self.waiting_queue)
+        logger.warning(
+            f"[DIAG] scheduler.abort_request called: rid={recv_req.rid}, abort_all={recv_req.abort_all}, "
+            f"running_batch={len(_running_rids)}, waiting_queue={_waiting_ct}"
+        )
         # Delete requests in the waiting queue
         to_del = []
         for i, req in enumerate(self.waiting_queue):
@@ -2424,7 +2431,7 @@ class Scheduler(
                 # Abort method 3: set `to_finish`
                 # The request will still run one decode forward pass.
                 # Then we reuse all existing code to clean up the KV cache allocation.
-                logger.debug(f"Abort running request. {req.rid=}")
+                logger.warning(f"[DIAG] Abort running request (method 3): {req.rid=}, finished={req.finished()}")
                 req.to_finish = FINISH_ABORT()
 
     def _pause_engine(self) -> Tuple[List[Req], int]:
