@@ -357,12 +357,14 @@ def _welm_mtp_uses_base_kv_cache(forward_batch: ForwardBatch) -> bool:
 
 
 def _welm_init_kv_mirror_last_q_indices(forward_batch: ForwardBatch) -> bool:
-    if hasattr(forward_batch, "custom_last_index"):
+    if getattr(forward_batch, "kv_mirror_output_size", None) is not None:
         return False
 
     last_q_indices = getattr(forward_batch, "welm_kv_mirror_last_q_indices", None)
     if last_q_indices is None:
-        last_q_indices = torch.cumsum(forward_batch.extend_seq_lens, dim=0) - 1
+        last_q_indices = getattr(forward_batch, "custom_last_index", None)
+        if last_q_indices is None:
+            last_q_indices = torch.cumsum(forward_batch.extend_seq_lens, dim=0) - 1
         active_batch_indices = torch.arange(
             last_q_indices.numel(),
             dtype=torch.long,
@@ -2430,6 +2432,7 @@ class Qwen2MoeModel(nn.Module):
                 residual=residual,
             )
         else:
+            kv_mirror_indices_initialized = False
             for i in range(self.start_layer, self.end_layer):
                 if i in self.layers_to_capture:
                     aux_hidden_states.append(
@@ -2443,8 +2446,11 @@ class Qwen2MoeModel(nn.Module):
                         _welm_should_contract_kv_mirror(forward_batch)
                         and i in layer.kv_mirror_layers
                     ):
-                        if i == layer.kv_mirror_layers[-1]:
+                        if not kv_mirror_indices_initialized:
+                            # PP can split mirror layers across ranks; initialize
+                            # before the first local mirror-layer skip check.
                             _welm_init_kv_mirror_last_q_indices(forward_batch)
+                            kv_mirror_indices_initialized = True
                         if (
                             _welm_kv_mirror_has_no_active_q(forward_batch)
                             and not _welm_kv_mirror_should_run_dummy_q(forward_batch)
