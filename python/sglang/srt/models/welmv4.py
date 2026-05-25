@@ -243,11 +243,17 @@ def _set_welm_custom_last_prefill_cache_loc(forward_batch: ForwardBatch) -> None
     context_forward_batch = get_current_forward_batch()
     if context_forward_batch is not None and context_forward_batch is not forward_batch:
         context_forward_batch.custom_last_index = forward_batch.custom_last_index
+        context_forward_batch.kv_mirror_active_batch_indices = (
+            forward_batch.kv_mirror_active_batch_indices
+        )
+        context_forward_batch.kv_mirror_output_size = forward_batch.kv_mirror_output_size
+        context_forward_batch.welm_kv_mirror_contracted = (
+            forward_batch.welm_kv_mirror_contracted
+        )
         if hasattr(forward_batch, "custom_last_cache_loc"):
             context_forward_batch.custom_last_cache_loc = (
                 forward_batch.custom_last_cache_loc
             )
-            context_forward_batch.out_cache_loc = forward_batch.custom_last_cache_loc
 
 
 def _get_welm_kv_mirror_states(
@@ -357,6 +363,7 @@ def _welm_mtp_uses_base_kv_cache(forward_batch: ForwardBatch) -> bool:
 
 
 def _welm_init_kv_mirror_last_q_indices(forward_batch: ForwardBatch) -> bool:
+    forward_batch.welm_kv_mirror_contracted = True
     if getattr(forward_batch, "kv_mirror_output_size", None) is not None:
         return False
 
@@ -437,6 +444,26 @@ def _welm_kv_mirror_has_no_active_q(forward_batch: ForwardBatch) -> bool:
 
 def _welm_kv_mirror_should_run_dummy_q(forward_batch: ForwardBatch) -> bool:
     return is_dp_attention_enabled() and _welm_kv_mirror_has_no_active_q(forward_batch)
+
+
+def _welm_write_kv_cache_only(
+    attn: RadixAttention,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    forward_batch: ForwardBatch,
+) -> None:
+    if k is None or v is None:
+        return
+    if forward_batch.out_cache_loc is None:
+        return
+    forward_batch.token_to_kv_pool.set_kv_buffer(
+        attn,
+        forward_batch.out_cache_loc,
+        k.view(-1, attn.tp_k_head_num, attn.qk_head_dim),
+        v.view(-1, attn.tp_v_head_num, attn.v_head_dim),
+        attn.k_scale,
+        attn.v_scale,
+    )
 
 
 def _welm_prepare_kv_mirror_logits_states(
@@ -715,12 +742,20 @@ class MirrorQProjection(BaseWelmQkvProjection):
         project_hidden_states = hidden_states
         if _welm_should_contract_kv_mirror(forward_batch):
             _welm_init_kv_mirror_last_q_indices(forward_batch)
-            first_contract = (
-                hidden_states.shape[0] != forward_batch.kv_mirror_output_size
-            )
-            project_hidden_states = _welm_select_kv_mirror_rows(
-                hidden_states, forward_batch, first_contract=first_contract
-            )
+            if _welm_kv_mirror_has_no_active_q(forward_batch):
+                project_hidden_states = hidden_states.new_empty(
+                    (0, hidden_states.shape[-1])
+                )
+                forward_batch.welm_kv_mirror_full_q_attention = False
+            else:
+                first_contract = (
+                    hidden_states.shape[0] != forward_batch.kv_mirror_output_size
+                )
+                forward_batch.welm_kv_mirror_full_q_attention = first_contract
+                if not first_contract:
+                    project_hidden_states = _welm_select_kv_mirror_rows(
+                        hidden_states, forward_batch, first_contract=False
+                    )
 
         kv_activation = kv_mirror_states.pop(self.imitated_layer_idx, None)
         if kv_activation is None:
@@ -769,12 +804,17 @@ class NextnMirrorQProjection(BaseWelmQkvProjection):
         project_hidden_states = hidden_states
         if _welm_should_contract_kv_mirror(forward_batch):
             _welm_init_kv_mirror_last_q_indices(forward_batch)
-            first_contract = (
-                hidden_states.shape[0] != forward_batch.kv_mirror_output_size
-            )
-            project_hidden_states = _welm_select_kv_mirror_rows(
-                hidden_states, forward_batch, first_contract=first_contract
-            )
+            if _welm_kv_mirror_has_no_active_q(forward_batch):
+                project_hidden_states = hidden_states.new_empty(
+                    (0, hidden_states.shape[-1])
+                )
+            else:
+                first_contract = (
+                    hidden_states.shape[0] != forward_batch.kv_mirror_output_size
+                )
+                project_hidden_states = _welm_select_kv_mirror_rows(
+                    hidden_states, forward_batch, first_contract=first_contract
+                )
 
         kv_activation = kv_mirror_states.pop(self.imitated_layer_idx, None)
         if kv_activation is None:
@@ -1663,6 +1703,7 @@ class Qwen2MoeAttention(nn.Module):
             if (
                 _welm_should_contract_kv_mirror(forward_batch)
                 and self.kv_mirror_layer_idx in self.kv_mirror_layers
+                and q.shape[0] == forward_batch.custom_last_index.numel()
             ):
                 self.rotary_emb.forward_cuda(
                     positions,
@@ -1688,6 +1729,8 @@ class Qwen2MoeAttention(nn.Module):
         if self.attn_sink is not None:
             attn_kwargs["sinks"] = self.attn_sink
         if q.shape[0] == 0:
+            if has_kv:
+                _welm_write_kv_cache_only(self.attn, k, v, forward_batch)
             attn_output = q.new_empty((0, self.num_heads * self.head_dim))
         else:
             attn_output = self.attn(
@@ -1710,12 +1753,22 @@ class Qwen2MoeAttention(nn.Module):
             if dump_this_layer:
                 _welm_dump_tensor(f"{dump_prefix}.gated_attn_output", attn_output)
 
-        output, _ = self.o_proj(attn_output)
+        if attn_output.shape[0] == 0:
+            output = hidden_states.new_empty((0, self.hidden_size))
+        else:
+            output, _ = self.o_proj(attn_output)
         if (
             _welm_should_contract_kv_mirror(forward_batch)
             and self.kv_mirror_layer_idx in self.kv_mirror_layers
         ):
-            output = _welm_scatter_kv_mirror_rows(output, forward_batch)
+            if getattr(forward_batch, "welm_kv_mirror_full_q_attention", False):
+                output = _welm_select_kv_mirror_rows(
+                    output, forward_batch, first_contract=True
+                )
+                output = _welm_scatter_kv_mirror_rows(output, forward_batch)
+                forward_batch.welm_kv_mirror_full_q_attention = False
+            else:
+                output = _welm_scatter_kv_mirror_rows(output, forward_batch)
         if dump_this_layer:
             _welm_dump_tensor(
                 f"model.layers.{self.layer_idx}.attn.mixer.o_proj_out", output
@@ -2451,12 +2504,6 @@ class Qwen2MoeModel(nn.Module):
                             # before the first local mirror-layer skip check.
                             _welm_init_kv_mirror_last_q_indices(forward_batch)
                             kv_mirror_indices_initialized = True
-                        if (
-                            _welm_kv_mirror_has_no_active_q(forward_batch)
-                            and not _welm_kv_mirror_should_run_dummy_q(forward_batch)
-                        ):
-                            kv_mirror_states = _empty_welm_kv_mirror_states()
-                            continue
                     hidden_states, residual, kv_mirror_states = layer(
                         positions,
                         hidden_states,
@@ -2601,10 +2648,7 @@ class WeLMV4MoeForCausalLM(nn.Module):
             if self.model.scale_seq_times > 0:
                 scale = self.model.scale_seq_times + 1
                 # Select every scale-th element (last of each group)
-                kv_mirror_contracted = (
-                    forward_batch.enable_welm_kv_mirror_opt
-                    and forward_batch.forward_mode.is_extend_without_speculative()
-                )
+                kv_mirror_contracted = _welm_should_contract_kv_mirror(forward_batch)
                 if not kv_mirror_contracted:
                     indices = torch.arange(
                         scale - 1,
@@ -2632,10 +2676,8 @@ class WeLMV4MoeForCausalLM(nn.Module):
                         forward_batch.extend_num_tokens // scale
                     )
 
-            if (
-                forward_batch.enable_welm_kv_mirror_opt
-                and forward_batch.forward_mode.is_extend_without_speculative()
-            ):
+            if _welm_should_contract_kv_mirror(forward_batch):
+                _welm_init_kv_mirror_last_q_indices(forward_batch)
                 hidden_states, aux_hidden_states = (
                     _welm_prepare_kv_mirror_logits_states(
                         hidden_states, aux_hidden_states, forward_batch
@@ -2709,10 +2751,7 @@ class WeLMV4MoeForCausalLM(nn.Module):
             # Contract expanded hidden_states back to logical size
             if self.model.scale_seq_times > 0:
                 scale = self.model.scale_seq_times + 1
-                kv_mirror_contracted = (
-                    forward_batch.enable_welm_kv_mirror_opt
-                    and forward_batch.forward_mode.is_extend_without_speculative()
-                )
+                kv_mirror_contracted = _welm_should_contract_kv_mirror(forward_batch)
                 if not kv_mirror_contracted:
                     indices = torch.arange(
                         scale - 1,

@@ -444,6 +444,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # For Over Encoding / WeLM kv-mirror
     oe_context: Optional["OverEncodingContext"] = None
     enable_welm_kv_mirror_opt: bool = False
+    welm_kv_mirror_contracted: bool = False
     scale_seq_factor: int = 1
 
     # For ngram embedding

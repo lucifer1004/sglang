@@ -211,6 +211,7 @@ class LogitsMetadata:
 
     # For KV Mirror
     enable_welm_kv_mirror_opt: bool = False
+    welm_kv_mirror_contracted: bool = False
     scale_seq_factor: int = 1
 
     @classmethod
@@ -264,6 +265,7 @@ class LogitsMetadata:
             global_num_tokens_for_logprob_gpu=forward_batch.global_num_tokens_for_logprob_gpu,
             dp_padding_mode=DpPaddingMode.SUM_LEN,
             enable_welm_kv_mirror_opt=forward_batch.enable_welm_kv_mirror_opt,
+            welm_kv_mirror_contracted=forward_batch.welm_kv_mirror_contracted,
             scale_seq_factor=forward_batch.scale_seq_factor,
         )
 
@@ -1190,11 +1192,7 @@ class LogitsProcessor(nn.Module):
                 multi_item_delimiter_indices,
             )
 
-        kv_mirror_pruned = logits_metadata.enable_welm_kv_mirror_opt and (
-            logits_metadata.forward_mode.is_extend_without_speculative()
-            or logits_metadata.scale_seq_factor > 1
-            or logits_metadata.forward_mode.is_draft_extend()
-        )
+        kv_mirror_pruned = logits_metadata.welm_kv_mirror_contracted
 
         # Get the last hidden states and last logits for the next token prediction
         if (

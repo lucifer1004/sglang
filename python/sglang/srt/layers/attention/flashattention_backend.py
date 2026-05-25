@@ -942,6 +942,12 @@ class FlashAttentionBackend(AttentionBackend):
             else None
         )
 
+        use_welm_custom_last_q = (
+            getattr(forward_batch, "welm_kv_mirror_contracted", False)
+            and getattr(forward_batch, "custom_last_index", None) is not None
+            and q.shape[0] == forward_batch.custom_last_index.numel()
+        )
+
         # Get the appropriate page table based on whether we're using local attention
         if use_local_attn:
             local_metadata = metadata.local_attn_metadata
@@ -956,7 +962,7 @@ class FlashAttentionBackend(AttentionBackend):
             cache_seqlens = swa_spec_metadata.cache_seqlens_int32
             max_seqlen_q = swa_spec_metadata.max_seq_len_q
             cu_seqlens_k = swa_spec_metadata.cu_seqlens_k
-        elif hasattr(forward_batch, "custom_last_index"):
+        elif use_welm_custom_last_q:
             page_table = metadata.page_table
             cu_seqlens_q = metadata.mirror_cu_seqlens_q
             cache_seqlens = metadata.cache_seqlens_int32
