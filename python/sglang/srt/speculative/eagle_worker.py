@@ -284,10 +284,9 @@ class EAGLEWorker(TpModelWorker):
             "cuda": EAGLEDraftCudaGraphRunner,
             "musa": EAGLEDraftCudaGraphRunner,
         }
-        skip_welmv4_mtp_cuda_graph = self._is_welmv4_mtp_draft_model()
 
         # Capture draft
-        if self.speculative_num_steps > 1 and not skip_welmv4_mtp_cuda_graph:
+        if self.speculative_num_steps > 1:
             tic = time.perf_counter()
             before_mem = get_available_gpu_memory(self.device, self.gpu_id)
             logger.info(
@@ -300,19 +299,9 @@ class EAGLEWorker(TpModelWorker):
             logger.info(
                 f"Capture draft cuda graph end. Time elapsed: {time.perf_counter() - tic:.2f} s. mem usage={(before_mem - after_mem):.2f} GB. avail mem={after_mem:.2f} GB."
             )
-        elif self.speculative_num_steps > 1 and skip_welmv4_mtp_cuda_graph:
-            logger.info(
-                "Skip draft cuda graph for WeLMV4 MTP; recursive draft decode "
-                "reuses base-position MTP KV cache without appending draft KV."
-            )
 
         # Capture extend
-        skip_draft_extend_cuda_graph = skip_welmv4_mtp_cuda_graph
-        if (
-            self.draft_extend_attn_backend
-            and not _is_npu
-            and not skip_draft_extend_cuda_graph
-        ):
+        if self.draft_extend_attn_backend and not _is_npu:
             tic = time.perf_counter()
             before_mem = get_available_gpu_memory(self.device, self.gpu_id)
             logger.info(
@@ -324,11 +313,6 @@ class EAGLEWorker(TpModelWorker):
             after_mem = get_available_gpu_memory(self.device, self.gpu_id)
             logger.info(
                 f"Capture draft extend cuda graph end. Time elapsed: {time.perf_counter() - tic:.2f} s. mem usage={(before_mem - after_mem):.2f} GB. avail mem={after_mem:.2f} GB."
-            )
-        elif self.draft_extend_attn_backend and skip_draft_extend_cuda_graph:
-            logger.info(
-                "Skip draft extend cuda graph for WeLMV4 MTP; its mirror-KV "
-                "path uses main-model activations from the current verify step."
             )
 
     def apply_runtime_state(self, state: SpecRuntimeState):
@@ -488,6 +472,9 @@ class EAGLEWorker(TpModelWorker):
             if self.draft_model_runner.server_args.enable_pdmux
             else self.draft_model_runner.attn_backend
         )
+        if getattr(forward_batch, "welm_mtp_base_kv_metadata_prepared", False):
+            forward_batch.attn_backend = attn_backend
+            return
         spec_info_backup = forward_batch.spec_info
         forward_batch.spec_info = None
         try:
@@ -1075,20 +1062,9 @@ class EAGLEWorker(TpModelWorker):
                 spec_info.retrieve_next_token.shape
             ).cpu()
 
-        # Forward. WeLMV4 MTP consumes Python-side mirror-KV activations from
-        # the target verify pass, so replaying a captured target CUDA graph
-        # cannot be used here.
-        target_graph_runner = None
-        if self._is_welmv4_mtp_draft_model():
-            target_graph_runner = self.target_worker.model_runner.graph_runner
-            self.target_worker.model_runner.graph_runner = None
-        try:
-            batch_result = self.target_worker.forward_batch_generation(
-                model_worker_batch, is_verify=True
-            )
-        finally:
-            if self._is_welmv4_mtp_draft_model():
-                self.target_worker.model_runner.graph_runner = target_graph_runner
+        batch_result = self.target_worker.forward_batch_generation(
+            model_worker_batch, is_verify=True
+        )
         logits_output, can_run_cuda_graph = (
             batch_result.logits_output,
             batch_result.can_run_cuda_graph,
@@ -1346,6 +1322,10 @@ class EAGLEWorker(TpModelWorker):
                 logits_output.topk_index,
             )
             forward_batch.spec_info.hidden_states = logits_output.hidden_states
+            if self._is_welmv4_mtp_draft_model():
+                forward_batch.spec_info.welm_mtp_base_positions = (
+                    self._get_welmv4_mtp_base_positions(forward_batch)
+                )
         else:
             forward_batch.can_run_dp_cuda_graph = False
             if not forward_batch.forward_mode.is_idle():

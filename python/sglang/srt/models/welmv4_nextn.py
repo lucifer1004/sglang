@@ -18,6 +18,7 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.models.welm_perf_opt import hash_input_ids_vectorized
+import sglang.srt.models.welmv4 as welmv4_module
 from sglang.srt.models.welmv4 import (
     Qwen2MoeDecoderLayer,
     WelmV4FusedRMSNorm,
@@ -37,16 +38,48 @@ logger = logging.getLogger(__name__)
 _is_cuda = is_cuda()
 _is_npu = is_npu()
 _MTP_DUMP_PASS = 0
+_MTP_DUMP_PASS_ACTIVE = False
+_MTP_GRAPH_DUMP_PASS_ACTIVE = False
 _MTP_DUMP_WRITTEN = set()
+_MTP_GRAPH_DUMP_CALL_INDEX = 0
+_MTP_GRAPH_DUMP_CURRENT_PREFIX = None
+_MTP_GRAPH_DUMP_PREV_NAME_PREFIX = ""
+_MTP_TRUE_ENV_VALUES = {"1", "true", "on", "yes"}
+_MTP_DUMP_ENABLED = (
+    os.environ.get("SGLANG_DUMP_MTP_ACTIVATIONS", "0").strip().lower()
+    in _MTP_TRUE_ENV_VALUES
+)
+
+
+def _reset_mtp_graph_dump_call_index() -> None:
+    if not _MTP_DUMP_ENABLED:
+        return
+    global _MTP_GRAPH_DUMP_CALL_INDEX, _MTP_GRAPH_DUMP_CURRENT_PREFIX
+    global _MTP_GRAPH_DUMP_PREV_NAME_PREFIX
+    _MTP_GRAPH_DUMP_CALL_INDEX = 0
+    _MTP_GRAPH_DUMP_CURRENT_PREFIX = None
+    _MTP_GRAPH_DUMP_PREV_NAME_PREFIX = ""
+    welmv4_module._welm_set_graph_dump_name_prefix(None)
+
+
+def _cuda_graph_capture_active() -> bool:
+    try:
+        from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
+
+        if get_is_capture_mode():
+            return True
+    except Exception:
+        pass
+    if not torch.cuda.is_available():
+        return False
+    try:
+        return torch.cuda.is_current_stream_capturing()
+    except RuntimeError:
+        return False
 
 
 def _mtp_dump_enabled() -> bool:
-    return os.environ.get("SGLANG_DUMP_MTP_ACTIVATIONS", "0").strip().lower() in {
-        "1",
-        "true",
-        "on",
-        "yes",
-    }
+    return _MTP_DUMP_ENABLED
 
 
 def _mtp_dump_dir() -> Path:
@@ -57,16 +90,110 @@ def _mtp_dump_dir() -> Path:
     return path
 
 
+def _start_mtp_dump_pass() -> None:
+    if not _MTP_DUMP_ENABLED:
+        return
+    global _MTP_DUMP_PASS_ACTIVE, _MTP_GRAPH_DUMP_PASS_ACTIVE
+    global _MTP_GRAPH_DUMP_CALL_INDEX, _MTP_GRAPH_DUMP_CURRENT_PREFIX
+    global _MTP_GRAPH_DUMP_PREV_NAME_PREFIX
+    capture_active = _cuda_graph_capture_active()
+    _MTP_DUMP_PASS_ACTIVE = not capture_active
+    _MTP_GRAPH_DUMP_PASS_ACTIVE = capture_active
+    if _MTP_GRAPH_DUMP_PASS_ACTIVE:
+        _MTP_GRAPH_DUMP_CURRENT_PREFIX = (
+            f"graph_step_{_MTP_GRAPH_DUMP_CALL_INDEX:05d}."
+        )
+        _MTP_GRAPH_DUMP_CALL_INDEX += 1
+        _MTP_GRAPH_DUMP_PREV_NAME_PREFIX = (
+            welmv4_module._welm_set_graph_dump_name_prefix(
+                _MTP_GRAPH_DUMP_CURRENT_PREFIX
+            )
+        )
+    else:
+        _MTP_GRAPH_DUMP_CURRENT_PREFIX = None
+        _MTP_GRAPH_DUMP_PREV_NAME_PREFIX = ""
+    if _MTP_DUMP_PASS_ACTIVE or _MTP_GRAPH_DUMP_PASS_ACTIVE:
+        _MTP_DUMP_WRITTEN.clear()
+        dump_dir = _mtp_dump_dir() if _MTP_DUMP_PASS_ACTIVE else None
+        if dump_dir is not None:
+            os.environ["SGLANG_DUMP_MTP_ACTIVATIONS_PROCESS_DIR"] = str(dump_dir)
+
+
+def _finish_mtp_dump_pass() -> None:
+    if not _MTP_DUMP_ENABLED:
+        return
+    global _MTP_DUMP_PASS, _MTP_DUMP_PASS_ACTIVE, _MTP_GRAPH_DUMP_PASS_ACTIVE
+    global _MTP_GRAPH_DUMP_CURRENT_PREFIX
+    global _MTP_GRAPH_DUMP_PREV_NAME_PREFIX
+    if _MTP_DUMP_PASS_ACTIVE or _MTP_GRAPH_DUMP_PASS_ACTIVE:
+        if _MTP_GRAPH_DUMP_PASS_ACTIVE:
+            welmv4_module._welm_set_graph_dump_name_prefix(
+                _MTP_GRAPH_DUMP_PREV_NAME_PREFIX
+            )
+        if _MTP_DUMP_PASS_ACTIVE:
+            _MTP_DUMP_PASS += 1
+        _MTP_DUMP_WRITTEN.clear()
+        os.environ.pop("SGLANG_DUMP_MTP_ACTIVATIONS_PROCESS_DIR", None)
+    _MTP_DUMP_PASS_ACTIVE = False
+    _MTP_GRAPH_DUMP_PASS_ACTIVE = False
+    _MTP_GRAPH_DUMP_CURRENT_PREFIX = None
+    _MTP_GRAPH_DUMP_PREV_NAME_PREFIX = ""
+
+
 def _safe_name(name: str) -> str:
     return "".join(c if c.isalnum() or c in "._-" else "_" for c in name)
 
 
 def _dump_tensor(name: str, value) -> None:
-    if not _mtp_dump_enabled() or name in _MTP_DUMP_WRITTEN:
+    if not _MTP_DUMP_ENABLED:
         return
     if isinstance(value, torch.Tensor):
-        torch.save(value.detach().cpu(), _mtp_dump_dir() / f"{_safe_name(name)}.pt")
+        safe_name = _safe_name(name)
+        capture_active = _cuda_graph_capture_active()
+        if not capture_active and name in _MTP_DUMP_WRITTEN:
+            return
+        if capture_active:
+            welmv4_module._welm_graph_dump_tensor(safe_name, value)
+            return
+        torch.save(value.detach().cpu(), _mtp_dump_dir() / f"{safe_name}.pt")
         _MTP_DUMP_WRITTEN.add(name)
+
+
+def _flush_mtp_graph_dump_pass(
+    context: str,
+    first_dim_limit: Optional[int] = None,
+) -> None:
+    global _MTP_DUMP_PASS
+    if not _MTP_DUMP_ENABLED:
+        return
+    dump_dir = _mtp_dump_dir()
+    saved = welmv4_module._welm_flush_graph_dump_buffers(
+        context, dump_dir, first_dim_limit=first_dim_limit
+    )
+    if not saved:
+        return
+
+    graph_step_files = []
+    for path in dump_dir.glob("graph_step_*.pt"):
+        stem = path.name[: -len(".pt")]
+        prefix, sep, rest = stem.partition(".")
+        if not sep or not prefix.startswith("graph_step_") or not rest:
+            continue
+        graph_step_files.append((prefix, rest, path))
+
+    if not graph_step_files:
+        _MTP_DUMP_PASS += 1
+        return
+
+    step_order = {
+        step: idx for idx, step in enumerate(sorted({x[0] for x in graph_step_files}))
+    }
+    for step, rest, path in graph_step_files:
+        pass_id = _MTP_DUMP_PASS + step_order[step]
+        step_dir = dump_dir.parent / f"Pass{pass_id:05d}"
+        step_dir.mkdir(parents=True, exist_ok=True)
+        path.replace(step_dir / f"{rest}.pt")
+    _MTP_DUMP_PASS += len(step_order)
 
 
 class WeLMV4ModelNextN(nn.Module):
@@ -147,11 +274,12 @@ class WeLMV4ModelNextN(nn.Module):
         input_embeds: torch.Tensor = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
 
-        _dump_tensor("model.mtp.0.input_ids", input_ids)
-        _dump_tensor("model.mtp.0.positions", positions)
-        _dump_tensor(
-            "model.mtp.0.main_hidden_in", forward_batch.spec_info.hidden_states
-        )
+        dump_enabled = _MTP_DUMP_ENABLED
+        main_hidden_states = forward_batch.spec_info.hidden_states
+        if dump_enabled:
+            _dump_tensor("model.mtp.0.input_ids", input_ids)
+            _dump_tensor("model.mtp.0.positions", positions)
+            _dump_tensor("model.mtp.0.main_hidden_in", main_hidden_states)
 
         if input_embeds is None:
             hidden_states = self.embed_tokens(input_ids)
@@ -186,9 +314,6 @@ class WeLMV4ModelNextN(nn.Module):
             emb_new, _ = self.oe_gate_up_proj(torch.cat(emb_ngram, dim=-1))
             hidden_states = (hidden_states + emb_new) / 2.0
 
-        _dump_tensor("model.mtp.0.embedding", hidden_states)
-
-        main_hidden_states = forward_batch.spec_info.hidden_states
         if (
             _welm_should_contract_kv_mirror(forward_batch)
             and main_hidden_states is not None
@@ -218,12 +343,11 @@ class WeLMV4ModelNextN(nn.Module):
         if hidden_states.shape[0] > 0:
             enorm_output = self.enorm(hidden_states)
             hnorm_output = self.hnorm(main_hidden_states)
-            _dump_tensor("model.mtp.0.enorm", enorm_output)
-            _dump_tensor("model.mtp.0.hnorm", hnorm_output)
             hidden_states = self.eh_proj(
                 torch.cat((enorm_output, hnorm_output), dim=-1)
             )
-            _dump_tensor("model.mtp.0.projector_out", hidden_states)
+            if dump_enabled:
+                _dump_tensor("model.mtp.0.projector_out", hidden_states)
 
         residual = None
         kv_mirror_states = _get_welm_kv_mirror_states(forward_batch)
@@ -240,8 +364,6 @@ class WeLMV4ModelNextN(nn.Module):
                 )
                 final_experts_output = getattr(layer, "final_mlp_experts_output", None)
                 final_shared_output = getattr(layer, "final_mlp_shared_output", None)
-                _dump_tensor(f"model.mtp.0.decoder.{layer_idx}.hidden", hidden_states)
-                _dump_tensor(f"model.mtp.0.decoder.{layer_idx}.residual", residual)
 
         hidden_states_for_next_mtp = None
         if not forward_batch.forward_mode.is_idle():
@@ -272,8 +394,12 @@ class WeLMV4ModelNextN(nn.Module):
                 hidden_states = (
                     norm_output[0] if isinstance(norm_output, tuple) else norm_output
                 )
-            _dump_tensor("model.mtp.0.decoder.0.output", hidden_states_for_next_mtp)
-        _dump_tensor("model.mtp.0.ln_f", hidden_states)
+            if dump_enabled:
+                _dump_tensor(
+                    "model.mtp.0.decoder.0.output", hidden_states_for_next_mtp
+                )
+        if dump_enabled:
+            _dump_tensor("model.mtp.0.ln_f", hidden_states)
         return hidden_states, hidden_states_for_next_mtp
 
 
@@ -304,27 +430,34 @@ class WeLMV4MoeForCausalLMNextN(WeLMV4MoeForCausalLM):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        hidden_states, hidden_states_for_next_mtp = self.model(
-            input_ids, positions, forward_batch
-        )
-        aux_hidden_states = (
-            [hidden_states_for_next_mtp]
-            if hidden_states_for_next_mtp is not None
-            else None
-        )
-        if _welm_should_contract_kv_mirror(forward_batch):
-            hidden_states, aux_hidden_states = _welm_prepare_kv_mirror_logits_states(
-                hidden_states, aux_hidden_states, forward_batch
+        if _MTP_DUMP_ENABLED:
+            _start_mtp_dump_pass()
+        try:
+            hidden_states, hidden_states_for_next_mtp = self.model(
+                input_ids, positions, forward_batch
             )
-        logits_output = self.logits_processor(
-            input_ids,
-            hidden_states,
-            self.lm_head,
-            forward_batch,
-            aux_hidden_states,
-        )
-        _dump_tensor("model.mtp.0.logits", logits_output.next_token_logits)
-        return logits_output
+            aux_hidden_states = (
+                [hidden_states_for_next_mtp]
+                if hidden_states_for_next_mtp is not None
+                else None
+            )
+            if _welm_should_contract_kv_mirror(forward_batch):
+                hidden_states, aux_hidden_states = _welm_prepare_kv_mirror_logits_states(
+                    hidden_states, aux_hidden_states, forward_batch
+                )
+            logits_output = self.logits_processor(
+                input_ids,
+                hidden_states,
+                self.lm_head,
+                forward_batch,
+                aux_hidden_states,
+            )
+            if _MTP_DUMP_ENABLED:
+                _dump_tensor("model.mtp.0.logits", logits_output.next_token_logits)
+            return logits_output
+        finally:
+            if _MTP_DUMP_ENABLED:
+                _finish_mtp_dump_pass()
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         super().load_weights(weights, is_nextn=True)

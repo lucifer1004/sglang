@@ -112,6 +112,20 @@ WELM_KV_MIRROR_STATES_KEY = "welm_kv_mirror_states"
 _WELM_DUMP_PROCESS_DIR = None
 _WELM_DUMP_BASE_DIR = None
 _WELM_DUMP_PASS_ID = -1
+_WELM_GRAPH_DUMP_CONTEXT = None
+_WELM_GRAPH_DUMP_NAME_PREFIX = ""
+_WELM_GRAPH_DUMP_BUFFERS = {}
+_WELM_GRAPH_DUMP_MISSING = set()
+_WELM_TRUE_ENV_VALUES = {"1", "true", "yes", "on"}
+_WELM_DUMP_ENABLED = (
+    os.getenv("SGLANG_DUMP_ACTIVATIONS", "0").strip().lower()
+    in _WELM_TRUE_ENV_VALUES
+)
+_WELM_MTP_DUMP_ENABLED = (
+    os.getenv("SGLANG_DUMP_MTP_ACTIVATIONS", "0").strip().lower()
+    in _WELM_TRUE_ENV_VALUES
+)
+_WELM_GRAPH_DUMP_ENABLED = _WELM_DUMP_ENABLED or _WELM_MTP_DUMP_ENABLED
 
 
 class WelmV4CommunicatorRMSNorm(nn.Module):
@@ -138,16 +152,122 @@ class WelmV4CommunicatorRMSNorm(nn.Module):
 
 
 def _welm_dump_enabled() -> bool:
-    return os.getenv("SGLANG_DUMP_ACTIVATIONS", "0").lower() in (
-        "1",
-        "true",
-        "yes",
-        "on",
+    return _WELM_DUMP_ENABLED
+
+
+def _welm_cuda_graph_capture_active() -> bool:
+    try:
+        from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
+
+        if get_is_capture_mode():
+            return True
+    except Exception:
+        pass
+    if not torch.cuda.is_available():
+        return False
+    try:
+        return torch.cuda.is_current_stream_capturing()
+    except RuntimeError:
+        return False
+
+
+def _welm_real_cuda_graph_capture_active() -> bool:
+    if not torch.cuda.is_available():
+        return False
+    try:
+        return torch.cuda.is_current_stream_capturing()
+    except RuntimeError:
+        return False
+
+
+def _welm_set_graph_dump_context(context: Optional[str]):
+    if not _WELM_GRAPH_DUMP_ENABLED:
+        return None
+    global _WELM_GRAPH_DUMP_CONTEXT
+    old_context = _WELM_GRAPH_DUMP_CONTEXT
+    _WELM_GRAPH_DUMP_CONTEXT = context
+    return old_context
+
+
+def _welm_set_graph_dump_name_prefix(prefix: Optional[str]):
+    if not _WELM_GRAPH_DUMP_ENABLED:
+        return ""
+    global _WELM_GRAPH_DUMP_NAME_PREFIX
+    old_prefix = _WELM_GRAPH_DUMP_NAME_PREFIX
+    _WELM_GRAPH_DUMP_NAME_PREFIX = prefix or ""
+    return old_prefix
+
+
+def _welm_graph_dump_tensor(name: str, tensor: torch.Tensor) -> bool:
+    if not _WELM_GRAPH_DUMP_ENABLED or _WELM_GRAPH_DUMP_CONTEXT is None:
+        return False
+    if not isinstance(tensor, torch.Tensor) or not tensor.is_cuda:
+        return False
+    if _WELM_GRAPH_DUMP_NAME_PREFIX:
+        name = f"{_WELM_GRAPH_DUMP_NAME_PREFIX}{name}"
+    key = (_WELM_GRAPH_DUMP_CONTEXT, name)
+    value = tensor.detach()
+    buffer = _WELM_GRAPH_DUMP_BUFFERS.get(key)
+    if buffer is None:
+        if _welm_real_cuda_graph_capture_active():
+            _WELM_GRAPH_DUMP_MISSING.add(key)
+            return False
+        buffer = torch.empty_like(value)
+        _WELM_GRAPH_DUMP_BUFFERS[key] = buffer
+    elif (
+        buffer.dtype != value.dtype
+        or buffer.device != value.device
+        or buffer.ndim != value.ndim
+        or any(buffer.shape[idx] < value.shape[idx] for idx in range(value.ndim))
+    ):
+        if _welm_real_cuda_graph_capture_active():
+            _WELM_GRAPH_DUMP_MISSING.add(key)
+            return False
+        buffer = torch.empty_like(value)
+        _WELM_GRAPH_DUMP_BUFFERS[key] = buffer
+
+    if buffer.shape == value.shape:
+        buffer.copy_(value)
+        return True
+    if buffer.ndim == value.ndim and all(
+        buffer.shape[idx] >= value.shape[idx] for idx in range(value.ndim)
+    ):
+        slices = tuple(slice(0, dim) for dim in value.shape)
+        buffer[slices].copy_(value)
+        return True
+    return False
+
+
+def _welm_flush_graph_dump_buffers(
+    context: str,
+    dump_dir: Union[str, Path],
+    first_dim_limit: Optional[int] = None,
+) -> int:
+    if not _WELM_GRAPH_DUMP_ENABLED:
+        return 0
+    dump_path = Path(dump_dir)
+    dump_path.mkdir(parents=True, exist_ok=True)
+    saved = 0
+    for (buffer_context, name), buffer in sorted(_WELM_GRAPH_DUMP_BUFFERS.items()):
+        if buffer_context != context:
+            continue
+        value = buffer
+        if first_dim_limit is not None and value.ndim > 0:
+            value = value[: min(int(first_dim_limit), value.shape[0])]
+        torch.save(value.detach().cpu(), dump_path / f"{name}.pt")
+        saved += 1
+    missing = sorted(
+        name
+        for buffer_context, name in _WELM_GRAPH_DUMP_MISSING
+        if buffer_context == context
     )
+    if missing:
+        torch.save(missing, dump_path / "graph_dump_missing.pt")
+    return saved
 
 
 def _welm_should_dump_layer(layer_idx: int) -> bool:
-    if not _welm_dump_enabled():
+    if not _WELM_DUMP_ENABLED:
         return False
     layer_idxs = os.getenv("SGLANG_DUMP_ACTIVATIONS_LAYER_IDXS")
     if not layer_idxs:
@@ -158,6 +278,15 @@ def _welm_should_dump_layer(layer_idx: int) -> bool:
 def _welm_dump_tensor(name: str, tensor: torch.Tensor) -> None:
     global _WELM_DUMP_PROCESS_DIR
     if not isinstance(tensor, torch.Tensor):
+        return
+    if _welm_cuda_graph_capture_active():
+        _welm_graph_dump_tensor(name, tensor)
+        return
+    mtp_process_dir = os.getenv("SGLANG_DUMP_MTP_ACTIVATIONS_PROCESS_DIR")
+    if mtp_process_dir:
+        process_dir = Path(mtp_process_dir)
+        process_dir.mkdir(parents=True, exist_ok=True)
+        torch.save(tensor.detach().cpu(), process_dir / f"{name}.pt")
         return
     if _WELM_DUMP_PROCESS_DIR is None:
         process_dir = os.getenv("SGLANG_DUMP_ACTIVATIONS_PROCESS_DIR")
@@ -179,7 +308,7 @@ def _welm_dump_tensor(name: str, tensor: torch.Tensor) -> None:
 
 def _welm_start_dump_pass() -> None:
     global _WELM_DUMP_BASE_DIR, _WELM_DUMP_PASS_ID, _WELM_DUMP_PROCESS_DIR
-    if not _welm_dump_enabled():
+    if not _WELM_DUMP_ENABLED:
         return
     if _WELM_DUMP_BASE_DIR is None:
         _WELM_DUMP_BASE_DIR = (
@@ -1066,8 +1195,11 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         return_components: bool = False,
         skip_component_output: bool = False,
     ) -> torch.Tensor:
-        dump_this_layer = _welm_should_dump_layer(self.layer_id)
-        dump_prefix = f"model.layers.{self.layer_id}.mlp"
+        dump_this_layer = _WELM_DUMP_ENABLED and _welm_should_dump_layer(
+            self.layer_id
+        )
+        if dump_this_layer:
+            dump_prefix = f"model.layers.{self.layer_id}.mlp"
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
         if dump_this_layer:
@@ -1616,8 +1748,20 @@ class Qwen2MoeAttention(nn.Module):
         kv_mirror_states: Dict[int, Tuple[torch.Tensor, torch.Tensor]],
         skip_o_norm: bool = False,
     ) -> torch.Tensor:
-        dump_this_layer = _welm_should_dump_layer(self.layer_idx)
-        dump_prefix = f"model.layers.{self.layer_idx}.self_attn"
+        dump_this_layer = _WELM_DUMP_ENABLED and _welm_should_dump_layer(
+            self.layer_idx
+        )
+        mtp_dump_attention_io = _WELM_MTP_DUMP_ENABLED and self.is_nextn
+        if dump_this_layer:
+            if self.is_nextn:
+                dump_prefix = f"model.mtp.0.decoder.{self.layer_idx}.layer.self_attn"
+            else:
+                dump_prefix = f"model.layers.{self.layer_idx}.self_attn"
+        if mtp_dump_attention_io:
+            mtp_dump_prefix = (
+                f"model.mtp.0.decoder.{self.layer_idx}.layer.self_attn"
+            )
+            _welm_dump_tensor(f"{mtp_dump_prefix}.input", hidden_states)
         if dump_this_layer:
             _welm_dump_tensor(f"{dump_prefix}.positions", positions)
             if forward_batch.extend_seq_lens is not None:
@@ -1794,6 +1938,8 @@ class Qwen2MoeAttention(nn.Module):
                 )
         if dump_this_layer:
             _welm_dump_tensor(f"model.layers.{self.layer_idx}.attn.mixer.0", output)
+        if mtp_dump_attention_io:
+            _welm_dump_tensor(f"{mtp_dump_prefix}.output", output)
         return output
 
 
@@ -1949,7 +2095,9 @@ class Qwen2MoeDecoderLayer(nn.Module):
         torch.Tensor, torch.Tensor, Dict[int, Tuple[torch.Tensor, torch.Tensor]]
     ]:
         use_previous_precision = welm_use_previous_precision()
-        dump_this_layer = _welm_should_dump_layer(self.layer_id)
+        dump_this_layer = _WELM_DUMP_ENABLED and _welm_should_dump_layer(
+            self.layer_id
+        )
         if dump_this_layer:
             _welm_dump_tensor(
                 f"model.layers.{self.layer_id}.__input__.0", hidden_states
@@ -2354,7 +2502,7 @@ class Qwen2MoeModel(nn.Module):
         if oe_up_proj_module is None:
             oe_up_proj_module = self.oe_gate_up_proj
 
-        dump_oe = _welm_dump_enabled()
+        dump_oe = _WELM_DUMP_ENABLED
         if not dump_oe:
             return compute_welm_oe_embedding(
                 input_ids=input_ids,
@@ -2443,13 +2591,14 @@ class Qwen2MoeModel(nn.Module):
         input_embeds: torch.Tensor = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[torch.Tensor, PPProxyTensors]:
-        _welm_start_dump_pass()
+        if _WELM_DUMP_ENABLED:
+            _welm_start_dump_pass()
         if self.pp_group.is_first_rank:
             if input_embeds is None:
                 hidden_states = self.embed_tokens(input_ids)
             else:
                 hidden_states = input_embeds
-            if _welm_dump_enabled():
+            if _WELM_DUMP_ENABLED:
                 _welm_dump_tensor("model.embed_tokens.output", hidden_states)
 
             if len(self.oe_grams) > 0 and getattr(forward_batch, "oe_context", None):
@@ -2527,7 +2676,7 @@ class Qwen2MoeModel(nn.Module):
                         hidden_states, _ = self.norm(hidden_states, residual)
                 elif residual is None:
                     pre_norm_hidden_states = hidden_states.to(self.norm.weight.dtype)
-                    if _welm_dump_enabled():
+                    if _WELM_DUMP_ENABLED:
                         _welm_dump_tensor(
                             "model.ln_f.__input__.0", pre_norm_hidden_states
                         )
@@ -2561,7 +2710,7 @@ class Qwen2MoeModel(nn.Module):
                     else:
                         hidden_states = hidden_states.float() + residual.float()
                     pre_norm_hidden_states = hidden_states.to(self.norm.weight.dtype)
-                    if _welm_dump_enabled():
+                    if _WELM_DUMP_ENABLED:
                         _welm_dump_tensor(
                             "model.ln_f.__input__.0", pre_norm_hidden_states
                         )
@@ -2571,7 +2720,7 @@ class Qwen2MoeModel(nn.Module):
                         self.norm.weight,
                         eps=self.norm.eps,
                     )
-                if _welm_dump_enabled():
+                if _WELM_DUMP_ENABLED:
                     _welm_dump_tensor("model.ln_f", hidden_states)
 
         if (

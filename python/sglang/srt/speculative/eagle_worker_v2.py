@@ -1,5 +1,6 @@
 import contextlib
 import logging
+import os
 import time
 from typing import List, Optional, Tuple
 
@@ -75,6 +76,21 @@ _is_musa = is_musa()
 _is_hip = is_hip()
 
 logger = logging.getLogger(__name__)
+_WELM_MTP_DUMP_ENABLED = os.environ.get(
+    "SGLANG_DUMP_MTP_ACTIVATIONS", "0"
+).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _flush_welmv4_mtp_graph_dump(
+    context: str, first_dim_limit: Optional[int] = None
+) -> None:
+    if not _WELM_MTP_DUMP_ENABLED:
+        return
+    from sglang.srt.models import welmv4_nextn as welmv4_nextn_module
+
+    welmv4_nextn_module._flush_mtp_graph_dump_pass(
+        context, first_dim_limit=first_dim_limit
+    )
 
 
 def _get_plan_stream(
@@ -265,6 +281,9 @@ class EagleDraftWorker(BaseDraftWorker):
             if self.draft_runner.server_args.enable_pdmux
             else self.draft_runner.attn_backend
         )
+        if getattr(forward_batch, "welm_mtp_base_kv_metadata_prepared", False):
+            forward_batch.attn_backend = attn_backend
+            return
         spec_info_backup = forward_batch.spec_info
         forward_batch.spec_info = None
         try:
@@ -304,6 +323,21 @@ class EagleDraftWorker(BaseDraftWorker):
         oe_context = getattr(forward_batch, "oe_context", None)
         if oe_context is None or oe_context.input_ids_buffer is None:
             return draft_oe_buffer
+        saved_oe_buffer = getattr(
+            getattr(forward_batch, "spec_info", None),
+            "welm_mtp_oe_buffer",
+            None,
+        )
+        if (
+            saved_oe_buffer is not None
+            and saved_oe_buffer.numel() == oe_context.input_ids_buffer.numel()
+        ):
+            oe_context.input_ids_buffer.copy_(
+                saved_oe_buffer.to(
+                    device=oe_context.input_ids_buffer.device,
+                    dtype=oe_context.input_ids_buffer.dtype,
+                ).reshape_as(oe_context.input_ids_buffer)
+            )
 
         batch_size = input_ids.numel()
         buffer_size = oe_context.buffer_size
@@ -324,6 +358,24 @@ class EagleDraftWorker(BaseDraftWorker):
                     f"buffer_batch_size={draft_oe_buffer.shape[0]} {batch_size=}"
                 )
             draft_oe_buffer = draft_oe_buffer[:batch_size]
+
+        if getattr(forward_batch, "welm_mtp_graph_oe_context_prepared", False):
+            for idx, gram_buffer in enumerate(oe_context.input_ids_grams):
+                n = idx + 2
+                if n - 1 <= buffer_size:
+                    ngram = draft_oe_buffer[:, -(n - 1)].contiguous()
+                else:
+                    ngram = input_ids.new_zeros((batch_size,), dtype=torch.int64)
+                if gram_buffer is not None and gram_buffer.shape[0] >= batch_size:
+                    gram_buffer[:batch_size].copy_(ngram.to(dtype=gram_buffer.dtype))
+                else:
+                    oe_context.set_gram(n, ngram.to(dtype=torch.int64))
+            input_ids_column = input_ids.to(dtype=draft_oe_buffer.dtype).view(
+                batch_size, 1
+            )
+            if buffer_size == 1:
+                return input_ids_column
+            return torch.cat([draft_oe_buffer[:, 1:], input_ids_column], dim=1)
 
         for idx in range(len(oe_context.input_ids_grams)):
             n = idx + 2
@@ -348,6 +400,10 @@ class EagleDraftWorker(BaseDraftWorker):
         draft_input.topk_p, draft_input.topk_index = fast_topk(probs, self.topk, dim=-1)
         draft_input.hidden_states = logits_output.hidden_states
         if self._is_welmv4_mtp_draft_model() and forward_batch is not None:
+            oe_context = getattr(forward_batch, "oe_context", None)
+            if oe_context is not None and oe_context.input_ids_buffer is not None:
+                oe_buffer = oe_context.input_ids_buffer.detach().clone()
+                draft_input.welm_mtp_oe_buffer = oe_buffer
             draft_input.welm_mtp_base_positions = self._get_welmv4_mtp_base_positions(
                 forward_batch
             )
@@ -392,9 +448,8 @@ class EagleDraftWorker(BaseDraftWorker):
             "cuda": EAGLEDraftCudaGraphRunner,
             "musa": EAGLEDraftCudaGraphRunner,
         }
-        skip_welmv4_mtp_cuda_graph = self._is_welmv4_mtp_draft_model()
         # Capture draft
-        if self.speculative_num_steps > 1 and not skip_welmv4_mtp_cuda_graph:
+        if self.speculative_num_steps > 1:
             tic = time.perf_counter()
             before_mem = get_available_gpu_memory(self.device, self.gpu_id)
             logger.info(
@@ -406,11 +461,6 @@ class EagleDraftWorker(BaseDraftWorker):
             after_mem = get_available_gpu_memory(self.device, self.gpu_id)
             logger.info(
                 f"Capture draft cuda graph end. Time elapsed: {time.perf_counter() - tic:.2f} s. mem usage={(before_mem - after_mem):.2f} GB. avail mem={after_mem:.2f} GB."
-            )
-        elif self.speculative_num_steps > 1 and skip_welmv4_mtp_cuda_graph:
-            logger.info(
-                "Skip draft cuda graph for WeLMV4 MTP; recursive draft decode "
-                "reuses base-position MTP KV cache without appending draft KV."
             )
 
         Device2ExtendCudaGraphRunner = {
@@ -437,7 +487,6 @@ class EagleDraftWorker(BaseDraftWorker):
         # TODO: support draft extend cuda graph for more attention backends
         if (
             self.draft_extend_attn_backend
-            and not skip_welmv4_mtp_cuda_graph
             and (
             _is_npu
             or supports_cuda_draft_extend_graph
@@ -456,11 +505,6 @@ class EagleDraftWorker(BaseDraftWorker):
             logger.info(
                 f"Capture draft extend cuda graph end. Time elapsed: {time.perf_counter() - tic:.2f} s. mem usage={(before_mem - after_mem):.2f} GB. avail mem={after_mem:.2f} GB."
             )
-        elif self.draft_extend_attn_backend and skip_welmv4_mtp_cuda_graph:
-            logger.info(
-                "Skip draft extend cuda graph for WeLMV4 MTP; its mirror-KV "
-                "path uses main-model activations from the current verify step."
-            )
 
     def draft(self, model_worker_batch: ModelWorkerBatch):
         draft_input: EagleDraftInput = model_worker_batch.spec_info
@@ -478,6 +522,15 @@ class EagleDraftWorker(BaseDraftWorker):
             parent_list, top_scores_index, draft_tokens = self.cuda_graph_runner.replay(
                 forward_batch,
             )
+            if _WELM_MTP_DUMP_ENABLED and self._is_welmv4_mtp_draft_model():
+                _flush_welmv4_mtp_graph_dump(
+                    "draft",
+                    first_dim_limit=getattr(
+                        self.cuda_graph_runner,
+                        "raw_bs",
+                        forward_batch.batch_size,
+                    ),
+                )
         else:
             if (
                 not forward_batch.forward_mode.is_idle()
@@ -692,6 +745,11 @@ class EagleDraftWorker(BaseDraftWorker):
                     (input_ids[1:], next_token_ids[i].reshape(1))
                 )
                 pt += extend_len
+            if batch.oe_context is not None:
+                batch.oe_context.refresh_for_draft_extend(
+                    batch.input_ids,
+                    [int(x) for x in batch.extend_seq_lens],
+                )
 
         # Construct spec_info
         next_draft_input = EagleDraftInput(
@@ -765,6 +823,11 @@ class EagleDraftWorker(BaseDraftWorker):
             draft_logits_output = self.cuda_graph_runner_for_draft_extend.replay(
                 forward_batch
             )
+            if _WELM_MTP_DUMP_ENABLED and self._is_welmv4_mtp_draft_model():
+                _flush_welmv4_mtp_graph_dump(
+                    "draft_extend",
+                    first_dim_limit=int(forward_batch.input_ids.shape[0]),
+                )
         else:
             draft_logits_output = self.draft_runner.forward(
                 forward_batch, skip_attn_backend_init=True
