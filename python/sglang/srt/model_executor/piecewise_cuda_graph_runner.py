@@ -59,6 +59,9 @@ from sglang.srt.model_executor.forward_batch_info import (
     PPProxyTensors,
 )
 from sglang.srt.model_executor.forward_batch_context import set_current_forward_batch
+from sglang.srt.model_executor.cuda_graph_runner import (
+    copy_router_replay_to_cuda_graph_buffers,
+)
 from sglang.srt.model_executor.input_buffers import ForwardInputBuffers
 from sglang.srt.utils import (
     get_available_gpu_memory,
@@ -434,6 +437,8 @@ class PiecewiseCudaGraphRunner:
                 capture_hidden_mode=CaptureHiddenMode.NULL,
                 num_token_non_padded=None,
                 num_token_non_padded_cpu=num_tokens,
+                router_replay_topk_ids=buffers.router_replay_topk_ids[:num_tokens],
+                router_replay_mask=buffers.router_replay_mask[:num_tokens],
                 global_forward_mode=ForwardMode.EXTEND,
                 lora_ids=None,
                 return_pooled_hidden_states=self.capture_return_pooled_hidden_states,
@@ -607,6 +612,8 @@ class PiecewiseCudaGraphRunner:
                 capture_hidden_mode=CaptureHiddenMode.NULL,
                 num_token_non_padded=None,
                 num_token_non_padded_cpu=num_tokens,
+                router_replay_topk_ids=buffers.router_replay_topk_ids[:num_tokens],
+                router_replay_mask=buffers.router_replay_mask[:num_tokens],
                 global_forward_mode=ForwardMode.EXTEND,
                 lora_ids=None,
                 return_pooled_hidden_states=self.capture_return_pooled_hidden_states,

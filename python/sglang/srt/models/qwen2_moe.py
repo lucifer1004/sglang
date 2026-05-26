@@ -26,6 +26,7 @@ from transformers import PretrainedConfig
 
 from sglang.srt.batch_overlap.two_batch_overlap import model_forward_maybe_tbo
 from sglang.srt.distributed import (
+    get_moe_data_parallel_world_size,
     get_pp_group,
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
@@ -75,6 +76,10 @@ from sglang.srt.layers.rotary_embedding import (
     yarn_get_mscale,
 )
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
+from sglang.srt.layers.utils.cp_utils import (
+    cp_all_gather_rerange_output,
+    is_prefill_context_parallel_enabled,
+)
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -491,6 +496,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         forward_batch: Optional[ForwardBatch] = None,
         use_reduce_scatter: bool = False,
     ) -> torch.Tensor:
+        should_allreduce_fusion = False
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
         shared_output = None
@@ -941,6 +947,7 @@ class Qwen2MoeDecoderLayer(nn.Module):
             num_layers=config.num_hidden_layers,
             is_layer_sparse=self.is_layer_sparse,
             is_previous_layer_sparse=is_previous_layer_sparse,
+            is_next_layer_sparse=True,
         )
 
         if self.is_layer_sparse:
