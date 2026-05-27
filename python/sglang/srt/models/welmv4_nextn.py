@@ -9,8 +9,12 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
-from sglang.srt.distributed import get_pp_group, get_tensor_model_parallel_world_size
+from sglang.srt.distributed import (
+    get_pp_group,
+    get_tensor_model_parallel_world_size,
+)
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
+from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
@@ -421,12 +425,19 @@ class WeLMV4ModelNextN(nn.Module):
                         hidden_states.float() + residual.float()
                     ).to(self.shared_head.norm.weight.dtype)
                     hidden_states, _ = self.shared_head.norm(hidden_states, residual)
-                elif final_experts_output is not None:
-                    hidden_states = final_experts_output.float() + residual.float()
-                    if final_shared_output is not None:
-                        hidden_states = hidden_states + final_shared_output.float()
                 else:
-                    hidden_states = hidden_states.float() + residual.float()
+                    final_layer = self.decoder_layers[-1]
+                    can_rebuild_final_mlp = (
+                        final_experts_output is not None
+                        and getattr(final_layer.mlp, "tp_size", 1) == 1
+                        and not is_dp_attention_enabled()
+                    )
+                    if can_rebuild_final_mlp:
+                        hidden_states = final_experts_output.float() + residual.float()
+                        if final_shared_output is not None:
+                            hidden_states = hidden_states + final_shared_output.float()
+                    else:
+                        hidden_states = hidden_states.float() + residual.float()
                 if hidden_states_for_next_mtp is None:
                     # MMQ feeds the MTP layer output before apply_ln_f into the next
                     # recursive MTP step; shared_head.norm is only for logits.
