@@ -1083,6 +1083,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         alt_stream: Optional[torch.cuda.Stream] = None,
         prefix: str = "",
+        config_layer_id: Optional[int] = None,
     ):
         super().__init__()
         self.tp_size = get_tensor_model_parallel_world_size()
@@ -1090,6 +1091,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             torch.zeros((config.num_experts), dtype=torch.float32)
         )
         self.layer_id = layer_id
+        self.config_layer_id = layer_id if config_layer_id is None else config_layer_id
         self.alt_stream = alt_stream
         if self.tp_size > config.num_experts:
             raise ValueError(
@@ -1101,16 +1103,18 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             config, "moe_expert_swiglu_clamp_limit_layerwise", []
         )
         moe_clamp_limit = (
-            moe_clamp_limits[layer_id]
-            if layer_id < len(moe_clamp_limits) and moe_clamp_limits[layer_id] > 0
+            moe_clamp_limits[self.config_layer_id]
+            if self.config_layer_id < len(moe_clamp_limits)
+            and moe_clamp_limits[self.config_layer_id] > 0
             else None
         )
         shared_clamp_limits = getattr(
             config, "shared_expert_swiglu_clamp_limit_layerwise", []
         )
         shared_clamp_limit = (
-            shared_clamp_limits[layer_id]
-            if layer_id < len(shared_clamp_limits) and shared_clamp_limits[layer_id] > 0
+            shared_clamp_limits[self.config_layer_id]
+            if self.config_layer_id < len(shared_clamp_limits)
+            and shared_clamp_limits[self.config_layer_id] > 0
             else None
         )
 
@@ -1596,6 +1600,8 @@ class Qwen2MoeAttention(nn.Module):
         self.kv_mirror_layers = kv_mirror_layers
         self.kv_mirror_imitated_layers = kv_mirror_imitated_layers
         self.layer_idx = layer_idx
+        self.config_layer_idx = layer_idx + total_layer_num if is_nextn else layer_idx
+        self.kv_mirror_layer_idx = self.config_layer_idx
         print(
             "self.layer_idx:{}".format(layer_idx),
             "self.kv_mirror_layers:",
@@ -1604,8 +1610,10 @@ class Qwen2MoeAttention(nn.Module):
             self.kv_mirror_imitated_layers,
             flush=True,
         )
-        if len(sliding_window_size_layerwise) > layer_idx:
-            self.sliding_window_size = sliding_window_size_layerwise[layer_idx]
+        if len(sliding_window_size_layerwise) > self.config_layer_idx:
+            self.sliding_window_size = sliding_window_size_layerwise[
+                self.config_layer_idx
+            ]
         else:
             self.sliding_window_size = -1
         print(
@@ -1614,8 +1622,10 @@ class Qwen2MoeAttention(nn.Module):
             self.sliding_window_size,
             flush=True,
         )
-        if len(enable_attn_sink_layerwise) > layer_idx:
-            self.enable_attention_sink = enable_attn_sink_layerwise[layer_idx]
+        if len(enable_attn_sink_layerwise) > self.config_layer_idx:
+            self.enable_attention_sink = enable_attn_sink_layerwise[
+                self.config_layer_idx
+            ]
         else:
             self.enable_attention_sink = False
         print(
@@ -1709,10 +1719,7 @@ class Qwen2MoeAttention(nn.Module):
             )
         self.attn.is_kv_mirror = (
             get_global_server_args().enable_welm_kv_mirror_opt
-            and self.layer_idx in self.kv_mirror_layers
-        )
-        self.kv_mirror_layer_idx = (
-            layer_idx if not is_nextn else layer_idx + total_layer_num
+            and self.kv_mirror_layer_idx in self.kv_mirror_layers
         )
         mirror_to_imitated, imitated_to_mirror = _get_kv_mirror_pair_maps(
             self.kv_mirror_layers,
@@ -1882,6 +1889,8 @@ class Qwen2MoeAttention(nn.Module):
             )
         if dump_this_layer:
             _welm_dump_tensor(f"{dump_prefix}.attn_output", attn_output)
+        if mtp_dump_attention_io:
+            _welm_dump_tensor(f"{mtp_dump_prefix}.attn_output", attn_output)
         if self.gated_self_attention_headwise and attn_output.shape[0] != 0:
             attn_shape = attn_output.shape
             gate = self.gate_proj(hidden_states)[0].unsqueeze(
@@ -2004,6 +2013,8 @@ class Qwen2MoeDecoderLayer(nn.Module):
         total_layer_num = getattr(
             config, "num_target_hidden_layers", config.num_hidden_layers
         )
+        num_nextn_predict_layers = getattr(config, "num_nextn_predict_layers", 0)
+        config_layer_id = layer_id + total_layer_num if is_nextn else layer_id
 
         self.self_attn = Qwen2MoeAttention(
             hidden_size=self.hidden_size,
@@ -2027,13 +2038,14 @@ class Qwen2MoeDecoderLayer(nn.Module):
             sliding_window_size_layerwise=self.sliding_window_size_layerwise,
             enable_attn_sink_layerwise=self.enable_attn_sink_layerwise,
             layer_idx=layer_id,
-            o_norm=o_norm and layer_id not in self.prenorm_layer_idx,
+            o_norm=o_norm and config_layer_id not in self.prenorm_layer_idx,
             rms_norm_eps=config.rms_norm_eps,
             total_layer_num=total_layer_num,
-            num_nextn_predict_layers=getattr(config, "num_nextn_predict_layers", 0),
+            num_nextn_predict_layers=num_nextn_predict_layers,
             is_nextn=is_nextn,
         )
         self.layer_id = layer_id
+        self.config_layer_id = config_layer_id
         self.is_nextn = is_nextn
         self.is_final_layer = layer_id == total_layer_num - 1 or is_nextn
 
@@ -2042,8 +2054,12 @@ class Qwen2MoeDecoderLayer(nn.Module):
         is_previous_layer_sparse = True
 
         self.layer_scatter_modes = LayerScatterModes.init_new(
-            layer_id=layer_id,
-            num_layers=config.num_hidden_layers,
+            layer_id=config_layer_id,
+            num_layers=(
+                total_layer_num + num_nextn_predict_layers
+                if is_nextn
+                else total_layer_num
+            ),
             is_layer_sparse=self.is_layer_sparse,
             is_previous_layer_sparse=is_previous_layer_sparse,
             is_next_layer_sparse=True,
@@ -2056,6 +2072,7 @@ class Qwen2MoeDecoderLayer(nn.Module):
                 quant_config=quant_config,
                 alt_stream=alt_stream,
                 prefix=add_prefix("mlp", prefix),
+                config_layer_id=config_layer_id,
             )
         else:
             self.mlp = Qwen2MoeMLP(
@@ -2103,7 +2120,7 @@ class Qwen2MoeDecoderLayer(nn.Module):
                 f"model.layers.{self.layer_id}.__input__.0", hidden_states
             )
         residual_after_layernorm = (
-            self.ppln and self.layer_id not in self.prenorm_layer_idx
+            self.ppln and self.config_layer_id not in self.prenorm_layer_idx
         )
         use_dp_layer_communicator = is_dp_attention_enabled()
         use_fp32_ppln_residual = (

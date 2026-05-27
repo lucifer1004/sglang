@@ -44,6 +44,7 @@ _MTP_DUMP_WRITTEN = set()
 _MTP_GRAPH_DUMP_CALL_INDEX = 0
 _MTP_GRAPH_DUMP_CURRENT_PREFIX = None
 _MTP_GRAPH_DUMP_PREV_NAME_PREFIX = ""
+_MTP_DUMP_CONTEXT_ENV = "SGLANG_DUMP_MTP_ACTIVATIONS_CONTEXT"
 _MTP_TRUE_ENV_VALUES = {"1", "true", "on", "yes"}
 _MTP_DUMP_ENABLED = (
     os.environ.get("SGLANG_DUMP_MTP_ACTIVATIONS", "0").strip().lower()
@@ -90,6 +91,31 @@ def _mtp_dump_dir() -> Path:
     return path
 
 
+def _current_mtp_dump_context() -> str:
+    return os.environ.get(_MTP_DUMP_CONTEXT_ENV, "").strip()
+
+
+def _write_mtp_pass_metadata(
+    dump_dir: Path,
+    *,
+    pass_id: int,
+    context: str,
+    graph_step: Optional[str] = None,
+    first_dim_limit: Optional[int] = None,
+) -> None:
+    if not _MTP_DUMP_ENABLED:
+        return
+    metadata = {
+        "pass_id": pass_id,
+        "context": context,
+        "graph_step": graph_step,
+        "first_dim_limit": first_dim_limit,
+        "pid": os.getpid(),
+        "rank": os.environ.get("RANK", "0"),
+    }
+    torch.save(metadata, dump_dir / "mtp_pass_metadata.pt")
+
+
 def _start_mtp_dump_pass() -> None:
     if not _MTP_DUMP_ENABLED:
         return
@@ -116,6 +142,11 @@ def _start_mtp_dump_pass() -> None:
         _MTP_DUMP_WRITTEN.clear()
         dump_dir = _mtp_dump_dir() if _MTP_DUMP_PASS_ACTIVE else None
         if dump_dir is not None:
+            _write_mtp_pass_metadata(
+                dump_dir,
+                pass_id=_MTP_DUMP_PASS,
+                context=_current_mtp_dump_context(),
+            )
             os.environ["SGLANG_DUMP_MTP_ACTIVATIONS_PROCESS_DIR"] = str(dump_dir)
 
 
@@ -162,16 +193,16 @@ def _dump_tensor(name: str, value) -> None:
 def _flush_mtp_graph_dump_pass(
     context: str,
     first_dim_limit: Optional[int] = None,
-) -> None:
+) -> list[Path]:
     global _MTP_DUMP_PASS
     if not _MTP_DUMP_ENABLED:
-        return
+        return []
     dump_dir = _mtp_dump_dir()
     saved = welmv4_module._welm_flush_graph_dump_buffers(
         context, dump_dir, first_dim_limit=first_dim_limit
     )
     if not saved:
-        return
+        return []
 
     graph_step_files = []
     for path in dump_dir.glob("graph_step_*.pt"):
@@ -182,9 +213,16 @@ def _flush_mtp_graph_dump_pass(
         graph_step_files.append((prefix, rest, path))
 
     if not graph_step_files:
+        _write_mtp_pass_metadata(
+            dump_dir,
+            pass_id=_MTP_DUMP_PASS,
+            context=context,
+            first_dim_limit=first_dim_limit,
+        )
         _MTP_DUMP_PASS += 1
-        return
+        return [dump_dir]
 
+    written_dirs = []
     step_order = {
         step: idx for idx, step in enumerate(sorted({x[0] for x in graph_step_files}))
     }
@@ -192,8 +230,18 @@ def _flush_mtp_graph_dump_pass(
         pass_id = _MTP_DUMP_PASS + step_order[step]
         step_dir = dump_dir.parent / f"Pass{pass_id:05d}"
         step_dir.mkdir(parents=True, exist_ok=True)
+        if step_dir not in written_dirs:
+            written_dirs.append(step_dir)
         path.replace(step_dir / f"{rest}.pt")
+        _write_mtp_pass_metadata(
+            step_dir,
+            pass_id=pass_id,
+            context=context,
+            graph_step=step,
+            first_dim_limit=first_dim_limit,
+        )
     _MTP_DUMP_PASS += len(step_order)
+    return written_dirs
 
 
 class WeLMV4ModelNextN(nn.Module):

@@ -2,6 +2,7 @@ import contextlib
 import logging
 import os
 import time
+from pathlib import Path
 from typing import List, Optional, Tuple
 
 import torch
@@ -79,16 +80,70 @@ logger = logging.getLogger(__name__)
 _WELM_MTP_DUMP_ENABLED = os.environ.get(
     "SGLANG_DUMP_MTP_ACTIVATIONS", "0"
 ).strip().lower() in {"1", "true", "yes", "on"}
+_WELM_VERIFY_AFTER_DUMP_ENABLED = os.environ.get(
+    "SGLANG_DUMP_VERIFY_AFTER_MTP_METADATA", "0"
+).strip().lower() in {"1", "true", "yes", "on"}
+_WELM_TRUE_VALUES = {"1", "true", "yes", "on"}
+_WELM_DISABLE_TARGET_VERIFY_GRAPH_FOR_DUMP = (
+    os.environ.get("SGLANG_WELMV4_DISABLE_TARGET_VERIFY_GRAPH_FOR_DUMP", "0")
+    .strip()
+    .lower()
+    in _WELM_TRUE_VALUES
+)
+_WELM_VERIFY_AFTER_EVENT_COUNTERS = {}
+
+
+def _to_cpu_payload(value):
+    if isinstance(value, torch.Tensor):
+        return value.detach().cpu()
+    if isinstance(value, dict):
+        return {k: _to_cpu_payload(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return type(value)(_to_cpu_payload(v) for v in value)
+    return value
+
+
+def _dump_verify_after_event(name: str, payload: dict) -> None:
+    if not _WELM_VERIFY_AFTER_DUMP_ENABLED:
+        return
+    root = os.environ.get(
+        "SGLANG_DUMP_VERIFY_AFTER_MTP_DIR",
+        os.environ.get("SGLANG_DUMP_MTP_ACTIVATIONS_DIR", "./sglang_mtp_dump"),
+    )
+    rank = os.environ.get("RANK", "0")
+    dump_dir = Path(root) / f"Rank{rank}_pid{os.getpid()}" / "verify_after_events"
+    dump_dir.mkdir(parents=True, exist_ok=True)
+    idx = _WELM_VERIFY_AFTER_EVENT_COUNTERS.get(name, 0)
+    _WELM_VERIFY_AFTER_EVENT_COUNTERS[name] = idx + 1
+    event = {"name": name, "index": idx, **payload}
+    torch.save(_to_cpu_payload(event), dump_dir / f"{name}_{idx:05d}.pt")
+
+
+@contextlib.contextmanager
+def _welmv4_mtp_dump_context(context: str):
+    if not _WELM_MTP_DUMP_ENABLED:
+        yield
+        return
+    env_key = "SGLANG_DUMP_MTP_ACTIVATIONS_CONTEXT"
+    previous = os.environ.get(env_key)
+    os.environ[env_key] = context
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop(env_key, None)
+        else:
+            os.environ[env_key] = previous
 
 
 def _flush_welmv4_mtp_graph_dump(
     context: str, first_dim_limit: Optional[int] = None
-) -> None:
+) -> list[Path]:
     if not _WELM_MTP_DUMP_ENABLED:
-        return
+        return []
     from sglang.srt.models import welmv4_nextn as welmv4_nextn_module
 
-    welmv4_nextn_module._flush_mtp_graph_dump_pass(
+    return welmv4_nextn_module._flush_mtp_graph_dump_pass(
         context, first_dim_limit=first_dim_limit
     )
 
@@ -390,6 +445,134 @@ class EagleDraftWorker(BaseDraftWorker):
             return input_ids_column
         return torch.cat([draft_oe_buffer[:, 1:], input_ids_column], dim=1)
 
+    def _prepare_welmv4_mtp_draft_extend_oe_context(
+        self,
+        forward_batch: ForwardBatch,
+        input_ids: torch.Tensor,
+        select_index: torch.Tensor,
+        accept_lens: torch.Tensor,
+        accepted_draft_token_ids: Optional[torch.Tensor],
+    ) -> None:
+        oe_context = getattr(forward_batch, "oe_context", None)
+        if (
+            oe_context is None
+            or oe_context.input_ids_buffer is None
+            or accepted_draft_token_ids is None
+        ):
+            return
+
+        if input_ids.numel() == 0 or accept_lens.numel() == 0:
+            return
+        buffer_size = oe_context.buffer_size
+        num_reqs = int(accept_lens.numel())
+        flat_token_count = int(input_ids.numel())
+        if oe_context.input_ids_buffer.numel() < num_reqs * buffer_size:
+            raise RuntimeError(
+                "WeLMV4 MTP draft-extend OE buffer is smaller than the request batch: "
+                f"buffer_len={oe_context.input_ids_buffer.numel()} "
+                f"required={num_reqs * buffer_size}"
+            )
+
+        extend_lens = getattr(forward_batch, "extend_seq_lens_cpu", None)
+        if extend_lens is None:
+            extend_lens = [self.speculative_num_draft_tokens] * num_reqs
+        else:
+            extend_lens = [int(x) for x in extend_lens[:num_reqs]]
+
+        if sum(extend_lens) != flat_token_count:
+            raise RuntimeError(
+                "WeLMV4 MTP draft-extend OE input length does not match extend_lens: "
+                f"input_len={flat_token_count} extend_lens={extend_lens}"
+            )
+
+        history_buffer = oe_context.input_ids_buffer[: num_reqs * buffer_size].view(
+            num_reqs, buffer_size
+        ).clone()
+        accept_lens_cpu = [int(x) for x in accept_lens[:num_reqs].cpu().tolist()]
+        for req_idx, committed_len in enumerate(accept_lens_cpu):
+            accepted_row = accepted_draft_token_ids[req_idx].reshape(-1)
+            # The draft OE buffer already contains the first committed token
+            # that seeds this draft extend. Append the remaining committed
+            # tokens so recursive MTP OE history matches the visible history.
+            committed = accepted_row[accepted_row >= 0][1 : max(0, committed_len)].to(
+                device=history_buffer.device,
+                dtype=history_buffer.dtype,
+            )
+            if committed.numel() > 0:
+                history_buffer[req_idx].copy_(
+                    torch.cat([history_buffer[req_idx], committed], dim=0)[
+                        -buffer_size:
+                    ]
+                )
+
+        input_ids_flat = input_ids.reshape(-1).to(dtype=torch.int64)
+        for idx, gram in enumerate(oe_context.input_ids_grams):
+            if gram is None:
+                continue
+            n = idx + 2
+            shift = n - 1
+            if gram.numel() >= flat_token_count:
+                gram_out = gram[:flat_token_count]
+            else:
+                gram_out = torch.empty(
+                    (flat_token_count,), device=input_ids.device, dtype=torch.int64
+                )
+                oe_context.set_gram(n, gram_out)
+
+            offset = 0
+            for req_idx, extend_len in enumerate(extend_lens):
+                if extend_len == 0:
+                    continue
+                segment = input_ids_flat[offset : offset + extend_len]
+                history = history_buffer[req_idx].to(
+                    device=input_ids.device, dtype=torch.int64
+                )
+                if shift <= buffer_size:
+                    source = torch.cat([history, segment], dim=0)
+                    values = source[
+                        buffer_size - shift : buffer_size - shift + extend_len
+                    ]
+                else:
+                    zeros = torch.zeros(
+                        (shift - buffer_size,),
+                        device=input_ids.device,
+                        dtype=torch.int64,
+                    )
+                    source = torch.cat([zeros, history, segment], dim=0)
+                    values = source[:extend_len]
+                gram_out[offset : offset + extend_len].copy_(
+                    values.to(dtype=gram_out.dtype)
+                )
+                offset += extend_len
+
+        oe_context.input_ids_buffer[: num_reqs * buffer_size].copy_(
+            history_buffer.reshape(-1).to(dtype=oe_context.input_ids_buffer.dtype)
+        )
+        selected_indices = select_index[:num_reqs].to(
+            device=input_ids.device, dtype=torch.long
+        )
+        if selected_indices.numel() > 0 and (
+            int(selected_indices.min().item()) < 0
+            or int(selected_indices.max().item()) >= flat_token_count
+        ):
+            raise RuntimeError(
+                "WeLMV4 MTP draft-extend OE selected index is out of range: "
+                f"indices={selected_indices.tolist()} input_len={flat_token_count}"
+            )
+        selected_tokens = input_ids_flat.index_select(0, selected_indices).to(
+            device=oe_context.input_ids_buffer.device,
+            dtype=oe_context.input_ids_buffer.dtype,
+        )
+        buffer_rows = oe_context.input_ids_buffer[: num_reqs * buffer_size].view(
+            num_reqs, buffer_size
+        )
+        for req_idx, token in enumerate(selected_tokens):
+            buffer_rows[req_idx].copy_(
+                torch.cat([buffer_rows[req_idx], token.reshape(1)], dim=0)[
+                    -buffer_size:
+                ]
+            )
+
     def _capture_for_decode(
         self,
         logits_output,
@@ -532,17 +715,31 @@ class EagleDraftWorker(BaseDraftWorker):
                     ),
                 )
         else:
-            if (
-                not forward_batch.forward_mode.is_idle()
-                and self.speculative_num_steps > 1
-                and not self._is_welmv4_mtp_draft_model()
-            ):
-                # Skip attention backend init for 1-step draft,
-                # `draft_forward` only does sample in this case.
-                self.draft_attn_backend.init_forward_metadata(forward_batch)
-            parent_list, top_scores_index, draft_tokens = self.draft_forward(
-                forward_batch
-            )
+            if _WELM_MTP_DUMP_ENABLED:
+                with _welmv4_mtp_dump_context("draft"):
+                    if (
+                        not forward_batch.forward_mode.is_idle()
+                        and self.speculative_num_steps > 1
+                        and not self._is_welmv4_mtp_draft_model()
+                    ):
+                        # Skip attention backend init for 1-step draft,
+                        # `draft_forward` only does sample in this case.
+                        self.draft_attn_backend.init_forward_metadata(forward_batch)
+                    parent_list, top_scores_index, draft_tokens = self.draft_forward(
+                        forward_batch
+                    )
+            else:
+                if (
+                    not forward_batch.forward_mode.is_idle()
+                    and self.speculative_num_steps > 1
+                    and not self._is_welmv4_mtp_draft_model()
+                ):
+                    # Skip attention backend init for 1-step draft,
+                    # `draft_forward` only does sample in this case.
+                    self.draft_attn_backend.init_forward_metadata(forward_batch)
+                parent_list, top_scores_index, draft_tokens = self.draft_forward(
+                    forward_batch
+                )
 
         if model_worker_batch.forward_mode.is_idle():
             return EagleVerifyInput.create_idle_input(
@@ -769,7 +966,21 @@ class EagleDraftWorker(BaseDraftWorker):
         forward_batch.return_logprob = False
         if mm_input_embeds is not None:
             forward_batch.mm_input_embeds = mm_input_embeds
-        logits_output = self.draft_runner.forward(forward_batch).logits_output
+        if _WELM_MTP_DUMP_ENABLED:
+            with _welmv4_mtp_dump_context("draft_extend_for_prefill"):
+                logits_output = self.draft_runner.forward(forward_batch).logits_output
+        else:
+            logits_output = self.draft_runner.forward(forward_batch).logits_output
+        if _WELM_VERIFY_AFTER_DUMP_ENABLED:
+            _dump_verify_after_event(
+                "draft_extend_for_prefill",
+                {
+                    "seq_lens": batch.seq_lens,
+                    "extend_seq_lens": getattr(batch, "extend_seq_lens", None),
+                    "input_ids": batch.input_ids,
+                    "next_token_ids": next_token_ids,
+                },
+            )
         maybe_detect_nan(logits_output.next_token_logits, "draft_extend_for_prefill")
 
         # Update spec_info for the next draft step
@@ -792,6 +1003,16 @@ class EagleDraftWorker(BaseDraftWorker):
             + batch_result.accept_lens
             - 1
         )
+        if _WELM_VERIFY_AFTER_DUMP_ENABLED:
+            _dump_verify_after_event(
+                "draft_extend_for_decode",
+                {
+                    "seq_lens": batch.seq_lens,
+                    "accept_lens": batch_result.accept_lens,
+                    "select_index": select_index,
+                    "predict": batch_result.next_token_ids,
+                },
+            )
 
         # Prepare for draft extend in a separate stream
         with self.plan_stream_ctx:
@@ -802,6 +1023,19 @@ class EagleDraftWorker(BaseDraftWorker):
                 self.draft_runner,
                 self.cuda_graph_runner_for_draft_extend,
             )
+            oe_context = getattr(forward_batch, "oe_context", None)
+            if (
+                self._is_welmv4_mtp_draft_model()
+                and oe_context is not None
+                and oe_context.input_ids_buffer is not None
+            ):
+                self._prepare_welmv4_mtp_draft_extend_oe_context(
+                    forward_batch,
+                    batch_result.next_token_ids,
+                    select_index,
+                    batch_result.accept_lens,
+                    getattr(batch_result, "welm_mtp_accepted_draft_token_ids", None),
+                )
 
         if self.plan_stream:
             torch.get_device_module(self.device).current_stream().wait_stream(
@@ -829,9 +1063,15 @@ class EagleDraftWorker(BaseDraftWorker):
                     first_dim_limit=int(forward_batch.input_ids.shape[0]),
                 )
         else:
-            draft_logits_output = self.draft_runner.forward(
-                forward_batch, skip_attn_backend_init=True
-            ).logits_output
+            if _WELM_MTP_DUMP_ENABLED:
+                with _welmv4_mtp_dump_context("draft_extend"):
+                    draft_logits_output = self.draft_runner.forward(
+                        forward_batch, skip_attn_backend_init=True
+                    ).logits_output
+            else:
+                draft_logits_output = self.draft_runner.forward(
+                    forward_batch, skip_attn_backend_init=True
+                ).logits_output
 
         maybe_detect_nan(
             draft_logits_output.next_token_logits,
@@ -988,7 +1228,9 @@ class EAGLEWorkerV2(BaseSpecWorker):
         verify_input: EagleVerifyInput = batch.spec_info
         verify_input.num_tokens_per_req = self.speculative_num_steps + 1
         bs = len(batch.seq_lens)
-        disable_target_graph_for_welmv4_mtp = False
+        disable_target_graph_for_welmv4_mtp = (
+            _WELM_DISABLE_TARGET_VERIFY_GRAPH_FOR_DUMP
+        )
         target_graph_runner = None
         if disable_target_graph_for_welmv4_mtp:
             target_graph_runner = self.target_worker.model_runner.graph_runner
@@ -1078,6 +1320,57 @@ class EAGLEWorkerV2(BaseSpecWorker):
             accept_index,
         ) = verify_input.sample(batch, logits_output, vocab_mask)
         new_seq_lens = batch.seq_lens + accept_lens
+        welm_mtp_accepted_draft_token_ids = None
+        has_welmv4_mtp_oe_context = (
+            self.draft_worker._is_welmv4_mtp_draft_model()
+            and not batch.forward_mode.is_idle()
+            and getattr(batch, "oe_context", None) is not None
+            and batch.oe_context.input_ids_buffer is not None
+        )
+        if has_welmv4_mtp_oe_context:
+            accepted_mask = accept_index >= 0
+            welm_mtp_accepted_draft_token_ids = torch.full_like(accept_index, -1)
+            if bool(accepted_mask.any().item()):
+                accepted_indices = accept_index[accepted_mask].to(torch.long)
+                welm_mtp_accepted_draft_token_ids[accepted_mask] = (
+                    verify_input.draft_token.reshape(-1)
+                    .index_select(0, accepted_indices)
+                    .to(welm_mtp_accepted_draft_token_ids.dtype)
+                )
+        if _WELM_VERIFY_AFTER_DUMP_ENABLED:
+            verify_dump_extra = {}
+            if not batch.forward_mode.is_idle():
+                accepted_mask = accept_index >= 0
+                accepted_predict = torch.full_like(accept_index, -1)
+                accepted_draft = (
+                    welm_mtp_accepted_draft_token_ids
+                    if welm_mtp_accepted_draft_token_ids is not None
+                    else torch.full_like(accept_index, -1)
+                )
+                if bool(accepted_mask.any().item()):
+                    accepted_indices = accept_index[accepted_mask].to(torch.long)
+                    accepted_predict[accepted_mask] = predict.index_select(
+                        0, accepted_indices
+                    ).to(accepted_predict.dtype)
+                verify_dump_extra = {
+                    "accepted_predict_token_ids": accepted_predict,
+                    "accepted_draft_token_ids": accepted_draft,
+                }
+            _dump_verify_after_event(
+                "verify",
+                {
+                    "seq_lens_before_verify": batch.seq_lens,
+                    "new_seq_lens": new_seq_lens,
+                    "predict": predict,
+                    "accept_lens": accept_lens,
+                    "accept_index": accept_index,
+                    "draft_token": verify_input.draft_token,
+                    "can_run_cuda_graph": can_run_cuda_graph,
+                    "speculative_num_draft_tokens": self.speculative_num_draft_tokens,
+                    "speculative_num_steps": self.speculative_num_steps,
+                    **verify_dump_extra,
+                },
+            )
 
         # Update mamba state for hybrid GDN models after verification
         if (
@@ -1122,6 +1415,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
             next_draft_input=next_draft_input,
             accept_lens=accept_lens,
             routed_experts_output=forward_batch_output.routed_experts_output,
+            welm_mtp_accepted_draft_token_ids=welm_mtp_accepted_draft_token_ids,
         )
 
     def _mamba_verify_update(

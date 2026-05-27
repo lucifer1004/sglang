@@ -90,6 +90,12 @@ def _dump_moe_debug_tensor(
         "on",
     ):
         return
+    if torch.cuda.is_available():
+        try:
+            if torch.cuda.is_current_stream_capturing():
+                return
+        except RuntimeError:
+            pass
     layer_filter = os.getenv("SGLANG_DUMP_ACTIVATIONS_LAYER_IDXS", "")
     if layer_filter:
         layer_ids = {int(x) for x in layer_filter.split(",") if x.strip()}
