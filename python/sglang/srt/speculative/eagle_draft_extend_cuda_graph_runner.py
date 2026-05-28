@@ -113,7 +113,12 @@ class EAGLEDraftExtendCudaGraphRunner:
         self.padded_static_len = -1
 
         # Attention backend
-        self.num_tokens_per_bs = self.speculative_num_steps + 1
+        self.num_tokens_per_bs = (
+            int(model_runner.server_args.speculative_num_draft_tokens)
+            if self.forward_mode == ForwardMode.DRAFT_EXTEND_V2
+            and model_runner.server_args.speculative_num_draft_tokens
+            else self.speculative_num_steps + 1
+        )
         self.max_bs = max(self.capture_bs)
         self.max_num_token = self.max_bs * self.num_tokens_per_bs
 

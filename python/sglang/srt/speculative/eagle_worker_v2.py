@@ -210,8 +210,10 @@ class EagleDraftWorker(BaseDraftWorker):
         else:
             ctx = empty_context()
         with (
-            ctx
-        ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
+            ctx,
+            speculative_moe_backend_context(),
+            speculative_moe_a2a_backend_context(),
+        ):
             # Init draft worker
             self.draft_worker = TpModelWorker(
                 server_args=server_args,
@@ -241,15 +243,18 @@ class EagleDraftWorker(BaseDraftWorker):
             )
         self.init_token_map()
         self.init_lm_head()
+        self._welmv4_mtp_base_kv_attn_backend = None
 
         # Init attention backend and cuda graphs
         self.draft_runner.server_args.disable_cuda_graph = backup_disable_cuda_graph
         self.draft_tp_context = (
             draft_tp_context if server_args.enable_dp_attention else empty_context
         )
-        with self.draft_tp_context(
-            self.draft_runner.tp_group
-        ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
+        with (
+            self.draft_tp_context(self.draft_runner.tp_group),
+            speculative_moe_backend_context(),
+            speculative_moe_a2a_backend_context(),
+        ):
             self.init_attention_backend()
             self.init_cuda_graphs()
 
@@ -301,13 +306,6 @@ class EagleDraftWorker(BaseDraftWorker):
             # Share the embedding and lm_head
             self.draft_runner.model.set_embed_and_head(embed, head)
 
-        if self._is_welmv4_mtp_draft_model():
-            if self.topk != 1:
-                raise ValueError(
-                    "WeLMV4 MTP speculative decoding currently supports "
-                    "speculative_eagle_topk=1 only."
-                )
-
     def _is_welmv4_mtp_draft_model(self) -> bool:
         architectures = getattr(
             self.draft_runner.model_config.hf_config, "architectures", []
@@ -322,38 +320,157 @@ class EagleDraftWorker(BaseDraftWorker):
             return forward_batch.positions[custom_last_index].clone()
 
         if forward_batch.extend_seq_lens is not None:
-            last_query_indices = torch.cumsum(
-                forward_batch.extend_seq_lens, dim=0
-            ) - 1
+            last_query_indices = torch.cumsum(forward_batch.extend_seq_lens, dim=0) - 1
             return forward_batch.positions[last_query_indices].clone()
 
         return (forward_batch.seq_lens - 1).to(forward_batch.positions.dtype)
 
     def _init_welmv4_mtp_base_kv_decode_metadata(
-        self, forward_batch: ForwardBatch
-    ) -> None:
-        attn_backend = (
-            self.draft_runner.decode_attn_backend
-            if self.draft_runner.server_args.enable_pdmux
-            else self.draft_runner.attn_backend
-        )
+        self, forward_batch: ForwardBatch, base_query_count: Optional[int] = None
+    ) -> Optional[Tuple[int, torch.Tensor, Optional[torch.Tensor], torch.Tensor, int]]:
+        attn_backend = self._get_welmv4_mtp_base_kv_decode_attn_backend()
         if getattr(forward_batch, "welm_mtp_base_kv_metadata_prepared", False):
             forward_batch.attn_backend = attn_backend
-            return
-        spec_info_backup = forward_batch.spec_info
-        forward_batch.spec_info = None
-        try:
-            attn_backend.init_forward_metadata(forward_batch)
-        finally:
-            forward_batch.spec_info = spec_info_backup
-        forward_batch.attn_backend = attn_backend
+            return None
+        batch_size = forward_batch.batch_size
+        num_queries = forward_batch.input_ids.numel()
+        if base_query_count is None:
+            base_query_count = batch_size
+        if base_query_count <= 0:
+            raise RuntimeError(
+                "WeLMV4 MTP base query count is not aligned with the draft "
+                f"batch: {base_query_count=} {batch_size=}"
+            )
+        restore_state = None
+        if num_queries != batch_size or base_query_count != batch_size:
+            if num_queries % base_query_count != 0:
+                raise RuntimeError(
+                    "WeLMV4 MTP draft decode query count must be a multiple of "
+                    f"base query count: {num_queries=} {base_query_count=}"
+                )
+            if base_query_count <= batch_size:
+                base_seq_lens = forward_batch.seq_lens[:base_query_count]
+                base_seq_lens_cpu = (
+                    forward_batch.seq_lens_cpu[:base_query_count]
+                    if forward_batch.seq_lens_cpu is not None
+                    else None
+                )
+                base_req_pool_indices = forward_batch.req_pool_indices[
+                    :base_query_count
+                ]
+            elif base_query_count % batch_size == 0:
+                base_repeat = base_query_count // batch_size
+                base_seq_lens = forward_batch.seq_lens.repeat_interleave(base_repeat)
+                base_seq_lens_cpu = (
+                    forward_batch.seq_lens_cpu.repeat_interleave(base_repeat)
+                    if forward_batch.seq_lens_cpu is not None
+                    else None
+                )
+                base_req_pool_indices = (
+                    forward_batch.req_pool_indices.repeat_interleave(base_repeat)
+                )
+            else:
+                raise RuntimeError(
+                    "WeLMV4 MTP base query count cannot be derived from the draft "
+                    f"batch: {base_query_count=} {batch_size=}"
+                )
+            repeat = num_queries // base_query_count
+            restore_state = (
+                forward_batch.batch_size,
+                forward_batch.seq_lens,
+                forward_batch.seq_lens_cpu,
+                forward_batch.req_pool_indices,
+                forward_batch.seq_lens_sum,
+            )
+            forward_batch.batch_size = num_queries
+            forward_batch.seq_lens = base_seq_lens.repeat_interleave(repeat)
+            if base_seq_lens_cpu is not None:
+                forward_batch.seq_lens_cpu = base_seq_lens_cpu.repeat_interleave(repeat)
+            forward_batch.req_pool_indices = base_req_pool_indices.repeat_interleave(
+                repeat
+            )
+            forward_batch.seq_lens_sum = int(forward_batch.seq_lens.sum().item())
 
-    def _forward_welmv4_mtp_base_kv_decode(self, forward_batch: ForwardBatch):
-        graph_runner_backup = self.draft_runner.graph_runner
         had_base_kv_attr = hasattr(forward_batch, "welm_mtp_use_base_kv_cache")
         base_kv_attr_backup = getattr(
             forward_batch, "welm_mtp_use_base_kv_cache", None
         )
+        forward_batch.welm_mtp_use_base_kv_cache = True
+        spec_info_backup = forward_batch.spec_info
+        clear_spec_info_for_metadata = not hasattr(attn_backend, "fa_impl_ver")
+        if clear_spec_info_for_metadata:
+            forward_batch.spec_info = None
+        try:
+            attn_backend.init_forward_metadata(forward_batch)
+        finally:
+            forward_batch.spec_info = spec_info_backup
+            if had_base_kv_attr:
+                forward_batch.welm_mtp_use_base_kv_cache = base_kv_attr_backup
+            else:
+                delattr(forward_batch, "welm_mtp_use_base_kv_cache")
+        forward_batch.attn_backend = attn_backend
+        return restore_state
+
+    def _get_welmv4_mtp_base_kv_decode_attn_backend(self):
+        return (
+            self.draft_runner.decode_attn_backend
+            if self.draft_runner.server_args.enable_pdmux
+            else self.draft_runner.attn_backend
+        )
+
+    def _restore_welmv4_mtp_base_kv_decode_metadata(
+        self,
+        forward_batch: ForwardBatch,
+        restore_state: Optional[
+            Tuple[int, torch.Tensor, Optional[torch.Tensor], torch.Tensor, int]
+        ],
+    ) -> None:
+        if restore_state is None:
+            return
+        (
+            forward_batch.batch_size,
+            forward_batch.seq_lens,
+            forward_batch.seq_lens_cpu,
+            forward_batch.req_pool_indices,
+            forward_batch.seq_lens_sum,
+        ) = restore_state
+
+    def _expand_welmv4_mtp_base_positions(
+        self,
+        base_positions: torch.Tensor,
+        num_queries: int,
+    ) -> torch.Tensor:
+        if base_positions.numel() == num_queries:
+            return base_positions
+        if num_queries % base_positions.numel() != 0:
+            raise RuntimeError(
+                "WeLMV4 MTP base positions cannot be expanded to draft queries: "
+                f"{base_positions.numel()=} {num_queries=}"
+            )
+        return base_positions.repeat_interleave(num_queries // base_positions.numel())
+
+    def _get_welmv4_mtp_selected_parent_indices(
+        self,
+        i: int,
+        tree_info: Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+        device: torch.device,
+    ) -> Optional[torch.Tensor]:
+        if i == 0:
+            return None
+        topk_cs_index = tree_info[2] - (self.topk**2 * (i - 1) + self.topk)
+        parent_offsets = torch.arange(
+            0,
+            topk_cs_index.shape[0] * self.topk,
+            step=self.topk,
+            dtype=topk_cs_index.dtype,
+            device=device,
+        ).repeat_interleave(self.topk)
+        return topk_cs_index.flatten() // self.topk + parent_offsets
+
+    def _forward_welmv4_mtp_base_kv_decode(self, forward_batch: ForwardBatch):
+        graph_runner_backup = self.draft_runner.graph_runner
+        had_base_kv_attr = hasattr(forward_batch, "welm_mtp_use_base_kv_cache")
+        base_kv_attr_backup = getattr(forward_batch, "welm_mtp_use_base_kv_cache", None)
         # Recursive WeLMV4 MTP draft decode reads the committed/base KV cache
         # populated from mirrored main-model KV, so the normal draft-decode
         # graph runner cannot be used here.
@@ -375,6 +492,8 @@ class EagleDraftWorker(BaseDraftWorker):
         forward_batch: ForwardBatch,
         input_ids: torch.Tensor,
         draft_oe_buffer: Optional[torch.Tensor],
+        selected_parent_indices: Optional[torch.Tensor] = None,
+        base_query_count: Optional[int] = None,
     ) -> Optional[torch.Tensor]:
         oe_context = getattr(forward_batch, "oe_context", None)
         if oe_context is None or oe_context.input_ids_buffer is None:
@@ -395,25 +514,39 @@ class EagleDraftWorker(BaseDraftWorker):
                 ).reshape_as(oe_context.input_ids_buffer)
             )
 
-        batch_size = input_ids.numel()
+        num_queries = input_ids.numel()
         buffer_size = oe_context.buffer_size
         if draft_oe_buffer is None:
             buffer_batch_size = oe_context.input_ids_buffer.numel() // buffer_size
-            if buffer_batch_size < batch_size:
-                raise RuntimeError(
-                    "WeLMV4 MTP draft OE buffer is smaller than the draft batch: "
-                    f"{buffer_batch_size=} {batch_size=}"
-                )
-            draft_oe_buffer = oe_context.input_ids_buffer.view(
+            base_buffer = oe_context.input_ids_buffer.view(
                 buffer_batch_size, buffer_size
-            )[:batch_size].clone()
-        elif draft_oe_buffer.shape[0] != batch_size:
-            if draft_oe_buffer.shape[0] < batch_size:
+            )
+            if (
+                base_query_count is not None
+                and base_query_count <= buffer_batch_size
+                and num_queries % base_query_count == 0
+            ):
+                draft_oe_buffer = (
+                    base_buffer[:base_query_count]
+                    .repeat_interleave(num_queries // base_query_count, dim=0)
+                    .clone()
+                )
+            else:
+                if buffer_batch_size < num_queries:
+                    raise RuntimeError(
+                        "WeLMV4 MTP draft OE buffer is smaller than the draft batch: "
+                        f"{buffer_batch_size=} {num_queries=}"
+                    )
+                draft_oe_buffer = base_buffer[:num_queries].clone()
+        elif selected_parent_indices is not None:
+            draft_oe_buffer = draft_oe_buffer[selected_parent_indices.to(torch.long)]
+        elif draft_oe_buffer.shape[0] != num_queries:
+            if draft_oe_buffer.shape[0] < num_queries:
                 raise RuntimeError(
                     "WeLMV4 MTP local draft OE buffer is smaller than the draft batch: "
-                    f"buffer_batch_size={draft_oe_buffer.shape[0]} {batch_size=}"
+                    f"buffer_batch_size={draft_oe_buffer.shape[0]} {num_queries=}"
                 )
-            draft_oe_buffer = draft_oe_buffer[:batch_size]
+            draft_oe_buffer = draft_oe_buffer[:num_queries]
 
         if getattr(forward_batch, "welm_mtp_graph_oe_context_prepared", False):
             for idx, gram_buffer in enumerate(oe_context.input_ids_grams):
@@ -421,13 +554,13 @@ class EagleDraftWorker(BaseDraftWorker):
                 if n - 1 <= buffer_size:
                     ngram = draft_oe_buffer[:, -(n - 1)].contiguous()
                 else:
-                    ngram = input_ids.new_zeros((batch_size,), dtype=torch.int64)
-                if gram_buffer is not None and gram_buffer.shape[0] >= batch_size:
-                    gram_buffer[:batch_size].copy_(ngram.to(dtype=gram_buffer.dtype))
+                    ngram = input_ids.new_zeros((num_queries,), dtype=torch.int64)
+                if gram_buffer is not None and gram_buffer.shape[0] >= num_queries:
+                    gram_buffer[:num_queries].copy_(ngram.to(dtype=gram_buffer.dtype))
                 else:
                     oe_context.set_gram(n, ngram.to(dtype=torch.int64))
             input_ids_column = input_ids.to(dtype=draft_oe_buffer.dtype).view(
-                batch_size, 1
+                num_queries, 1
             )
             if buffer_size == 1:
                 return input_ids_column
@@ -438,10 +571,12 @@ class EagleDraftWorker(BaseDraftWorker):
             if n - 1 <= buffer_size:
                 ngram = draft_oe_buffer[:, -(n - 1)].contiguous()
             else:
-                ngram = input_ids.new_zeros((batch_size,), dtype=torch.int64)
+                ngram = input_ids.new_zeros((num_queries,), dtype=torch.int64)
             oe_context.set_gram(n, ngram.to(dtype=torch.int64))
 
-        input_ids_column = input_ids.to(dtype=draft_oe_buffer.dtype).view(batch_size, 1)
+        input_ids_column = input_ids.to(dtype=draft_oe_buffer.dtype).view(
+            num_queries, 1
+        )
         if buffer_size == 1:
             return input_ids_column
         return torch.cat([draft_oe_buffer[:, 1:], input_ids_column], dim=1)
@@ -485,15 +620,14 @@ class EagleDraftWorker(BaseDraftWorker):
             num_reqs, buffer_size
         )
         accepted_rows = accepted_draft_token_ids.reshape(num_reqs, -1)
-        if accepted_rows.shape[1] < num_draft_tokens:
+        accepted_width = accepted_rows.shape[1]
+        if accepted_width == 0:
             raise RuntimeError(
-                "WeLMV4 MTP accepted draft token buffer is shorter than draft tokens: "
-                f"{accepted_rows.shape[1]} < {num_draft_tokens}"
+                "WeLMV4 MTP accepted draft token buffer is empty."
             )
 
         # Keep this preparation GPU-only. Copying accept_lens to CPU here
         # serializes target verify and draft-extend on every decode step.
-        accepted_width = accepted_rows.shape[1]
         accepted_order = torch.arange(
             accepted_width, device=accepted_rows.device, dtype=torch.long
         )
@@ -503,15 +637,16 @@ class EagleDraftWorker(BaseDraftWorker):
         accepted_compact = accepted_rows.gather(
             1, torch.argsort(accepted_sort_keys, dim=1)
         )
-        accepted_tail = accepted_compact[:, 1:num_draft_tokens].to(
+        accepted_tail = accepted_compact[:, 1:].to(
             device=history_buffer.device,
             dtype=history_buffer.dtype,
         )
+        max_extra_lens = max(0, accepted_width - 1)
         extra_lens = torch.clamp(
             accept_lens[:num_reqs].to(device=history_buffer.device, dtype=torch.long)
             - 1,
             min=0,
-            max=max(0, num_draft_tokens - 1),
+            max=max_extra_lens,
         )
         history_with_accepted = torch.cat([history_buffer, accepted_tail], dim=1)
         history_offsets = extra_lens[:, None] + torch.arange(
@@ -566,6 +701,7 @@ class EagleDraftWorker(BaseDraftWorker):
         logits_output,
         draft_input: EagleDraftInput,
         forward_batch: Optional[ForwardBatch] = None,
+        welmv4_mtp_base_positions: Optional[torch.Tensor] = None,
     ) -> None:
         probs = torch.softmax(logits_output.next_token_logits, dim=-1)
         draft_input.topk_p, draft_input.topk_index = fast_topk(probs, self.topk, dim=-1)
@@ -575,9 +711,11 @@ class EagleDraftWorker(BaseDraftWorker):
             if oe_context is not None and oe_context.input_ids_buffer is not None:
                 oe_buffer = oe_context.input_ids_buffer.detach().clone()
                 draft_input.welm_mtp_oe_buffer = oe_buffer
-            draft_input.welm_mtp_base_positions = self._get_welmv4_mtp_base_positions(
-                forward_batch
-            )
+            if welmv4_mtp_base_positions is None:
+                welmv4_mtp_base_positions = self._get_welmv4_mtp_base_positions(
+                    forward_batch
+                )
+            draft_input.welm_mtp_base_positions = welmv4_mtp_base_positions
 
     def init_attention_backend(self):
         # Create multi-step attn backends and cuda graph runners
@@ -665,9 +803,9 @@ class EagleDraftWorker(BaseDraftWorker):
         if (
             self.draft_extend_attn_backend
             and (
-            _is_npu
-            or supports_cuda_draft_extend_graph
-            or supports_hip_aiter_draft_extend_graph
+                _is_npu
+                or supports_cuda_draft_extend_graph
+                or supports_hip_aiter_draft_extend_graph
             )
         ):
             tic = time.perf_counter()
@@ -804,13 +942,26 @@ class EagleDraftWorker(BaseDraftWorker):
         welmv4_mtp_base_positions = None
         welmv4_mtp_draft_oe_buffer = None
         if is_welmv4_mtp and not forward_batch.forward_mode.is_idle():
-            if self.topk != 1:
-                raise RuntimeError("WeLMV4 MTP recursive draft decode requires topk=1.")
             welmv4_mtp_base_positions = spec_info.welm_mtp_base_positions
             if welmv4_mtp_base_positions is None:
-                welmv4_mtp_base_positions = (
-                    forward_batch.seq_lens - 1
-                ).to(forward_batch.positions.dtype)
+                welmv4_mtp_base_positions = (forward_batch.seq_lens - 1).to(
+                    forward_batch.positions.dtype
+                )
+            if self.topk > 1 and topk_p.shape[0] != welmv4_mtp_base_positions.numel():
+                if welmv4_mtp_base_positions.numel() > topk_p.shape[0]:
+                    welmv4_mtp_base_positions = welmv4_mtp_base_positions[
+                        : topk_p.shape[0]
+                    ]
+                else:
+                    padded_base_positions = (forward_batch.seq_lens - 1).to(
+                        device=welmv4_mtp_base_positions.device,
+                        dtype=welmv4_mtp_base_positions.dtype,
+                    )[: topk_p.shape[0]]
+                    padded_base_positions[: welmv4_mtp_base_positions.numel()] = (
+                        welmv4_mtp_base_positions
+                    )
+                    welmv4_mtp_base_positions = padded_base_positions
+                spec_info.welm_mtp_base_positions = welmv4_mtp_base_positions
 
         out_cache_loc = out_cache_loc.reshape(
             forward_batch.batch_size, self.topk, self.speculative_num_steps
@@ -846,15 +997,38 @@ class EagleDraftWorker(BaseDraftWorker):
                 step_cache_loc = step_cache_loc[: input_ids.numel()]
             forward_batch.out_cache_loc = step_cache_loc
             if is_welmv4_mtp:
-                forward_batch.positions = welmv4_mtp_base_positions[
-                    : input_ids.numel()
-                ].to(dtype=step_positions.dtype)
+                base_query_count = welmv4_mtp_base_positions.numel()
+                if (
+                    input_ids.numel() % base_query_count != 0
+                    and input_ids.numel() % self.topk == 0
+                    and base_query_count > input_ids.numel() // self.topk
+                ):
+                    base_query_count = input_ids.numel() // self.topk
+                step_base_positions = welmv4_mtp_base_positions[:base_query_count]
+                forward_batch.positions = self._expand_welmv4_mtp_base_positions(
+                    step_base_positions, input_ids.numel()
+                ).to(dtype=step_positions.dtype)
+                selected_parent_indices = self._get_welmv4_mtp_selected_parent_indices(
+                    i, tree_info, input_ids.device
+                )
                 welmv4_mtp_draft_oe_buffer = (
                     self._prepare_welmv4_mtp_draft_decode_oe_context(
-                        forward_batch, input_ids, welmv4_mtp_draft_oe_buffer
+                        forward_batch,
+                        input_ids,
+                        welmv4_mtp_draft_oe_buffer,
+                        selected_parent_indices,
+                        base_query_count,
                     )
                 )
-                self._init_welmv4_mtp_base_kv_decode_metadata(forward_batch)
+                restore_mtp_metadata = self._init_welmv4_mtp_base_kv_decode_metadata(
+                    forward_batch, base_query_count
+                )
+                if (
+                    self.topk > 1
+                    and hidden_states is not None
+                    and hasattr(forward_batch, "hidden_states_backup")
+                ):
+                    forward_batch.hidden_states_backup = hidden_states
             else:
                 forward_batch.positions = step_positions.add(1)
                 forward_batch.attn_backend = self.draft_attn_backend.attn_backends[i]
@@ -862,7 +1036,14 @@ class EagleDraftWorker(BaseDraftWorker):
 
             # Run forward
             if is_welmv4_mtp:
-                logits_output = self._forward_welmv4_mtp_base_kv_decode(forward_batch)
+                try:
+                    logits_output = self._forward_welmv4_mtp_base_kv_decode(
+                        forward_batch
+                    )
+                finally:
+                    self._restore_welmv4_mtp_base_kv_decode_metadata(
+                        forward_batch, restore_mtp_metadata
+                    )
             else:
                 logits_output = self.draft_runner.forward(
                     forward_batch, skip_attn_backend_init=True
@@ -984,12 +1165,22 @@ class EagleDraftWorker(BaseDraftWorker):
     def _draft_extend_for_decode(
         self, batch: ModelWorkerBatch, batch_result: GenerationBatchResult
     ):
+        next_draft_input = batch_result.next_draft_input
         # Batch 2: Draft extend
+        draft_hidden_states = next_draft_input.hidden_states
+        if draft_hidden_states is None:
+            draft_hidden_states = batch_result.logits_output.hidden_states
+            if self.topk > 1 and not batch.forward_mode.is_idle():
+                raise RuntimeError(
+                    "Spec v2 topk>1 draft extend requires packed hidden states "
+                    "from the verify step."
+                )
         draft_input = EagleDraftInput(
-            hidden_states=batch_result.logits_output.hidden_states,
-            num_tokens_per_req=self.speculative_num_steps + 1,
-            num_tokens_for_logprob_per_req=self.speculative_num_steps + 1,
+            hidden_states=draft_hidden_states,
+            num_tokens_per_req=self.speculative_num_draft_tokens,
+            num_tokens_for_logprob_per_req=self.speculative_num_draft_tokens,
             model_specific_states=batch_result.logits_output.model_specific_states,
+            mirrored_kv_indices=next_draft_input.mirrored_kv_indices,
         )
         select_index = (
             torch.arange(len(batch.seq_lens), device=self.device)
@@ -1079,10 +1270,17 @@ class EagleDraftWorker(BaseDraftWorker):
         draft_logits_output.hidden_states = draft_logits_output.hidden_states[
             select_index
         ]
+        welmv4_mtp_base_positions = None
+        if self._is_welmv4_mtp_draft_model() and self.topk > 1:
+            welmv4_mtp_base_positions = forward_batch.positions[select_index].clone()
 
         # Construct the return values
-        next_draft_input = batch_result.next_draft_input
-        self._capture_for_decode(draft_logits_output, next_draft_input, forward_batch)
+        self._capture_for_decode(
+            draft_logits_output,
+            next_draft_input,
+            forward_batch,
+            welmv4_mtp_base_positions,
+        )
 
 
 class EAGLEWorkerV2(BaseSpecWorker):
@@ -1136,6 +1334,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
             (), dtype=torch.int64, device=self.device
         )
         self.extend_lens = torch.empty((), dtype=torch.int64, device=self.device)
+        self._welmv4_mtp_target_verify_attn_backend = None
 
         self.plan_stream, self.plan_stream_ctx = _get_plan_stream(self.device)
 
@@ -1146,6 +1345,36 @@ class EAGLEWorkerV2(BaseSpecWorker):
     @property
     def draft_worker(self):
         return self._draft_worker
+
+    def _get_welmv4_mtp_target_verify_attn_backend(self):
+        if self._welmv4_mtp_target_verify_attn_backend is None:
+            target_model_runner = self.target_worker.model_runner
+            backend = target_model_runner._get_attention_backend_from_str("triton")
+            init_forward_metadata = backend.init_forward_metadata
+
+            def init_forward_metadata_with_swa_fallback(forward_batch):
+                init_forward_metadata(forward_batch)
+                if not forward_batch.forward_mode.is_target_verify():
+                    return
+                metadata = backend.forward_metadata
+                if metadata.window_kv_indptr is None:
+                    metadata.window_kv_indptr = metadata.kv_indptr
+                    metadata.window_kv_indices = metadata.kv_indices
+                    metadata.window_kv_offsets = torch.zeros(
+                        metadata.kv_indptr.numel() - 1,
+                        dtype=torch.int32,
+                        device=metadata.kv_indptr.device,
+                    )
+
+            backend.init_forward_metadata = init_forward_metadata_with_swa_fallback
+            self._welmv4_mtp_target_verify_attn_backend = backend
+        return self._welmv4_mtp_target_verify_attn_backend
+
+    def _should_use_welmv4_mtp_target_verify_attn_backend(self) -> bool:
+        return False
+
+    def _should_disable_welmv4_mtp_target_verify_graph(self) -> bool:
+        return False
 
     def clear_cache_pool(self):
         # allocator and kv cache pool are shared with target worker, which are cleared in scheduler
@@ -1164,9 +1393,13 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
             # Draft prefill
             model_worker_batch.capture_hidden_mode = CaptureHiddenMode.LAST
-            with self.draft_worker.draft_tp_context(
-                self.draft_worker.draft_runner.tp_group
-            ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
+            with (
+                self.draft_worker.draft_tp_context(
+                    self.draft_worker.draft_runner.tp_group
+                ),
+                speculative_moe_backend_context(),
+                speculative_moe_a2a_backend_context(),
+            ):
                 batch_output.next_draft_input = (
                     self.draft_worker._draft_extend_for_prefill(
                         model_worker_batch,
@@ -1186,9 +1419,13 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     topk=self.topk,
                     capture_hidden_mode=CaptureHiddenMode.LAST,
                 )
-            with self.draft_worker.draft_tp_context(
-                self.draft_worker.draft_runner.tp_group
-            ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
+            with (
+                self.draft_worker.draft_tp_context(
+                    self.draft_worker.draft_runner.tp_group
+                ),
+                speculative_moe_backend_context(),
+                speculative_moe_a2a_backend_context(),
+            ):
                 verify_input: EagleVerifyInput = self.draft_worker.draft(
                     model_worker_batch
                 )
@@ -1202,13 +1439,80 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 self._draft_done_event.record()
             model_worker_batch.spec_info = verify_input
             batch_output = self.verify(model_worker_batch)
-            with self.draft_worker.draft_tp_context(
-                self.draft_worker.draft_runner.tp_group
-            ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
+            with (
+                self.draft_worker.draft_tp_context(
+                    self.draft_worker.draft_runner.tp_group
+                ),
+                speculative_moe_backend_context(),
+                speculative_moe_a2a_backend_context(),
+            ):
                 self.draft_worker._draft_extend_for_decode(
                     model_worker_batch, batch_output
                 )
             return batch_output
+
+    def _pack_accept_path_indices(
+        self,
+        accept_index: torch.Tensor,
+        accept_lens: torch.Tensor,
+        draft_token_num: int,
+    ) -> torch.Tensor:
+        if accept_index.numel() == 0:
+            return accept_index.to(dtype=torch.long).flatten()
+
+        bs, max_accept_len = accept_index.shape
+        if max_accept_len > draft_token_num:
+            raise RuntimeError(
+                "Spec v2 accept path is wider than the dense draft row: "
+                f"{max_accept_len=} {draft_token_num=}"
+            )
+
+        device = accept_index.device
+        row_offsets = (
+            torch.arange(bs, device=device, dtype=torch.long) * draft_token_num
+        )
+        draft_offsets = torch.arange(draft_token_num, device=device, dtype=torch.long)
+        rank = draft_offsets.unsqueeze(0).expand(bs, draft_token_num).clone()
+        rank += max_accept_len
+
+        path_order = torch.arange(max_accept_len, device=device, dtype=torch.long)
+        valid_accept = path_order.unsqueeze(0) < accept_lens.to(torch.long).unsqueeze(1)
+        accepted_offsets = accept_index.to(torch.long) - row_offsets.unsqueeze(1)
+        row_ids = torch.arange(bs, device=device, dtype=torch.long).unsqueeze(1)
+        row_ids = row_ids.expand(bs, max_accept_len)
+        rank[row_ids[valid_accept], accepted_offsets[valid_accept]] = path_order[
+            None, :
+        ].expand(bs, max_accept_len)[valid_accept]
+
+        packed_offsets = torch.argsort(rank, dim=1)
+        return (row_offsets.unsqueeze(1) + packed_offsets).flatten()
+
+    def _compact_topk_accept_path_in_req_pool(
+        self,
+        batch: ModelWorkerBatch,
+        packed_indices: torch.Tensor,
+        draft_token_num: int,
+    ) -> torch.Tensor:
+        bs = len(batch.seq_lens)
+        if bs == 0:
+            return batch.out_cache_loc
+
+        packed_cache_locs = batch.out_cache_loc[packed_indices]
+        logical_offsets = torch.arange(
+            draft_token_num, device=batch.seq_lens.device, dtype=torch.long
+        )
+        logical_positions = batch.seq_lens.to(torch.long).unsqueeze(1) + (
+            logical_offsets.unsqueeze(0)
+        )
+        req_pool_indices = batch.req_pool_indices.to(torch.long).unsqueeze(1)
+        req_pool_indices = req_pool_indices.expand(bs, draft_token_num)
+        self.req_to_token_pool.req_to_token[req_pool_indices, logical_positions] = (
+            packed_cache_locs.view(bs, draft_token_num).to(
+                dtype=self.req_to_token_pool.req_to_token.dtype
+            )
+        )
+        batch.out_cache_loc = packed_cache_locs
+        return packed_cache_locs
 
     def verify(self, batch: ModelWorkerBatch):
         # Since batch.seq_lens is allocated in another stream, we need
@@ -1220,15 +1524,26 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
         # Parse args
         verify_input: EagleVerifyInput = batch.spec_info
-        verify_input.num_tokens_per_req = self.speculative_num_steps + 1
+        verify_input.num_tokens_per_req = verify_input.draft_token_num
         bs = len(batch.seq_lens)
+        use_welmv4_mtp_verify_backend = (
+            self._should_use_welmv4_mtp_target_verify_attn_backend()
+        )
         disable_target_graph_for_welmv4_mtp = (
             _WELM_DISABLE_TARGET_VERIFY_GRAPH_FOR_DUMP
+            or self._should_disable_welmv4_mtp_target_verify_graph()
         )
+        target_model_runner = self.target_worker.model_runner
         target_graph_runner = None
+        target_attn_backend = None
         if disable_target_graph_for_welmv4_mtp:
-            target_graph_runner = self.target_worker.model_runner.graph_runner
-            self.target_worker.model_runner.graph_runner = None
+            target_graph_runner = target_model_runner.graph_runner
+            target_model_runner.graph_runner = None
+        if use_welmv4_mtp_verify_backend:
+            target_attn_backend = target_model_runner.attn_backend
+            target_model_runner.attn_backend = (
+                self._get_welmv4_mtp_target_verify_attn_backend()
+            )
 
         try:
             # Batch 1: Target verify
@@ -1282,8 +1597,10 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 skip_attn_backend_init=True,
             )
         finally:
+            if target_attn_backend is not None:
+                target_model_runner.attn_backend = target_attn_backend
             if disable_target_graph_for_welmv4_mtp:
-                self.target_worker.model_runner.graph_runner = target_graph_runner
+                target_model_runner.graph_runner = target_graph_runner
         logits_output = forward_batch_output.logits_output
 
         # Generate vocab mask for constrained decoding
@@ -1384,15 +1701,38 @@ class EAGLEWorkerV2(BaseSpecWorker):
         verify_done = torch.get_device_module(self.device).Event()
         verify_done.record()
 
-        if not batch.forward_mode.is_idle():
-            all_verified_id = predict[accept_index]
-            verified_id = torch.empty_like(accept_lens, dtype=torch.int32)
-            fill_new_verified_id[(bs,)](
-                all_verified_id,
-                accept_lens,
-                verified_id,
-                self.speculative_num_draft_tokens,
+        next_token_ids = predict
+        packed_hidden_states = None
+        mirrored_kv_indices = None
+        if self.topk > 1 and not batch.forward_mode.is_idle():
+            packed_indices = self._pack_accept_path_indices(
+                accept_index, accept_lens, self.speculative_num_draft_tokens
             )
+            next_token_ids = predict[packed_indices]
+            mirrored_kv_indices = packed_indices
+            if logits_output.hidden_states is not None:
+                packed_hidden_states = logits_output.hidden_states[packed_indices]
+            self._compact_topk_accept_path_in_req_pool(
+                batch, packed_indices, self.speculative_num_draft_tokens
+            )
+
+        if not batch.forward_mode.is_idle():
+            verified_id = torch.empty_like(accept_lens, dtype=torch.int32)
+            if self.topk > 1:
+                fill_new_verified_id[(bs,)](
+                    next_token_ids,
+                    accept_lens,
+                    verified_id,
+                    self.speculative_num_draft_tokens,
+                )
+            else:
+                all_verified_id = predict[accept_index]
+                fill_new_verified_id[(bs,)](
+                    all_verified_id,
+                    accept_lens,
+                    verified_id,
+                    self.speculative_num_draft_tokens,
+                )
         else:
             verified_id = torch.empty((0,), device=self.device, dtype=torch.int32)
 
@@ -1406,11 +1746,13 @@ class EAGLEWorkerV2(BaseSpecWorker):
             verified_id=verified_id,
             new_seq_lens=new_seq_lens,
             verify_done=verify_done,
+            hidden_states=packed_hidden_states,
+            mirrored_kv_indices=mirrored_kv_indices,
         )
 
         return GenerationBatchResult(
             logits_output=logits_output,
-            next_token_ids=predict,
+            next_token_ids=next_token_ids,
             can_run_cuda_graph=can_run_cuda_graph,
             next_draft_input=next_draft_input,
             accept_lens=accept_lens,

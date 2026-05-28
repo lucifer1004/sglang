@@ -269,15 +269,28 @@ class EAGLEDraftCudaGraphRunner:
         spec_info_backup = forward_batch.spec_info
         forward_batch.spec_info = None
         try:
-            attn_backend.init_forward_metadata_capture_cuda_graph(
-                bs,
-                num_tokens,
-                forward_batch.req_pool_indices,
-                forward_batch.seq_lens,
-                None,
-                ForwardMode.DECODE,
-                None,
-            )
+            if not (
+                self.topk > 1
+                and hasattr(
+                    attn_backend,
+                    "init_welm_mtp_base_kv_metadata_capture_cuda_graph",
+                )
+                and attn_backend.init_welm_mtp_base_kv_metadata_capture_cuda_graph(
+                    bs,
+                    num_tokens,
+                    forward_batch.req_pool_indices,
+                    forward_batch.seq_lens,
+                )
+            ):
+                attn_backend.init_forward_metadata_capture_cuda_graph(
+                    bs,
+                    num_tokens,
+                    forward_batch.req_pool_indices,
+                    forward_batch.seq_lens,
+                    None,
+                    ForwardMode.DECODE,
+                    None,
+                )
         finally:
             forward_batch.spec_info = spec_info_backup
         forward_batch.attn_backend = attn_backend
@@ -296,16 +309,30 @@ class EAGLEDraftCudaGraphRunner:
         spec_info_backup = forward_batch.spec_info
         forward_batch.spec_info = None
         try:
-            attn_backend.init_forward_metadata_replay_cuda_graph(
-                bs,
-                forward_batch.req_pool_indices,
-                forward_batch.seq_lens,
-                seq_lens_sum,
-                None,
-                ForwardMode.DECODE,
-                None,
-                seq_lens_cpu=forward_batch.seq_lens_cpu,
-            )
+            if not (
+                self.topk > 1
+                and hasattr(
+                    attn_backend,
+                    "init_welm_mtp_base_kv_metadata_replay_cuda_graph",
+                )
+                and attn_backend.init_welm_mtp_base_kv_metadata_replay_cuda_graph(
+                    bs,
+                    self.num_tokens_per_bs,
+                    forward_batch.req_pool_indices,
+                    forward_batch.seq_lens,
+                    forward_batch.seq_lens_cpu,
+                )
+            ):
+                attn_backend.init_forward_metadata_replay_cuda_graph(
+                    bs,
+                    forward_batch.req_pool_indices,
+                    forward_batch.seq_lens,
+                    seq_lens_sum,
+                    None,
+                    ForwardMode.DECODE,
+                    None,
+                    seq_lens_cpu=forward_batch.seq_lens_cpu,
+                )
         finally:
             forward_batch.spec_info = spec_info_backup
         forward_batch.attn_backend = attn_backend

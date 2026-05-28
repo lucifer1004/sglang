@@ -3468,10 +3468,19 @@ class ServerArgs:
                     "Max running requests is reset to 48 for speculative decoding. You can override this by explicitly setting --max-running-requests."
                 )
 
+            model_hf_config = self.get_model_config().hf_config
+            model_arch = model_hf_config.architectures[0]
+            supports_spec_v2_topk = (
+                model_arch == "WeLMV4MoeForCausalLM"
+                and self.speculative_draft_model_path is not None
+                and getattr(model_hf_config, "num_nextn_predict_layers", 0) > 0
+            )
+
             spec_v1_reason = None
             if (
                 self.speculative_eagle_topk is not None
                 and self.speculative_eagle_topk > 1
+                and not supports_spec_v2_topk
                 and not self.disable_overlap_schedule
             ):
                 self.disable_overlap_schedule = True
@@ -3500,7 +3509,6 @@ class ServerArgs:
                     "eagle speculative decoding."
                 )
 
-            model_arch = self.get_model_config().hf_config.architectures[0]
             if model_arch in [
                 "DeepseekV32ForCausalLM",
                 "DeepseekV3ForCausalLM",

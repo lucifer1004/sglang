@@ -377,6 +377,7 @@ class FlashAttentionBackend(AttentionBackend):
         self.kv_cache_dtype = model_runner.kv_cache_dtype
         self.kv_cache_dtype_str = model_runner.server_args.kv_cache_dtype
         self.page_size = model_runner.page_size
+        self.is_welm_v4_model = _is_welm_v4_model(model_runner.model_config)
         self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
         self.skip_prefill = skip_prefill
         self.is_hybrid_swa = model_runner.is_hybrid_swa
@@ -502,10 +503,13 @@ class FlashAttentionBackend(AttentionBackend):
         seqlens_in_batch = forward_batch.seq_lens
         batch_size = forward_batch.batch_size
         device = seqlens_in_batch.device
+        use_welm_mtp_base_kv_decode = getattr(
+            forward_batch, "welm_mtp_use_base_kv_cache", False
+        )
 
         if forward_batch.forward_mode.is_decode_or_idle():
             # Draft Decode
-            if forward_batch.spec_info is not None:
+            if forward_batch.spec_info is not None and not use_welm_mtp_base_kv_decode:
                 if self.topk <= 1:
                     metadata.cache_seqlens_int32 = (
                         seqlens_in_batch + (self.speculative_step_id + 1)
@@ -810,6 +814,7 @@ class FlashAttentionBackend(AttentionBackend):
                 self.topk > 1
                 and forward_batch.forward_mode.is_decode_or_idle()
                 and forward_batch.spec_info is not None
+                and not use_welm_mtp_base_kv_decode
             ):
                 # Modifies cache_seqlens_int32 and page_table(B, speculative_num_steps).
                 last_page_lens = forward_batch.seq_lens % self.page_size
@@ -920,15 +925,30 @@ class FlashAttentionBackend(AttentionBackend):
             and (hasattr(layer, "use_irope") and layer.use_irope)
         )
 
-        # We do cascade attention for Target Verify with topk > 1
-        # We don't use cascade attention for Sliding Window Attention:
-        # - Different window sizes should be passed in for each q in the first stage of cascade attention, but FA3 interface doesn't support pass in a list of window sizes.
-        # - The overhead of duplicated computation of the common prefix part is small for sliding window layers (seq_len <= window_size), so we can just expand it.
+        # We do cascade attention for Target Verify with topk > 1.
+        # For generic SWA layers we keep the historical single-pass path. WeLM
+        # MTP needs cascade even for SWA because its candidate rows are dense
+        # positions; compressing a tree path changes the local-attention offset.
+        use_welm_mtp_swa_cascade = (
+            self.is_welm_v4_model
+            and forward_batch.forward_mode.is_target_verify()
+            and self.topk > 1
+            and is_hybrid_swa
+        )
         use_cascade_attn = (
             forward_batch.forward_mode.is_target_verify()
             and self.topk > 1
-            and not is_hybrid_swa
+            and (not is_hybrid_swa or use_welm_mtp_swa_cascade)
         )
+        cascade_prefix_window_size = window_size
+        cascade_expand_window_size = window_size
+        if use_welm_mtp_swa_cascade:
+            q_len = int(self.speculative_num_draft_tokens or metadata.max_seq_len_q)
+            cascade_prefix_window_size = (
+                max(int(layer.sliding_window_size) - q_len, 0),
+                max(q_len - 1, 0),
+            )
+            cascade_expand_window_size = (-1, -1)
 
         kwargs = {}
         if self.fa_impl_ver != 3:
@@ -955,7 +975,11 @@ class FlashAttentionBackend(AttentionBackend):
             cu_seqlens_q = local_metadata.local_query_start_loc
             cache_seqlens = local_metadata.local_seqused_k
             max_seqlen_q = local_metadata.local_max_query_len
-        elif is_hybrid_swa and metadata.swa_spec_metadata is not None:
+        elif (
+            is_hybrid_swa
+            and metadata.swa_spec_metadata is not None
+            and not use_welm_mtp_swa_cascade
+        ):
             swa_spec_metadata = metadata.swa_spec_metadata
             page_table = swa_spec_metadata.page_table
             cu_seqlens_q = swa_spec_metadata.cu_seqlens_q
@@ -1025,7 +1049,11 @@ class FlashAttentionBackend(AttentionBackend):
                         max_seqlen_q=max_seqlen_q_cp,
                         softmax_scale=layer.scaling,
                         causal=False if use_cascade_attn else causal,
-                        window_size=window_size,
+                        window_size=(
+                            cascade_prefix_window_size
+                            if use_cascade_attn
+                            else window_size
+                        ),
                         softcap=layer.logit_cap,
                         k_descale=k_descale,
                         v_descale=v_descale,
@@ -1061,7 +1089,11 @@ class FlashAttentionBackend(AttentionBackend):
                     max_seqlen_k=max_seqlen_q,
                     softmax_scale=layer.scaling,
                     causal=causal,
-                    window_size=window_size,
+                    window_size=(
+                        cascade_prefix_window_size
+                        if use_cascade_attn
+                        else window_size
+                    ),
                     softcap=layer.logit_cap,
                     num_splits=self.num_splits,
                     out=_fa_out,
@@ -1079,7 +1111,11 @@ class FlashAttentionBackend(AttentionBackend):
                     max_seqlen_q=max_seqlen_q,
                     softmax_scale=layer.scaling,
                     causal=False if use_cascade_attn else causal,
-                    window_size=window_size,
+                    window_size=(
+                        cascade_prefix_window_size
+                        if use_cascade_attn
+                        else window_size
+                    ),
                     softcap=layer.logit_cap,
                     k_descale=k_descale,
                     v_descale=v_descale,
@@ -1108,7 +1144,7 @@ class FlashAttentionBackend(AttentionBackend):
                     max_seqlen_q=self.forward_metadata_spec_decode_expand.max_seq_len_q,
                     softmax_scale=layer.scaling,
                     causal=False,
-                    window_size=window_size,
+                    window_size=cascade_expand_window_size,
                     softcap=layer.logit_cap,
                     k_descale=k_descale,
                     v_descale=v_descale,
@@ -1251,7 +1287,7 @@ class FlashAttentionBackend(AttentionBackend):
                             max_seqlen_q=self.forward_metadata_spec_decode_expand.max_seq_len_q,
                             softmax_scale=layer.scaling,
                             causal=False,
-                            window_size=window_size,
+                            window_size=cascade_expand_window_size,
                             softcap=layer.logit_cap,
                             k_descale=k_descale,
                             v_descale=v_descale,
@@ -1317,7 +1353,14 @@ class FlashAttentionBackend(AttentionBackend):
         # When Spec Decode enabled, forward_decode would be called with two mode:
         # 1. DRAFT_DECODE: we enable cascade attention when top_k > 1
         # 2. IDLE: we don’t need cascade attention, spec_info will be none in this case
-        use_cascade_attn = forward_batch.spec_info is not None and self.topk > 1
+        use_welm_mtp_base_kv_decode = getattr(
+            forward_batch, "welm_mtp_use_base_kv_cache", False
+        )
+        use_cascade_attn = (
+            forward_batch.spec_info is not None
+            and self.topk > 1
+            and not use_welm_mtp_base_kv_decode
+        )
 
         # Calculate window size (can be moved to metadata if layer properties don't change)
         # we don't do layer.sliding_window_size - 1 since in model.get_attention_sliding_window_size() we already - 1
@@ -1328,6 +1371,8 @@ class FlashAttentionBackend(AttentionBackend):
         window_size = (layer.sliding_window_size, 0) if is_swa_layer else (-1, -1)
         causal = True
         if layer.is_cross_attention or layer.attn_type == AttentionType.ENCODER_ONLY:
+            causal = False
+        if use_welm_mtp_base_kv_decode:
             causal = False
 
         # For fa3 interface version compatibility, we put new fields into conditional keyword args
@@ -1562,6 +1607,95 @@ class FlashAttentionBackend(AttentionBackend):
 
         return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
+    def init_welm_mtp_base_kv_metadata_capture_cuda_graph(
+        self,
+        bs: int,
+        num_tokens: int,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+    ) -> bool:
+        metadata_store = getattr(self, "welm_mtp_base_kv_decode_metadata", None)
+        if metadata_store is None:
+            return False
+        if bs <= 0 or num_tokens % bs != 0:
+            raise RuntimeError(
+                "WeLM MTP base-KV graph metadata requires grouped query tokens: "
+                f"{bs=} {num_tokens=}"
+            )
+
+        query_group_size = num_tokens // bs
+        metadata = FlashAttentionMetadata()
+        metadata.cache_seqlens_int32 = metadata_store["cache_seqlens"][:bs]
+        metadata.cache_seqlens_int32.copy_(seq_lens.to(torch.int32))
+        metadata.max_seq_len_q = query_group_size
+        metadata.max_seq_len_k = seq_lens.max().item()
+        metadata.cu_seqlens_q = metadata_store["cu_seqlens_q"][: bs + 1]
+        metadata.cu_seqlens_q.copy_(
+            torch.arange(
+                0,
+                num_tokens + 1,
+                query_group_size,
+                dtype=torch.int32,
+                device=seq_lens.device,
+            )
+        )
+        metadata.cu_seqlens_k = metadata_store["cu_seqlens_k"][: bs + 1]
+        metadata.cu_seqlens_k[1:].copy_(
+            torch.cumsum(metadata.cache_seqlens_int32, dim=0, dtype=torch.int32)
+        )
+        metadata.page_table = metadata_store["page_table"][:bs, :]
+        metadata_store[bs] = metadata
+        self.forward_metadata = metadata
+        self.forward_metadata_spec_decode_expand = None
+        return True
+
+    def init_welm_mtp_base_kv_metadata_replay_cuda_graph(
+        self,
+        bs: int,
+        num_tokens_per_bs: int,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        seq_lens_cpu: torch.Tensor,
+    ) -> bool:
+        metadata_store = getattr(self, "welm_mtp_base_kv_decode_metadata", None)
+        if metadata_store is None:
+            return False
+
+        seq_lens = seq_lens[:bs]
+        seq_lens_cpu = seq_lens_cpu[:bs]
+        req_pool_indices = req_pool_indices[:bs]
+        metadata = metadata_store[bs]
+        metadata.cache_seqlens_int32.copy_(seq_lens.to(torch.int32))
+        metadata.max_seq_len_q = num_tokens_per_bs
+        metadata.max_seq_len_k = seq_lens_cpu.max().item()
+
+        num_tokens = bs * num_tokens_per_bs
+        metadata.cu_seqlens_q.copy_(
+            torch.arange(
+                0,
+                num_tokens + 1,
+                num_tokens_per_bs,
+                dtype=torch.int32,
+                device=seq_lens.device,
+            )
+        )
+        max_seq_pages = (metadata.max_seq_len_k + self.page_size - 1) // self.page_size
+        normal_decode_set_metadata(
+            metadata.cache_seqlens_int32,
+            metadata.cu_seqlens_k,
+            metadata.page_table,
+            self.req_to_token,
+            req_pool_indices,
+            metadata_store["strided_indices"],
+            max_seq_pages,
+            seq_lens,
+            0,
+            self.page_size,
+        )
+        self.forward_metadata = metadata
+        self.forward_metadata_spec_decode_expand = None
+        return True
+
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         """Initialize CUDA graph state for the attention backend.
 
@@ -1693,6 +1827,31 @@ class FlashAttentionBackend(AttentionBackend):
                         device=self.device,
                     )
                 )
+
+            # WeLM MTP draft decode reuses committed/base KV instead of writing
+            # speculative KV. CUDA graph replay therefore needs metadata for
+            # grouped sibling queries over the same prefix, separate from the
+            # normal EAGLE topk cascade metadata above.
+            self.welm_mtp_base_kv_decode_metadata = {
+                "cache_seqlens": torch.zeros(
+                    max_bs, dtype=torch.int32, device=self.device
+                ),
+                "cu_seqlens_q": torch.zeros(
+                    max_bs + 1, dtype=torch.int32, device=self.device
+                ),
+                "cu_seqlens_k": torch.zeros(
+                    max_bs + 1, dtype=torch.int32, device=self.device
+                ),
+                "page_table": torch.zeros(
+                    max_bs,
+                    max_num_pages,
+                    dtype=torch.int32,
+                    device=self.device,
+                ),
+                "strided_indices": torch.arange(
+                    0, self.max_context_len, self.page_size, device=self.device
+                ),
+            }
 
         if (
             self.speculative_num_draft_tokens is not None
