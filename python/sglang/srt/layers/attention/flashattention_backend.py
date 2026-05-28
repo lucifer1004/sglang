@@ -2114,7 +2114,7 @@ class FlashAttentionBackend(AttentionBackend):
                     self.target_verify_metadata_topk_swa[bs] = metadata_swa
                     metadata.swa_spec_metadata = metadata_swa
 
-        elif forward_mode.is_draft_extend():
+        elif forward_mode.is_draft_extend(include_v2=True):
             metadata.cache_seqlens_int32 = self.draft_extend_metadata["cache_seqlens"][
                 :bs
             ]
@@ -2135,6 +2135,9 @@ class FlashAttentionBackend(AttentionBackend):
             metadata.cu_seqlens_k = self.draft_extend_metadata["cu_seqlens_k"][
                 : (bs + 1)
             ]
+            metadata.cu_seqlens_k[1:].copy_(
+                torch.cumsum(metadata.cache_seqlens_int32, dim=0, dtype=torch.int32)
+            )
             metadata.page_table = self.draft_extend_metadata["page_table"][:bs, :]
 
             self.draft_extend_metadata[bs] = metadata
@@ -2430,7 +2433,7 @@ class FlashAttentionBackend(AttentionBackend):
                         metadata, metadata_expand, metadata_swa
                     )
 
-        elif forward_mode.is_draft_extend():
+        elif forward_mode.is_draft_extend(include_v2=True):
             metadata = self.draft_extend_metadata[bs]
             metadata.cache_seqlens_int32.copy_(seq_lens)
 
@@ -2438,11 +2441,16 @@ class FlashAttentionBackend(AttentionBackend):
             metadata.cu_seqlens_k[1:].copy_(
                 torch.cumsum(metadata.cache_seqlens_int32, dim=0, dtype=torch.int32)
             )
-            extend_lens = spec_info.num_accepted_tokens[:bs]
-            if spec_info.num_accepted_tokens_cpu:
-                metadata.max_seq_len_q = max(spec_info.num_accepted_tokens_cpu)
+
+            if forward_mode.is_draft_extend_v2():
+                extend_lens = spec_info.extend_seq_lens_tensor[:bs]
+                metadata.max_seq_len_q = max(spec_info.extend_seq_lens_cpu[:bs])
             else:
-                metadata.max_seq_len_q = 1
+                extend_lens = spec_info.num_accepted_tokens[:bs]
+                if spec_info.num_accepted_tokens_cpu:
+                    metadata.max_seq_len_q = max(spec_info.num_accepted_tokens_cpu)
+                else:
+                    metadata.max_seq_len_q = 1
 
             metadata.cu_seqlens_q[1:].copy_(
                 torch.cumsum(extend_lens, dim=0, dtype=torch.int32)

@@ -14,6 +14,7 @@ from sglang.srt.hardware_backend.npu.graph_runner.eagle_draft_extend_npu_graph_r
 from sglang.srt.hardware_backend.npu.graph_runner.eagle_draft_npu_graph_runner import (
     EAGLEDraftNpuGraphRunner,
 )
+from sglang.srt.layers.attention.flashattention_backend import FlashAttentionBackend
 from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
 from sglang.srt.layers.attention.trtllm_mla_backend import (
     TRTLLMMLABackend,
@@ -473,39 +474,58 @@ class EagleDraftWorker(BaseDraftWorker):
                 f"required={num_reqs * buffer_size}"
             )
 
-        extend_lens = getattr(forward_batch, "extend_seq_lens_cpu", None)
-        if extend_lens is None:
-            extend_lens = [self.speculative_num_draft_tokens] * num_reqs
-        else:
-            extend_lens = [int(x) for x in extend_lens[:num_reqs]]
-
-        if sum(extend_lens) != flat_token_count:
+        num_draft_tokens = self.speculative_num_draft_tokens
+        if flat_token_count != num_reqs * num_draft_tokens:
             raise RuntimeError(
                 "WeLMV4 MTP draft-extend OE input length does not match extend_lens: "
-                f"input_len={flat_token_count} extend_lens={extend_lens}"
+                f"input_len={flat_token_count} expected={num_reqs * num_draft_tokens}"
             )
 
         history_buffer = oe_context.input_ids_buffer[: num_reqs * buffer_size].view(
             num_reqs, buffer_size
-        ).clone()
-        accept_lens_cpu = [int(x) for x in accept_lens[:num_reqs].cpu().tolist()]
-        for req_idx, committed_len in enumerate(accept_lens_cpu):
-            accepted_row = accepted_draft_token_ids[req_idx].reshape(-1)
-            # The draft OE buffer already contains the first committed token
-            # that seeds this draft extend. Append the remaining committed
-            # tokens so recursive MTP OE history matches the visible history.
-            committed = accepted_row[accepted_row >= 0][1 : max(0, committed_len)].to(
-                device=history_buffer.device,
-                dtype=history_buffer.dtype,
+        )
+        accepted_rows = accepted_draft_token_ids.reshape(num_reqs, -1)
+        if accepted_rows.shape[1] < num_draft_tokens:
+            raise RuntimeError(
+                "WeLMV4 MTP accepted draft token buffer is shorter than draft tokens: "
+                f"{accepted_rows.shape[1]} < {num_draft_tokens}"
             )
-            if committed.numel() > 0:
-                history_buffer[req_idx].copy_(
-                    torch.cat([history_buffer[req_idx], committed], dim=0)[
-                        -buffer_size:
-                    ]
-                )
+
+        # Keep this preparation GPU-only. Copying accept_lens to CPU here
+        # serializes target verify and draft-extend on every decode step.
+        accepted_width = accepted_rows.shape[1]
+        accepted_order = torch.arange(
+            accepted_width, device=accepted_rows.device, dtype=torch.long
+        )
+        accepted_sort_keys = torch.where(
+            accepted_rows >= 0, accepted_order, accepted_order + accepted_width
+        )
+        accepted_compact = accepted_rows.gather(
+            1, torch.argsort(accepted_sort_keys, dim=1)
+        )
+        accepted_tail = accepted_compact[:, 1:num_draft_tokens].to(
+            device=history_buffer.device,
+            dtype=history_buffer.dtype,
+        )
+        extra_lens = torch.clamp(
+            accept_lens[:num_reqs].to(device=history_buffer.device, dtype=torch.long)
+            - 1,
+            min=0,
+            max=max(0, num_draft_tokens - 1),
+        )
+        history_with_accepted = torch.cat([history_buffer, accepted_tail], dim=1)
+        history_offsets = extra_lens[:, None] + torch.arange(
+            buffer_size, device=history_buffer.device, dtype=torch.long
+        )
+        history_after_accept = torch.gather(
+            history_with_accepted, 1, history_offsets
+        )
 
         input_ids_flat = input_ids.reshape(-1).to(dtype=torch.int64)
+        input_ids_matrix = input_ids.reshape(num_reqs, num_draft_tokens).to(
+            dtype=history_after_accept.dtype
+        )
+        ngram_source = torch.cat([history_after_accept, input_ids_matrix], dim=1)
         for idx, gram in enumerate(oe_context.input_ids_grams):
             if gram is None:
                 continue
@@ -519,46 +539,17 @@ class EagleDraftWorker(BaseDraftWorker):
                 )
                 oe_context.set_gram(n, gram_out)
 
-            offset = 0
-            for req_idx, extend_len in enumerate(extend_lens):
-                if extend_len == 0:
-                    continue
-                segment = input_ids_flat[offset : offset + extend_len]
-                history = history_buffer[req_idx].to(
-                    device=input_ids.device, dtype=torch.int64
-                )
-                if shift <= buffer_size:
-                    source = torch.cat([history, segment], dim=0)
-                    values = source[
-                        buffer_size - shift : buffer_size - shift + extend_len
-                    ]
-                else:
-                    zeros = torch.zeros(
-                        (shift - buffer_size,),
-                        device=input_ids.device,
-                        dtype=torch.int64,
-                    )
-                    source = torch.cat([zeros, history, segment], dim=0)
-                    values = source[:extend_len]
-                gram_out[offset : offset + extend_len].copy_(
-                    values.to(dtype=gram_out.dtype)
-                )
-                offset += extend_len
+            values = ngram_source[
+                :, buffer_size - shift : buffer_size - shift + num_draft_tokens
+            ].reshape(-1)
+            gram_out[:flat_token_count].copy_(values.to(dtype=gram_out.dtype))
 
         oe_context.input_ids_buffer[: num_reqs * buffer_size].copy_(
-            history_buffer.reshape(-1).to(dtype=oe_context.input_ids_buffer.dtype)
+            history_after_accept.reshape(-1).to(dtype=oe_context.input_ids_buffer.dtype)
         )
         selected_indices = select_index[:num_reqs].to(
             device=input_ids.device, dtype=torch.long
         )
-        if selected_indices.numel() > 0 and (
-            int(selected_indices.min().item()) < 0
-            or int(selected_indices.max().item()) >= flat_token_count
-        ):
-            raise RuntimeError(
-                "WeLMV4 MTP draft-extend OE selected index is out of range: "
-                f"indices={selected_indices.tolist()} input_len={flat_token_count}"
-            )
         selected_tokens = input_ids_flat.index_select(0, selected_indices).to(
             device=oe_context.input_ids_buffer.device,
             dtype=oe_context.input_ids_buffer.dtype,
@@ -566,12 +557,9 @@ class EagleDraftWorker(BaseDraftWorker):
         buffer_rows = oe_context.input_ids_buffer[: num_reqs * buffer_size].view(
             num_reqs, buffer_size
         )
-        for req_idx, token in enumerate(selected_tokens):
-            buffer_rows[req_idx].copy_(
-                torch.cat([buffer_rows[req_idx], token.reshape(1)], dim=0)[
-                    -buffer_size:
-                ]
-            )
+        buffer_rows.copy_(
+            torch.cat([buffer_rows[:, 1:], selected_tokens[:, None]], dim=1)
+        )
 
     def _capture_for_decode(
         self,
@@ -662,9 +650,15 @@ class EagleDraftWorker(BaseDraftWorker):
                 self.draft_attn_backend, AiterMultiStepDraftBackend
             )
 
-        supports_cuda_draft_extend_graph = (_is_cuda or _is_musa) and (
-            isinstance(self.draft_extend_attn_backend, TritonAttnBackend)
-            or isinstance(self.draft_extend_attn_backend, TRTLLMMLABackend)
+        supports_cuda_draft_extend_graph = (
+            _is_cuda
+            and isinstance(self.draft_extend_attn_backend, FlashAttentionBackend)
+        ) or (
+            (_is_cuda or _is_musa)
+            and (
+                isinstance(self.draft_extend_attn_backend, TritonAttnBackend)
+                or isinstance(self.draft_extend_attn_backend, TRTLLMMLABackend)
+            )
         )
         # Capture extend
         # TODO: support draft extend cuda graph for more attention backends
@@ -1329,14 +1323,20 @@ class EAGLEWorkerV2(BaseSpecWorker):
         )
         if has_welmv4_mtp_oe_context:
             accepted_mask = accept_index >= 0
-            welm_mtp_accepted_draft_token_ids = torch.full_like(accept_index, -1)
-            if bool(accepted_mask.any().item()):
-                accepted_indices = accept_index[accepted_mask].to(torch.long)
-                welm_mtp_accepted_draft_token_ids[accepted_mask] = (
-                    verify_input.draft_token.reshape(-1)
-                    .index_select(0, accepted_indices)
-                    .to(welm_mtp_accepted_draft_token_ids.dtype)
-                )
+            safe_accept_index = torch.where(
+                accepted_mask, accept_index, torch.zeros_like(accept_index)
+            ).to(torch.long)
+            accepted_draft_token_ids = (
+                verify_input.draft_token.reshape(-1)
+                .index_select(0, safe_accept_index.reshape(-1))
+                .reshape_as(accept_index)
+                .to(accept_index.dtype)
+            )
+            welm_mtp_accepted_draft_token_ids = torch.where(
+                accepted_mask,
+                accepted_draft_token_ids,
+                torch.full_like(accept_index, -1),
+            )
         if _WELM_VERIFY_AFTER_DUMP_ENABLED:
             verify_dump_extra = {}
             if not batch.forward_mode.is_idle():
