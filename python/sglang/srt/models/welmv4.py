@@ -480,7 +480,7 @@ def _unpack_welm_kv_mirror_states(
 def _welm_should_contract_kv_mirror(forward_batch: ForwardBatch) -> bool:
     return forward_batch.enable_welm_kv_mirror_opt and (
         forward_batch.forward_mode.is_extend_without_speculative()
-        or forward_batch.forward_mode.is_draft_extend()
+        or forward_batch.forward_mode.is_draft_extend(include_v2=True)
     )
 
 
@@ -852,6 +852,15 @@ class ImitateQkvKvProjection(BaseWelmQkvProjection):
             [attn.q_size, attn.kv_size, attn.kv_size, attn.kv_size, attn.kv_size],
             dim=-1,
         )
+        if _WELM_DUMP_ENABLED:
+            _welm_dump_tensor(
+                f"model.layers.{attn.layer_idx}.self_attn.mirror_k_pre_rope",
+                mirror_k,
+            )
+            _welm_dump_tensor(
+                f"model.layers.{attn.layer_idx}.self_attn.mirror_v",
+                mirror_v,
+            )
         kv_mirror_states[attn.kv_mirror_layer_idx] = (mirror_k, mirror_v)
         return q, k, v, hidden_states
 
@@ -956,9 +965,14 @@ class NextnMirrorQProjection(BaseWelmQkvProjection):
             forward_batch.spec_info, "mirrored_kv_indices", None
         )
         if (
-            forward_batch.forward_mode.is_draft_extend()
+            forward_batch.forward_mode.is_draft_extend(include_v2=True)
             and mirrored_kv_indices is not None
         ):
+            if _WELM_MTP_DUMP_ENABLED:
+                _welm_dump_tensor(
+                    "model.mtp.0.decoder.0.layer.self_attn.mirrored_kv_indices",
+                    mirrored_kv_indices,
+                )
             k = k[mirrored_kv_indices]
             v = v[mirrored_kv_indices]
         if attn.need_clear_kv_cache:

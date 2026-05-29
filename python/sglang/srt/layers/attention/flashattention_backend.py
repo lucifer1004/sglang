@@ -925,15 +925,22 @@ class FlashAttentionBackend(AttentionBackend):
             and (hasattr(layer, "use_irope") and layer.use_irope)
         )
 
-        # We do cascade attention for Target Verify with topk > 1.
-        # For generic SWA layers we keep the historical single-pass path. WeLM
-        # MTP needs cascade even for SWA because its candidate rows are dense
-        # positions; compressing a tree path changes the local-attention offset.
+        # We do cascade attention for Target Verify with topk > 1. WeLM MTP
+        # uses dense tree rows, so real SWA layers need an exact compact KV
+        # table instead of a row-index-based local window.
+        use_welm_mtp_swa_compact = (
+            self.is_welm_v4_model
+            and forward_batch.forward_mode.is_target_verify()
+            and self.topk > 1
+            and is_hybrid_swa
+            and int(layer.sliding_window_size) < int(self.max_context_len)
+        )
         use_welm_mtp_swa_cascade = (
             self.is_welm_v4_model
             and forward_batch.forward_mode.is_target_verify()
             and self.topk > 1
             and is_hybrid_swa
+            and not use_welm_mtp_swa_compact
         )
         use_cascade_attn = (
             forward_batch.forward_mode.is_target_verify()
@@ -949,12 +956,27 @@ class FlashAttentionBackend(AttentionBackend):
                 max(q_len - 1, 0),
             )
             cascade_expand_window_size = (-1, -1)
+        if use_welm_mtp_swa_compact:
+            self._init_sliding_window_attn_spec_metadata(
+                metadata,
+                self.forward_metadata_spec_decode_expand,
+                metadata.swa_spec_metadata,
+                sliding_window_size=int(layer.sliding_window_size),
+                compact_prefix=True,
+            )
 
         kwargs = {}
         if self.fa_impl_ver != 3:
             kwargs["ver"] = self.fa_impl_ver
         if sinks is not None:
             kwargs["sinks"] = sinks
+        cascade_expand_kwargs = kwargs
+        if use_cascade_attn and sinks is not None:
+            # Attention sink is a single global softmax state. Cascade attention
+            # splits KV into prefix and expand branches, so include the sink in
+            # exactly one branch before merging states.
+            cascade_expand_kwargs = dict(kwargs)
+            cascade_expand_kwargs.pop("sinks", None)
 
         _fa_out = (
             forward_batch._attn_output.view(-1, layer.tp_q_head_num, layer.v_head_dim)
@@ -1048,11 +1070,19 @@ class FlashAttentionBackend(AttentionBackend):
                         cu_seqlens_k_new=cu_seqlens_k if not use_local_attn else None,
                         max_seqlen_q=max_seqlen_q_cp,
                         softmax_scale=layer.scaling,
-                        causal=False if use_cascade_attn else causal,
+                        causal=(
+                            False
+                            if use_cascade_attn or use_welm_mtp_swa_compact
+                            else causal
+                        ),
                         window_size=(
-                            cascade_prefix_window_size
-                            if use_cascade_attn
-                            else window_size
+                            (-1, -1)
+                            if use_welm_mtp_swa_compact
+                            else (
+                                cascade_prefix_window_size
+                                if use_cascade_attn
+                                else window_size
+                            )
                         ),
                         softcap=layer.logit_cap,
                         k_descale=k_descale,
@@ -1088,11 +1118,15 @@ class FlashAttentionBackend(AttentionBackend):
                     max_seqlen_q=max_seqlen_q,
                     max_seqlen_k=max_seqlen_q,
                     softmax_scale=layer.scaling,
-                    causal=causal,
+                    causal=causal and not use_welm_mtp_swa_compact,
                     window_size=(
-                        cascade_prefix_window_size
-                        if use_cascade_attn
-                        else window_size
+                        (-1, -1)
+                        if use_welm_mtp_swa_compact
+                        else (
+                            cascade_prefix_window_size
+                            if use_cascade_attn
+                            else window_size
+                        )
                     ),
                     softcap=layer.logit_cap,
                     num_splits=self.num_splits,
@@ -1110,11 +1144,19 @@ class FlashAttentionBackend(AttentionBackend):
                     cu_seqlens_k_new=cu_seqlens_k if not use_local_attn else None,
                     max_seqlen_q=max_seqlen_q,
                     softmax_scale=layer.scaling,
-                    causal=False if use_cascade_attn else causal,
+                    causal=(
+                        False
+                        if use_cascade_attn or use_welm_mtp_swa_compact
+                        else causal
+                    ),
                     window_size=(
-                        cascade_prefix_window_size
-                        if use_cascade_attn
-                        else window_size
+                        (-1, -1)
+                        if use_welm_mtp_swa_compact
+                        else (
+                            cascade_prefix_window_size
+                            if use_cascade_attn
+                            else window_size
+                        )
                     ),
                     softcap=layer.logit_cap,
                     k_descale=k_descale,
@@ -1151,7 +1193,7 @@ class FlashAttentionBackend(AttentionBackend):
                     return_softmax_lse=True,
                     num_splits=self.num_splits,
                     ver=self.fa_impl_ver,
-                    **kwargs,
+                    **cascade_expand_kwargs,
                 )
                 o, _ = merge_state_v2_wrapper(
                     o,
@@ -1381,6 +1423,13 @@ class FlashAttentionBackend(AttentionBackend):
             kwargs["ver"] = self.fa_impl_ver
         if sinks is not None:
             kwargs["sinks"] = sinks
+        cascade_expand_kwargs = kwargs
+        if use_cascade_attn and sinks is not None:
+            # Attention sink is a single global softmax state. Cascade attention
+            # splits KV into prefix and expand branches, so include the sink in
+            # exactly one branch before merging states.
+            cascade_expand_kwargs = dict(kwargs)
+            cascade_expand_kwargs.pop("sinks", None)
 
         _fa_out = (
             forward_batch._attn_output.view(-1, layer.tp_q_head_num, layer.v_head_dim)
@@ -1516,7 +1565,7 @@ class FlashAttentionBackend(AttentionBackend):
                             return_softmax_lse=True,
                             num_splits=self.num_splits,
                             ver=self.fa_impl_ver,
-                            **kwargs,
+                            **cascade_expand_kwargs,
                         )
                     )
                     o, _ = merge_state_v2(
@@ -2837,38 +2886,72 @@ class FlashAttentionBackend(AttentionBackend):
         metadata: FlashAttentionMetadata,
         metadata_expand: FlashAttentionMetadata,
         metadata_swa: Optional[FlashAttentionMetadata] = None,
+        sliding_window_size: Optional[int] = None,
+        compact_prefix: bool = False,
     ):
         # TODO: support page_size > 1 for swa spec
         assert (
             self.page_size == 1
         ), "FlashAttention backend doesn't support topk > 1 speculative decoding with page size > 1 sliding window attention"
 
-        cache_seqlens_int32 = (
-            metadata.cache_seqlens_int32.repeat_interleave(
-                self.speculative_num_draft_tokens
+        if compact_prefix:
+            assert sliding_window_size is not None
+            window_tokens = int(sliding_window_size) + 1
+            expand_keep = torch.minimum(
+                metadata_expand.cache_seqlens_int32,
+                torch.full_like(metadata_expand.cache_seqlens_int32, window_tokens),
             )
-            + metadata_expand.cache_seqlens_int32
-        )
+            prefix_keep = torch.minimum(
+                torch.clamp(
+                    window_tokens - expand_keep,
+                    min=0,
+                ),
+                metadata.cache_seqlens_int32.repeat_interleave(
+                    self.speculative_num_draft_tokens
+                ),
+            )
+            cache_seqlens_int32 = prefix_keep + expand_keep
+        else:
+            cache_seqlens_int32 = (
+                metadata.cache_seqlens_int32.repeat_interleave(
+                    self.speculative_num_draft_tokens
+                )
+                + metadata_expand.cache_seqlens_int32
+            )
         cu_seqlens_k = torch.nn.functional.pad(
             torch.cumsum(cache_seqlens_int32, dim=0, dtype=torch.int32), (1, 0)
         )
         bs = cache_seqlens_int32.shape[0]
+        page_table_len = (
+            int(sliding_window_size) + 1
+            if compact_prefix
+            else metadata.max_seq_len_k + metadata_expand.page_table.shape[1]
+        )
         page_table = (
-            metadata.page_table.new_zeros(
-                (bs, metadata.max_seq_len_k + metadata_expand.page_table.shape[1])
-            )
+            metadata.page_table.new_zeros((bs, page_table_len))
             if metadata_swa is None
             else metadata_swa.page_table
         )
 
-        prepare_swa_spec_page_table_triton(
-            page_table,
-            metadata.page_table,
-            metadata_expand.page_table,
-            metadata.cache_seqlens_int32,
-            metadata_expand.cache_seqlens_int32,
-            self.speculative_num_draft_tokens,
-        )
+        if compact_prefix:
+            prepare_compact_swa_spec_page_table_triton(
+                page_table,
+                metadata.page_table,
+                metadata_expand.page_table,
+                metadata.cache_seqlens_int32,
+                metadata_expand.cache_seqlens_int32,
+                int(sliding_window_size),
+                self.speculative_num_draft_tokens,
+            )
+        else:
+            prepare_swa_spec_page_table_triton(
+                page_table,
+                metadata.page_table,
+                metadata_expand.page_table,
+                metadata.cache_seqlens_int32,
+                metadata_expand.cache_seqlens_int32,
+                self.speculative_num_draft_tokens,
+            )
 
         if metadata_swa is None:
             metadata_swa = FlashAttentionMetadata()
@@ -2978,6 +3061,102 @@ def prepare_swa_spec_page_table_triton(
         page_table_a.stride(1),
         page_table_b.stride(0),
         page_table_b.stride(1),
+        LEN_A=LEN_A,
+        LEN_B=LEN_B,
+        REPEAT_STEP=REPEAT_STEP,
+        BLOCK_N=BLOCK_N,
+        num_warps=4,
+    )
+
+
+@triton.jit
+def _prepare_compact_swa_spec_page_table_kernel(
+    dst_ptr,
+    src_a_ptr,
+    src_b_ptr,
+    seq_len_a_ptr,
+    seq_len_b_ptr,
+    dst_stride_m,
+    dst_stride_n,
+    a_stride_m,
+    a_stride_n,
+    b_stride_m,
+    b_stride_n,
+    SLIDING_WINDOW_SIZE: tl.constexpr,
+    LEN_A: tl.constexpr,
+    LEN_B: tl.constexpr,
+    REPEAT_STEP: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    idx_a = pid_m // REPEAT_STEP
+    seq_len_a = tl.load(seq_len_a_ptr + idx_a)
+    seq_len_b = tl.load(seq_len_b_ptr + pid_m)
+    window_tokens = SLIDING_WINDOW_SIZE + 1
+    keep_b = tl.minimum(seq_len_b, window_tokens)
+    prefix_budget = window_tokens - keep_b
+    keep_a = tl.minimum(seq_len_a, tl.maximum(prefix_budget, 0))
+    start_a = seq_len_a - keep_a
+    start_b = seq_len_b - keep_b
+    total_len = keep_a + keep_b
+
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    if pid_n * BLOCK_N >= total_len:
+        return
+
+    mask = offs_n < total_len
+    dst = dst_ptr + pid_m * dst_stride_m + offs_n * dst_stride_n
+    use_a = offs_n < keep_a
+
+    a_offs = start_a + offs_n
+    a_ptr = src_a_ptr + idx_a * a_stride_m + a_offs * a_stride_n
+    a_mask = mask & use_a & (a_offs >= 0) & (a_offs < LEN_A)
+    a_val = tl.load(a_ptr, mask=a_mask, other=0)
+
+    b_offs = start_b + offs_n - keep_a
+    b_ptr = src_b_ptr + pid_m * b_stride_m + b_offs * b_stride_n
+    b_mask = mask & (~use_a) & (b_offs >= 0) & (b_offs < LEN_B)
+    b_val = tl.load(b_ptr, mask=b_mask, other=0)
+
+    val = tl.where(use_a, a_val, b_val)
+    tl.store(dst, val, mask=mask)
+
+
+def prepare_compact_swa_spec_page_table_triton(
+    page_table_dst: torch.Tensor,
+    page_table_a: torch.Tensor,
+    page_table_b: torch.Tensor,
+    seq_len_a: torch.Tensor,
+    seq_len_b: torch.Tensor,
+    sliding_window_size: int,
+    speculative_num_draft_tokens: int,
+):
+    bs = seq_len_a.numel()
+    bs_expand = seq_len_b.numel()
+    assert bs_expand == bs * speculative_num_draft_tokens
+
+    LEN_A = page_table_a.shape[1]
+    LEN_B = page_table_b.shape[1]
+    REPEAT_STEP = speculative_num_draft_tokens
+    BLOCK_N = 256
+    max_out = min(page_table_dst.shape[1], int(sliding_window_size) + 1)
+
+    grid = (bs_expand, triton.cdiv(max_out, BLOCK_N))
+    _prepare_compact_swa_spec_page_table_kernel[grid](
+        page_table_dst,
+        page_table_a,
+        page_table_b,
+        seq_len_a,
+        seq_len_b,
+        page_table_dst.stride(0),
+        page_table_dst.stride(1),
+        page_table_a.stride(0),
+        page_table_a.stride(1),
+        page_table_b.stride(0),
+        page_table_b.stride(1),
+        SLIDING_WINDOW_SIZE=int(sliding_window_size),
         LEN_A=LEN_A,
         LEN_B=LEN_B,
         REPEAT_STEP=REPEAT_STEP,
