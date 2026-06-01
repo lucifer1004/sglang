@@ -648,7 +648,10 @@ class SchedulerOutputProcessorMixin:
 
         if req.finished():
             # delete feature to save memory
-            if req.multimodal_inputs is not None and req.session is None:
+            if (
+                req.multimodal_inputs is not None
+                and getattr(req, "session", getattr(req, "session_id", None)) is None
+            ):
                 req.multimodal_inputs.release_features()
             self.maybe_collect_routed_experts(req)
 
@@ -872,7 +875,9 @@ class SchedulerOutputProcessorMixin:
                 prefill (e.g., computing input token logprobs).
         """
         if output.input_token_logprobs is None:
-            output.input_token_logprobs = tuple(float("-inf") for _ in range(num_input_logprobs))
+            output.input_token_logprobs = tuple(
+                float("-inf") for _ in range(num_input_logprobs)
+            )
         if req.input_token_logprobs is None:
             req.input_token_logprobs = []
         if req.temp_input_top_logprobs_val is None:
@@ -944,35 +949,31 @@ class SchedulerOutputProcessorMixin:
             if req.return_logprob:
                 relevant_tokens_len = self._calculate_relevant_tokens_len(req)
                 if len(req.input_token_logprobs_val) != relevant_tokens_len:
-                    req.input_token_logprobs_val = (
-                        req.input_token_logprobs_val[:relevant_tokens_len]
-                        + [None]
-                        * max(0, relevant_tokens_len - len(req.input_token_logprobs_val))
+                    req.input_token_logprobs_val = req.input_token_logprobs_val[
+                        :relevant_tokens_len
+                    ] + [None] * max(
+                        0, relevant_tokens_len - len(req.input_token_logprobs_val)
                     )
                 if len(req.input_token_logprobs_idx) != relevant_tokens_len:
-                    req.input_token_logprobs_idx = (
-                        req.input_token_logprobs_idx[:relevant_tokens_len]
-                        + [None]
-                        * max(0, relevant_tokens_len - len(req.input_token_logprobs_idx))
+                    req.input_token_logprobs_idx = req.input_token_logprobs_idx[
+                        :relevant_tokens_len
+                    ] + [None] * max(
+                        0, relevant_tokens_len - len(req.input_token_logprobs_idx)
                     )
                 if req.top_logprobs_num > 0:
                     if len(req.input_top_logprobs_val) != relevant_tokens_len:
-                        req.input_top_logprobs_val = (
-                            req.input_top_logprobs_val[:relevant_tokens_len]
-                            + [[]]
-                            * max(
-                                0,
-                                relevant_tokens_len - len(req.input_top_logprobs_val),
-                            )
+                        req.input_top_logprobs_val = req.input_top_logprobs_val[
+                            :relevant_tokens_len
+                        ] + [[]] * max(
+                            0,
+                            relevant_tokens_len - len(req.input_top_logprobs_val),
                         )
                     if len(req.input_top_logprobs_idx) != relevant_tokens_len:
-                        req.input_top_logprobs_idx = (
-                            req.input_top_logprobs_idx[:relevant_tokens_len]
-                            + [[]]
-                            * max(
-                                0,
-                                relevant_tokens_len - len(req.input_top_logprobs_idx),
-                            )
+                        req.input_top_logprobs_idx = req.input_top_logprobs_idx[
+                            :relevant_tokens_len
+                        ] + [[]] * max(
+                            0,
+                            relevant_tokens_len - len(req.input_top_logprobs_idx),
                         )
                 if req.token_ids_logprob is not None:
                     if len(req.input_token_ids_logprobs_val) != relevant_tokens_len:

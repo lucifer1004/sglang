@@ -375,7 +375,9 @@ def _set_welm_custom_last_prefill_cache_loc(forward_batch: ForwardBatch) -> None
         context_forward_batch.kv_mirror_active_batch_indices = (
             forward_batch.kv_mirror_active_batch_indices
         )
-        context_forward_batch.kv_mirror_output_size = forward_batch.kv_mirror_output_size
+        context_forward_batch.kv_mirror_output_size = (
+            forward_batch.kv_mirror_output_size
+        )
         context_forward_batch.welm_kv_mirror_contracted = (
             forward_batch.welm_kv_mirror_contracted
         )
@@ -485,9 +487,8 @@ def _welm_should_contract_kv_mirror(forward_batch: ForwardBatch) -> bool:
 
 
 def _welm_mtp_uses_base_kv_cache(forward_batch: ForwardBatch) -> bool:
-    return (
-        forward_batch.forward_mode.is_decode()
-        and getattr(forward_batch, "welm_mtp_use_base_kv_cache", False)
+    return forward_batch.forward_mode.is_decode() and getattr(
+        forward_batch, "welm_mtp_use_base_kv_cache", False
     )
 
 
@@ -1257,9 +1258,11 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             return (
                 experts_output.view(num_tokens, hidden_dim),
                 experts_output.view(num_tokens, hidden_dim),
-                None
-                if shared_output is None
-                else shared_output.view(num_tokens, hidden_dim),
+                (
+                    None
+                    if shared_output is None
+                    else shared_output.view(num_tokens, hidden_dim)
+                ),
             )
         if shared_output is not None:
             if dump_this_layer:
@@ -1275,9 +1278,11 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             return (
                 final_hidden_states,
                 experts_output.view(num_tokens, hidden_dim),
-                None
-                if shared_output is None
-                else shared_output.view(num_tokens, hidden_dim),
+                (
+                    None
+                    if shared_output is None
+                    else shared_output.view(num_tokens, hidden_dim)
+                ),
             )
         return final_hidden_states
 
@@ -1942,8 +1947,7 @@ class Qwen2MoeAttention(nn.Module):
             )
         if self.use_o_norm and not skip_o_norm:
             need_attn_tp_reduce_for_o_norm = (
-                self.o_norm_needs_attn_tp_reduce
-                and output.shape[0] != 0
+                self.o_norm_needs_attn_tp_reduce and output.shape[0] != 0
             )
             if need_attn_tp_reduce_for_o_norm:
                 output = attention_tensor_model_parallel_all_reduce(output)
@@ -2162,18 +2166,22 @@ class Qwen2MoeDecoderLayer(nn.Module):
                 residual,
                 residual_after_layernorm=residual_after_layernorm,
                 clone_fp32_out=True,
-                output_dtype=self.input_layernorm.weight.dtype
-                if hidden_states.dtype == torch.float32
-                else hidden_states.dtype,
+                output_dtype=(
+                    self.input_layernorm.weight.dtype
+                    if hidden_states.dtype == torch.float32
+                    else hidden_states.dtype
+                ),
             )
         else:
             hidden_states, residual = self.input_layernorm(
                 hidden_states,
                 residual,
                 residual_after_layernorm=residual_after_layernorm,
-                output_dtype=self.input_layernorm.weight.dtype
-                if hidden_states.dtype == torch.float32
-                else hidden_states.dtype,
+                output_dtype=(
+                    self.input_layernorm.weight.dtype
+                    if hidden_states.dtype == torch.float32
+                    else hidden_states.dtype
+                ),
             )
         if dump_this_layer:
             _welm_dump_tensor(
@@ -2534,7 +2542,13 @@ class Qwen2MoeModel(nn.Module):
             oe_up_proj_module = self.oe_gate_up_proj
 
         dump_oe = _WELM_DUMP_ENABLED
-        if not dump_oe:
+        # When WELM_USE_PREVIOUS_PRECISION is set we must reproduce the
+        # main_v056 numerics bit-for-bit. The perf-branch fast path
+        # (compute_welm_oe_embedding -> TP-fused / triton-preprocess /
+        # delayed all-reduce) reorders bf16 reductions, so fall back to the
+        # explicit inline implementation that mirrors main_v056's
+        # _compute_oe_embedding.
+        if not dump_oe and not welm_use_previous_precision():
             return compute_welm_oe_embedding(
                 input_ids=input_ids,
                 forward_batch=forward_batch,
@@ -2621,6 +2635,7 @@ class Qwen2MoeModel(nn.Module):
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
+        skip_oe_fusion: bool = False,
     ) -> Union[torch.Tensor, PPProxyTensors]:
         if _WELM_DUMP_ENABLED:
             _welm_start_dump_pass()
@@ -2632,7 +2647,11 @@ class Qwen2MoeModel(nn.Module):
             if _WELM_DUMP_ENABLED:
                 _welm_dump_tensor("model.embed_tokens.output", hidden_states)
 
-            if len(self.oe_grams) > 0 and getattr(forward_batch, "oe_context", None):
+            if (
+                len(self.oe_grams) > 0
+                and not skip_oe_fusion
+                and getattr(forward_batch, "oe_context", None)
+            ):
                 hidden_states = self._compute_oe_embedding(
                     input_ids, forward_batch, hidden_states
                 )
@@ -2807,6 +2826,7 @@ class WeLMV4MoeForCausalLM(nn.Module):
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
+        skip_oe_fusion: bool = False,
     ) -> torch.Tensor:
         model_output = self.model(
             input_ids,
@@ -2814,6 +2834,7 @@ class WeLMV4MoeForCausalLM(nn.Module):
             forward_batch,
             input_embeds,
             pp_proxy_tensors=pp_proxy_tensors,
+            skip_oe_fusion=skip_oe_fusion,
         )
         aux_hidden_states = None
         if isinstance(model_output, tuple):

@@ -25,6 +25,7 @@ import signal
 import socket
 import sys
 import threading
+import time
 from collections import deque
 from contextlib import nullcontext
 from datetime import datetime
@@ -1421,6 +1422,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     and await request.is_disconnected()
                 ):
                     # Abort the request for disconnected requests (non-streaming, waiting queue)
+                    logger.warning(f"[DIAG] Type 1 disconnect detected: rid={obj.rid}, stream={obj.stream}")
                     self.abort_request(obj.rid)
                     # Use exception to kill the whole call stack and asyncio task
                     raise ValueError(
@@ -1485,7 +1487,28 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 yield out
                 break
 
+            state.event.clear()
+
             if is_stream:
+                # [FIX] streaming disconnect check
+                if request is not None and not obj.background:
+                    _created = getattr(state, 'created_time', None)
+                    _elapsed = (time.time() - _created) if _created is not None else 0.0
+                    _disconnected = await request.is_disconnected()
+                    if _disconnected:
+                        logger.warning(
+                            f"[DIAG] Streaming req DISCONNECTED: rid={obj.rid}, elapsed={_elapsed:.1f}s. Aborting."
+                        )
+                        self.abort_request(obj.rid)
+                        break
+                    elif _created is not None and _elapsed > 120:
+                        logger.warning(
+                            f"[DIAG] Long streaming req: rid={obj.rid}, elapsed={_elapsed:.1f}s, is_disconnected={_disconnected}"
+                        )
+                # [FIX] Mark yield timestamps for stale/leak detection.
+                if not hasattr(state, '_first_yield_ts'):
+                    state._first_yield_ts = time.time()
+                state._last_yield_ts = time.time()
                 # Record response sent time right before we send response.
                 if not state.time_stats.response_sent_to_client_time:
                     state.time_stats.set_response_sent_to_client_time()
@@ -1721,6 +1744,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # Abort the request if the client is disconnected.
         async def abort_request():
             await asyncio.sleep(2)
+            logger.warning(f"[DIAG] BackgroundTasks abort_request fired: rid={obj.rid}")
             if obj.is_single:
                 self.abort_request(obj.rid)
             else:
@@ -1730,6 +1754,106 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         background_tasks = BackgroundTasks()
         background_tasks.add_task(abort_request)
         return background_tasks
+
+    async def _sweep_stale_streaming_reqs(self):
+        """[FIX] Periodically detect and abort leaked streaming requests.
+
+        Method 1 — yield-blocked detection:
+          If _last_yield_ts hasn't updated for STALE_TIMEOUT seconds, the generator
+          is stuck at yield (TCP send buffer full, nobody reading). Abort it.
+
+        Method 2 — router reconciliation:
+          Fetch router's prometheus metrics to get how many requests the router
+          thinks are running on this worker. Compare with local rid_to_state count.
+          If local count is significantly higher, the excess are leaked requests.
+          Abort the oldest streaming requests to bring the count back in line.
+        """
+        import os as _os
+        import urllib.request as _urllib
+
+        _STALE_TIMEOUT = int(_os.environ.get("FIX_STALE_TIMEOUT", "120"))
+        _SWEEP_INTERVAL = int(_os.environ.get("FIX_SWEEP_INTERVAL", "30"))
+        _RECONCILE_MARGIN = int(_os.environ.get("FIX_RECONCILE_MARGIN", "2"))
+        _RECONCILE_MIN_AGE = int(_os.environ.get("FIX_RECONCILE_MIN_AGE", "60"))
+        _RECONCILE_MAX_ABORT = int(_os.environ.get("FIX_RECONCILE_MAX_ABORT", "5"))
+        _METRICS_PORT = int(_os.environ.get("FIX_ROUTER_METRICS_PORT", "29000"))
+        _WORKER_PORT = int(_os.environ.get("FIX_WORKER_PORT", "0"))
+        if _WORKER_PORT == 0:
+            _WORKER_PORT = getattr(getattr(self, 'server_args', None), 'port', 0)
+        _METRICS_URL = f"http://127.0.0.1:{_METRICS_PORT}/metrics"
+
+        logger.info(
+            f"[FIX] Sweep started (stale_timeout={_STALE_TIMEOUT}s, "
+            f"interval={_SWEEP_INTERVAL}s, worker_port={_WORKER_PORT}, "
+            f"router_metrics={_METRICS_URL})"
+        )
+
+        while True:
+            await asyncio.sleep(_SWEEP_INTERVAL)
+            now = time.time()
+            to_abort = []
+
+            # --- Method 1: yield-blocked detection ---
+            for rid, state in list(self.rid_to_state.items()):
+                last_ts = getattr(state, '_last_yield_ts', None)
+                if last_ts is not None and not state.finished:
+                    gap = now - last_ts
+                    if gap > _STALE_TIMEOUT:
+                        to_abort.append((rid, gap, "yield_blocked"))
+
+            # --- Method 2: router reconciliation ---
+            if _WORKER_PORT:
+                try:
+                    with _urllib.urlopen(_METRICS_URL, timeout=3) as _resp:
+                        _txt = _resp.read().decode()
+
+                    _router_running = None
+                    _port_tag = f":{_WORKER_PORT}"
+                    for _line in _txt.splitlines():
+                        if ("sgl_router_running_requests" in _line
+                                and _port_tag in _line
+                                and not _line.startswith("#")):
+                            _router_running = int(float(_line.split()[-1]))
+                            break
+
+                    if _router_running is not None:
+                        _local = len(self.rid_to_state)
+                        _leak = _local - _router_running - _RECONCILE_MARGIN
+
+                        if _leak > 0:
+                            _skip = {r[0] for r in to_abort}
+                            _cands = []
+                            for rid, state in list(self.rid_to_state.items()):
+                                if rid in _skip:
+                                    continue
+                                _fts = getattr(state, '_first_yield_ts', None)
+                                if _fts is not None and not state.finished:
+                                    _age = now - _fts
+                                    if _age > _RECONCILE_MIN_AGE:
+                                        _cands.append((rid, _age))
+                            _cands.sort(key=lambda x: -x[1])
+                            _n = min(_leak, _RECONCILE_MAX_ABORT, len(_cands))
+                            for rid, _age in _cands[:_n]:
+                                to_abort.append((rid, _age, "reconciliation"))
+
+                        logger.info(
+                            f"[FIX] Reconcile: router={_router_running}, "
+                            f"local={_local}, leak_est={max(0, _leak)}"
+                        )
+                except Exception as _e:
+                    logger.debug(f"[FIX] Reconciliation skipped: {_e}")
+
+            # --- Abort collected requests ---
+            for rid, duration, reason in to_abort:
+                logger.warning(
+                    f"[FIX] Aborting stale request: rid={rid}, "
+                    f"duration={duration:.0f}s, reason={reason}"
+                )
+                from sglang.srt.managers.io_struct import AbortReq
+                _req = AbortReq(rid=rid, abort_all=False)
+                self.send_to_scheduler.send_pyobj(_req)
+                if rid in self.rid_to_state:
+                    del self.rid_to_state[rid]
 
     def auto_create_handle_loop(self):
         if self.event_loop is not None:
@@ -1755,6 +1879,129 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.asyncio_tasks.add(
             loop.create_task(print_exception_wrapper(self.sigterm_watchdog))
         )
+        # [FIX] Start the stale streaming request sweeper
+        self.asyncio_tasks.add(
+            loop.create_task(print_exception_wrapper(self._sweep_stale_streaming_reqs))
+        )
+
+    def dump_requests_before_crash(self):
+        if self.crash_dump_performed:
+            logger.info(
+                "SIGTERM/SIGQUIT/Exception triggered, but crash dump already performed, skipping."
+            )
+            return
+
+        if not self.crash_dump_folder:
+            return
+
+        logger.error(f"Dumping requests before crash. {self.crash_dump_folder=}")
+        self.crash_dump_performed = True
+
+        # Check if NFS directory is available
+        # expected_nfs_dir = "/" + self.crash_dump_folder.lstrip("/").split("/")[0]
+        # use_nfs_dir = os.path.isdir(expected_nfs_dir) and os.access(
+        #     expected_nfs_dir, os.W_OK
+        # )
+        use_nfs_dir = False
+        if not use_nfs_dir:
+            logger.error(
+                f"Expected NFS directory is not available or writable. Uploading to GCS."
+            )
+
+        data_to_dump = []
+        if self.crash_dump_request_list:
+            data_to_dump.extend(self.crash_dump_request_list)
+
+        # Add unfinished requests from rid_to_state
+        unfinished_requests = []
+        for rid, state in self.rid_to_state.items():
+            if not state.finished:
+                unfinished_requests.append(
+                    (
+                        state.obj,
+                        state.out_list[-1] if state.out_list else {},
+                        state.created_time,
+                        time.time(),
+                    )
+                )
+        if unfinished_requests:
+            data_to_dump.extend(unfinished_requests)
+
+        if not data_to_dump:
+            return
+
+        object_name = f'crash_dump_{datetime.now().strftime("%Y-%m-%d_%H-%M-%S")}.pkl'
+        filename = os.path.join(
+            self.crash_dump_folder,
+            os.getenv("HOSTNAME", None),
+            object_name,
+        )
+
+        os.makedirs(os.path.dirname(filename), exist_ok=True)
+        # Include server_args in the dump
+        data_to_dump_with_server_args = {
+            "server_args": self.server_args,
+            "requests": data_to_dump,
+        }
+        with open(filename, "wb") as f:
+            pickle.dump(data_to_dump_with_server_args, f)
+        logger.error(
+            f"Dumped {len(self.crash_dump_request_list)} finished and {len(unfinished_requests)} unfinished requests before crash to {filename}"
+        )
+
+        def _upload_file_to_gcs(bucket_name, source_file_path, object_name):
+            from google.cloud import storage
+
+            client = storage.Client()
+            bucket = client.bucket(bucket_name)
+            blob = bucket.blob(object_name)
+            blob.upload_from_filename(source_file_path, if_generation_match=0)
+            logger.error(
+                f"Successfully uploaded {source_file_path} to gs://{bucket_name}/{object_name}"
+            )
+
+        if not use_nfs_dir:
+            _upload_file_to_gcs(
+                "sglang_crash_dump",
+                filename,
+                os.getenv("HOSTNAME", None) + "/" + object_name,
+            )
+
+    async def sigterm_watchdog(self):
+        while not self.gracefully_exit:
+            await asyncio.sleep(5)
+
+        # Drain requests
+        while True:
+            remain_num_req = len(self.rid_to_state)
+            remaining_rids = list(self.rid_to_state.keys())
+
+            if self.server_status == ServerStatus.UnHealthy:
+                # if health check failed, we should exit immediately
+                logger.error(
+                    "Signal SIGTERM received while health check failed. Force exiting."
+                )
+                self.dump_requests_before_crash()
+                break
+
+            elif get_bool_env_var("SGL_FORCE_SHUTDOWN"):
+                # if force shutdown flag set, exit immediately
+                logger.error(
+                    "Signal SIGTERM received while force shutdown flag set. Force exiting."
+                )
+                break
+
+            logger.info(
+                f"Gracefully exiting... Remaining number of requests {remain_num_req}. Remaining requests {remaining_rids=}."
+            )
+            if remain_num_req > 0:
+                await asyncio.sleep(5)
+            else:
+                self.dump_requests_before_crash()
+                break
+
+        kill_process_tree(os.getpid(), include_parent=True)
+        sys.exit(0)
 
     async def handle_loop(self):
         """The event loop that handles requests"""

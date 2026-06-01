@@ -211,6 +211,16 @@ class MMEncoder:
             self.model_config.hf_config, "model_type", "unknown"
         ).lower()
 
+        # Match the single-server path's per-model JPEG decode policy.
+        # ``BaseMultimodalProcessor`` exposes a ``gpu_image_decode`` class
+        # attribute that processors override (e.g. KimiVL sets False because
+        # its HF processor cannot consume tensor inputs; WeLMV4/Qwen inherit
+        # the default True for nvJPEG GPU decode). The encoder server runs
+        # without instantiating a BaseMultimodalProcessor, so we look up the
+        # class directly from the processor registry. Falls back to True
+        # (the base default) if the arch is not registered.
+        self._gpu_image_decode = self._lookup_gpu_image_decode()
+
         self.device = server_args.device
         self.gpu_id = server_args.base_gpu_id + rank
 
@@ -437,6 +447,40 @@ class MMEncoder:
             logger.warning(f"Failed to load audio processor: {e}")
             self.audio_processor = None
 
+    def _lookup_gpu_image_decode(self) -> bool:
+        """Return the ``gpu_image_decode`` class attribute that the matching
+        ``BaseMultimodalProcessor`` subclass would use in single-server mode.
+
+        Walks ``PROCESSOR_MAPPING`` for any model class whose name appears in
+        ``hf_config.architectures``. Returns the first match's setting, or
+        ``True`` (the base default) when the arch is not registered.
+        """
+        try:
+            from sglang.srt.managers.multimodal_processor import (
+                PROCESSOR_MAPPING,
+                import_processors,
+            )
+            from sglang.srt.multimodal.processors.base_processor import (
+                BaseMultimodalProcessor,
+            )
+
+            # Ensure the processor classes have been imported so the registry
+            # is populated. Cheap and idempotent.
+            import_processors("sglang.srt.multimodal.processors")
+
+            archs = getattr(self.model_config.hf_config, "architectures", []) or []
+            for model_cls, processor_cls in PROCESSOR_MAPPING.items():
+                if model_cls.__name__ in archs:
+                    return bool(getattr(processor_cls, "gpu_image_decode", True))
+            return bool(getattr(BaseMultimodalProcessor, "gpu_image_decode", True))
+        except Exception as e:  # pragma: no cover - defensive
+            logger.warning(
+                f"Failed to look up gpu_image_decode (archs="
+                f"{getattr(self.model_config.hf_config, 'architectures', None)}): "
+                f"{e}. Falling back to True."
+            )
+            return True
+
     def _load_single_item(
         self,
         data,
@@ -453,7 +497,14 @@ class MMEncoder:
             return data
         try:
             if modality == Modality.IMAGE:
-                img, _ = load_image(data, False)
+                # Use the same JPEG decode policy as the single-server path
+                # so encoder output stays bitwise-aligned with single mode.
+                # Hardcoding True here would regress models such as KimiVL
+                # whose processor explicitly sets gpu_image_decode=False
+                # (its HF processor cannot consume tensor inputs); for
+                # WeLMV4/Qwen this resolves to True (nvJPEG GPU decode),
+                # matching their single-mode behaviour.
+                img, _ = load_image(data, self._gpu_image_decode)
                 if (
                     discard_alpha_channel
                     and not isinstance(img, torch.Tensor)

@@ -628,6 +628,27 @@ class MultimodalInputs:
 
         return ret
 
+    @staticmethod
+    def from_processor_output(obj):
+        """Create MultimodalInputs from a MultimodalProcessorOutput or dict.
+
+        Delegates to from_dict() to avoid duplicating field-mapping logic.
+        If *obj* is already a dict it is passed through directly; otherwise
+        (e.g. a MultimodalProcessorOutput dataclass) it is converted to a
+        dict first so that from_dict() remains the single source of truth
+        for which optional fields are copied.
+        """
+        if isinstance(obj, dict):
+            return MultimodalInputs.from_dict(obj)
+        # Convert dataclass to dict, filtering out None values and
+        # non-serializable defaults so from_dict() can handle them uniformly.
+        d = {
+            f.name: getattr(obj, f.name)
+            for f in dataclasses.fields(obj)
+            if getattr(obj, f.name) is not None
+        }
+        return MultimodalInputs.from_dict(d)
+
     def contains_image_inputs(self) -> bool:
         return any(item.is_image() for item in self.mm_items)
 
