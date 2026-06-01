@@ -1942,7 +1942,7 @@ class Scheduler(
             if not req.finished() or not (mm_inputs := req.multimodal_inputs):
                 continue
             # For session requests, keep mm_inputs for the next request
-            if req.session:
+            if req.session_id:
                 continue
             # For non-session requests, clear features and mm_inputs
             mm_inputs.release_features()

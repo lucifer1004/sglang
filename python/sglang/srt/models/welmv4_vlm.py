@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import copy
+import dataclasses
 import os
 from types import SimpleNamespace
 from typing import Iterable, List, Optional, Tuple
@@ -28,22 +29,11 @@ from sglang.srt.managers.mm_utils import (
 from sglang.srt.managers.schedule_batch import (
     MultimodalDataItem,
     MultimodalInputs,
-    NGramInputIds,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.models.welmv4 import WeLMV4MoeForCausalLM
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix, print_warning_once
-
-# When set to a truthy value, the vision encoder runs data-parallel: each
-# tensor-parallel rank computes the full attention / MLP / projector locally
-# instead of sharding across heads. This avoids the bf16 all-reduce that
-# ``RowParallelLinear`` performs at the end of attention and projector,
-# whose accumulation order differs per TP-size and contributes a small but
-# measurable per-block drift relative to a single-rank forward. Recommended
-# when output reproducibility across TP sizes (or against a single-rank
-# training forward) matters more than the modest TP throughput gain on the
-# vision encoder. The flag has no effect on the LLM decoder path.
-_VISION_DP_ENV_VAR = "SGLANG_VLM_VISION_DATA_PARALLEL"
 
 # Maximum number of vision-encoder patch tokens processed in a single
 # forward pass through the 27-layer vision transformer. **Disabled by
@@ -55,15 +45,6 @@ _VISION_DP_ENV_VAR = "SGLANG_VLM_VISION_DATA_PARALLEL"
 # the chunk size for the patch-embed unfold/GEMM step.
 _VISION_MAX_PATCHES_ENV_VAR = "SGLANG_VLM_VISION_MAX_PATCHES"
 _VISION_MAX_PATCHES_DISABLED = 0
-
-
-def _vision_uses_data_parallel() -> bool:
-    return os.getenv(_VISION_DP_ENV_VAR, "0").strip().lower() in {
-        "1",
-        "true",
-        "on",
-        "yes",
-    }
 
 
 def _read_positive_int_env(name: str, default: int) -> int:
@@ -90,12 +71,12 @@ def _vision_max_patches() -> int:
     )
 
 
-def _vision_dp_tp_kwargs() -> dict:
+def _vision_dp_tp_kwargs(use_data_parallel: bool) -> dict:
     """Linear kwargs that force ``tp_size=1`` when vision DP is enabled.
 
-    Empty dict (i.e. inherit the global TP) when the env is off.
+    Empty dict (i.e. inherit the global TP) when DP is off.
     """
-    if _vision_uses_data_parallel():
+    if use_data_parallel:
         return {"tp_size": 1, "tp_rank": 0}
     return {}
 
@@ -295,6 +276,7 @@ class WeLMV4VisionAttention(VisionAttention):
         config: PretrainedConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        use_data_parallel: bool = False,
     ):
         super().__init__(
             embed_dim=config.hidden_size,
@@ -307,7 +289,7 @@ class WeLMV4VisionAttention(VisionAttention):
             quant_config=quant_config,
             prefix=prefix,
             customized_position_embedding_applier=_apply_welmv4_vision_rope,
-            use_data_parallel=_vision_uses_data_parallel(),
+            use_data_parallel=use_data_parallel,
         )
 
     def forward(
@@ -331,12 +313,10 @@ class WeLMV4VisionMLP(nn.Module):
         config: PretrainedConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        use_data_parallel: bool = False,
     ):
         super().__init__()
-        # Match WeLMV4VisionAttention's TP mode: when vision DP is enabled the
-        # attention runs unsharded, so the MLP must also run unsharded to keep
-        # the residual stream aligned across ranks.
-        tp_kwargs = _vision_dp_tp_kwargs()
+        tp_kwargs = _vision_dp_tp_kwargs(use_data_parallel)
         self.fc1 = ColumnParallelLinear(
             config.hidden_size,
             config.intermediate_size,
@@ -380,6 +360,7 @@ class WeLMV4VisionBlock(nn.Module):
         config: PretrainedConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        use_data_parallel: bool = False,
     ):
         super().__init__()
         self.norm1 = nn.LayerNorm(config.hidden_size, eps=1e-6)
@@ -388,11 +369,13 @@ class WeLMV4VisionBlock(nn.Module):
             config,
             quant_config=quant_config,
             prefix=add_prefix("attn", prefix),
+            use_data_parallel=use_data_parallel,
         )
         self.mlp = WeLMV4VisionMLP(
             config,
             quant_config=quant_config,
             prefix=add_prefix("mlp", prefix),
+            use_data_parallel=use_data_parallel,
         )
 
     def forward(
@@ -416,6 +399,7 @@ class WeLMV4VisionEncoder(nn.Module):
         config: PretrainedConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        use_data_parallel: bool = False,
     ):
         super().__init__()
         self.config = config
@@ -427,6 +411,7 @@ class WeLMV4VisionEncoder(nn.Module):
                     config,
                     quant_config=quant_config,
                     prefix=add_prefix(f"blocks.{i}", prefix),
+                    use_data_parallel=use_data_parallel,
                 )
                 for i in range(config.num_hidden_layers)
             ]
@@ -598,15 +583,13 @@ class WeLMV4VisionProjector(nn.Module):
         config: PretrainedConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        use_data_parallel: bool = False,
     ):
         super().__init__()
         merge_hidden_size = config.hidden_size * (config.spatial_merge_size**2)
         self.merge_hidden_size = merge_hidden_size
         self.ln_q = nn.LayerNorm(config.hidden_size, eps=1e-6)
-        # Same TP mode as the encoder blocks (see WeLMV4VisionAttention) so
-        # the post-block pipeline avoids a second bf16 all-reduce when
-        # vision DP is enabled.
-        tp_kwargs = _vision_dp_tp_kwargs()
+        tp_kwargs = _vision_dp_tp_kwargs(use_data_parallel)
         self.mlp = nn.ModuleList(
             [
                 ColumnParallelLinear(
@@ -643,18 +626,51 @@ class WeLMV4VLMForConditionalGeneration(WeLMV4MoeForCausalLM):
             raise ValueError("WeLMV4 VLM config must contain text_config.")
         text_config = _as_config(config.text_config)
         vision_config = _as_config(config.vision_config)
+
+        encoder_only = getattr(config, "encoder_only", False)
+        language_only = getattr(config, "language_only", False)
+        self.use_data_parallel = get_global_server_args().mm_enable_dp_encoder
+
+        if encoder_only:
+            # In encoder_only mode, skip LLM instantiation entirely to save
+            # GPU memory. Only the vision encoder + projector are needed.
+            nn.Module.__init__(self)
+            self.config = config
+            self.vision_encoder = WeLMV4VisionEncoder(
+                vision_config,
+                quant_config=quant_config,
+                prefix=add_prefix("vision_encoder", prefix),
+                use_data_parallel=self.use_data_parallel,
+            )
+            self.vision_projector = WeLMV4VisionProjector(
+                vision_config,
+                quant_config=quant_config,
+                prefix=add_prefix("vision_projector", prefix),
+                use_data_parallel=self.use_data_parallel,
+            )
+            return
+
         super().__init__(text_config, quant_config=quant_config, prefix=prefix)
         self.config = config
-        self.vision_encoder = WeLMV4VisionEncoder(
-            vision_config,
-            quant_config=quant_config,
-            prefix=add_prefix("vision_encoder", prefix),
-        )
-        self.vision_projector = WeLMV4VisionProjector(
-            vision_config,
-            quant_config=quant_config,
-            prefix=add_prefix("vision_projector", prefix),
-        )
+
+        # In language_only mode the vision encoder runs on a separate server;
+        # skip instantiating vision modules to save GPU memory.
+        if not language_only:
+            self.vision_encoder = WeLMV4VisionEncoder(
+                vision_config,
+                quant_config=quant_config,
+                prefix=add_prefix("vision_encoder", prefix),
+                use_data_parallel=self.use_data_parallel,
+            )
+            self.vision_projector = WeLMV4VisionProjector(
+                vision_config,
+                quant_config=quant_config,
+                prefix=add_prefix("vision_projector", prefix),
+                use_data_parallel=self.use_data_parallel,
+            )
+        else:
+            self.vision_encoder = None
+            self.vision_projector = None
 
     def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
         pattern = MultiModalityDataPaddingPatternMultimodalTokens()
@@ -684,9 +700,21 @@ class WeLMV4VLMForConditionalGeneration(WeLMV4MoeForCausalLM):
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]], is_nextn=False):
         params_dict = dict(self.named_parameters())
+        language_only = getattr(self.config, "language_only", False)
+        encoder_only = getattr(self.config, "encoder_only", False)
 
         def load_qkv_weights_and_forward_others():
             for name, loaded_weight in weights:
+                # Skip vision weights entirely in language_only mode
+                if language_only and (
+                    "vision_encoder" in name or "vision_projector" in name
+                ):
+                    continue
+                # Skip LLM weights entirely in encoder_only mode
+                if encoder_only and not (
+                    "vision_encoder" in name or "vision_projector" in name
+                ):
+                    continue
                 if "vision_encoder" in name and "attn.qkv." in name:
                     qkv_name = name.replace("attn.qkv.", "attn.qkv_proj.")
                     param = params_dict.get(qkv_name)
@@ -727,18 +755,36 @@ class WeLMV4VLMForConditionalGeneration(WeLMV4MoeForCausalLM):
     def _logical_forward_batch(
         self, forward_batch: ForwardBatch, image_items: List[MultimodalDataItem]
     ) -> ForwardBatch:
-        if forward_batch.n_gram_input_ids is None:
+        # On the perf branch, OE embedding is computed on `logical_input_ids`
+        # (where image-pad placeholders have been mapped back to
+        # `image_token_id`). The OE inline path also reads
+        # `forward_batch.oe_context.input_ids_grams` for the n-gram lookup
+        # tensors -- those grams are derived from `r.fill_ids`, which still
+        # contain the *hashed* multimodal pad values (a hash of the image
+        # bytes -- effectively random ints).
+        #
+        # If we leave the gram tensors unmodified, OE indexes its vocab
+        # embeddings at random hash positions for image rows, while the
+        # token-level path indexes at `image_token_id`. The two paths produce
+        # incoherent OE outputs and the difference propagates through every
+        # downstream layer. main_v056 had a real `_logical_forward_batch`
+        # that rewrote the n_gram_input_ids in lock-step with input_ids;
+        # without this rewrite on the perf branch, even `WELM_USE_PREVIOUS_PRECISION=True`
+        # cannot reproduce main_v056's output bit-for-bit.
+        #
+        # Mirror main_v056 here: rewrite oe_context grams (and the buffer
+        # used by the decode path) so pad values become `image_token_id`.
+        if forward_batch.oe_context is None:
             return forward_batch
         pad_values = [
             item.pad_value for item in image_items if item.pad_value is not None
         ]
         if not pad_values:
             return forward_batch
-
         image_token_id = self._image_token_id()
-        logical_batch = copy.copy(forward_batch)
-        logical_grams = []
-        for gram in forward_batch.n_gram_input_ids.input_ids_grams:
+
+        logical_grams: List[Optional[torch.Tensor]] = []
+        for gram in forward_batch.oe_context.input_ids_grams:
             if gram is None:
                 logical_grams.append(None)
                 continue
@@ -746,7 +792,20 @@ class WeLMV4VLMForConditionalGeneration(WeLMV4MoeForCausalLM):
             for pad_value in pad_values:
                 logical_gram[logical_gram == pad_value] = image_token_id
             logical_grams.append(logical_gram)
-        logical_batch.n_gram_input_ids = NGramInputIds(input_ids_grams=logical_grams)
+
+        logical_buffer = forward_batch.oe_context.input_ids_buffer
+        if logical_buffer is not None:
+            logical_buffer = logical_buffer.clone()
+            for pad_value in pad_values:
+                logical_buffer[logical_buffer == pad_value] = image_token_id
+
+        logical_oe_context = dataclasses.replace(
+            forward_batch.oe_context,
+            input_ids_grams=logical_grams,
+            input_ids_buffer=logical_buffer,
+        )
+        logical_batch = copy.copy(forward_batch)
+        logical_batch.oe_context = logical_oe_context
         return logical_batch
 
     def _get_image_embedding_and_mask(
@@ -782,7 +841,9 @@ class WeLMV4VLMForConditionalGeneration(WeLMV4MoeForCausalLM):
         placeholder_tensor = torch.as_tensor(
             [item.pad_value for item in image_items], device=input_ids.device
         )
-        return get_embedding_and_mask(
+        # Third return value is the (possibly pruned) input_ids for EVS.
+        # WeLMV4 VLM does not use EVS, so it is safe to discard.
+        embedding, mask, _pruned_ids = get_embedding_and_mask(
             data_embedding_func=self.get_image_feature,
             embedding_items=image_items,
             placeholder_tensor=placeholder_tensor,
@@ -792,6 +853,7 @@ class WeLMV4VLMForConditionalGeneration(WeLMV4MoeForCausalLM):
             extend_length=extend_lens,
             items_offset_list=items_offsets,
         )
+        return embedding, mask
 
     def _build_multimodal_input_embeds(
         self, input_ids: torch.Tensor, forward_batch: ForwardBatch
@@ -808,7 +870,7 @@ class WeLMV4VLMForConditionalGeneration(WeLMV4MoeForCausalLM):
         input_embeds = self.model.embed_tokens(logical_input_ids)
         logical_batch = self._logical_forward_batch(forward_batch, image_items)
 
-        if len(self.model.oe_grams) > 0 and logical_batch.n_gram_input_ids is not None:
+        if len(self.model.oe_grams) > 0 and logical_batch.oe_context is not None:
             input_embeds = self.model._compute_oe_embedding(
                 logical_input_ids, logical_batch, input_embeds
             )

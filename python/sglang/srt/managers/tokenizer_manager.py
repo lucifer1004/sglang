@@ -25,6 +25,7 @@ import signal
 import socket
 import sys
 import threading
+import time
 from collections import deque
 from contextlib import nullcontext
 from datetime import datetime
@@ -1491,7 +1492,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             if is_stream:
                 # [FIX] streaming disconnect check
                 if request is not None and not obj.background:
-                    _elapsed = time.time() - (getattr(state, 'created_time', None) or time.time())
+                    _created = getattr(state, 'created_time', None)
+                    _elapsed = (time.time() - _created) if _created is not None else 0.0
                     _disconnected = await request.is_disconnected()
                     if _disconnected:
                         logger.warning(
@@ -1499,7 +1501,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         )
                         self.abort_request(obj.rid)
                         break
-                    elif _elapsed > 120:
+                    elif _created is not None and _elapsed > 120:
                         logger.warning(
                             f"[DIAG] Long streaming req: rid={obj.rid}, elapsed={_elapsed:.1f}s, is_disconnected={_disconnected}"
                         )
@@ -1880,9 +1882,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # [FIX] Start the stale streaming request sweeper
         self.asyncio_tasks.add(
             loop.create_task(print_exception_wrapper(self._sweep_stale_streaming_reqs))
-        )
-        self.asyncio_tasks.add(
-            loop.create_task(print_exception_wrapper(self.watch_load_thread))
         )
 
     def dump_requests_before_crash(self):

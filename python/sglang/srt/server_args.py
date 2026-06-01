@@ -1663,7 +1663,7 @@ class ServerArgs:
         hf_config = self.get_model_config().hf_config
         model_arch = hf_config.architectures[0]
 
-        if model_arch == "WeLMV4MoeForCausalLM":
+        if model_arch in ["WeLMV4MoeForCausalLM", "WeLMV4VLMForConditionalGeneration"]:
             self.prepare_n_gram_inputs = True
             self.disable_piecewise_cuda_graph = True
 
@@ -3853,6 +3853,7 @@ class ServerArgs:
             "Qwen2_5OmniForConditionalGeneration",
             "KimiVLForConditionalGeneration",
             "KimiK25ForConditionalGeneration",
+            "WeLMV4VLMForConditionalGeneration",
         ]:
             raise ValueError(
                 f"Model type {model_arch} is not supported for encoder disaggregation, only Qwen models are supported for now."

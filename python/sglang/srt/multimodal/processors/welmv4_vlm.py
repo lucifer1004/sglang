@@ -3,11 +3,14 @@ import re
 import time
 from typing import List, Union
 
+from sglang.srt.managers.schedule_batch import MultimodalProcessorOutput
 from sglang.srt.models.welmv4_vlm import WeLMV4VLMForConditionalGeneration
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor as SGLangBaseProcessor,
 )
-from sglang.srt.multimodal.processors.base_processor import MultimodalSpecialTokens
+from sglang.srt.multimodal.processors.base_processor import (
+    MultimodalSpecialTokens,
+)
 from sglang.utils import logger
 
 
@@ -30,6 +33,12 @@ class WeLMV4VLMImageProcessor(SGLangBaseProcessor):
         self.vision_end_token_id = tokenizer.convert_tokens_to_ids(
             self.vision_end_token
         )
+
+        # Required by base class for language_only EPD mode (encode_receiver
+        # uses these to reconstruct MultimodalInputs from embeddings).
+        self.IM_START_TOKEN_ID = self.vision_start_token_id
+        self.IM_END_TOKEN_ID = self.vision_end_token_id
+        self.IM_TOKEN_ID = self.image_token_id
 
         self.mm_tokens = MultimodalSpecialTokens(
             image_token=(
@@ -81,10 +90,10 @@ class WeLMV4VLMImageProcessor(SGLangBaseProcessor):
             f"total_time: {(process_time - entry_time) * 1000:.2f} ms"
         )
 
-        return {
-            "input_ids": input_ids.flatten().tolist(),
-            "mm_items": mm_items,
-            "im_start_id": self.vision_start_token_id,
-            "im_end_id": self.vision_end_token_id,
-            "im_token_id": self.mm_tokens.image_token_id,
-        }
+        return MultimodalProcessorOutput(
+            input_ids=input_ids.flatten().tolist(),
+            mm_items=mm_items,
+            im_start_id=self.vision_start_token_id,
+            im_end_id=self.vision_end_token_id,
+            im_token_id=self.mm_tokens.image_token_id,
+        )
