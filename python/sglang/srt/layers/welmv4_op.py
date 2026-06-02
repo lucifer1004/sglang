@@ -21,7 +21,9 @@ def welm_use_previous_precision() -> bool:
 
 def _get_num_sms(multiplier: int = 1) -> int:
     return (
-        torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
+        torch.cuda.get_device_properties(
+            torch.cuda.current_device()
+        ).multi_processor_count
         * multiplier
     )
 
@@ -46,7 +48,9 @@ def _router_matmul_get_configs():
 
 
 @triton.jit
-def _router_matmul_compute_pid(tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M, NUM_SMS):
+def _router_matmul_compute_pid(
+    tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M, NUM_SMS
+):
     group_id = tile_id // num_pid_in_group
     first_pid_m = group_id * GROUP_SIZE_M
     group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
@@ -55,7 +59,9 @@ def _router_matmul_compute_pid(tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_
     return pid_m, pid_n
 
 
-@triton.autotune(configs=_router_matmul_get_configs(), key=["N", "K"], restore_value=["c_ptr"])
+@triton.autotune(
+    configs=_router_matmul_get_configs(), key=["N", "K"], restore_value=["c_ptr"]
+)
 @triton.jit
 def mmq_style_router_linear_kernel(  # pylint: disable=too-many-arguments,too-many-locals
     a_ptr,
@@ -74,7 +80,7 @@ def mmq_style_router_linear_kernel(  # pylint: disable=too-many-arguments,too-ma
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
-    NUM_SMS: tl.constexpr,
+    NUM_SMS,
 ):
     start_pid = tl.program_id(axis=0)
     num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
@@ -142,7 +148,9 @@ def mmq_style_router_linear(x: torch.Tensor, weight: torch.Tensor) -> torch.Tens
     assert x.dtype in (torch.bfloat16, torch.float16)
     weight = weight.to(x.dtype)
     weight_t = weight.t()
-    output = torch.empty((x.shape[0], weight.shape[0]), device=x.device, dtype=torch.float32)
+    output = torch.empty(
+        (x.shape[0], weight.shape[0]), device=x.device, dtype=torch.float32
+    )
     tokens, hidden_size = x.shape
     num_experts = weight.shape[0]
     num_sms = min(
@@ -221,9 +229,7 @@ def mmq_style_expert_bias_topk_kernel(
         tl.store(topk_weights_ptr + row * TOPK + k, selected_score)
         tl.store(topk_ids_ptr + row * TOPK + k, selected_idx)
         candidate_mask = candidate_mask & (offs != selected_idx)
-        routing_scores = tl.where(
-            candidate_mask, routing_scores, -float("inf")
-        )
+        routing_scores = tl.where(candidate_mask, routing_scores, -float("inf"))
 
 
 def mmq_style_expert_bias_topk(
@@ -298,7 +304,7 @@ def mmq_style_norm_after_attn_kernel(
     rows: int,
     cols: tl.constexpr,
     eps: float,
-    NUM_SMS: tl.constexpr,  # pylint: disable=invalid-name
+    NUM_SMS,  # pylint: disable=invalid-name
     BLOCK_SIZE: tl.constexpr,  # pylint: disable=invalid-name
 ):
     cols_offsets = tl.arange(0, BLOCK_SIZE)
@@ -364,7 +370,7 @@ def mmq_style_add_residual_kernel(
     output_ptr: tl.tensor,
     rows: int,
     cols: tl.constexpr,
-    NUM_SMS: tl.constexpr,  # pylint: disable=invalid-name
+    NUM_SMS,  # pylint: disable=invalid-name
     BLOCK_SIZE: tl.constexpr,  # pylint: disable=invalid-name
 ):
     cols_off = tl.arange(0, BLOCK_SIZE)
@@ -372,9 +378,9 @@ def mmq_style_add_residual_kernel(
 
     for row_id in tl.range(tl.program_id(0), rows, NUM_SMS, num_stages=2):
         offs = (row_id * cols + cols_off).to(tl.int64)
-        hidden_states = tl.load(
-            hidden_states_ptr + offs, mask=mask, other=0.0
-        ).to(tl.float32)
+        hidden_states = tl.load(hidden_states_ptr + offs, mask=mask, other=0.0).to(
+            tl.float32
+        )
         residual = tl.load(residual_ptr + offs, mask=mask, other=0.0).to(tl.float32)
         tl.store(output_ptr + offs, hidden_states + residual, mask=mask)
 
@@ -423,7 +429,7 @@ def rms_norm_kernel(  # pylint: disable=too-many-arguments,too-many-locals
     hidden_states_kv_stride: int,
     residual_row_stride: int,
     residual_after_layernorm: tl.constexpr,
-    NUM_SMS: tl.constexpr,  # pylint: disable=invalid-name
+    NUM_SMS,  # pylint: disable=invalid-name
     BLOCK_SIZE: tl.constexpr,  # pylint: disable=invalid-name
     USE_PREVIOUS_PRECISION: tl.constexpr,
 ):
@@ -623,7 +629,7 @@ def mmq_style_shared_experts_add_residual_rms_norm_kernel(
     rows: int,
     cols: tl.constexpr,
     eps: float,
-    NUM_SMS: tl.constexpr,  # pylint: disable=invalid-name
+    NUM_SMS,  # pylint: disable=invalid-name
     BLOCK_SIZE: tl.constexpr,  # pylint: disable=invalid-name
 ):
     row_start = tl.program_id(0)
@@ -634,12 +640,12 @@ def mmq_style_shared_experts_add_residual_rms_norm_kernel(
 
     for row_id in tl.range(row_start, rows, NUM_SMS, num_stages=2):
         offs = (row_id * cols + cols_off).to(tl.int64)
-        experts_output = tl.load(
-            experts_output_ptr + offs, mask=mask, other=0.0
-        ).to(tl.float32)
-        shared_output = tl.load(
-            shared_output_ptr + offs, mask=mask, other=0.0
-        ).to(tl.float32)
+        experts_output = tl.load(experts_output_ptr + offs, mask=mask, other=0.0).to(
+            tl.float32
+        )
+        shared_output = tl.load(shared_output_ptr + offs, mask=mask, other=0.0).to(
+            tl.float32
+        )
         residual = tl.load(residual_ptr + offs, mask=mask, other=0.0).to(tl.float32)
 
         hidden_state = experts_output + shared_output
@@ -694,7 +700,7 @@ def mmq_style_k_rms_norm_kernel(
     x_token_stride: int,
     out_token_stride: int,
     eps: float,
-    NUM_SMS: tl.constexpr,  # pylint: disable=invalid-name
+    NUM_SMS,  # pylint: disable=invalid-name
     KV_HEADS_BLOCK: tl.constexpr,  # pylint: disable=invalid-name
 ):
     head_dim_offs = tl.arange(0, head_dim)
@@ -745,7 +751,7 @@ def sigmoid_mul_kernel(
     cols: tl.constexpr,
     y_row_stride: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
-    NUM_SMS: tl.constexpr,
+    NUM_SMS,
 ):
     row_start = tl.program_id(0)
     col_off = tl.arange(0, BLOCK_SIZE)
@@ -811,7 +817,7 @@ def _welmv4_inplace_rope_kernel(
     k_token_stride: tl.constexpr,
     head_dim: tl.constexpr,
     rope_dim: tl.constexpr,
-    num_sms: tl.constexpr,
+    num_sms,
     num_stages: tl.constexpr,
     num_q_heads: tl.constexpr,
     num_k_heads: tl.constexpr,
