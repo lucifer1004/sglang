@@ -173,12 +173,14 @@ class FusedMoE(torch.nn.Module):
         prefix: str = "",
         activation: str = "silu",
         apply_router_weight_on_input: bool = False,
+        apply_router_weight_on_swiglu: bool = False,
         use_presharded_weights: bool = False,
         inplace: bool = True,
         no_combine: bool = False,
         routed_scaling_factor: Optional[float] = None,
         gemm1_alpha: Optional[float] = None,
         gemm1_clamp_limit: Optional[float] = None,
+        swiglu_clamp_limit: Optional[float] = None,
         swiglu_limit: Optional[float] = None,
         use_weight_loader_fused: bool = False,
         with_bias=False,
@@ -241,6 +243,8 @@ class FusedMoE(torch.nn.Module):
 
         self.quant_config = quant_config
         self.use_flashinfer_mxfp4_moe = get_moe_runner_backend().is_flashinfer_mxfp4()
+        if swiglu_limit is None:
+            swiglu_limit = swiglu_clamp_limit
         # TODO maybe we should remove this `if`, since `Mxfp4MoEMethod` does another round-up logic
         if (
             self.quant_config is not None
@@ -261,11 +265,13 @@ class FusedMoE(torch.nn.Module):
             params_dtype=params_dtype,
             activation=activation,
             apply_router_weight_on_input=apply_router_weight_on_input,
+            apply_router_weight_on_swiglu=apply_router_weight_on_swiglu,
             inplace=inplace,
             no_combine=no_combine,
             routed_scaling_factor=routed_scaling_factor,
             gemm1_alpha=gemm1_alpha,
             gemm1_clamp_limit=gemm1_clamp_limit,
+            swiglu_clamp_limit=swiglu_limit,
             swiglu_limit=swiglu_limit,
             is_gated=is_gated,
             routing_method_type=routing_method_type,

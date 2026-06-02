@@ -43,11 +43,13 @@ class MoeRunnerConfig:
     activation: str = "silu"
     is_gated: bool = True
     apply_router_weight_on_input: bool = False
+    apply_router_weight_on_swiglu: bool = False
     inplace: bool = True
     no_combine: bool = False
     routed_scaling_factor: Optional[float] = None
     gemm1_alpha: Optional[float] = None
     gemm1_clamp_limit: Optional[float] = None
+    swiglu_clamp_limit: Optional[float] = None
     swiglu_limit: Optional[float] = None
 
 
