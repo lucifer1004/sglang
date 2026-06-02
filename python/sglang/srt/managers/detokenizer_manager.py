@@ -21,7 +21,6 @@ from collections import OrderedDict, defaultdict
 from typing import Dict, List, Optional, Tuple, Union
 
 import psutil
-import pybase64
 import setproctitle
 import torch
 import zmq
@@ -37,6 +36,7 @@ from sglang.srt.managers.io_struct import (
 from sglang.srt.managers.multi_tokenizer_mixin import MultiHttpWorkerDetokenizerMixin
 from sglang.srt.observability.cpu_monitor import start_cpu_monitor_thread
 from sglang.srt.server_args import PortArgs, ServerArgs
+from sglang.srt.state_capturer.routed_experts import encode_routed_experts_payload
 from sglang.srt.utils import (
     configure_logger,
     freeze_gc,
@@ -121,6 +121,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
         self.decode_status = LimitedCapacityDict(capacity=DETOKENIZER_MAX_STATES)
         self.disable_tokenizer_batch_decode = server_args.disable_tokenizer_batch_decode
         self.is_tool_call_parser_gpt_oss = server_args.tool_call_parser == "gpt-oss"
+        self.routed_experts_store_dsn = server_args.routed_experts_store_dsn
 
         self.soft_watchdog = Watchdog.create(
             debug_name="DetokenizerManager",
@@ -337,11 +338,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
         if data_list is None:
             return None
         return [
-            (
-                pybase64.b64encode(item.numpy().tobytes()).decode("utf-8")
-                if item is not None
-                else None
-            )
+            encode_routed_experts_payload(item) if item is not None else None
             for item in data_list
         ]
 
@@ -352,7 +349,11 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             if len(recv_obj.rids) > 0
             else []
         )
-        routed_experts = self._b64_encode_per_request(recv_obj.routed_experts)
+        routed_experts = (
+            recv_obj.routed_experts
+            if self.routed_experts_store_dsn
+            else self._b64_encode_per_request(recv_obj.routed_experts)
+        )
         indexer_topk = self._b64_encode_per_request(recv_obj.indexer_topk)
         return BatchStrOutput(
             rids=recv_obj.rids,

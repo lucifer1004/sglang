@@ -134,16 +134,20 @@ class SchedulerOutputProcessorMixin:
         )
 
         expected_rows = max(0, req.seqlen - 1 - start_len)
-        if (
-            req.routed_experts is not None
-            and req.routed_experts.shape[0] != expected_rows
-        ):
+        routed_rows = None
+        if isinstance(req.routed_experts, torch.Tensor):
+            routed_rows = req.routed_experts.shape[0]
+        elif isinstance(req.routed_experts, dict):
+            shape = req.routed_experts.get("shape")
+            if isinstance(shape, list) and shape:
+                routed_rows = shape[0]
+        if routed_rows is not None and routed_rows != expected_rows:
             logger.warning(
                 "routed_experts row-count mismatch for req %s: got %d, "
                 "expected %d (seqlen=%d, cached_tokens=%d, start_len=%s). "
                 "This indicates a silent bug.",
                 req.rid,
-                req.routed_experts.shape[0],
+                routed_rows,
                 expected_rows,
                 req.seqlen,
                 req.cached_tokens,

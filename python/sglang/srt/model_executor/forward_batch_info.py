@@ -334,6 +334,13 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     extend_seq_lens_cpu: Optional[List[int]] = None
     extend_logprob_start_lens_cpu: Optional[List[int]] = None
     extend_input_logprob_token_ids_gpu: Optional[torch.Tensor] = None
+    welm_kv_mirror_last_q_indices: Optional[torch.Tensor] = None
+    welm_kv_mirror_active_batch_indices: Optional[torch.Tensor] = None
+    welm_kv_mirror_output_size: Optional[int] = None
+
+    # For MoE router replay
+    router_replay_topk_ids: Optional[torch.Tensor] = None
+    router_replay_mask: Optional[torch.Tensor] = None
 
     # For split prefill
     # intermediate values for split prefill
@@ -434,6 +441,12 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # For hisparse
     hisparse_coordinator: Optional[HiSparseCoordinator] = None
 
+    # For Over Encoding / WeLM kv-mirror
+    oe_context: Optional["OverEncodingContext"] = None
+    enable_welm_kv_mirror_opt: bool = False
+    welm_kv_mirror_contracted: bool = False
+    scale_seq_factor: int = 1
+
     # For ngram embedding
     ngram_embedding_info: Optional[NgramEmbeddingInfo] = None
 
@@ -471,6 +484,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             all_extend_in_batch=batch.all_extend_in_batch,
             can_run_dp_cuda_graph=batch.can_run_dp_cuda_graph,
             global_forward_mode=batch.global_forward_mode,
+            router_replay_topk_ids=batch.router_replay_topk_ids,
+            router_replay_mask=batch.router_replay_mask,
             is_prefill_only=batch.is_prefill_only,
             multi_item_delimiter_indices=batch.multi_item_delimiter_indices,
             lora_ids=batch.lora_ids,
@@ -489,9 +504,17 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             dimensions=batch.dimensions,
             return_hidden_states_before_norm=batch.return_hidden_states_before_norm,
             return_pooled_hidden_states=batch.return_pooled_hidden_states,
+            model_specific_states=getattr(
+                batch.spec_info, "model_specific_states", None
+            ),
+            oe_context=batch.oe_context,
+            scale_seq_factor=batch.scale_seq_factor,
             rids=[req.rid for req in batch.reqs],
         )
         device = model_runner.device
+        ret.enable_welm_kv_mirror_opt = (
+            model_runner.server_args.enable_welm_kv_mirror_opt
+        )
 
         if batch.extend_input_logprob_token_ids is not None:
             ret.extend_input_logprob_token_ids_gpu = (
@@ -578,6 +601,18 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             ret.extend_prefix_lens_cpu = batch.extend_prefix_lens
             ret.extend_seq_lens_cpu = batch.extend_seq_lens
             ret.extend_logprob_start_lens_cpu = batch.extend_logprob_start_lens
+            if batch.welm_kv_mirror_last_q_indices is not None:
+                ret.welm_kv_mirror_last_q_indices = torch.tensor(
+                    batch.welm_kv_mirror_last_q_indices,
+                    dtype=torch.long,
+                    device=device,
+                )
+                ret.welm_kv_mirror_active_batch_indices = torch.tensor(
+                    batch.welm_kv_mirror_active_batch_indices,
+                    dtype=torch.long,
+                    device=device,
+                )
+                ret.welm_kv_mirror_output_size = batch.welm_kv_mirror_output_size
 
         if model_runner.use_ngram_embedding:
             ret._init_ngram_embedding_info(batch, model_runner, device)
@@ -922,6 +957,20 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         global_num_tokens_pinned = torch.tensor(global_num_tokens, pin_memory=True)
         self.global_num_tokens_gpu.copy_(global_num_tokens_pinned, non_blocking=True)
 
+        if self.router_replay_topk_ids is not None:
+            from sglang.srt.layers.dp_attention import dp_gather_partial
+
+            gathered_topk_ids = self.router_replay_topk_ids.new_empty(
+                (self.global_dp_buffer_len, *self.router_replay_topk_ids.shape[1:])
+            )
+            dp_gather_partial(gathered_topk_ids, self.router_replay_topk_ids, self)
+            self.router_replay_topk_ids = gathered_topk_ids
+
+            replay_mask_i32 = self.router_replay_mask.to(torch.int32)
+            gathered_mask_i32 = replay_mask_i32.new_empty((self.global_dp_buffer_len,))
+            dp_gather_partial(gathered_mask_i32, replay_mask_i32, self)
+            self.router_replay_mask = gathered_mask_i32.to(torch.bool)
+
         TboForwardBatchPreparer.prepare(
             batch=self, is_draft_worker=model_runner.is_draft_worker
         )
@@ -972,6 +1021,21 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             self.mamba_track_seqlens = self._pad_tensor_to_size(
                 self.mamba_track_seqlens, bs
             )
+        if self.router_replay_topk_ids is not None:
+            self.router_replay_topk_ids = self._pad_tensor_to_size(
+                self.router_replay_topk_ids, num_tokens
+            )
+        if self.router_replay_mask is not None:
+            self.router_replay_mask = self._pad_tensor_to_size(
+                self.router_replay_mask, num_tokens, value=0
+            )
+
+        oe_context = getattr(self, "oe_context", None)
+        if oe_context is not None and oe_context.input_ids_grams is not None:
+            oe_context.input_ids_grams = [
+                self._pad_tensor_to_size(gram, num_tokens)
+                for gram in oe_context.input_ids_grams
+            ]
 
         if self.mrope_positions is not None:
             self.mrope_positions = torch.cat(

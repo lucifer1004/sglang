@@ -44,7 +44,7 @@ from enum import Enum, auto
 from functools import lru_cache
 from http import HTTPStatus
 from itertools import chain
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple, Union
+from typing import TYPE_CHECKING, Any, ClassVar, Dict, List, Optional, Set, Tuple, Union
 
 import numpy as np
 import torch
@@ -94,6 +94,11 @@ from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs, get_global_server_args
 from sglang.srt.utils import flatten_nested_list
 from sglang.srt.utils.cuda_ipc_transport_utils import CudaIpcTensorTransportProxy
+from sglang.srt.utils.over_encoding_utils import (
+    assign_ngram_input_ids_draft_extend,
+    filter_buffer,
+    update_ngram_buffer_from_segments,
+)
 
 if TYPE_CHECKING:
     from typing import Any, Dict
@@ -127,6 +132,177 @@ def sanity_check_mm_pad_shift_value(vocab_size: int) -> None:
 def _compute_pad_value(hash: int) -> int:
     """Compute pad value from hash."""
     return MM_PAD_SHIFT_VALUE + (hash % (1 << 30))
+
+
+def validate_router_replay_experts(
+    routed_experts: Any,
+    *,
+    num_layers: int,
+    num_experts_per_tok: int,
+    num_logical_routed_experts: int,
+    min_router_seq_len: int = 0,
+    rid: Optional[str] = None,
+) -> Optional[torch.Tensor]:
+    if routed_experts is None:
+        return None
+
+    req_msg = f" for request {rid}" if rid is not None else ""
+    try:
+        tensor = torch.as_tensor(routed_experts)
+    except Exception as exc:
+        raise ValueError(f"Invalid routed_experts{req_msg}: {exc}") from exc
+
+    if tensor.dim() != 3:
+        raise ValueError(
+            f"Invalid routed_experts{req_msg}: expected rank-3 tensor "
+            "[router_seq_len, num_layers, num_experts_per_tok], "
+            f"got shape {tuple(tensor.shape)}."
+        )
+    if tensor.shape[1] != num_layers:
+        raise ValueError(
+            f"Invalid routed_experts{req_msg}: num_layers mismatch, "
+            f"expected {num_layers}, got {tensor.shape[1]}."
+        )
+    if tensor.shape[2] != num_experts_per_tok:
+        raise ValueError(
+            f"Invalid routed_experts{req_msg}: num_experts_per_tok mismatch, "
+            f"expected {num_experts_per_tok}, got {tensor.shape[2]}."
+        )
+    if tensor.shape[0] < min_router_seq_len:
+        raise ValueError(
+            f"Invalid routed_experts{req_msg}: router replay trace is too short, "
+            f"expected at least {min_router_seq_len} token positions, "
+            f"got {tensor.shape[0]}."
+        )
+
+    tensor = tensor.to(device="cpu", dtype=torch.int32)
+    if tensor.numel() > 0 and not getattr(tensor, "_sglang_router_replay_trusted", False):
+        if bool((tensor < -1).any()):
+            min_id = int(tensor.min().item())
+            raise ValueError(
+                f"Invalid routed_experts{req_msg}: expert id out of range "
+                f"[0, {num_logical_routed_experts}) or -1 for masked layers; "
+                f"min={min_id}."
+            )
+        invalid_mask = tensor < 0
+        partially_masked = invalid_mask.any(dim=2) & ~invalid_mask.all(dim=2)
+        if bool(partially_masked.any()):
+            raise ValueError(
+                f"Invalid routed_experts{req_msg}: expert id out of range; "
+                "-1 mask values must cover all experts for a token/layer."
+            )
+        valid_tensor = tensor[tensor >= 0]
+        if valid_tensor.numel() > 0:
+            min_id = int(valid_tensor.min().item())
+            max_id = int(valid_tensor.max().item())
+        else:
+            min_id = max_id = -1
+        if valid_tensor.numel() > 0 and max_id >= num_logical_routed_experts:
+            raise ValueError(
+                f"Invalid routed_experts{req_msg}: expert id out of range "
+                f"[0, {num_logical_routed_experts}); min={min_id}, max={max_id}."
+            )
+
+    return tensor
+
+
+def _has_router_replay(req: Any) -> bool:
+    return getattr(req, "router_replay_experts", None) is not None
+
+
+def _check_router_replay_batch_consistency(reqs: List[Any]) -> bool:
+    replay_flags = [_has_router_replay(req) for req in reqs]
+    if any(replay_flags) and not all(replay_flags):
+        raise ValueError("Cannot mix router replay requests with non-replay requests.")
+    return any(replay_flags)
+
+
+def _router_replay_short_trace_error(
+    req: Any, start: int, end: int, router_seq_len: int
+) -> ValueError:
+    rid = getattr(req, "rid", None)
+    req_msg = f" for request {rid}" if rid is not None else ""
+    return ValueError(
+        f"router replay trace{req_msg} is too short: need token positions "
+        f"[{start}:{end}), but trace length is {router_seq_len}."
+    )
+
+
+def _is_router_replay_decode_overrun(req: Any, trace_pos: int) -> bool:
+    sampling_params = getattr(req, "sampling_params", None)
+    max_new_tokens = getattr(sampling_params, "max_new_tokens", None)
+    origin_input_ids = getattr(req, "origin_input_ids", None)
+    if max_new_tokens is None or origin_input_ids is None:
+        return False
+
+    max_forward_trace_len = len(origin_input_ids) + max(max_new_tokens - 1, 0)
+    return trace_pos >= max_forward_trace_len
+
+
+def build_router_replay_extend_batch(
+    reqs: List[Any],
+    logical_prefix_lens: List[int],
+    device: Union[str, torch.device],
+) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+    if not _check_router_replay_batch_consistency(reqs):
+        return None, None
+
+    slices = []
+    for req, logical_prefix_len in zip(reqs, logical_prefix_lens):
+        trace = req.router_replay_experts
+        start = logical_prefix_len
+        end = logical_prefix_len + req.extend_input_len
+        if end > trace.shape[0]:
+            raise _router_replay_short_trace_error(req, start, end, trace.shape[0])
+        slices.append(trace[start:end])
+
+    if len(slices) == 0:
+        return None, None
+    if sum(s.shape[0] for s in slices) == 0:
+        ref = reqs[0].router_replay_experts
+        topk_ids = torch.empty((0, ref.shape[1], ref.shape[2]), dtype=torch.int32)
+    else:
+        topk_ids = torch.cat(slices, dim=0)
+    topk_ids = topk_ids.to(device=device, non_blocking=True)
+    mask = torch.ones((topk_ids.shape[0],), dtype=torch.bool, device=device)
+    return topk_ids, mask
+
+
+def build_router_replay_decode_batch(
+    reqs: List[Any],
+    device: Union[str, torch.device],
+    trace_positions: Optional[List[int]] = None,
+) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+    if not _check_router_replay_batch_consistency(reqs):
+        return None, None
+    if trace_positions is not None and len(trace_positions) != len(reqs):
+        raise ValueError(
+            "router replay decode trace_positions length must match request count."
+        )
+
+    slices = []
+    masks = []
+    for i, req in enumerate(reqs):
+        trace = req.router_replay_experts
+        trace_pos = (
+            trace_positions[i] if trace_positions is not None else req.seqlen - 1
+        )
+        if trace_pos >= trace.shape[0]:
+            if _is_router_replay_decode_overrun(req, trace_pos):
+                slices.append(torch.zeros_like(trace[:1]))
+                masks.append(False)
+                continue
+            raise _router_replay_short_trace_error(
+                req, trace_pos, trace_pos + 1, trace.shape[0]
+            )
+        slices.append(trace[trace_pos : trace_pos + 1])
+        masks.append(True)
+
+    if len(slices) == 0:
+        return None, None
+    topk_ids = torch.cat(slices, dim=0).to(device=device, non_blocking=True)
+    mask = torch.tensor(masks, dtype=torch.bool, device=device)
+    return topk_ids, mask
 
 
 class BaseFinishReason:
@@ -575,6 +751,207 @@ class MultimodalInputs:
         # other args would be kept intact
 
 
+@dataclasses.dataclass
+class OverEncodingContext:
+    """Context data for over-encoding shifted input IDs."""
+
+    NUM_GRAMS: ClassVar[int] = 3
+
+    input_ids_grams: List[torch.Tensor] = dataclasses.field(default_factory=list)
+    input_ids_buffer: Optional[torch.Tensor] = None
+    buffer_size: int = 4
+    filtered: bool = False
+
+    @classmethod
+    def from_extend(cls, reqs, logical_prefix_lens, device) -> "OverEncodingContext":
+        gram_lists = [[] for _ in range(cls.NUM_GRAMS)]
+        for req, logical_prefix_len in zip(reqs, logical_prefix_lens):
+            for gram_idx in range(cls.NUM_GRAMS):
+                gram_lists[gram_idx].append(
+                    cls._shift_ids(req.fill_ids, gram_idx + 1)[logical_prefix_len:]
+                )
+
+        flat_per_gram = [sum(gram_lists[gram_idx], []) for gram_idx in range(cls.NUM_GRAMS)]
+        num_tokens = len(flat_per_gram[0])
+        all_flat = []
+        for flat in flat_per_gram:
+            all_flat.extend(flat)
+
+        gram_tensor = torch.tensor(all_flat, dtype=torch.int64).to(
+            device, non_blocking=True
+        )
+        buffer_builder = cls()
+        input_ids_buffer = torch.tensor(
+            sum([buffer_builder.get_token_ids_buffer(req.fill_ids) for req in reqs], []),
+            dtype=torch.int64,
+        ).to(device, non_blocking=True)
+        return cls(
+            input_ids_grams=[
+                gram_tensor[i * num_tokens : (i + 1) * num_tokens]
+                for i in range(cls.NUM_GRAMS)
+            ],
+            input_ids_buffer=input_ids_buffer,
+        )
+
+    @classmethod
+    def from_decode(cls, reqs, enable_overlap, device) -> "OverEncodingContext":
+        batch_size = len(reqs)
+        gram_lists = [[] for _ in range(cls.NUM_GRAMS)]
+        for req in reqs:
+            ids = req.origin_input_ids + req.output_ids
+            if enable_overlap:
+                decode_count = getattr(req, "_overlap_decode_count", 0)
+                offset = 1 if len(req.output_ids) > decode_count else 0
+                req._overlap_decode_count = decode_count + 1
+            else:
+                offset = 1
+            for gram_idx in range(cls.NUM_GRAMS):
+                shift = gram_idx + 1 + offset
+                gram_lists[gram_idx].append(ids[-shift] if len(ids) >= shift else 0)
+
+        all_grams = []
+        for gram_list in gram_lists:
+            all_grams.extend(gram_list)
+
+        gram_tensor = torch.tensor(all_grams, dtype=torch.int64).to(
+            device, non_blocking=True
+        )
+        buffer_builder = cls()
+        input_ids_buffer = torch.tensor(
+            sum(
+                [
+                    buffer_builder.get_token_ids_buffer(
+                        req.origin_input_ids + req.output_ids
+                    )
+                    for req in reqs
+                ],
+                [],
+            ),
+            dtype=torch.int64,
+        ).to(device, non_blocking=True)
+        return cls(
+            input_ids_grams=[
+                gram_tensor[i * batch_size : (i + 1) * batch_size]
+                for i in range(cls.NUM_GRAMS)
+            ],
+            input_ids_buffer=input_ids_buffer,
+        )
+
+    def merge_buffer(self, other: "OverEncodingContext"):
+        if self.input_ids_buffer is not None and other.input_ids_buffer is not None:
+            self.input_ids_buffer = torch.cat(
+                [self.input_ids_buffer, other.input_ids_buffer]
+            )
+        if len(self.input_ids_grams) != len(other.input_ids_grams):
+            raise ValueError(
+                "Cannot merge OverEncodingContext with different n-gram levels: "
+                f"{len(self.input_ids_grams)} vs {len(other.input_ids_grams)}."
+            )
+
+        merged_grams = []
+        for idx, (lhs, rhs) in enumerate(
+            zip(self.input_ids_grams, other.input_ids_grams)
+        ):
+            if lhs is None or rhs is None:
+                raise ValueError(
+                    "Cannot merge OverEncodingContext with missing n-gram "
+                    f"state at level {idx}: {lhs is None} vs {rhs is None}."
+                )
+            merged_grams.append(torch.cat([lhs, rhs]))
+        self.input_ids_grams = merged_grams
+
+    def filter_buffer(self, unfinished_index_device: torch.Tensor):
+        if self.input_ids_buffer is not None and not self.filtered:
+            self.input_ids_buffer = filter_buffer(
+                self.input_ids_buffer, unfinished_index_device, self.buffer_size
+            )
+            self.filtered = True
+
+    def start_new_step(self):
+        self.filtered = False
+
+    def refresh_for_draft_extend(
+        self,
+        input_ids: torch.Tensor,
+        extend_lens: List[int],
+    ):
+        for idx, gram_tensor in enumerate(self.input_ids_grams):
+            if gram_tensor is None:
+                continue
+            assign_ngram_input_ids_draft_extend(
+                input_ids,
+                gram_tensor,
+                extend_lens,
+                idx + 2,
+            )
+
+        if self.input_ids_buffer is None:
+            return
+
+        expected_buffer_size = len(extend_lens) * self.buffer_size
+        if self.input_ids_buffer.numel() != expected_buffer_size:
+            raise ValueError(
+                "OverEncodingContext input_ids_buffer size does not match "
+                "draft-extend batch size: "
+                f"{self.input_ids_buffer.numel()} vs {expected_buffer_size}."
+            )
+        update_ngram_buffer_from_segments(
+            input_ids,
+            self.input_ids_buffer,
+            extend_lens,
+            self.buffer_size,
+        )
+
+    def get_gram(self, n: int) -> Optional[torch.Tensor]:
+        idx = n - 2
+        if 0 <= idx < len(self.input_ids_grams):
+            return self.input_ids_grams[idx]
+        return None
+
+    def set_gram(self, n: int, value: torch.Tensor):
+        idx = n - 2
+        while len(self.input_ids_grams) <= idx:
+            self.input_ids_grams.append(None)
+        self.input_ids_grams[idx] = value
+
+    def __getitem__(self, n: int) -> Optional[torch.Tensor]:
+        return self.get_gram(n)
+
+    def __len__(self) -> int:
+        return len(self.input_ids_grams)
+
+    @staticmethod
+    def _shift_ids(req_input_ids: List[int], n: int):
+        seq_len = len(req_input_ids)
+        result_id = [0] * seq_len
+        if seq_len <= n:
+            return result_id
+        result_id[n:] = req_input_ids[:-n]
+        return result_id
+
+    def get_token_ids_buffer(self, req_input_ids: List[int]):
+        seq_len = len(req_input_ids)
+        result_id = [0] * self.buffer_size
+        start_idx = min(seq_len, self.buffer_size)
+        result_id[-start_idx:] = req_input_ids[-start_idx:]
+        return result_id
+
+    def __getattr__(self, name: str):
+        if name.startswith("input_ids_gram"):
+            suffix = name[len("input_ids_gram") :]
+            if suffix.isdigit():
+                return self.get_gram(int(suffix))
+        raise AttributeError(f"'{type(self).__name__}' has no attribute '{name}'")
+
+    def __setattr__(self, name: str, value):
+        if name.startswith("input_ids_gram"):
+            suffix = name[len("input_ids_gram") :]
+            if suffix.isdigit():
+                self.set_gram(int(suffix), value)
+                return
+        object.__setattr__(self, name, value)
+
+
 class Req(ReqDllmMixin):
     """The input and output status of a request."""
 
@@ -600,6 +977,7 @@ class Req(ReqDllmMixin):
         return_hidden_states: bool = False,
         return_routed_experts: bool = False,
         routed_experts_start_len: int = 0,
+        router_replay_experts: Optional[torch.Tensor] = None,
         return_indexer_topk: bool = False,
         eos_token_ids: Optional[Set[int]] = None,
         bootstrap_host: Optional[str] = None,
@@ -753,6 +1131,8 @@ class Req(ReqDllmMixin):
         self.swa_prefix_lock_released: bool = False
         # The prefix length that is inserted into the tree cache
         self.cache_protected_len: int = 0
+        # Physical-to-logical KV scale factor, set by init_next_round_input.
+        self._scale_seq_factor: int = 1
 
         # Whether or not if it is chunked. It increments whenever
         # it is chunked, and decrement whenever chunked request is
@@ -822,6 +1202,7 @@ class Req(ReqDllmMixin):
         # capture routed experts
         self.return_routed_experts = return_routed_experts
         self.routed_experts_start_len = routed_experts_start_len
+        self.router_replay_experts = router_replay_experts
         self.routed_experts: Optional[torch.Tensor] = (
             None  # cpu tensor: shape (seqlen, topk)
         )
@@ -1062,6 +1443,8 @@ class Req(ReqDllmMixin):
             if self.is_dllm():
                 self._update_block_offset_for_dllm()
 
+            self._scale_seq_factor = getattr(tree_cache, "scale_seq_factor", 1)
+
         if (
             self.is_retracted
             and self.multimodal_inputs is not None
@@ -1077,7 +1460,9 @@ class Req(ReqDllmMixin):
                 )
             )
 
-        self.set_extend_input_len(len(self.fill_ids) - len(self.prefix_indices))
+        self.set_extend_input_len(
+            len(self.fill_ids) - len(self.prefix_indices) // self._scale_seq_factor
+        )
 
     # Based on https://github.com/vllm-project/vllm/blob/7a64d24aad69e4d2548aa0bf528d9fe63428ab01/vllm/transformers_utils/detokenizer.py#L194-L313
     def init_incremental_detokenize(self):
@@ -1332,13 +1717,15 @@ class Req(ReqDllmMixin):
         # - extend_logprob_start_len: Relative position within current extend batch where logprob computation begins
         # - extend_input_len: Number of tokens that need to be processed in this extend batch
         self.extend_input_len = extend_input_len
+        scale = getattr(self, "_scale_seq_factor", 1) or 1
+        prefix_len = len(self.prefix_indices) // scale
         if self.logprob_start_len == -1:
-            logprob_start_len = len(self.fill_ids)
+            logprob_start_len = len(self.fill_ids) - 1
         else:
             # logprob_start_len should be at least the length of the prefix indices
-            logprob_start_len = max(self.logprob_start_len, len(self.prefix_indices))
+            logprob_start_len = max(self.logprob_start_len, prefix_len)
         self.extend_logprob_start_len = min(
-            logprob_start_len - len(self.prefix_indices),
+            logprob_start_len - prefix_len,
             self.extend_input_len,
         )
 
@@ -1503,6 +1890,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     return_indexer_topk: bool = False
 
+    # MoE router replay tensors aligned to current forward rows.
+    router_replay_topk_ids: Optional[torch.Tensor] = None
+    router_replay_mask: Optional[torch.Tensor] = None
+
     # Whether this batch is prefill-only (no token generation needed)
     is_prefill_only: bool = False
 
@@ -1511,6 +1902,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     # hicache pointer for synchronizing data loading from CPU to GPU
     hicache_consumer_index: int = -1
+
+    oe_context: Optional[OverEncodingContext] = None
+    scale_seq_factor: int = 1
 
     # Diffusion LLM
     dllm_config: Optional[DllmConfig] = None
@@ -1572,6 +1966,23 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     def is_dllm(self):
         return self.dllm_config is not None
+
+    def _get_scale_seq_factor(self) -> int:
+        if not self.reqs:
+            return 1
+
+        scale = max(getattr(req, "_scale_seq_factor", 1) or 1 for req in self.reqs)
+        for req in self.reqs:
+            req_scale = getattr(req, "_scale_seq_factor", 1) or 1
+            if req_scale != scale:
+                raise ValueError(
+                    f"Cannot batch requests with different scale_seq_factor: "
+                    f"batch_scale={scale}, req_scale={req_scale}, rid={req.rid}"
+                )
+        return scale
+
+    def has_router_replay(self) -> bool:
+        return any(_has_router_replay(req) for req in self.reqs)
 
     def prepare_encoder_info_extend(self, input_ids: List[int], seq_lens: List[int]):
         _pin = is_pin_memory_available(self.device)
@@ -1698,14 +2109,19 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             # For DLLM, we use a separate forward mode
             self.forward_mode = ForwardMode.DLLM_EXTEND
 
+        self.scale_seq_factor = self._get_scale_seq_factor()
+
         # Init tensors
         reqs = self.reqs
-        input_ids = [r.fill_ids[len(r.prefix_indices) :] for r in reqs]
+        scale = self.scale_seq_factor
+        logical_prefix_lens = [len(r.prefix_indices) // scale for r in reqs]
+        input_ids = [r.fill_ids[lpl:] for r, lpl in zip(reqs, logical_prefix_lens)]
         extend_num_tokens = sum(len(ids) for ids in input_ids)
         seq_lens = [len(r.fill_ids) for r in reqs]
         orig_seq_lens = [max(len(r.fill_ids), len(r.origin_input_ids)) for r in reqs]
-        prefix_lens = [len(r.prefix_indices) for r in reqs]
+        prefix_lens = logical_prefix_lens
         extend_lens = [r.extend_input_len for r in reqs]
+        expanded_seq_lens = [s * scale for s in seq_lens]
 
         # For matryoshka embeddings
         if self.model_config.is_matryoshka and any(
@@ -1730,10 +2146,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         input_ids_tensor = torch.tensor(
             list(chain.from_iterable(input_ids)), dtype=torch.int64, pin_memory=_pin
         ).to(self.device, non_blocking=True)
-        seq_lens_tensor = torch.tensor(seq_lens, dtype=torch.int64, pin_memory=_pin).to(
-            self.device, non_blocking=True
+        self.oe_context = OverEncodingContext.from_extend(
+            reqs, logical_prefix_lens, self.device
         )
-        seq_lens_cpu = torch.tensor(seq_lens, dtype=torch.int64)
+        seq_lens_tensor = torch.tensor(
+            expanded_seq_lens, dtype=torch.int64, pin_memory=_pin
+        ).to(self.device, non_blocking=True)
+        seq_lens_cpu = torch.tensor(expanded_seq_lens, dtype=torch.int64)
         orig_seq_lens_tensor = torch.tensor(
             orig_seq_lens, dtype=torch.int32, pin_memory=_pin
         ).to(self.device, non_blocking=True)
@@ -1749,7 +2168,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.extend_lens = extend_lens
         self.seq_lens = seq_lens_tensor
         self.seq_lens_cpu = seq_lens_cpu
-        self.extend_num_tokens = extend_num_tokens
+        self.extend_num_tokens = extend_num_tokens * scale
 
         # Allocate memory
         out_cache_loc, req_pool_indices_tensor, req_pool_indices = alloc_for_extend(
@@ -1771,7 +2190,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         for i, (req, seq_len, pre_len) in enumerate(zip(reqs, seq_lens, prefix_lens)):
             req.req_pool_idx = req_pool_indices[i]
-            assert seq_len - pre_len == req.extend_input_len
+            assert seq_len - pre_len == req.extend_input_len, (
+                f"seq_len={seq_len}, pre_len={pre_len}, "
+                f"extend_input_len={req.extend_input_len}, "
+                f"len(prefix_indices)={len(req.prefix_indices)}, "
+                f"batch_scale={scale}, req_scale={getattr(req, '_scale_seq_factor', 1)}, "
+                f"is_chunked={req.is_chunked}, rid={req.rid}"
+            )
 
             req.extend_batch_idx += 1
 
@@ -1866,7 +2291,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 # fill_ids = [3, 4]
                 # extend_input_logprob_token_id = [4, 0]
                 global_start_idx, global_end_idx = (
-                    len(req.prefix_indices),
+                    pre_len,
                     len(req.fill_ids),
                 )
                 if req.logprob_start_len == -1:
@@ -1940,7 +2365,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 )
         self.multimodal_inputs = multimodal_inputs
         self.token_type_ids = token_type_ids_tensor
-        self.seq_lens_sum = sum(seq_lens)
+        self.seq_lens_sum = sum(expanded_seq_lens)
 
         # Pre-compute delimiter indices as CPU tensors for MIS.
         # When --enable-mis is on, every request in the batch is expected to
@@ -1964,6 +2389,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.token_ids_logprobs = [r.token_ids_logprob for r in reqs]
 
         self.extend_logprob_start_lens = [r.extend_logprob_start_len for r in reqs]
+        self.prefix_lens = [p * scale for p in prefix_lens]
+        self.extend_lens = [e * scale for e in extend_lens]
         self.extend_input_logprob_token_ids = extend_input_logprob_token_ids
 
         if get_global_server_args().enable_mamba_extra_buffer():
@@ -1985,6 +2412,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         if self.model_config.is_encoder_decoder:
             self.prepare_encoder_info_extend(input_ids, seq_lens)
+
+        self.router_replay_topk_ids, self.router_replay_mask = (
+            build_router_replay_extend_batch(
+                reqs, logical_prefix_lens=logical_prefix_lens, device=self.device
+            )
+        )
 
         # Build sampling info
         self.sampling_info = SamplingBatchInfo.from_schedule_batch(
@@ -2080,6 +2513,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     def mix_with_running(self, running_batch: "ScheduleBatch"):
         self.forward_mode = ForwardMode.MIXED
         running_bs = running_batch.batch_size()
+        scale = self._get_scale_seq_factor()
 
         for req in running_batch.reqs:
             req.fill_ids = req.origin_input_ids + req.output_ids
@@ -2098,12 +2532,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # NOTE: prefix_indices is what has been cached, but we don't cache each decode step
         self.prefix_lens.extend(
             [
-                len(r.origin_input_ids) + len(r.output_ids) + delta
+                (len(r.origin_input_ids) + len(r.output_ids) + delta) * scale
                 for r in running_batch.reqs
             ]
         )
-        self.extend_lens.extend([1] * running_bs)
-        self.extend_num_tokens += running_bs
+        self.extend_lens.extend([scale] * running_bs)
+        self.extend_num_tokens += running_bs * scale
         # TODO (lianmin): Revisit this. It should be seq_len - 1
         self.extend_logprob_start_lens.extend([0] * running_bs)
         self.is_prefill_only = False
@@ -2112,6 +2546,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self, selected_indices: Optional[List[int]] = None
     ):
         page_size = self.token_to_kv_pool_allocator.page_size
+        scale = self._get_scale_seq_factor()
         requests = (
             self.reqs
             if selected_indices is None
@@ -2119,8 +2554,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         )
 
         if self.spec_algorithm.is_none():
-            new_pages = sum(1 for r in requests if r.kv_committed_len % page_size == 0)
-            return new_pages * page_size
+            return sum(
+                ceil_align(r.kv_committed_len + scale, page_size)
+                - ceil_align(r.kv_committed_len, page_size)
+                for r in requests
+            )
 
         if self.is_spec_v2:
             return self._new_tokens_required_next_decode_spec_v2(requests, page_size)
@@ -2269,6 +2707,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.orig_seq_lens = torch.empty(0, dtype=torch.int32, device=self.device)
         self.out_cache_loc = torch.empty(0, dtype=torch.int64, device=self.device)
         self.req_pool_indices = torch.empty(0, dtype=torch.int64, device=self.device)
+        self.router_replay_topk_ids = None
+        self.router_replay_mask = None
         self.seq_lens_sum = 0
         self.extend_num_tokens = 0
         self.sampling_info = SamplingBatchInfo.from_schedule_batch(
@@ -2284,6 +2724,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         return ret
 
     def prepare_for_decode(self):
+        scale = self._get_scale_seq_factor()
         self.forward_mode = ForwardMode.DECODE
         bs = len(self.reqs)
         # Decode embeds the last output token via embed_tokens; clear the stale
@@ -2333,31 +2774,41 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # but downstream kernels enforce int64 (e.g. DeepSeek-V4 hash_topk).
         self.input_ids = self.output_ids.to(torch.int64)
         self.output_ids = None
+        trace_positions = (self.seq_lens_cpu // scale).tolist()
+        self.router_replay_topk_ids, self.router_replay_mask = (
+            build_router_replay_decode_batch(
+                self.reqs, device=self.device, trace_positions=trace_positions
+            )
+        )
+        self.oe_context = OverEncodingContext.from_decode(
+            self.reqs, self.enable_overlap, self.device
+        )
 
         if self.model_config.is_encoder_decoder:
             self.prepare_encoder_info_decode()
 
         # Allocate memory
-        self.out_cache_loc = alloc_for_decode(self, token_per_req=1)
+        self.out_cache_loc = alloc_for_decode(self, token_per_req=scale)
 
         # Update req-level memory management fields
         for req in self.reqs:
             req.decode_batch_idx += 1
             req.kv_committed_len += 1
             req.kv_allocated_len += 1
+        locs = self.seq_lens.clone()
 
         # Update seq_lens after allocation
         if self.enable_overlap:
             # Do not use in-place operations in the overlap mode
-            self.seq_lens = self.seq_lens + 1
-            self.seq_lens_cpu = self.seq_lens_cpu + 1
+            self.seq_lens = self.seq_lens + scale
+            self.seq_lens_cpu = self.seq_lens_cpu + scale
             self.orig_seq_lens = self.orig_seq_lens + 1
         else:
             # A faster in-place version
-            self.seq_lens.add_(1)
-            self.seq_lens_cpu.add_(1)
+            self.seq_lens.add_(scale)
+            self.seq_lens_cpu.add_(scale)
             self.orig_seq_lens.add_(1)
-        self.seq_lens_sum += bs
+        self.seq_lens_sum += bs * scale
 
         if self.hisparse_coordinator is not None:
             self.hisparse_coordinator.map_last_loc_to_buffer(
@@ -2396,6 +2847,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 .pin_memory()
                 .to(device=self.device, non_blocking=True)
             )
+
+        if scale > 1:
+            self.extend_num_tokens = bs * scale
+            self.extend_lens = [scale] * bs
+            self.prefix_lens = locs.tolist()
+            self.extend_logprob_start_lens = [0] * bs
+            self.extend_input_logprob_token_ids = None
 
     def maybe_wait_verify_done(self):
         if self.is_spec_v2:
@@ -2461,6 +2919,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.mamba_track_indices = None
         self.mamba_track_mask = None
         self.mamba_track_seqlens = None
+        self.router_replay_topk_ids = None
+        self.router_replay_mask = None
         self.return_logprob = any(req.return_logprob for req in self.reqs)
         if self.return_logprob:
             self.top_logprobs_nums = [self.top_logprobs_nums[i] for i in keep_indices]
@@ -2483,6 +2943,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 new_indices=keep_indices_device,
                 has_been_filtered=has_been_filtered,
             )
+        if self.oe_context:
+            self.oe_context.filter_buffer(keep_indices_device)
 
     def merge_batch(self, other: "ScheduleBatch"):
         # In the regular scheduler path:
@@ -2534,19 +2996,32 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.has_grammar |= other.has_grammar
         self.return_hidden_states |= other.return_hidden_states
         self.is_prefill_only = self.is_prefill_only and other.is_prefill_only
+        self.router_replay_topk_ids = None
+        self.router_replay_mask = None
 
         if self.spec_info:
             self.spec_info.merge_batch(other.spec_info)
+        if self.oe_context and other.oe_context:
+            self.oe_context.merge_buffer(other.oe_context)
 
     def get_model_worker_batch(
         self, seq_lens_cpu_cache: Optional[torch.Tensor] = None
     ) -> ModelWorkerBatch:
-        if self.forward_mode.is_decode_or_idle():
+        scale = self._get_scale_seq_factor()
+        if self.forward_mode.is_decode_or_idle() and scale <= 1:
             extend_seq_lens = extend_prefix_lens = extend_logprob_start_lens = None
+            welm_kv_mirror_last_q_indices = None
+            welm_kv_mirror_active_batch_indices = None
+            welm_kv_mirror_output_size = None
         else:
             extend_seq_lens = self.extend_lens
             extend_prefix_lens = self.prefix_lens
             extend_logprob_start_lens = self.extend_logprob_start_lens
+            (
+                welm_kv_mirror_last_q_indices,
+                welm_kv_mirror_active_batch_indices,
+                welm_kv_mirror_output_size,
+            ) = self._get_welm_kv_mirror_last_q_indices()
 
         if self.sampling_info:
             if self.has_grammar:
@@ -2581,6 +3056,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             extend_seq_lens=extend_seq_lens,
             extend_prefix_lens=extend_prefix_lens,
             extend_logprob_start_lens=extend_logprob_start_lens,
+            welm_kv_mirror_last_q_indices=welm_kv_mirror_last_q_indices,
+            welm_kv_mirror_active_batch_indices=welm_kv_mirror_active_batch_indices,
+            welm_kv_mirror_output_size=welm_kv_mirror_output_size,
+            router_replay_topk_ids=self.router_replay_topk_ids,
+            router_replay_mask=self.router_replay_mask,
             multimodal_inputs=self.multimodal_inputs,
             encoder_cached=self.encoder_cached,
             encoder_lens=self.encoder_lens,
@@ -2616,10 +3096,41 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             dllm_config=self.dllm_config,
             reqs=self.reqs,
             has_grammar=self.has_grammar,
+            dp_cooperation_info=self.dp_cooperation_info,
+            prefill_stats=self.prefill_stats,
+            oe_context=self.oe_context,
+            scale_seq_factor=scale,
             mamba_track_indices=self.mamba_track_indices,
             mamba_track_mask=self.mamba_track_mask,
             mamba_track_seqlens=self.mamba_track_seqlens,
         )
+
+    def _get_welm_kv_mirror_last_q_indices(
+        self,
+    ) -> Tuple[Optional[List[int]], Optional[List[int]], Optional[int]]:
+        if not self.extend_lens:
+            return None, None, None
+
+        last_q_indices: List[int] = []
+        active_batch_indices: List[int] = []
+        offset = 0
+        for batch_idx, (req, extend_len) in enumerate(zip(self.reqs, self.extend_lens)):
+            if self.forward_mode.is_draft_extend():
+                if extend_len > 0:
+                    last_q_indices.append(offset + extend_len - 1)
+                    active_batch_indices.append(batch_idx)
+                offset += extend_len
+                continue
+
+            committed_seq_len = len(req.origin_input_ids) + max(
+                len(req.output_ids) - 1, 0
+            )
+            if extend_len > 0 and len(req.fill_ids) >= committed_seq_len:
+                last_q_indices.append(offset + extend_len - 1)
+                active_batch_indices.append(batch_idx)
+            offset += extend_len
+
+        return last_q_indices, active_batch_indices, len(self.extend_lens)
 
     def copy(self):
         # Only contain fields that will be used by process_batch_result.
@@ -2641,6 +3152,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             all_extend_in_batch=self.all_extend_in_batch,
             is_extend_in_batch=self.is_extend_in_batch,
             is_prefill_only=self.is_prefill_only,
+            router_replay_topk_ids=self.router_replay_topk_ids,
+            router_replay_mask=self.router_replay_mask,
             seq_lens_cpu=self.seq_lens_cpu,
             enable_overlap=self.enable_overlap,
             mamba_track_indices=self.mamba_track_indices,
@@ -2786,7 +3299,12 @@ class ModelWorkerBatch:
     extend_seq_lens: Optional[List[int]]
     extend_prefix_lens: Optional[List[int]]
     extend_logprob_start_lens: Optional[List[int]]
+    welm_kv_mirror_last_q_indices: Optional[List[int]]
+    welm_kv_mirror_active_batch_indices: Optional[List[int]]
+    welm_kv_mirror_output_size: Optional[int]
     extend_input_logprob_token_ids: Optional[torch.Tensor]
+    router_replay_topk_ids: Optional[torch.Tensor]
+    router_replay_mask: Optional[torch.Tensor]
 
     # For multimodal
     multimodal_inputs: Optional[List[MultimodalInputs]]
@@ -2846,6 +3364,14 @@ class ModelWorkerBatch:
     # FIXME(lsyin): remove this after fully overlap grammar
     reqs: Optional[List[Req]] = None
     has_grammar: bool = False
+
+    # Over Encoding
+    oe_context: Optional[OverEncodingContext] = None
+    scale_seq_factor: int = 1
+
+    # Metrics
+    dp_cooperation_info: Optional[DPCooperationInfo] = None
+    prefill_stats: Optional[PrefillStats] = None
 
     # For hidden states before normal
     return_hidden_states_before_norm: bool = False

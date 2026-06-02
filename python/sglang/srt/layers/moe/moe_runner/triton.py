@@ -121,6 +121,7 @@ class TritonRunnerCore(MoeRunnerCore):
             no_combine=self.config.no_combine,
             inplace=self.config.inplace,
             apply_router_weight_on_input=self.config.apply_router_weight_on_input,
+            apply_router_weight_on_swiglu=self.config.apply_router_weight_on_swiglu,
             routed_scaling_factor=self.config.routed_scaling_factor,
             gemm1_alpha=self.config.gemm1_alpha,
             gemm1_limit=self.config.gemm1_clamp_limit,

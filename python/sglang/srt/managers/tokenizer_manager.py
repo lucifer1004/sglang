@@ -74,6 +74,7 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.mm_utils import TensorTransportMode, wrap_shm_features
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
+from sglang.srt.managers.routed_experts_store import create_routed_experts_store
 from sglang.srt.managers.schedule_batch import MultimodalDataItem
 from sglang.srt.managers.scheduler import is_health_check_generate_req
 from sglang.srt.managers.scheduler_input_blocker import input_blocker_guard_region
@@ -100,6 +101,7 @@ from sglang.srt.server_args import (
     set_global_server_args_for_tokenizer,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.state_capturer.routed_experts import encode_routed_experts_payload
 from sglang.srt.utils import (
     configure_gc_warning,
     freeze_gc,
@@ -226,6 +228,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.enable_metrics = server_args.enable_metrics
         self.preferred_sampling_params = server_args.preferred_sampling_params
         self.crash_dump_folder = server_args.crash_dump_folder
+        self.routed_experts_store = create_routed_experts_store(
+            server_args.routed_experts_store_dsn
+        )
         set_global_server_args_for_tokenizer(server_args)
 
         # Init model config
@@ -1726,10 +1731,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             if getattr(recv_obj, "routed_experts", None):
                 val = recv_obj.routed_experts[i]
                 if val is not None:
-                    # BatchStrOutput is pre-encoded by the detokenizer;
-                    # BatchTokenIDOutput (skip_tokenizer_init) bypasses it.
-                    if isinstance(val, torch.Tensor):
-                        val = pybase64.b64encode(val.numpy().tobytes()).decode("utf-8")
+                    # BatchStrOutput is pre-encoded unless a remote store is
+                    # configured; BatchTokenIDOutput bypasses the detokenizer.
+                    if self.routed_experts_store is not None:
+                        val = self.routed_experts_store.put(val)
+                    val = encode_routed_experts_payload(val)
                     meta_info["routed_experts"] = val
             if getattr(recv_obj, "indexer_topk", None):
                 val = recv_obj.indexer_topk[i]

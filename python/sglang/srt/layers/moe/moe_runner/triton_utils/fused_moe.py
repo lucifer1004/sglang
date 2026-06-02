@@ -32,7 +32,9 @@ from sglang.srt.utils.custom_op import register_custom_op
 from .fused_moe_triton_config import get_config_dtype_str, try_get_optimal_moe_config
 from .fused_moe_triton_kernels import (
     act_and_mul_triton,
+    apply_routed_weight_to_cache,
     invoke_fused_moe_kernel,
+    mmq_swiglu_mul_routed_weight,
     moe_sum_reduce_triton,
     support_tensor_descriptor,
 )
@@ -88,6 +90,28 @@ if not _is_cuda and not _is_hip and not _is_xpu:
 padding_size = get_moe_padding_size(_use_aiter)
 
 
+def mmq_sequential_moe_sum(
+    intermediate_cache: torch.Tensor,
+    out_hidden_states: torch.Tensor,
+    routed_scaling_factor: float,
+) -> None:
+    topk = intermediate_cache.shape[1]
+    if topk == 1:
+        if routed_scaling_factor == 1.0:
+            out_hidden_states.copy_(intermediate_cache[:, 0])
+        else:
+            torch.mul(
+                intermediate_cache[:, 0], routed_scaling_factor, out=out_hidden_states
+            )
+        return
+
+    torch.add(intermediate_cache[:, 0], intermediate_cache[:, 1], out=out_hidden_states)
+    for i in range(2, topk):
+        torch.add(out_hidden_states, intermediate_cache[:, i], out=out_hidden_states)
+    if routed_scaling_factor != 1.0:
+        out_hidden_states.mul_(routed_scaling_factor)
+
+
 @register_custom_op(mutates_args=["hidden_states"])
 def inplace_fused_experts(
     hidden_states: torch.Tensor,
@@ -100,6 +124,7 @@ def inplace_fused_experts(
     activation: str = "silu",
     is_gated: bool = True,
     apply_router_weight_on_input: bool = False,
+    apply_router_weight_on_swiglu: bool = False,
     use_fp8_w8a8: bool = False,
     use_int8_w8a8: bool = False,
     use_int8_w8a16: bool = False,
@@ -130,6 +155,7 @@ def inplace_fused_experts(
         activation,
         is_gated,
         apply_router_weight_on_input,
+        apply_router_weight_on_swiglu,
         use_fp8_w8a8,
         use_int8_w8a8,
         use_int8_w8a16,
@@ -163,6 +189,7 @@ def outplace_fused_experts(
     activation: str = "silu",
     is_gated: bool = True,
     apply_router_weight_on_input: bool = False,
+    apply_router_weight_on_swiglu: bool = False,
     use_fp8_w8a8: bool = False,
     use_int8_w8a8: bool = False,
     use_int8_w8a16: bool = False,
@@ -194,6 +221,7 @@ def outplace_fused_experts(
         activation,
         is_gated,
         apply_router_weight_on_input,
+        apply_router_weight_on_swiglu,
         use_fp8_w8a8,
         use_int8_w8a8,
         use_int8_w8a16,
@@ -254,6 +282,7 @@ def fused_experts(
             moe_runner_config.activation,
             moe_runner_config.is_gated,
             moe_runner_config.apply_router_weight_on_input,
+            moe_runner_config.apply_router_weight_on_swiglu,
             use_fp8_w8a8,
             use_int8_w8a8,
             use_int8_w8a16,
@@ -285,6 +314,7 @@ def fused_experts(
             moe_runner_config.activation,
             moe_runner_config.is_gated,
             moe_runner_config.apply_router_weight_on_input,
+            moe_runner_config.apply_router_weight_on_swiglu,
             use_fp8_w8a8,
             use_int8_w8a8,
             use_int8_w8a16,
@@ -430,6 +460,7 @@ def _fused_moe_kernel_sequence(
     no_combine: bool,
     inplace: bool,
     apply_router_weight_on_input: bool,
+    apply_router_weight_on_swiglu: bool,
     routed_scaling_factor: Optional[float],
     gemm1_alpha: Optional[float],
     gemm1_limit: Optional[float],
@@ -447,6 +478,9 @@ def _fused_moe_kernel_sequence(
     E, N, _ = w1.shape
     topk = topk_ids.shape[1]
     compute_type = tl.bfloat16 if hidden_states.dtype == torch.bfloat16 else tl.float16
+    assert not (
+        apply_router_weight_on_input and apply_router_weight_on_swiglu
+    ), "Cannot apply router weights both on MoE input and SwiGLU output"
 
     padded_tokens = (
         min(num_tokens * topk, E + 1) * (config["BLOCK_SIZE_M"] - 1)
@@ -526,6 +560,8 @@ def _fused_moe_kernel_sequence(
         dtype=hidden_states.dtype,
     )
 
+    fused_router_weight_on_swiglu = False
+
     # Activation function with multiplication
     if activation == "silu" and is_gated:
         # - gemm1_alpha != None: GPT-OSS-style swiglu(alpha, limit)
@@ -540,6 +576,23 @@ def _fused_moe_kernel_sequence(
             intermediate_cache2 = _swiglu_silu_clamp_mul(
                 intermediate_cache1.view(-1, N), gemm1_limit
             )
+        elif (
+            apply_router_weight_on_swiglu
+            and swiglu_limit is None
+            and gemm1_alpha is None
+            and gemm1_limit is None
+            and (_is_cuda or _is_hip)
+        ):
+            mmq_swiglu_mul_routed_weight(
+                intermediate_cache1,
+                intermediate_cache2,
+                topk_weights,
+                sorted_token_ids,
+                num_tokens_post_padded,
+                down_moe_use_tma,
+                True,
+            )
+            fused_router_weight_on_swiglu = True
         elif swiglu_limit is not None:
             # DeepSeek V4: swiglu clamp before silu_and_mul.
             # Two paths gated by SGLANG_OPT_SWIGLU_CLAMP_FUSION:
@@ -646,6 +699,15 @@ def _fused_moe_kernel_sequence(
     else:
         raise ValueError(f"Unsupported activation: {activation=}, with {is_gated=}")
 
+    if apply_router_weight_on_swiglu and not fused_router_weight_on_swiglu:
+        apply_routed_weight_to_cache(
+            intermediate_cache2,
+            topk_weights,
+            sorted_token_ids,
+            num_tokens_post_padded,
+            False,
+        )
+
     del intermediate_cache1
 
     intermediate_cache3 = torch.empty(
@@ -684,7 +746,9 @@ def _fused_moe_kernel_sequence(
         sorted_token_ids,
         expert_ids,
         num_tokens_post_padded,
-        not apply_router_weight_on_input and not no_combine,
+        not apply_router_weight_on_input
+        and not apply_router_weight_on_swiglu
+        and not no_combine,
         1,
         down_config or config,
         compute_type=compute_type,
@@ -718,6 +782,14 @@ def _fused_moe_kernel_sequence(
             if routed_scaling_factor != 1.0:
                 assert out_slice is not None
                 out_slice.mul_(routed_scaling_factor)
+        elif apply_router_weight_on_swiglu and get_bool_env_var(
+            "SGLANG_WELMV4_MMQ_MOE_COMBINE", "false"
+        ):
+            mmq_sequential_moe_sum(
+                intermediate_cache3,
+                out_hidden_states,
+                routed_scaling_factor,
+            )
         elif topk == 1 and routed_scaling_factor == 1.0 and not _use_intermediate:
             pass  # we wrote directly into out_hidden_states
         elif topk == 2 and routed_scaling_factor == 1.0:
@@ -797,6 +869,7 @@ def fused_experts_impl(
     activation: str = "silu",
     is_gated: bool = True,
     apply_router_weight_on_input: bool = False,
+    apply_router_weight_on_swiglu: bool = False,
     use_fp8_w8a8: bool = False,
     use_int8_w8a8: bool = False,
     use_int8_w8a16: bool = False,
@@ -884,6 +957,7 @@ def fused_experts_impl(
         no_combine=no_combine,
         inplace=inplace,
         apply_router_weight_on_input=apply_router_weight_on_input,
+        apply_router_weight_on_swiglu=apply_router_weight_on_swiglu,
         routed_scaling_factor=routed_scaling_factor,
         gemm1_alpha=gemm1_alpha,
         gemm1_limit=gemm1_limit,

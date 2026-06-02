@@ -88,6 +88,18 @@ _is_gfx95_supported = is_gfx95_supported()
 _is_npu = is_npu()
 _use_ag_after_qlora = envs.SGLANG_USE_AG_AFTER_QLORA.get()
 
+
+def _use_welm_legacy_dp_buffer(forward_batch: ForwardBatch) -> bool:
+    return (
+        getattr(forward_batch, "enable_welm_kv_mirror_opt", False)
+        or getattr(forward_batch, "scale_seq_factor", 1) != 1
+        or getattr(forward_batch, "oe_context", None) is not None
+    )
+
+
+def _get_dp_buffer_group(forward_batch: ForwardBatch, default_group):
+    return get_tp_group() if _use_welm_legacy_dp_buffer(forward_batch) else default_group
+
 if _use_aiter:
     from aiter.ops.rmsnorm import add_rmsnorm_quant as _aiter_add_rmsnorm_quant
     from aiter.ops.rmsnorm import rmsnorm_quant as _aiter_rmsnorm_quant
@@ -702,7 +714,10 @@ class LayerCommunicator:
             self._communicate_summable_tensor_pair_fn
             is CommunicateSummableTensorPairFn._scatter_hidden_states
         ):
-            if should_use_dp_reduce_scatterv():
+            if (
+                not _use_welm_legacy_dp_buffer(forward_batch)
+                and should_use_dp_reduce_scatterv()
+            ):
                 return True
             if forward_batch.dp_padding_mode.is_max_len():
                 return True
@@ -856,7 +871,9 @@ class CommunicateSimpleFn:
             return tuple(gathered_hidden_states)
 
         hidden_states, local_hidden_states = (
-            get_local_dp_buffer(get_attention_tp_group()),
+            get_local_dp_buffer(
+                _get_dp_buffer_group(forward_batch, get_attention_tp_group())
+            ),
             hidden_states,
         )
         attn_tp_all_gather_into_tensor(
@@ -966,7 +983,9 @@ class CommunicateWithAllReduceAndLayerNormFn:
 
         if residual_input_mode == ScatterMode.SCATTERED and context.attn_tp_size > 1:
             residual, local_residual = (
-                get_local_dp_buffer(get_attention_tp_group()),
+                get_local_dp_buffer(
+                    _get_dp_buffer_group(forward_batch, get_attention_tp_group())
+                ),
                 residual,
             )
             attn_tp_all_gather_into_tensor(residual, local_residual)
@@ -1211,7 +1230,9 @@ class CommunicateSummableTensorPairFn:
         context: CommunicateContext,
         allow_reduce_scatter: bool = False,
     ):
-        if get_tensor_model_parallel_world_size() == get_attention_dp_size():
+        if _use_welm_legacy_dp_buffer(forward_batch):
+            group = get_tp_group()
+        elif get_tensor_model_parallel_world_size() == get_attention_dp_size():
             group = get_tp_group()
         else:
             group = get_attention_tp_group()
@@ -1219,7 +1240,10 @@ class CommunicateSummableTensorPairFn:
             get_local_dp_buffer(group),
             hidden_states,
         )
-        if should_use_dp_reduce_scatterv():
+        if (
+            not _use_welm_legacy_dp_buffer(forward_batch)
+            and should_use_dp_reduce_scatterv()
+        ):
             get_tp_group().reduce_scatterv(
                 global_hidden_states,
                 output=hidden_states,
@@ -1242,7 +1266,9 @@ class CommunicateSummableTensorPairFn:
         hidden_states += residual
         residual = None
         hidden_states, local_hidden_states = (
-            get_local_dp_buffer(get_attention_tp_group()),
+            get_local_dp_buffer(
+                _get_dp_buffer_group(forward_batch, get_attention_tp_group())
+            ),
             hidden_states,
         )
         attn_tp_all_gather_into_tensor(
@@ -1301,7 +1327,9 @@ class CommunicateSummableTensorPairFn:
 
         # DP scatter (if DP attention is enabled)
         if context.attn_dp_size > 1:
-            if get_tensor_model_parallel_world_size() == get_attention_dp_size():
+            if _use_welm_legacy_dp_buffer(forward_batch):
+                group = get_tp_group()
+            elif get_tensor_model_parallel_world_size() == get_attention_dp_size():
                 group = get_tp_group()
             else:
                 group = get_attention_tp_group()

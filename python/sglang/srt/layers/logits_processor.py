@@ -72,6 +72,8 @@ class LogitsProcessorOutput:
     # Used by speculative decoding (EAGLE)
     # The last hidden layers
     hidden_states: Optional[torch.Tensor] = None
+    # Model-specific request-scope states that need to survive into follow-up forwards.
+    model_specific_states: Optional[Dict[str, Any]] = None
 
     ## Part 2: This part will be assigned in python/sglang/srt/layers/sampler.py::Sampler
     # he log probs of output tokens, if SGLANG_RETURN_ORIGINAL_LOGPROB = True, will get the log probs before applying temperature. If False, will get the log probs before applying temperature.
@@ -149,6 +151,11 @@ class LogitsMetadata:
     # Whether this batch is prefill-only (no token generation needed)
     is_prefill_only: bool = False
 
+    # For KV Mirror
+    enable_welm_kv_mirror_opt: bool = False
+    welm_kv_mirror_contracted: bool = False
+    scale_seq_factor: int = 1
+
     mm_input_embeds: Optional[torch.Tensor] = None
 
     @classmethod
@@ -201,6 +208,9 @@ class LogitsMetadata:
             global_num_tokens_for_logprob_cpu=forward_batch.global_num_tokens_for_logprob_cpu,
             global_num_tokens_for_logprob_gpu=forward_batch.global_num_tokens_for_logprob_gpu,
             dp_padding_mode=DpPaddingMode.SUM_LEN,
+            enable_welm_kv_mirror_opt=forward_batch.enable_welm_kv_mirror_opt,
+            welm_kv_mirror_contracted=forward_batch.welm_kv_mirror_contracted,
+            scale_seq_factor=forward_batch.scale_seq_factor,
             mm_input_embeds=forward_batch.mm_input_embeds,
         )
 
@@ -338,7 +348,12 @@ class LogitsProcessor(nn.Module):
         )
         del hidden_states
 
-        if not logits_metadata.extend_return_logprob:
+        # With KV mirror contraction, hidden states have already been reduced to
+        # sampled positions, so input-token logprobs are unavailable.
+        if (
+            not logits_metadata.extend_return_logprob
+            or logits_metadata.welm_kv_mirror_contracted
+        ):
             # Compute logits for both input and sampled tokens.
             logits = self._get_logits(pruned_states, lm_head, logits_metadata)
             sampled_logits = (
@@ -411,11 +426,13 @@ class LogitsProcessor(nn.Module):
         pruned_states_before_norm: Optional[torch.Tensor] = None
         aux_pruned_states = None
         token_to_seq_idx = []
+        kv_mirror_pruned = logits_metadata.welm_kv_mirror_contracted
 
         if (
             logits_metadata.forward_mode.is_decode_or_idle()
             or logits_metadata.forward_mode.is_target_verify()
             or logits_metadata.forward_mode.is_draft_extend_v2()
+            or kv_mirror_pruned
         ):
             pruned_states = hidden_states
             pruned_states_before_norm = hidden_states_before_norm

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
@@ -31,6 +32,43 @@ from sglang.jit_kernel.flash_attention import (
     flash_attn_varlen_func,
     flash_attn_with_kvcache,
 )
+
+_WELM_V4_MODEL_TYPES = {"welmv4_moe"}
+_WELM_V4_ARCHITECTURES = {
+    "WeLMV4MoeForCausalLM",
+    "WeLMV4MoeForCausalLMNextN",
+}
+_WELM_V4_NUM_SPLITS_ENV = "SGLANG_WELMV4_FLASH_ATTENTION_NUM_SPLITS"
+
+
+def _is_welm_v4_model(model_config) -> bool:
+    hf_config = getattr(model_config, "hf_config", None)
+    hf_text_config = getattr(model_config, "hf_text_config", None)
+    model_type = getattr(hf_config, "model_type", None) or getattr(
+        hf_text_config, "model_type", None
+    )
+    if model_type in _WELM_V4_MODEL_TYPES:
+        return True
+
+    architectures = getattr(hf_config, "architectures", None) or getattr(
+        hf_text_config, "architectures", None
+    )
+    return bool(
+        architectures and any(arch in _WELM_V4_ARCHITECTURES for arch in architectures)
+    )
+
+
+def _get_welm_v4_num_splits() -> int:
+    env_value = os.getenv(_WELM_V4_NUM_SPLITS_ENV)
+    if env_value is None or not env_value.strip():
+        return 0
+    try:
+        num_splits = int(env_value)
+    except ValueError as exc:
+        raise ValueError(f"{_WELM_V4_NUM_SPLITS_ENV} must be an integer.") from exc
+    if num_splits < 0:
+        raise ValueError(f"{_WELM_V4_NUM_SPLITS_ENV} must be non-negative.")
+    return num_splits
 
 
 @dataclass
@@ -69,6 +107,10 @@ class FlashAttentionMetadata:
     encoder_lens_int32: torch.Tensor = None
     # Page table for the encoder
     encoder_page_table: torch.Tensor = None
+
+    # For WeLM KV mirror contracted query rows
+    mirror_cu_seqlens_q: torch.Tensor = None
+    mirror_max_seq_len_q: int = 1
 
     @dataclass
     class LocalAttentionMetadata:
@@ -130,6 +172,7 @@ class FlashAttentionBackend(AttentionBackend):
         self.kv_cache_dtype = model_runner.kv_cache_dtype
         self.kv_cache_dtype_str = model_runner.server_args.kv_cache_dtype
         self.page_size = model_runner.page_size
+        self.is_welm_v4_model = _is_welm_v4_model(model_runner.model_config)
         self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
         self.skip_prefill = skip_prefill
         self.attn_cp_size = model_runner.attn_cp_size
@@ -204,15 +247,14 @@ class FlashAttentionBackend(AttentionBackend):
         # We set nums splits to 1 if deterministic inference is enabled.
         # See https://thinkingmachines.ai/blog/defeating-nondeterminism-in-llm-inference/ for more details.
         # Furthermore, FA4 does not support num_splits=0 with CUDA Graph, so we set num_splits to 1 if CUDA Graph is enabled.
-        self.num_splits = (
-            1
-            if model_runner.server_args.enable_deterministic_inference
-            or (
-                self.fa_impl_ver == 4
-                and not model_runner.server_args.disable_cuda_graph
-            )
-            else 0
-        )
+        if model_runner.server_args.enable_deterministic_inference or (
+            self.fa_impl_ver == 4 and not model_runner.server_args.disable_cuda_graph
+        ):
+            self.num_splits = 1
+        elif self.is_welm_v4_model:
+            self.num_splits = _get_welm_v4_num_splits()
+        else:
+            self.num_splits = 0
 
         # In embedding mode with no chunked prefill and radix cache disabled,
         # skip KV cache write and use flash_attn_varlen_func with raw K/V
@@ -509,6 +551,15 @@ class FlashAttentionBackend(AttentionBackend):
             metadata.page_table = forward_batch.req_to_token_pool.req_to_token[
                 forward_batch.req_pool_indices, : metadata.max_seq_len_k
             ]
+            if forward_batch.enable_welm_kv_mirror_opt:
+                mirror_num_queries = batch_size
+                if forward_batch.welm_kv_mirror_last_q_indices is not None:
+                    mirror_num_queries = (
+                        forward_batch.welm_kv_mirror_last_q_indices.numel()
+                    )
+                metadata.mirror_cu_seqlens_q = torch.arange(
+                    0, mirror_num_queries + 1, dtype=torch.int32, device=device
+                )
 
             if any(
                 forward_batch.extend_prefix_lens_cpu
@@ -715,6 +766,12 @@ class FlashAttentionBackend(AttentionBackend):
             else None
         )
 
+        use_welm_custom_last_q = (
+            getattr(forward_batch, "welm_kv_mirror_contracted", False)
+            and getattr(forward_batch, "custom_last_index", None) is not None
+            and q.shape[0] == forward_batch.custom_last_index.numel()
+        )
+
         # Get the appropriate page table based on whether we're using local attention
         if use_local_attn:
             local_metadata = metadata.local_attn_metadata
@@ -729,6 +786,31 @@ class FlashAttentionBackend(AttentionBackend):
             cache_seqlens = swa_spec_metadata.cache_seqlens_int32
             max_seqlen_q = swa_spec_metadata.max_seq_len_q
             cu_seqlens_k = swa_spec_metadata.cu_seqlens_k
+        elif use_welm_custom_last_q:
+            page_table = metadata.page_table
+            if is_swa_layer and self.use_sliding_window_kv_pool:
+                if metadata.swa_page_table is not None:
+                    page_table = metadata.swa_page_table
+                else:
+                    page_table = self.token_to_kv_pool.translate_loc_from_full_to_swa(
+                        metadata.page_table
+                    )
+            cu_seqlens_q = metadata.mirror_cu_seqlens_q
+            cache_seqlens = metadata.cache_seqlens_int32
+            max_seqlen_q = metadata.mirror_max_seq_len_q
+            cu_seqlens_k = metadata.cu_seqlens_k
+            active_indices = getattr(
+                forward_batch, "kv_mirror_active_batch_indices", None
+            )
+            if (
+                active_indices is not None
+                and active_indices.numel() != page_table.shape[0]
+            ):
+                page_table = page_table[active_indices]
+                cache_seqlens = cache_seqlens[active_indices]
+                cu_seqlens_k = torch.nn.functional.pad(
+                    torch.cumsum(cache_seqlens, dim=0, dtype=torch.int32), (1, 0)
+                )
         else:
             page_table = metadata.page_table
             if is_swa_layer and self.use_sliding_window_kv_pool:

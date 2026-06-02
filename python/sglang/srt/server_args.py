@@ -78,6 +78,32 @@ from sglang.utils import is_in_ci
 logger = logging.getLogger(__name__)
 
 # Define constants
+_WELM_V4_MODEL_TYPES = {"welmv4_moe"}
+_WELM_V4_ARCHITECTURES = {
+    "WeLMV4MoeForCausalLM",
+    "WeLMV4MoeForCausalLMNextN",
+}
+
+
+def _is_local_welm_v4_model_path(model_path: str) -> bool:
+    if not model_path or not os.path.isdir(model_path):
+        return False
+
+    config_path = os.path.join(model_path, "config.json")
+    try:
+        with open(config_path) as f:
+            config = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return False
+
+    model_type = config.get("model_type")
+    if model_type in _WELM_V4_MODEL_TYPES:
+        return True
+
+    architectures = config.get("architectures") or []
+    return any(arch in _WELM_V4_ARCHITECTURES for arch in architectures)
+
+
 DEFAULT_UVICORN_ACCESS_LOG_EXCLUDE_PREFIXES = ()
 MIMO_V2_MODEL_ARCHS = (
     "MiMoV2ForCausalLM",
@@ -4258,6 +4284,21 @@ class ServerArgs:
         envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.set(
             "1" if self.enable_deterministic_inference else "0"
         )
+        if (
+            _is_local_welm_v4_model_path(self.model_path)
+            and envs.SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2.get()
+        ):
+            if envs.SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2.is_set():
+                logger.warning(
+                    "Disabling SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2 for WeLM v4 "
+                    "to preserve legacy tensor-parallel all-reduce numerics."
+                )
+            else:
+                logger.info(
+                    "Disabling SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2 for WeLM v4 "
+                    "to preserve legacy tensor-parallel all-reduce numerics."
+                )
+            envs.SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2.set("0")
         # Custom all-reduce v2 uses IPC handles and is intra-node only. Force-disable
         # on multi-node so the dispatch falls back to the legacy CustomAllreduce path.
         if self.nnodes > 1 and envs.SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2.get():

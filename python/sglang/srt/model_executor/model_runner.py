@@ -147,6 +147,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
     PPProxyTensors,
 )
+from sglang.srt.model_executor.forward_batch_context import set_current_forward_batch
 from sglang.srt.model_executor.hook_manager import register_forward_hooks
 from sglang.srt.model_executor.model_runner_kv_cache_mixin import (
     ModelRunnerKVCacheMixin,
@@ -2669,6 +2670,15 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             num_tokens_per_bs=num_tokens_per_bs,
             cache_loc_dtype=torch.int64,
             enable_mamba_track=False,
+            prepare_n_gram_inputs=self.server_args.prepare_n_gram_inputs,
+            scale_seq_factor=getattr(self.model_config.hf_config, "scale_seq_times", 0)
+            + 1,
+            router_replay_num_layers=getattr(
+                self.model_config.hf_text_config, "num_hidden_layers", 0
+            ),
+            router_replay_top_k=getattr(
+                self.model_config.hf_text_config, "num_experts_per_tok", 0
+            ),
         )
         buffers.num_token_non_padded[...] = num_tokens
 
@@ -3326,6 +3336,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 self.forward_pass_id,
                 forward_batch,
             ) as recorder_outputs,
+            set_current_forward_batch(forward_batch),
         ):
             output = self._forward_raw(
                 forward_batch,
