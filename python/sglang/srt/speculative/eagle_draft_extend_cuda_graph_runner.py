@@ -2,14 +2,12 @@ from __future__ import annotations
 
 import bisect
 import contextlib
-import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable, Optional
 
 import torch
 
 from sglang.srt.layers.dp_attention import DpPaddingMode, set_dp_buffer_len
-from sglang.srt.managers.schedule_batch import OverEncodingContext
 from sglang.srt.model_executor.cuda_graph_runner import (
     CUDA_GRAPH_CAPTURE_FAILED_MSG,
     CudaGraphRunner,
@@ -22,14 +20,13 @@ from sglang.srt.model_executor.cuda_graph_runner import (
     set_is_extend_in_batch,
     set_torch_compile_config,
 )
-from sglang.srt.model_executor.forward_batch_context import set_current_forward_batch
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
     ForwardMode,
 )
 from sglang.srt.model_executor.input_buffers import ForwardInputBuffers
-from sglang.srt.speculative.eagle_info import EagleDraftInput
+from sglang.srt.speculative.eagle_info import EagleDraftExtendInput
 from sglang.srt.speculative.spec_utils import fast_topk
 from sglang.srt.utils import (
     require_attn_tp_gather,
@@ -42,11 +39,6 @@ if TYPE_CHECKING:
     from sglang.srt.speculative.eagle_worker import EAGLEWorker
 
 
-_WELM_MTP_DUMP_ENABLED = os.environ.get(
-    "SGLANG_DUMP_MTP_ACTIVATIONS", "0"
-).strip().lower() in {"1", "true", "yes", "on"}
-
-
 @dataclass
 class EagleDraftExtendInputBuffers(ForwardInputBuffers):
     input_ids: torch.Tensor
@@ -54,14 +46,13 @@ class EagleDraftExtendInputBuffers(ForwardInputBuffers):
     out_cache_loc: torch.Tensor
     positions: torch.Tensor
     mrope_positions: torch.Tensor
-    hidden_states: torch.Tensor
+    hidden_states: Optional[torch.Tensor]
     seq_lens: torch.Tensor
     seq_lens_cpu: torch.Tensor
     extend_seq_lens: torch.Tensor
-    num_accepted_drafts: torch.Tensor
-    num_accepted_tokens: torch.Tensor
+    num_correct_drafts: torch.Tensor
+    num_accept_tokens: torch.Tensor
     next_token_logits_buffer: torch.Tensor
-    mirrored_kv_indices: Optional[torch.Tensor]
     global_num_tokens_gpu: Optional[torch.Tensor]
     global_num_tokens_for_logprob_gpu: Optional[torch.Tensor]
 
@@ -113,12 +104,7 @@ class EAGLEDraftExtendCudaGraphRunner:
         self.padded_static_len = -1
 
         # Attention backend
-        self.num_tokens_per_bs = (
-            int(model_runner.server_args.speculative_num_draft_tokens)
-            if self.forward_mode == ForwardMode.DRAFT_EXTEND_V2
-            and model_runner.server_args.speculative_num_draft_tokens
-            else self.speculative_num_steps + 1
-        )
+        self.num_tokens_per_bs = self.speculative_num_steps + 1
         self.max_bs = max(self.capture_bs)
         self.max_num_token = self.max_bs * self.num_tokens_per_bs
 
@@ -146,33 +132,15 @@ class EAGLEDraftExtendCudaGraphRunner:
             positions = torch.zeros((self.max_num_token,), dtype=torch.int64)
             mrope_positions = torch.zeros((3, self.max_num_token), dtype=torch.int64)
 
-            if (
-                self.eagle_worker.speculative_algorithm.is_eagle3()
-                and self.eagle_worker.eagle_use_aux_hidden_state
-            ):
-                hidden_states = torch.zeros(
-                    (
-                        self.max_num_token,
-                        (
-                            self.model_runner.model_config.hf_config.target_hidden_size
-                            * 3
-                            if hasattr(
-                                self.model_runner.model_config.hf_config,
-                                "target_hidden_size",
-                            )
-                            else self.model_runner.model_config.hidden_size * 3
-                        ),
-                    ),
-                    dtype=self.model_runner.dtype,
+            _hidden_size = EagleDraftExtendInput.hidden_size_for(self.eagle_worker)
+            hidden_states = (
+                torch.zeros(
+                    (self.max_num_token, _hidden_size),
+                    dtype=EagleDraftExtendInput.dtype_for(self.eagle_worker),
                 )
-            else:
-                hidden_states = torch.zeros(
-                    (
-                        self.max_num_token,
-                        self.model_runner.model_config.spec_hidden_size,
-                    ),
-                    dtype=self.model_runner.dtype,
-                )
+                if _hidden_size is not None
+                else None
+            )
             self.seq_len_fill_value = (
                 self.model_runner.attn_backend.get_cuda_graph_seq_len_fill_value()
             )
@@ -182,10 +150,10 @@ class EAGLEDraftExtendCudaGraphRunner:
             extend_seq_lens = torch.full(
                 (self.max_bs,), self.num_tokens_per_bs, dtype=torch.int32
             )
-            num_accepted_drafts = torch.full(
+            num_correct_drafts = torch.full(
                 (self.max_bs,), self.num_tokens_per_bs, dtype=torch.int32
             )
-            num_accepted_tokens = torch.full(
+            num_accept_tokens = torch.full(
                 (self.max_bs,), self.num_tokens_per_bs, dtype=torch.int32
             )
 
@@ -229,45 +197,6 @@ class EAGLEDraftExtendCudaGraphRunner:
                 ),
                 dtype=torch.float,
             )
-            if self.model_runner.server_args.prepare_n_gram_inputs:
-                self.ngram_input_ids = OverEncodingContext(
-                    input_ids_grams=[
-                        torch.zeros((self.max_num_token,), dtype=torch.int64)
-                        for _ in range(3)
-                    ],
-                    input_ids_buffer=torch.zeros(
-                        (self.max_bs * OverEncodingContext.buffer_size), dtype=torch.int64
-                    ),
-                )
-            else:
-                self.ngram_input_ids = None
-
-            mirrored_kv_indices = None
-            self.welm_mtp_mirror_kv_states = None
-            self.welm_mtp_mirror_kv_len = 0
-            self.welm_mtp_mirror_padding_index = 0
-            if self._is_welmv4_mtp_draft_model():
-                mirrored_kv_indices = torch.arange(
-                    self.max_num_token, dtype=torch.int64
-                )
-                welm_mtp_mirror_source_len = self.max_bs * max(
-                    self.num_tokens_per_bs,
-                    int(model_runner.server_args.speculative_num_draft_tokens or 0),
-                )
-                self.welm_mtp_mirror_padding_index = welm_mtp_mirror_source_len
-                self.welm_mtp_mirror_kv_len = welm_mtp_mirror_source_len + 1
-                self.welm_mtp_mirror_kv_states = {}
-                for imitated_layer_idx, kv_size in self._welmv4_mtp_mirror_kv_specs():
-                    self.welm_mtp_mirror_kv_states[imitated_layer_idx] = (
-                        torch.zeros(
-                            (self.welm_mtp_mirror_kv_len, kv_size),
-                            dtype=self.model_runner.dtype,
-                        ),
-                        torch.zeros(
-                            (self.welm_mtp_mirror_kv_len, kv_size),
-                            dtype=self.model_runner.dtype,
-                        ),
-                    )
 
         self.buffers = EagleDraftExtendInputBuffers(
             input_ids=input_ids,
@@ -279,10 +208,9 @@ class EAGLEDraftExtendCudaGraphRunner:
             seq_lens=seq_lens,
             seq_lens_cpu=seq_lens_cpu,
             extend_seq_lens=extend_seq_lens,
-            num_accepted_drafts=num_accepted_drafts,
-            num_accepted_tokens=num_accepted_tokens,
+            num_correct_drafts=num_correct_drafts,
+            num_accept_tokens=num_accept_tokens,
             next_token_logits_buffer=next_token_logits_buffer,
-            mirrored_kv_indices=mirrored_kv_indices,
             global_num_tokens_gpu=global_num_tokens_gpu,
             global_num_tokens_for_logprob_gpu=global_num_tokens_for_logprob_gpu,
         )
@@ -325,164 +253,6 @@ class EAGLEDraftExtendCudaGraphRunner:
     def _cache_loc_dtype(self):
         return torch.int64
 
-    def _is_welmv4_mtp_draft_model(self) -> bool:
-        architectures = getattr(
-            self.model_runner.model_config.hf_config, "architectures", None
-        )
-        return bool(architectures and architectures[0] == "WeLMV4MoeForCausalLMNextN")
-
-    def _welmv4_mtp_mirror_kv_specs(self) -> list[tuple[int, int]]:
-        specs = {}
-        model = getattr(self.model_runner.model, "model", None)
-        for layer in getattr(model, "decoder_layers", []):
-            attn = getattr(layer, "self_attn", None)
-            qkv_proj = getattr(attn, "qkv_proj", None)
-            imitated_layer_idx = getattr(qkv_proj, "imitated_layer_idx", None)
-            kv_size = getattr(attn, "kv_size", None)
-            if imitated_layer_idx is not None and kv_size is not None:
-                specs[int(imitated_layer_idx)] = int(kv_size)
-        return sorted(specs.items())
-
-    def _welmv4_mtp_graph_model_specific_states(self):
-        if not self.welm_mtp_mirror_kv_states:
-            return None
-        return {
-            "welm_kv_mirror_states": {
-                layer_idx: (k, v)
-                for layer_idx, (k, v) in self.welm_mtp_mirror_kv_states.items()
-            }
-        }
-
-    def _copy_welmv4_mtp_mirror_kv_states(
-        self, forward_batch: ForwardBatch, num_tokens: int
-    ):
-        if not self.welm_mtp_mirror_kv_states:
-            return
-
-        model_specific_states = forward_batch.model_specific_states or {}
-        kv_states = model_specific_states.get("welm_kv_mirror_states")
-        if not isinstance(kv_states, dict):
-            raise RuntimeError(
-                "Missing WeLMV4 MTP mirrored KV states for draft-extend CUDA graph replay."
-            )
-        mirrored_kv_indices = getattr(
-            forward_batch.spec_info, "mirrored_kv_indices", None
-        )
-        required_kv_len = 0
-        if mirrored_kv_indices is not None and mirrored_kv_indices.numel() > 0:
-            required_kv_len = int(mirrored_kv_indices.max().item()) + 1
-        if required_kv_len > self.welm_mtp_mirror_padding_index:
-            raise RuntimeError(
-                "WeLMV4 MTP mirrored_kv_indices exceed draft-extend graph mirror-KV "
-                "source capacity: "
-                f"{required_kv_len=} capacity={self.welm_mtp_mirror_padding_index}"
-            )
-
-        for layer_idx, (dst_k, dst_v) in self.welm_mtp_mirror_kv_states.items():
-            src_pair = kv_states.get(layer_idx)
-            if src_pair is None:
-                raise RuntimeError(
-                    "Missing WeLMV4 MTP mirrored KV state for draft-extend "
-                    f"CUDA graph replay: {layer_idx=}"
-                )
-            src_k, src_v = src_pair
-            if src_k.shape[0] < required_kv_len or src_v.shape[0] < required_kv_len:
-                raise RuntimeError(
-                    "WeLMV4 MTP mirrored KV state is shorter than mirrored_kv_indices "
-                    f"require: {layer_idx=} {required_kv_len=} "
-                    f"k_len={src_k.shape[0]} v_len={src_v.shape[0]}"
-                )
-            dst_k.zero_()
-            dst_v.zero_()
-            copy_len = min(
-                self.welm_mtp_mirror_padding_index, src_k.shape[0], src_v.shape[0]
-            )
-            dst_k[:copy_len].copy_(src_k[:copy_len])
-            dst_v[:copy_len].copy_(src_v[:copy_len])
-
-    def _copy_welmv4_mtp_mirrored_kv_indices(
-        self, forward_batch: ForwardBatch, num_tokens: int
-    ):
-        if self.buffers.mirrored_kv_indices is None:
-            return
-        self.buffers.mirrored_kv_indices[:num_tokens].fill_(
-            self.welm_mtp_mirror_padding_index
-        )
-        mirrored_kv_indices = getattr(
-            forward_batch.spec_info, "mirrored_kv_indices", None
-        )
-        if mirrored_kv_indices is None:
-            self.buffers.mirrored_kv_indices[:num_tokens].copy_(
-                torch.arange(
-                    num_tokens,
-                    dtype=self.buffers.mirrored_kv_indices.dtype,
-                    device=self.buffers.mirrored_kv_indices.device,
-                )
-            )
-            return
-        if mirrored_kv_indices.numel() > num_tokens:
-            raise RuntimeError(
-                "WeLMV4 MTP mirrored_kv_indices is longer than draft-extend "
-                f"graph tokens: {mirrored_kv_indices.numel()} > {num_tokens}"
-            )
-        self.buffers.mirrored_kv_indices[: mirrored_kv_indices.numel()].copy_(
-            mirrored_kv_indices
-        )
-
-    def _copy_ngram_inputs(
-        self,
-        forward_batch: ForwardBatch,
-        raw_bs: int,
-        bs: int,
-        raw_num_tokens: int,
-        graph_num_tokens: int,
-    ):
-        if self.ngram_input_ids is None:
-            return
-
-        for gram in self.ngram_input_ids.input_ids_grams:
-            gram[:graph_num_tokens].zero_()
-        graph_buffer_len = bs * self.ngram_input_ids.buffer_size
-        self.ngram_input_ids.input_ids_buffer[:graph_buffer_len].zero_()
-
-        oe_context = getattr(forward_batch, "oe_context", None)
-        if oe_context is None:
-            return
-
-        if len(oe_context.input_ids_grams) != len(
-            self.ngram_input_ids.input_ids_grams
-        ):
-            raise RuntimeError(
-                "Draft-extend CUDA graph OE gram count mismatch: "
-                f"{len(oe_context.input_ids_grams)} vs "
-                f"{len(self.ngram_input_ids.input_ids_grams)}"
-            )
-
-        for dst_gram, src_gram in zip(
-            self.ngram_input_ids.input_ids_grams,
-            oe_context.input_ids_grams,
-        ):
-            if src_gram is None or src_gram.numel() < raw_num_tokens:
-                raise RuntimeError(
-                    "Draft-extend CUDA graph OE gram buffer is shorter than input: "
-                    f"gram_len={None if src_gram is None else src_gram.numel()} "
-                    f"{raw_num_tokens=}"
-                )
-            dst_gram[:raw_num_tokens].copy_(src_gram[:raw_num_tokens])
-
-        if oe_context.input_ids_buffer is None:
-            return
-        raw_buffer_len = raw_bs * self.ngram_input_ids.buffer_size
-        if oe_context.input_ids_buffer.numel() < raw_buffer_len:
-            raise RuntimeError(
-                "Draft-extend CUDA graph OE rolling buffer is shorter than batch: "
-                f"buffer_len={oe_context.input_ids_buffer.numel()} "
-                f"{raw_buffer_len=}"
-            )
-        self.ngram_input_ids.input_ids_buffer[:raw_buffer_len].copy_(
-            oe_context.input_ids_buffer[:raw_buffer_len]
-        )
-
     def _capture_init(self, run_once_fn):
         for _ in range(2):
             torch.cuda.synchronize()
@@ -524,9 +294,13 @@ class EAGLEDraftExtendCudaGraphRunner:
         out_cache_loc = buffers.out_cache_loc[:num_tokens]
         positions = buffers.positions[:num_tokens]
         mrope_positions = buffers.mrope_positions[:, :num_tokens]
-        hidden_states = buffers.hidden_states[:num_tokens]
-        num_accepted_drafts = buffers.num_accepted_drafts[:bs]
-        num_accepted_tokens = buffers.num_accepted_tokens[:bs]
+        hidden_states = (
+            buffers.hidden_states[:num_tokens]
+            if buffers.hidden_states is not None
+            else None
+        )
+        num_correct_drafts = buffers.num_correct_drafts[:bs]
+        num_accept_tokens = buffers.num_accept_tokens[:bs]
         next_token_logits_buffer = buffers.next_token_logits_buffer[
             : bs if self.forward_mode == ForwardMode.DRAFT_EXTEND else num_tokens
         ]
@@ -572,30 +346,13 @@ class EAGLEDraftExtendCudaGraphRunner:
         else:
             global_dp_buffer_len = None
 
-        spec_info = EagleDraftInput(
+        spec_info = EagleDraftExtendInput(
             hidden_states=hidden_states,
-            num_accepted_drafts=num_accepted_drafts,
-            num_accepted_tokens=num_accepted_tokens,
-            model_specific_states=self._welmv4_mtp_graph_model_specific_states(),
+            num_correct_drafts=num_correct_drafts,
+            num_accept_tokens=num_accept_tokens,
         )
-        spec_info.positions = None
-        if buffers.mirrored_kv_indices is not None:
-            spec_info.mirrored_kv_indices = buffers.mirrored_kv_indices[:num_tokens]
 
         self.deepep_adapter.capture(is_extend_in_batch=True)
-
-        if self.ngram_input_ids is not None:
-            buffer = self.ngram_input_ids.input_ids_buffer[
-                : bs * self.ngram_input_ids.buffer_size
-            ]
-            current_ngram_input_ids = OverEncodingContext(
-                input_ids_grams=[
-                    gram[:num_tokens] for gram in self.ngram_input_ids.input_ids_grams
-                ],
-                input_ids_buffer=buffer,
-            )
-        else:
-            current_ngram_input_ids = None
 
         # Forward batch
         forward_batch = ForwardBatch(
@@ -621,11 +378,9 @@ class EAGLEDraftExtendCudaGraphRunner:
             global_dp_buffer_len=global_dp_buffer_len,
             spec_algorithm=self.model_runner.spec_algorithm,
             spec_info=spec_info,
-            model_specific_states=spec_info.model_specific_states,
             capture_hidden_mode=CaptureHiddenMode.LAST,
             attn_backend=self.draft_extend_attn_backend,
             padded_static_len=self.padded_static_len,
-            oe_context=current_ngram_input_ids,
         )
 
         self.draft_extend_attn_backend.init_forward_metadata_capture_cuda_graph(
@@ -642,14 +397,6 @@ class EAGLEDraftExtendCudaGraphRunner:
         def run_once():
             # Clean intermediate result cache for DP attention
             forward_batch.dp_local_start_pos = forward_batch.dp_local_num_tokens = None
-            for attr in (
-                "custom_last_index",
-                "custom_last_cache_loc",
-                "kv_mirror_active_batch_indices",
-                "kv_mirror_output_size",
-            ):
-                if hasattr(forward_batch, attr):
-                    delattr(forward_batch, attr)
             set_dp_buffer_len(
                 global_dp_buffer_len,
                 num_tokens,
@@ -661,30 +408,11 @@ class EAGLEDraftExtendCudaGraphRunner:
             output_cache_loc_backup = forward_batch.out_cache_loc
             hidden_states_backup = forward_batch.spec_info.hidden_states
 
-            if _WELM_MTP_DUMP_ENABLED:
-                from sglang.srt.models import welmv4 as welmv4_module
-                from sglang.srt.models import welmv4_nextn as welmv4_nextn_module
-
-                welmv4_nextn_module._reset_mtp_graph_dump_call_index()
-                old_dump_context = welmv4_module._welm_set_graph_dump_context(
-                    "draft_extend"
-                )
-                try:
-                    with set_current_forward_batch(forward_batch):
-                        ret = self.model_runner.model.forward(
-                            forward_batch.input_ids,
-                            forward_batch.positions,
-                            forward_batch,
-                        )
-                finally:
-                    welmv4_module._welm_set_graph_dump_context(old_dump_context)
-            else:
-                with set_current_forward_batch(forward_batch):
-                    ret = self.model_runner.model.forward(
-                        forward_batch.input_ids,
-                        forward_batch.positions,
-                        forward_batch,
-                    )
+            ret = self.model_runner.model.forward(
+                forward_batch.input_ids,
+                forward_batch.positions,
+                forward_batch,
+            )
             probs = torch.softmax(ret.next_token_logits, dim=-1)
             ret.topk_p, ret.topk_index = fast_topk(probs, self.topk, dim=-1)
 
@@ -723,14 +451,11 @@ class EAGLEDraftExtendCudaGraphRunner:
 
         bs = self.capture_bs[index]
         if bs * self.num_tokens_per_bs != num_tokens:
-            graph_num_tokens = bs * self.num_tokens_per_bs
-            buffers.input_ids[:graph_num_tokens].zero_()
             buffers.seq_lens.fill_(self.seq_len_fill_value)
             buffers.out_cache_loc.zero_()
             buffers.positions.zero_()
-            buffers.hidden_states[:graph_num_tokens].zero_()
-            buffers.num_accepted_drafts.fill_(self.num_tokens_per_bs)
-            buffers.num_accepted_tokens.fill_(self.num_tokens_per_bs)
+            buffers.num_correct_drafts.fill_(self.num_tokens_per_bs)
+            buffers.num_accept_tokens.fill_(self.num_tokens_per_bs)
             buffers.extend_seq_lens.fill_(self.num_tokens_per_bs)
 
         # Common inputs
@@ -742,26 +467,21 @@ class EAGLEDraftExtendCudaGraphRunner:
             buffers.extend_seq_lens[:raw_bs].fill_(self.num_tokens_per_bs)
         buffers.out_cache_loc[:num_tokens].copy_(forward_batch.out_cache_loc)
         buffers.positions[:num_tokens].copy_(forward_batch.positions)
-        self._copy_welmv4_mtp_mirror_kv_states(
-            forward_batch,
-            self.welm_mtp_mirror_kv_len,
-        )
-        self._copy_welmv4_mtp_mirrored_kv_indices(
-            forward_batch, bs * self.num_tokens_per_bs
-        )
         if (
-            forward_batch.spec_info.hidden_states.shape[1]
+            buffers.hidden_states is not None
+            and forward_batch.spec_info.hidden_states is not None
+            and forward_batch.spec_info.hidden_states.shape[1]
             == buffers.hidden_states.shape[1]
         ):
             buffers.hidden_states[:num_tokens].copy_(
                 forward_batch.spec_info.hidden_states
             )
-        if forward_batch.spec_info.num_accepted_drafts is not None:
-            buffers.num_accepted_drafts[:raw_bs].copy_(
-                forward_batch.spec_info.num_accepted_drafts
+        if forward_batch.spec_info.num_correct_drafts is not None:
+            buffers.num_correct_drafts[:raw_bs].copy_(
+                forward_batch.spec_info.num_correct_drafts
             )
-            buffers.num_accepted_tokens[:raw_bs].copy_(
-                forward_batch.spec_info.num_accepted_tokens
+            buffers.num_accept_tokens[:raw_bs].copy_(
+                forward_batch.spec_info.num_accept_tokens
             )
         buffers.req_pool_indices[:raw_bs].copy_(forward_batch.req_pool_indices)
 
@@ -789,13 +509,6 @@ class EAGLEDraftExtendCudaGraphRunner:
             self.extend_seq_lens_cpu[raw_bs:bs] = [self.num_tokens_per_bs] * (
                 bs - raw_bs
             )
-        self._copy_ngram_inputs(
-            forward_batch,
-            raw_bs,
-            bs,
-            num_tokens,
-            bs * self.num_tokens_per_bs,
-        )
         forward_batch.spec_info.extend_seq_lens_cpu = list(
             self.extend_seq_lens_cpu[:bs]
         )
@@ -803,12 +516,8 @@ class EAGLEDraftExtendCudaGraphRunner:
 
         if bs != raw_bs:
             forward_batch.spec_info.positions = buffers.positions[:num_tokens]
-            forward_batch.spec_info.num_accepted_drafts = buffers.num_accepted_drafts[
-                :bs
-            ]
-            forward_batch.spec_info.num_accepted_tokens = buffers.num_accepted_tokens[
-                :bs
-            ]
+            forward_batch.spec_info.num_correct_drafts = buffers.num_correct_drafts[:bs]
+            forward_batch.spec_info.num_accept_tokens = buffers.num_accept_tokens[:bs]
 
         self.draft_extend_attn_backend.init_forward_metadata_replay_cuda_graph(
             bs=bs,
@@ -832,10 +541,10 @@ class EAGLEDraftExtendCudaGraphRunner:
             # DRAFT_EXTEND_V2: all tokens calculations whether accepted or not.
             unpadding_bs = num_tokens
         elif bs != raw_bs:
-            forward_batch.spec_info.num_accepted_drafts = buffers.num_accepted_drafts[
+            forward_batch.spec_info.num_correct_drafts = buffers.num_correct_drafts[
                 :raw_bs
             ]
-            forward_batch.spec_info.num_accepted_tokens = buffers.num_accepted_tokens[
+            forward_batch.spec_info.num_accept_tokens = buffers.num_accept_tokens[
                 :raw_bs
             ]
             unpadding_bs = raw_bs

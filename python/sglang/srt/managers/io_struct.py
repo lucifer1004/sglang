@@ -95,13 +95,13 @@ class SpeculativeDecodingMetricsMixin:
 
     # Accepted drafts: Number of accepted draft tokens during speculative decoding
     # (strict drafts-only count, excludes the bonus token).
-    spec_accepted_drafts: List[int]
+    spec_num_correct_drafts: List[int]
 
     # Acceptance histogram: List of lists, where each inner list represents histogram counts.
     # List index = number of accepted tokens in a step, List value = count of steps with that many accepted tokens.
     # Example: histogram[0] = 5 means 5 steps with 0 accepted tokens, histogram[3] = 10 means 10 steps with 3 accepted tokens.
     # Empty list [] when speculative decoding is disabled.
-    spec_acceptance_histogram: List[List[int]]
+    spec_correct_drafts_histogram: List[List[int]]
 
 
 # Parameters for a session
@@ -139,10 +139,6 @@ class GenerateReqInput(BaseReq):
     input_ids: Optional[Union[List[List[int]], List[int]]] = None
     # The embeddings for input_ids; one can specify either text or input_ids or input_embeds.
     input_embeds: Optional[Union[List[List[List[float]]], List[List[float]]]] = None
-    # Embedding overrides to place at specific token positions.
-    # Runtime type: Optional[Union[PositionalEmbeds, List[Optional[PositionalEmbeds]]]]
-    # Typed as Any to avoid Pydantic/FastAPI schema errors (PositionalEmbeds contains torch.Tensor).
-    positional_embed_overrides: Any = None
     # The image input. It can be an image instance, file name, URL, or base64 encoded string.
     # Can be formatted as:
     # - Single image for a single request
@@ -177,23 +173,11 @@ class GenerateReqInput(BaseReq):
     return_hidden_states: Union[List[bool], bool] = False
     # Whether to return captured routed experts
     return_routed_experts: bool = False
-    # The start location in the prompt for returning routed experts.
+    return_indexer_topk: bool = False
+    # Absolute start position for returned routings; response covers
+    # `[routed_experts_start_len, seqlen - 1)`. Must be in [0, prompt_tokens].
+    # 0 = full sequence.
     routed_experts_start_len: int = 0
-    # Force MoE router replay with structured expert ids.
-    # Single request: [router_seq_len, num_layers, top_k]
-    # Batch request: [batch, router_seq_len, num_layers, top_k]
-    routed_experts: Optional[
-        Union[
-            Dict[str, Any],
-            List[Union[Dict[str, Any], List[List[List[int]]]]],
-            List[List[List[int]]],
-            List[List[List[List[int]]]],
-        ]
-    ] = None
-    # Force the generated decode token sequence after each forward has run.
-    # Single request: [max_new_tokens]
-    # Batch request: [batch, max_new_tokens]
-    forced_decode_token_ids: Optional[Union[List[int], List[List[int]]]] = None
 
     # The modalities of the image data [image, multi-images, video]
     modalities: Optional[List[str]] = None
@@ -209,6 +193,10 @@ class GenerateReqInput(BaseReq):
     # of `CustomLogitProcessor` in python/sglang/srt/sampling/custom_logit_processor.py
     # Use the processor's `to_str()` method to generate the serialized string.
     custom_logit_processor: Optional[Union[List[Optional[str]], str]] = None
+    # Embedding overrides to place at specific token positions.
+    # Runtime type: Optional[Union[PositionalEmbeds, List[Optional[PositionalEmbeds]]]]
+    # Typed as Any to avoid Pydantic/FastAPI schema errors (PositionalEmbeds contains torch.Tensor).
+    positional_embed_overrides: Any = None
 
     # For disaggregated inference
     bootstrap_host: Optional[Union[List[str], str]] = None
@@ -381,10 +369,6 @@ class GenerateReqInput(BaseReq):
                 self.input_ids = [self.input_ids]
             if self.input_embeds is not None:
                 self.input_embeds = [self.input_embeds]
-            if self.routed_experts is not None:
-                self.routed_experts = [self.routed_experts]
-            if self.forced_decode_token_ids is not None:
-                self.forced_decode_token_ids = [self.forced_decode_token_ids]
 
     def _normalize_single_inputs(self):
         """Normalize inputs for a single example."""
@@ -418,8 +402,6 @@ class GenerateReqInput(BaseReq):
         self._normalize_video_data(num)
         self._normalize_audio_data(num)
         self._normalize_sampling_params(num)
-        self._normalize_routed_experts(num)
-        self._normalize_forced_decode_token_ids(num)
         self._normalize_logprob_params(num)
         self._normalize_custom_logit_processor(num)
         self._normalize_bootstrap_params(num)
@@ -521,54 +503,6 @@ class GenerateReqInput(BaseReq):
             self.sampling_params = [self.sampling_params] * num
         else:  # Already a list
             self.sampling_params = self.sampling_params * self.parallel_sample_num
-
-    def _normalize_routed_experts(self, num):
-        """Normalize MoE router replay traces for batch processing."""
-        if self.routed_experts is None:
-            return
-        if not isinstance(self.routed_experts, list):
-            raise ValueError("routed_experts should be a list.")
-        if len(self.routed_experts) != self.batch_size:
-            raise ValueError(
-                "The length of routed_experts should be equal to the batch size."
-            )
-
-        has_replay = [item is not None for item in self.routed_experts]
-        if not any(has_replay):
-            self.routed_experts = None
-            return
-        if not all(has_replay):
-            raise ValueError(
-                "In a batch generate request, all items must provide routed_experts "
-                "or none of them should."
-            )
-
-        self.routed_experts = self.routed_experts * self.parallel_sample_num
-
-    def _normalize_forced_decode_token_ids(self, num):
-        """Normalize forced decode token ids for batch processing."""
-        if self.forced_decode_token_ids is None:
-            return
-        if not isinstance(self.forced_decode_token_ids, list):
-            raise ValueError("forced_decode_token_ids should be a list.")
-        if not self.forced_decode_token_ids:
-            raise ValueError("forced_decode_token_ids should not be empty.")
-        if not isinstance(self.forced_decode_token_ids[0], list):
-            raise ValueError(
-                "Batch generate requests must provide forced_decode_token_ids "
-                "as a list of per-request token-id lists."
-            )
-        if len(self.forced_decode_token_ids) != self.batch_size:
-            raise ValueError(
-                "The length of forced_decode_token_ids should be equal to the "
-                "batch size."
-            )
-        if any(item is None or len(item) == 0 for item in self.forced_decode_token_ids):
-            raise ValueError("Each forced_decode_token_ids item should be non-empty.")
-
-        self.forced_decode_token_ids = (
-            self.forced_decode_token_ids * self.parallel_sample_num
-        )
 
     def _normalize_rid(self, num):
         """Normalize request IDs for batch processing."""
@@ -722,14 +656,8 @@ class GenerateReqInput(BaseReq):
                 else self.return_hidden_states
             ),
             return_routed_experts=self.return_routed_experts,
-            routed_experts=(
-                self.routed_experts[i] if self.routed_experts is not None else None
-            ),
-            forced_decode_token_ids=(
-                self.forced_decode_token_ids[i]
-                if self.forced_decode_token_ids is not None
-                else None
-            ),
+            routed_experts_start_len=self.routed_experts_start_len,
+            return_indexer_topk=self.return_indexer_topk,
             modalities=self.modalities[i] if self.modalities else None,
             session_params=self.session_params,
             lora_path=self.lora_path[i] if self.lora_path is not None else None,
@@ -805,12 +733,10 @@ class TokenizedGenerateReqInput(BaseReq):
 
     # Whether to return captured routed experts
     return_routed_experts: bool = False
-    # The start location in the prompt for returning routed experts.
+    # See GenerateReqInput.routed_experts_start_len.
     routed_experts_start_len: int = 0
-    # Replay-specific routed experts, still in structured request-list form.
-    router_replay_experts: Optional[Union[List[List[List[int]]], torch.Tensor]] = None
-    # Request-provided decode token ids to use after each forward has executed.
-    forced_decode_token_ids: Optional[List[int]] = None
+
+    return_indexer_topk: bool = False
 
     # The input embeds
     input_embeds: Optional[Union[List[List[List[float]]], List[List[float]]]] = None
@@ -1182,10 +1108,13 @@ class BatchTokenIDOutput(BaseBatchReq, SpeculativeDecodingMetricsMixin):
     # Hidden states
     output_hidden_states: List[List[float]]
 
-    # Per-request routed experts (input + output tokens). The common dense
-    # tensor shape is (token, layer, top_k). KV-mirror prefill can return a
-    # masked-dense dict because some layer-token routes are intentionally absent.
-    routed_experts: List[Optional[Union[torch.Tensor, Dict[str, Any]]]]
+    # Per-request routed experts (input + output tokens), shape
+    # (token, layer, top_k). DetokenizerManager encodes to base64 into
+    # BatchStrOutput; on the skip_tokenizer_init path the scheduler sends this
+    # straight to TokenizerManager, which encodes on demand.
+    routed_experts: List[Optional[torch.Tensor]]
+
+    indexer_topk: List[Optional[torch.Tensor]]
 
     # The information of placeholder tokens (e.g., image token)
     # idx is the index of the token in the prompt after expansion.
@@ -1245,9 +1174,12 @@ class BatchStrOutput(BaseBatchReq, SpeculativeDecodingMetricsMixin):
     # Hidden states
     output_hidden_states: List[List[float]]
 
-    # Per-request routed experts, encoded by DetokenizerManager off the tokenizer
-    # hot path. Dense payloads are base64 strings; masked-dense payloads are dicts.
-    routed_experts: List[Optional[Union[str, Dict[str, Any]]]]
+    # Per-request routed experts, base64-encoded by DetokenizerManager off the
+    # tokenizer hot path. Underlying tensor shape is (token, layer, top_k);
+    # see BatchTokenIDOutput.routed_experts.
+    routed_experts: List[Optional[str]]
+
+    indexer_topk: List[Optional[str]]
 
     # The information of placeholder tokens (e.g., image token)
     # idx is the index of the token in the prompt after expansion.
@@ -1449,7 +1381,26 @@ class PauseGenerationReqInput(BaseReq):
 
 @dataclass
 class ContinueGenerationReqInput(BaseReq):
-    pass
+    # Call torch.cuda.empty_cache() before un-pausing. Returns blocks
+    # cached by the PyTorch allocator (left over from transient allocs
+    # during post-weight-update processing) back to the driver before
+    # inference resumes, with no race against active streams. Set to
+    # False to skip the empty_cache call.
+    torch_empty_cache: bool = True
+
+
+@dataclass
+class TokenizerWorkerRegistration:
+    """Sent by each TokenizerWorker on startup to register its IPC name with the router."""
+
+    worker_ipc_name: str
+
+
+@dataclass
+class PauseContinueBroadcast:
+    """Broadcast from router to all workers to set is_pause state."""
+
+    is_pause: bool
 
 
 @dataclass
@@ -1464,7 +1415,7 @@ class UpdateWeightFromDiskReqInput(BaseReq):
     weight_version: Optional[str] = None
     # Whether to update weights asynchronously
     is_async: bool = False
-    # Whether to empty torch cache
+    # Whether to call torch.cuda.empty_cache() during flush
     torch_empty_cache: bool = False
     # Whether to keep the scheduler paused after weight update
     keep_pause: bool = False
@@ -1696,6 +1647,7 @@ class CheckWeightsReqInput(BaseReq):
 class CheckWeightsReqOutput(BaseReq):
     success: bool
     message: str
+    payload: Optional[Dict] = None
 
 
 @dataclass
@@ -1814,6 +1766,7 @@ class ConfigureLoggingReq(BaseReq):
     dump_requests_folder: Optional[str] = None
     dump_requests_threshold: Optional[int] = None
     crash_dump_folder: Optional[str] = None
+    dump_requests_exclude_meta_keys: Optional[List[str]] = None
 
 
 @dataclass
@@ -2026,8 +1979,8 @@ class DisaggregationMetrics:
     """PD disaggregation metrics."""
 
     mode: str  # "prefill", "decode", or "null" - not a metric
-    prefill_prealloc_queue_reqs: int = field(
-        default=0, metadata={"metric": ("gauge", "Prefill prealloc queue requests")}
+    prefill_bootstrap_queue_reqs: int = field(
+        default=0, metadata={"metric": ("gauge", "Prefill bootstrap queue requests")}
     )
     prefill_inflight_queue_reqs: int = field(
         default=0, metadata={"metric": ("gauge", "Prefill inflight queue requests")}

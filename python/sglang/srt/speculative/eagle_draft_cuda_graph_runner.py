@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import bisect
 import contextlib
-import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable, Optional
 
@@ -26,9 +25,11 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
 )
 from sglang.srt.model_executor.input_buffers import ForwardInputBuffers
-from sglang.srt.managers.schedule_batch import OverEncodingContext
 from sglang.srt.speculative.eagle_info import EagleDraftInput
-from sglang.srt.speculative.spec_utils import maybe_detect_nan, maybe_detect_oob
+from sglang.srt.speculative.spec_utils import (
+    maybe_detect_nan,
+    maybe_detect_oob,
+)
 from sglang.srt.utils import (
     require_attn_tp_gather,
     require_gathered_buffer,
@@ -38,11 +39,6 @@ from sglang.srt.utils import (
 
 if TYPE_CHECKING:
     from sglang.srt.speculative.eagle_worker import EAGLEWorker
-
-
-_WELM_MTP_DUMP_ENABLED = os.environ.get(
-    "SGLANG_DUMP_MTP_ACTIVATIONS", "0"
-).strip().lower() in {"1", "true", "yes", "on"}
 
 
 @dataclass
@@ -57,9 +53,7 @@ class EagleDraftInputBuffers(ForwardInputBuffers):
     extend_seq_lens: torch.Tensor
     topk_p: torch.Tensor
     topk_index: torch.Tensor
-    hidden_states: torch.Tensor
-    ngram_input_ids: Optional[list[torch.Tensor]]
-    ngram_input_ids_buffer: Optional[torch.Tensor]
+    hidden_states: Optional[torch.Tensor]
     global_num_tokens_gpu: Optional[torch.Tensor]
     global_num_tokens_for_logprob_gpu: Optional[torch.Tensor]
 
@@ -111,11 +105,6 @@ class EAGLEDraftCudaGraphRunner:
         self.max_num_token = self.max_bs * self.num_tokens_per_bs
 
         self.draft_attn_backend.init_cuda_graph_state(self.max_bs, self.max_num_token)
-        welmv4_mtp_base_kv_attn_backend = self._get_welmv4_mtp_base_kv_attn_backend()
-        if welmv4_mtp_base_kv_attn_backend is not None:
-            welmv4_mtp_base_kv_attn_backend.init_cuda_graph_state(
-                self.max_bs, self.max_num_token
-            )
         self.seq_len_fill_value = self.draft_attn_backend.attn_backends[
             0
         ].get_cuda_graph_seq_len_fill_value()
@@ -143,21 +132,15 @@ class EAGLEDraftCudaGraphRunner:
             extend_seq_lens = torch.ones((self.max_bs,), dtype=torch.int32)
             topk_p = torch.zeros((self.max_bs, self.topk), dtype=torch.float32)
             topk_index = torch.zeros((self.max_bs, self.topk), dtype=torch.int64)
-            hidden_states = torch.zeros(
-                (self.max_bs, self.model_runner.model_config.spec_hidden_size),
-                dtype=self.model_runner.dtype,
-            )
-            if self.model_runner.server_args.prepare_n_gram_inputs:
-                ngram_input_ids = [
-                    torch.zeros((self.max_num_token,), dtype=torch.int64)
-                    for _ in range(3)
-                ]
-                ngram_input_ids_buffer = torch.zeros(
-                    (self.max_bs * OverEncodingContext.buffer_size,), dtype=torch.int64
+            _hidden_size = EagleDraftInput.hidden_size_for(self.eagle_worker)
+            hidden_states = (
+                torch.zeros(
+                    (self.max_bs, _hidden_size),
+                    dtype=EagleDraftInput.dtype_for(self.eagle_worker),
                 )
-            else:
-                ngram_input_ids = None
-                ngram_input_ids_buffer = None
+                if _hidden_size is not None
+                else None
+            )
 
             if self.require_gathered_buffer:
                 if self.require_mlp_tp_gather:
@@ -189,8 +172,6 @@ class EAGLEDraftCudaGraphRunner:
             topk_p=topk_p,
             topk_index=topk_index,
             hidden_states=hidden_states,
-            ngram_input_ids=ngram_input_ids,
-            ngram_input_ids_buffer=ngram_input_ids_buffer,
             global_num_tokens_gpu=global_num_tokens_gpu,
             global_num_tokens_for_logprob_gpu=global_num_tokens_for_logprob_gpu,
         )
@@ -238,105 +219,18 @@ class EAGLEDraftCudaGraphRunner:
             torch.cuda.synchronize()
             self.model_runner.tp_group.barrier()
             run_once_fn()
+            hook = getattr(
+                self.model_runner.draft_attn_backend,
+                "on_after_cuda_graph_warmup",
+                None,
+            )
+            if hook is not None:
+                hook()
 
     def _capture_graph(self, graph, pool, stream, run_once_fn):
         with torch.cuda.graph(graph, pool=pool, stream=stream):
             out = run_once_fn()
         return out
-
-    def _get_welmv4_mtp_base_kv_attn_backend(self):
-        is_welmv4_mtp = getattr(
-            self.eagle_worker, "_is_welmv4_mtp_draft_model", lambda: False
-        )()
-        if not is_welmv4_mtp:
-            return None
-        return (
-            self.model_runner.decode_attn_backend
-            if self.model_runner.server_args.enable_pdmux
-            else self.model_runner.attn_backend
-        )
-
-    def _prepare_welmv4_mtp_base_kv_capture_metadata(
-        self,
-        forward_batch: ForwardBatch,
-        bs: int,
-        num_tokens: int,
-    ) -> None:
-        attn_backend = self._get_welmv4_mtp_base_kv_attn_backend()
-        if attn_backend is None:
-            return
-
-        spec_info_backup = forward_batch.spec_info
-        forward_batch.spec_info = None
-        try:
-            if not (
-                self.topk > 1
-                and hasattr(
-                    attn_backend,
-                    "init_welm_mtp_base_kv_metadata_capture_cuda_graph",
-                )
-                and attn_backend.init_welm_mtp_base_kv_metadata_capture_cuda_graph(
-                    bs,
-                    num_tokens,
-                    forward_batch.req_pool_indices,
-                    forward_batch.seq_lens,
-                )
-            ):
-                attn_backend.init_forward_metadata_capture_cuda_graph(
-                    bs,
-                    num_tokens,
-                    forward_batch.req_pool_indices,
-                    forward_batch.seq_lens,
-                    None,
-                    ForwardMode.DECODE,
-                    None,
-                )
-        finally:
-            forward_batch.spec_info = spec_info_backup
-        forward_batch.attn_backend = attn_backend
-        forward_batch.welm_mtp_base_kv_metadata_prepared = True
-
-    def _prepare_welmv4_mtp_base_kv_replay_metadata(
-        self,
-        forward_batch: ForwardBatch,
-        bs: int,
-        seq_lens_sum: int,
-    ) -> None:
-        attn_backend = self._get_welmv4_mtp_base_kv_attn_backend()
-        if attn_backend is None:
-            return
-
-        spec_info_backup = forward_batch.spec_info
-        forward_batch.spec_info = None
-        try:
-            if not (
-                self.topk > 1
-                and hasattr(
-                    attn_backend,
-                    "init_welm_mtp_base_kv_metadata_replay_cuda_graph",
-                )
-                and attn_backend.init_welm_mtp_base_kv_metadata_replay_cuda_graph(
-                    bs,
-                    self.num_tokens_per_bs,
-                    forward_batch.req_pool_indices,
-                    forward_batch.seq_lens,
-                    forward_batch.seq_lens_cpu,
-                )
-            ):
-                attn_backend.init_forward_metadata_replay_cuda_graph(
-                    bs,
-                    forward_batch.req_pool_indices,
-                    forward_batch.seq_lens,
-                    seq_lens_sum,
-                    None,
-                    ForwardMode.DECODE,
-                    None,
-                    seq_lens_cpu=forward_batch.seq_lens_cpu,
-                )
-        finally:
-            forward_batch.spec_info = spec_info_backup
-        forward_batch.attn_backend = attn_backend
-        forward_batch.welm_mtp_base_kv_metadata_prepared = True
 
     def _replay(self, forward_batch: ForwardBatch):
         ctx = (
@@ -367,20 +261,13 @@ class EAGLEDraftCudaGraphRunner:
         out_cache_loc = buffers.out_cache_loc[: num_tokens * self.speculative_num_steps]
         positions = buffers.positions[:num_tokens]
         mrope_positions = buffers.mrope_positions[:, :num_tokens]
-        hidden_states = buffers.hidden_states[:num_seqs]
+        hidden_states = (
+            buffers.hidden_states[:num_seqs]
+            if buffers.hidden_states is not None
+            else None
+        )
         topk_p = buffers.topk_p[:num_seqs]
         topk_index = buffers.topk_index[:num_seqs]
-        if buffers.ngram_input_ids_buffer is not None:
-            current_ngram_input_ids = OverEncodingContext(
-                input_ids_grams=[
-                    gram[:num_tokens] for gram in buffers.ngram_input_ids
-                ],
-                input_ids_buffer=buffers.ngram_input_ids_buffer[
-                    : num_seqs * OverEncodingContext.buffer_size
-                ],
-            )
-        else:
-            current_ngram_input_ids = None
 
         if self.require_mlp_tp_gather:
             buffers.global_num_tokens_gpu.copy_(
@@ -423,11 +310,16 @@ class EAGLEDraftCudaGraphRunner:
             global_dp_buffer_len = None
             global_num_tokens_for_logprob = None
 
+        capture_mode = (
+            CaptureHiddenMode.NULL
+            if self.model_runner.spec_algorithm.is_standalone()
+            else CaptureHiddenMode.LAST
+        )
         spec_info = EagleDraftInput(
             topk_p=topk_p,
             topk_index=topk_index,
             hidden_states=hidden_states,
-            capture_hidden_mode=CaptureHiddenMode.LAST,
+            capture_hidden_mode=capture_mode,
         )
 
         # Forward batch
@@ -456,20 +348,10 @@ class EAGLEDraftCudaGraphRunner:
             capture_hidden_mode=(
                 spec_info.capture_hidden_mode if spec_info else CaptureHiddenMode.NULL
             ),
-            oe_context=current_ngram_input_ids,
         )
-        if getattr(
-            self.eagle_worker, "_is_welmv4_mtp_draft_model", lambda: False
-        )():
-            forward_batch.welm_mtp_graph_oe_context_prepared = True
 
         # Attention backend
         self.draft_attn_backend.init_forward_metadata_capture_cuda_graph(forward_batch)
-        self._prepare_welmv4_mtp_base_kv_capture_metadata(
-            forward_batch,
-            num_seqs,
-            num_tokens,
-        )
 
         # Run and capture
         def run_once():
@@ -482,25 +364,15 @@ class EAGLEDraftCudaGraphRunner:
             )
             set_is_extend_in_batch(False)
 
-            # Backup two fields, which will be modified in-place in `draft_forward`.
+            # Backup fields that are modified in-place in `draft_forward`.
             output_cache_loc_backup = forward_batch.out_cache_loc
             hidden_states_backup = forward_batch.spec_info.hidden_states
 
-            if _WELM_MTP_DUMP_ENABLED:
-                from sglang.srt.models import welmv4 as welmv4_module
-                from sglang.srt.models import welmv4_nextn as welmv4_nextn_module
-
-                welmv4_nextn_module._reset_mtp_graph_dump_call_index()
-                old_dump_context = welmv4_module._welm_set_graph_dump_context("draft")
-                try:
-                    ret = self.eagle_worker.draft_forward(forward_batch)
-                finally:
-                    welmv4_module._welm_set_graph_dump_context(old_dump_context)
-            else:
-                ret = self.eagle_worker.draft_forward(forward_batch)
+            ret = self.eagle_worker.draft_forward(forward_batch)
 
             forward_batch.out_cache_loc = output_cache_loc_backup
             forward_batch.spec_info.hidden_states = hidden_states_backup
+            forward_batch.positions.sub_(self.eagle_worker.speculative_num_steps - 1)
             return ret
 
         self.deepep_adapter.capture(is_extend_in_batch=False)
@@ -547,13 +419,9 @@ class EAGLEDraftCudaGraphRunner:
             buffers.positions.zero_()
             buffers.topk_p.zero_()
             buffers.topk_index.zero_()
-            buffers.hidden_states.zero_()
+            if buffers.hidden_states is not None:
+                buffers.hidden_states.zero_()
             buffers.req_pool_indices.zero_()
-            if buffers.ngram_input_ids_buffer is not None:
-                buffers.ngram_input_ids_buffer.zero_()
-            if buffers.ngram_input_ids is not None:
-                for gram in buffers.ngram_input_ids:
-                    gram.zero_()
 
         num_tokens = bs * self.num_tokens_per_bs
 
@@ -576,48 +444,12 @@ class EAGLEDraftCudaGraphRunner:
         )
         buffers.topk_p[:raw_bs].copy_(forward_batch.spec_info.topk_p)
         buffers.topk_index[:raw_bs].copy_(forward_batch.spec_info.topk_index)
-        buffers.hidden_states[:raw_bs].copy_(forward_batch.spec_info.hidden_states)
+        if (
+            buffers.hidden_states is not None
+            and forward_batch.spec_info.hidden_states is not None
+        ):
+            buffers.hidden_states[:raw_bs].copy_(forward_batch.spec_info.hidden_states)
         buffers.req_pool_indices[:raw_bs].copy_(forward_batch.req_pool_indices)
-        if buffers.ngram_input_ids_buffer is not None:
-            raw_buffer_len = raw_bs * OverEncodingContext.buffer_size
-            saved_oe_buffer = getattr(
-                getattr(forward_batch, "spec_info", None),
-                "welm_mtp_oe_buffer",
-                None,
-            )
-            oe_context = getattr(forward_batch, "oe_context", None)
-            if saved_oe_buffer is not None and saved_oe_buffer.numel() >= raw_buffer_len:
-                buffers.ngram_input_ids_buffer[:raw_buffer_len].copy_(
-                    saved_oe_buffer[:raw_buffer_len].to(
-                        device=buffers.ngram_input_ids_buffer.device,
-                        dtype=buffers.ngram_input_ids_buffer.dtype,
-                    )
-                )
-            elif oe_context is not None and oe_context.input_ids_buffer is not None:
-                buffers.ngram_input_ids_buffer[:raw_buffer_len].copy_(
-                    oe_context.input_ids_buffer[:raw_buffer_len]
-                )
-            else:
-                buffers.ngram_input_ids_buffer[:raw_buffer_len].zero_()
-            if buffers.ngram_input_ids is not None:
-                source_buffer = buffers.ngram_input_ids_buffer[
-                    :raw_buffer_len
-                ].view(raw_bs, OverEncodingContext.buffer_size)
-                for idx, gram_buffer in enumerate(buffers.ngram_input_ids):
-                    n = idx + 2
-                    if n - 1 <= OverEncodingContext.buffer_size:
-                        gram = source_buffer[:, -(n - 1)]
-                    else:
-                        gram = torch.zeros(
-                            (raw_bs,),
-                            device=gram_buffer.device,
-                            dtype=gram_buffer.dtype,
-                        )
-                    if self.num_tokens_per_bs != 1:
-                        gram = gram.repeat_interleave(self.num_tokens_per_bs)
-                    gram_buffer[:raw_num_token].copy_(
-                        gram.to(device=gram_buffer.device, dtype=gram_buffer.dtype)
-                    )
 
         # TODO(ch-wan): support num_token_non_padded
         if self.require_gathered_buffer:
@@ -639,11 +471,6 @@ class EAGLEDraftCudaGraphRunner:
 
         self.draft_attn_backend.init_forward_metadata_replay_cuda_graph(
             forward_batch, bs
-        )
-        self._prepare_welmv4_mtp_base_kv_replay_metadata(
-            forward_batch,
-            bs,
-            forward_batch.seq_lens_sum + (bs - raw_bs) * self.seq_len_fill_value,
         )
         self.raw_bs = raw_bs
         self.bs = bs

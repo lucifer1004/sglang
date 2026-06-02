@@ -14,7 +14,6 @@
 """TokenizerManager is a process that tokenizes the text."""
 
 import asyncio
-import base64
 import copy
 import dataclasses
 import json
@@ -25,7 +24,6 @@ import signal
 import socket
 import sys
 import threading
-import time
 from collections import deque
 from contextlib import nullcontext
 from datetime import datetime
@@ -34,7 +32,7 @@ from http import HTTPStatus
 from typing import Any, Awaitable, Dict, List, Optional, Tuple, Union
 
 import fastapi
-import numpy as np
+import pybase64
 import torch
 import uvloop
 import zmq
@@ -42,6 +40,7 @@ import zmq.asyncio
 from fastapi import BackgroundTasks
 
 from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.disaggregation.encode_receiver import create_mm_receiver
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
@@ -77,7 +76,6 @@ from sglang.srt.managers.mm_utils import TensorTransportMode, wrap_shm_features
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
 from sglang.srt.managers.schedule_batch import MultimodalDataItem
 from sglang.srt.managers.scheduler import is_health_check_generate_req
-from sglang.srt.managers.routed_experts_store import create_routed_experts_store
 from sglang.srt.managers.scheduler_input_blocker import input_blocker_guard_region
 from sglang.srt.managers.tokenizer_control_mixin import TokenizerControlMixin
 from sglang.srt.managers.tokenizer_manager_score_mixin import (
@@ -228,9 +226,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.enable_metrics = server_args.enable_metrics
         self.preferred_sampling_params = server_args.preferred_sampling_params
         self.crash_dump_folder = server_args.crash_dump_folder
-        self.routed_experts_store = create_routed_experts_store(
-            server_args.routed_experts_store_dsn
-        )
         set_global_server_args_for_tokenizer(server_args)
 
         # Init model config
@@ -396,6 +391,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # Dumping
         self.dump_requests_folder = ""  # By default do not dump
         self.dump_requests_threshold = 1000
+        self.dump_requests_exclude_meta_keys: List[str] = [
+            "routed_experts",
+            "hidden_states",
+        ]
         self.dump_request_list: List[Tuple] = []
         self.crash_dump_request_list: deque[Tuple] = deque()
         self.crash_dump_performed = False  # Flag to ensure dump is only called once
@@ -690,9 +689,16 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             )
         else:
             logger.debug(f"Using regular tokenizer for {len(tokenizer_input)} inputs")
-            encoded = self.tokenizer(tokenizer_input, **tokenizer_kwargs)
-            input_ids = encoded["input_ids"]
-            token_type_ids = encoded.get("token_type_ids") if is_cross_encoder else None
+
+            if not is_cross_encoder and (not getattr(self.tokenizer, "is_fast", False)):
+                input_ids = [self.tokenizer.encode(t) for t in tokenizer_input]
+                token_type_ids = None
+            else:
+                encoded = self.tokenizer(tokenizer_input, **tokenizer_kwargs)
+                input_ids = encoded["input_ids"]
+                token_type_ids = (
+                    encoded.get("token_type_ids") if is_cross_encoder else None
+                )
 
         # Step 4: Extract results based on input format
         return self._extract_tokenizer_results(
@@ -843,9 +849,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     f"model's context length ({self.context_len} tokens)."
                 )
 
-        if isinstance(obj, GenerateReqInput):
-            TokenizerManager._validate_forced_decode_token_ids(self, obj)
-
         # Validate total tokens (input + max_new_tokens)
         max_new_tokens = obj.sampling_params.get("max_new_tokens")
         if (
@@ -873,32 +876,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 )
                 raise ValueError(error_msg)
 
-        if isinstance(obj, GenerateReqInput):
-            if (
-                obj.return_hidden_states
-                and not self.server_args.enable_return_hidden_states
-            ):
-                raise ValueError(
-                    "The server is not configured to return the hidden states. "
-                    "Please set `--enable-return-hidden-states` to enable this feature."
-                )
-            if (
-                obj.routed_experts is not None
-                and not self.server_args.enable_moe_router_replay
-            ):
-                raise ValueError(
-                    "The server is not configured to enable MoE router replay. "
-                    "Please set `--enable-moe-router-replay` to enable this feature."
-                )
-            if (
-                obj.custom_logit_processor
-                and not self.server_args.enable_custom_logit_processor
-            ):
-                raise ValueError(
-                    "The server is not configured to enable custom logit processor. "
-                    "Please set `--enable-custom-logit-processor` to enable this feature."
-                )
-
         # Validate embedding requests
         if isinstance(obj, EmbeddingReqInput) and self.is_generation:
             raise ValueError(
@@ -910,44 +887,24 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         if isinstance(obj, EmbeddingReqInput):
             self._validate_for_matryoshka_dim(obj)
 
-    def _validate_forced_decode_token_ids(self, obj: GenerateReqInput) -> None:
-        forced_ids = obj.forced_decode_token_ids
-        if forced_ids is None:
-            return
-        if not isinstance(forced_ids, list) or not forced_ids:
-            raise ValueError("forced_decode_token_ids should be a non-empty list.")
-        if any(isinstance(item, list) for item in forced_ids):
-            raise ValueError(
-                "Single generate requests should provide forced_decode_token_ids "
-                "as a flat list of token ids."
-            )
-        normalized_ids = []
-        for token_id in forced_ids:
-            if not isinstance(token_id, int):
+        # Validate custom logit processor
+        if isinstance(obj, GenerateReqInput):
+            if (
+                obj.return_hidden_states
+                and not self.server_args.enable_return_hidden_states
+            ):
                 raise ValueError(
-                    "forced_decode_token_ids should contain integer token ids."
+                    "The server is not configured to return the hidden states. "
+                    "Please set `--enable-return-hidden-states` to enable this feature."
                 )
-            if token_id < 0 or token_id >= self.model_config.vocab_size:
+            if (
+                obj.custom_logit_processor
+                and not self.server_args.enable_custom_logit_processor
+            ):
                 raise ValueError(
-                    "forced_decode_token_ids contains token id "
-                    f"{token_id}, outside valid range [0, {self.model_config.vocab_size})."
+                    "The server is not configured to enable custom logit processor. "
+                    "Please set `--enable-custom-logit-processor` to enable this feature."
                 )
-            normalized_ids.append(int(token_id))
-        obj.forced_decode_token_ids = normalized_ids
-
-        max_new_tokens = obj.sampling_params.get("max_new_tokens")
-        if max_new_tokens is None:
-            obj.sampling_params["max_new_tokens"] = len(normalized_ids)
-        elif int(max_new_tokens) != len(normalized_ids):
-            raise ValueError(
-                "forced_decode_token_ids length must match sampling_params.max_new_tokens "
-                f"when both are provided. Got {len(normalized_ids)} forced ids and "
-                f"max_new_tokens={max_new_tokens}."
-            )
-        if obj.return_logprob:
-            raise ValueError(
-                "forced_decode_token_ids does not support return_logprob yet."
-            )
 
     def _validate_mm_limits(
         self, obj: Union[GenerateReqInput, EmbeddingReqInput]
@@ -1036,9 +993,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             session_params = (
                 SessionParams(**obj.session_params) if obj.session_params else None
             )
-            router_replay_experts = self._resolve_router_replay_experts(
-                obj.routed_experts
-            )
 
             bootstrap_room = obj.bootstrap_room
             if (
@@ -1071,8 +1025,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 require_reasoning=obj.require_reasoning,
                 return_hidden_states=obj.return_hidden_states,
                 return_routed_experts=obj.return_routed_experts,
-                router_replay_experts=router_replay_experts,
-                forced_decode_token_ids=obj.forced_decode_token_ids,
+                routed_experts_start_len=obj.routed_experts_start_len,
+                return_indexer_topk=obj.return_indexer_topk,
                 routed_dp_rank=obj.routed_dp_rank,
                 disagg_prefill_dp_rank=obj.disagg_prefill_dp_rank,
                 priority=obj.priority,
@@ -1115,79 +1069,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.rid_to_state[obj.rid].time_stats.set_tokenize_finish_time()
 
         return tokenized_obj
-
-    @staticmethod
-    def _dtype_from_routed_experts_ref(ref: Dict[str, Any]) -> np.dtype:
-        dtype = str(ref.get("dtype", "int32")).removeprefix("torch.")
-        if dtype == "bool":
-            return np.dtype(np.bool_)
-        return np.dtype(dtype)
-
-    def _decode_remote_routed_experts_tensor(self, ref: Dict[str, Any]) -> torch.Tensor:
-        if self.routed_experts_store is None:
-            raise ValueError(
-                "Remote routed_experts replay requires --routed-experts-store-dsn."
-            )
-        if ref.get("format") != "remote":
-            raise ValueError(f"Unsupported routed_experts remote reference: {ref}")
-        payload = self.routed_experts_store.get(ref)
-        dtype = self._dtype_from_routed_experts_ref(ref)
-        tensor = np.frombuffer(payload, dtype=dtype).copy()
-        shape = ref.get("shape")
-        if shape is not None:
-            tensor = tensor.reshape(shape)
-        return torch.from_numpy(tensor)
-
-    def _decode_routed_experts_valid_mask(self, payload: Dict[str, Any]) -> torch.Tensor:
-        valid_mask = payload.get("valid_mask")
-        if valid_mask is None:
-            shape = payload.get("valid_mask_shape")
-            if shape is None:
-                shape = payload.get("shape", [])[:2]
-            return torch.ones(shape, dtype=torch.bool)
-
-        if isinstance(valid_mask, dict):
-            mask = self._decode_remote_routed_experts_tensor(valid_mask)
-        elif isinstance(valid_mask, str):
-            raw = base64.b64decode(valid_mask.encode("utf-8"))
-            mask = torch.from_numpy(np.frombuffer(raw, dtype=np.uint8).copy())
-            if payload.get("valid_mask_shape") is not None:
-                mask = mask.reshape(payload["valid_mask_shape"])
-        else:
-            mask = torch.as_tensor(valid_mask)
-        return mask.to(dtype=torch.bool)
-
-    def _resolve_router_replay_experts(self, routed_experts):
-        if not isinstance(routed_experts, dict):
-            return routed_experts
-
-        fmt = routed_experts.get("format")
-        if fmt == "remote":
-            tensor = self._decode_remote_routed_experts_tensor(routed_experts).to(
-                dtype=torch.int32
-            )
-            tensor._sglang_router_replay_trusted = True
-            return tensor
-        if fmt != "remote_masked_dense":
-            raise ValueError(f"Unsupported routed_experts payload format: {fmt!r}")
-
-        values_ref = routed_experts.get("values")
-        if not isinstance(values_ref, dict):
-            raise ValueError(
-                "remote_masked_dense routed_experts requires a remote values reference."
-            )
-        values = self._decode_remote_routed_experts_tensor(values_ref).to(
-            dtype=torch.int32
-        )
-        valid_mask = self._decode_routed_experts_valid_mask(routed_experts)
-        if values.shape[:2] != valid_mask.shape:
-            raise ValueError(
-                "Invalid remote_masked_dense routed_experts shapes: "
-                f"values={tuple(values.shape)}, valid_mask={tuple(valid_mask.shape)}."
-            )
-        values[~valid_mask] = -1
-        values._sglang_router_replay_trusted = True
-        return values
 
     @staticmethod
     def _resolve_embed_overrides(
@@ -1422,7 +1303,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     and await request.is_disconnected()
                 ):
                     # Abort the request for disconnected requests (non-streaming, waiting queue)
-                    logger.warning(f"[DIAG] Type 1 disconnect detected: rid={obj.rid}, stream={obj.stream}")
                     self.abort_request(obj.rid)
                     # Use exception to kill the whole call stack and asyncio task
                     raise ValueError(
@@ -1487,28 +1367,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 yield out
                 break
 
-            state.event.clear()
-
             if is_stream:
-                # [FIX] streaming disconnect check
-                if request is not None and not obj.background:
-                    _created = getattr(state, 'created_time', None)
-                    _elapsed = (time.time() - _created) if _created is not None else 0.0
-                    _disconnected = await request.is_disconnected()
-                    if _disconnected:
-                        logger.warning(
-                            f"[DIAG] Streaming req DISCONNECTED: rid={obj.rid}, elapsed={_elapsed:.1f}s. Aborting."
-                        )
-                        self.abort_request(obj.rid)
-                        break
-                    elif _created is not None and _elapsed > 120:
-                        logger.warning(
-                            f"[DIAG] Long streaming req: rid={obj.rid}, elapsed={_elapsed:.1f}s, is_disconnected={_disconnected}"
-                        )
-                # [FIX] Mark yield timestamps for stale/leak detection.
-                if not hasattr(state, '_first_yield_ts'):
-                    state._first_yield_ts = time.time()
-                state._last_yield_ts = time.time()
                 # Record response sent time right before we send response.
                 if not state.time_stats.response_sent_to_client_time:
                     state.time_stats.set_response_sent_to_client_time()
@@ -1730,6 +1589,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             self.dump_requests_folder = obj.dump_requests_folder
         if obj.dump_requests_threshold is not None:
             self.dump_requests_threshold = obj.dump_requests_threshold
+        if obj.dump_requests_exclude_meta_keys is not None:
+            self.dump_requests_exclude_meta_keys = list(
+                obj.dump_requests_exclude_meta_keys
+            )
         if obj.crash_dump_folder is not None:
             self.crash_dump_folder = obj.crash_dump_folder
         logging.info(f"Config logging: {obj=}")
@@ -1744,7 +1607,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # Abort the request if the client is disconnected.
         async def abort_request():
             await asyncio.sleep(2)
-            logger.warning(f"[DIAG] BackgroundTasks abort_request fired: rid={obj.rid}")
             if obj.is_single:
                 self.abort_request(obj.rid)
             else:
@@ -1754,106 +1616,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         background_tasks = BackgroundTasks()
         background_tasks.add_task(abort_request)
         return background_tasks
-
-    async def _sweep_stale_streaming_reqs(self):
-        """[FIX] Periodically detect and abort leaked streaming requests.
-
-        Method 1 — yield-blocked detection:
-          If _last_yield_ts hasn't updated for STALE_TIMEOUT seconds, the generator
-          is stuck at yield (TCP send buffer full, nobody reading). Abort it.
-
-        Method 2 — router reconciliation:
-          Fetch router's prometheus metrics to get how many requests the router
-          thinks are running on this worker. Compare with local rid_to_state count.
-          If local count is significantly higher, the excess are leaked requests.
-          Abort the oldest streaming requests to bring the count back in line.
-        """
-        import os as _os
-        import urllib.request as _urllib
-
-        _STALE_TIMEOUT = int(_os.environ.get("FIX_STALE_TIMEOUT", "120"))
-        _SWEEP_INTERVAL = int(_os.environ.get("FIX_SWEEP_INTERVAL", "30"))
-        _RECONCILE_MARGIN = int(_os.environ.get("FIX_RECONCILE_MARGIN", "2"))
-        _RECONCILE_MIN_AGE = int(_os.environ.get("FIX_RECONCILE_MIN_AGE", "60"))
-        _RECONCILE_MAX_ABORT = int(_os.environ.get("FIX_RECONCILE_MAX_ABORT", "5"))
-        _METRICS_PORT = int(_os.environ.get("FIX_ROUTER_METRICS_PORT", "29000"))
-        _WORKER_PORT = int(_os.environ.get("FIX_WORKER_PORT", "0"))
-        if _WORKER_PORT == 0:
-            _WORKER_PORT = getattr(getattr(self, 'server_args', None), 'port', 0)
-        _METRICS_URL = f"http://127.0.0.1:{_METRICS_PORT}/metrics"
-
-        logger.info(
-            f"[FIX] Sweep started (stale_timeout={_STALE_TIMEOUT}s, "
-            f"interval={_SWEEP_INTERVAL}s, worker_port={_WORKER_PORT}, "
-            f"router_metrics={_METRICS_URL})"
-        )
-
-        while True:
-            await asyncio.sleep(_SWEEP_INTERVAL)
-            now = time.time()
-            to_abort = []
-
-            # --- Method 1: yield-blocked detection ---
-            for rid, state in list(self.rid_to_state.items()):
-                last_ts = getattr(state, '_last_yield_ts', None)
-                if last_ts is not None and not state.finished:
-                    gap = now - last_ts
-                    if gap > _STALE_TIMEOUT:
-                        to_abort.append((rid, gap, "yield_blocked"))
-
-            # --- Method 2: router reconciliation ---
-            if _WORKER_PORT:
-                try:
-                    with _urllib.urlopen(_METRICS_URL, timeout=3) as _resp:
-                        _txt = _resp.read().decode()
-
-                    _router_running = None
-                    _port_tag = f":{_WORKER_PORT}"
-                    for _line in _txt.splitlines():
-                        if ("sgl_router_running_requests" in _line
-                                and _port_tag in _line
-                                and not _line.startswith("#")):
-                            _router_running = int(float(_line.split()[-1]))
-                            break
-
-                    if _router_running is not None:
-                        _local = len(self.rid_to_state)
-                        _leak = _local - _router_running - _RECONCILE_MARGIN
-
-                        if _leak > 0:
-                            _skip = {r[0] for r in to_abort}
-                            _cands = []
-                            for rid, state in list(self.rid_to_state.items()):
-                                if rid in _skip:
-                                    continue
-                                _fts = getattr(state, '_first_yield_ts', None)
-                                if _fts is not None and not state.finished:
-                                    _age = now - _fts
-                                    if _age > _RECONCILE_MIN_AGE:
-                                        _cands.append((rid, _age))
-                            _cands.sort(key=lambda x: -x[1])
-                            _n = min(_leak, _RECONCILE_MAX_ABORT, len(_cands))
-                            for rid, _age in _cands[:_n]:
-                                to_abort.append((rid, _age, "reconciliation"))
-
-                        logger.info(
-                            f"[FIX] Reconcile: router={_router_running}, "
-                            f"local={_local}, leak_est={max(0, _leak)}"
-                        )
-                except Exception as _e:
-                    logger.debug(f"[FIX] Reconciliation skipped: {_e}")
-
-            # --- Abort collected requests ---
-            for rid, duration, reason in to_abort:
-                logger.warning(
-                    f"[FIX] Aborting stale request: rid={rid}, "
-                    f"duration={duration:.0f}s, reason={reason}"
-                )
-                from sglang.srt.managers.io_struct import AbortReq
-                _req = AbortReq(rid=rid, abort_all=False)
-                self.send_to_scheduler.send_pyobj(_req)
-                if rid in self.rid_to_state:
-                    del self.rid_to_state[rid]
 
     def auto_create_handle_loop(self):
         if self.event_loop is not None:
@@ -1879,129 +1641,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.asyncio_tasks.add(
             loop.create_task(print_exception_wrapper(self.sigterm_watchdog))
         )
-        # [FIX] Start the stale streaming request sweeper
-        self.asyncio_tasks.add(
-            loop.create_task(print_exception_wrapper(self._sweep_stale_streaming_reqs))
-        )
-
-    def dump_requests_before_crash(self):
-        if self.crash_dump_performed:
-            logger.info(
-                "SIGTERM/SIGQUIT/Exception triggered, but crash dump already performed, skipping."
-            )
-            return
-
-        if not self.crash_dump_folder:
-            return
-
-        logger.error(f"Dumping requests before crash. {self.crash_dump_folder=}")
-        self.crash_dump_performed = True
-
-        # Check if NFS directory is available
-        # expected_nfs_dir = "/" + self.crash_dump_folder.lstrip("/").split("/")[0]
-        # use_nfs_dir = os.path.isdir(expected_nfs_dir) and os.access(
-        #     expected_nfs_dir, os.W_OK
-        # )
-        use_nfs_dir = False
-        if not use_nfs_dir:
-            logger.error(
-                f"Expected NFS directory is not available or writable. Uploading to GCS."
-            )
-
-        data_to_dump = []
-        if self.crash_dump_request_list:
-            data_to_dump.extend(self.crash_dump_request_list)
-
-        # Add unfinished requests from rid_to_state
-        unfinished_requests = []
-        for rid, state in self.rid_to_state.items():
-            if not state.finished:
-                unfinished_requests.append(
-                    (
-                        state.obj,
-                        state.out_list[-1] if state.out_list else {},
-                        state.created_time,
-                        time.time(),
-                    )
-                )
-        if unfinished_requests:
-            data_to_dump.extend(unfinished_requests)
-
-        if not data_to_dump:
-            return
-
-        object_name = f'crash_dump_{datetime.now().strftime("%Y-%m-%d_%H-%M-%S")}.pkl'
-        filename = os.path.join(
-            self.crash_dump_folder,
-            os.getenv("HOSTNAME", None),
-            object_name,
-        )
-
-        os.makedirs(os.path.dirname(filename), exist_ok=True)
-        # Include server_args in the dump
-        data_to_dump_with_server_args = {
-            "server_args": self.server_args,
-            "requests": data_to_dump,
-        }
-        with open(filename, "wb") as f:
-            pickle.dump(data_to_dump_with_server_args, f)
-        logger.error(
-            f"Dumped {len(self.crash_dump_request_list)} finished and {len(unfinished_requests)} unfinished requests before crash to {filename}"
-        )
-
-        def _upload_file_to_gcs(bucket_name, source_file_path, object_name):
-            from google.cloud import storage
-
-            client = storage.Client()
-            bucket = client.bucket(bucket_name)
-            blob = bucket.blob(object_name)
-            blob.upload_from_filename(source_file_path, if_generation_match=0)
-            logger.error(
-                f"Successfully uploaded {source_file_path} to gs://{bucket_name}/{object_name}"
-            )
-
-        if not use_nfs_dir:
-            _upload_file_to_gcs(
-                "sglang_crash_dump",
-                filename,
-                os.getenv("HOSTNAME", None) + "/" + object_name,
-            )
-
-    async def sigterm_watchdog(self):
-        while not self.gracefully_exit:
-            await asyncio.sleep(5)
-
-        # Drain requests
-        while True:
-            remain_num_req = len(self.rid_to_state)
-            remaining_rids = list(self.rid_to_state.keys())
-
-            if self.server_status == ServerStatus.UnHealthy:
-                # if health check failed, we should exit immediately
-                logger.error(
-                    "Signal SIGTERM received while health check failed. Force exiting."
-                )
-                self.dump_requests_before_crash()
-                break
-
-            elif get_bool_env_var("SGL_FORCE_SHUTDOWN"):
-                # if force shutdown flag set, exit immediately
-                logger.error(
-                    "Signal SIGTERM received while force shutdown flag set. Force exiting."
-                )
-                break
-
-            logger.info(
-                f"Gracefully exiting... Remaining number of requests {remain_num_req}. Remaining requests {remaining_rids=}."
-            )
-            if remain_num_req > 0:
-                await asyncio.sleep(5)
-            else:
-                self.dump_requests_before_crash()
-                break
-
-        kill_process_tree(os.getpid(), include_parent=True)
-        sys.exit(0)
 
     async def handle_loop(self):
         """The event loop that handles requests"""
@@ -2031,6 +1670,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         for i, rid in enumerate(recv_obj.rids):
             state = self.rid_to_state.get(rid, None)
             if state is None:
+                # Known race: /health_generate pops its rid as soon as ANY message bumps last_receive_tstamp.
+                if rid.startswith(HEALTH_CHECK_RID_PREFIX):
+                    continue
                 logger.error(
                     f"Received output for {rid=} but the state was deleted in TokenizerManager."
                 )
@@ -2042,7 +1684,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 "finish_reason": recv_obj.finished_reasons[i],
                 "prompt_tokens": recv_obj.prompt_tokens[i],
                 "weight_version": self.server_args.weight_version,
-                "total_retractions": recv_obj.retraction_counts[i],
+                "num_retractions": recv_obj.retraction_counts[i],
             }
 
             if self.enable_metrics:
@@ -2084,16 +1726,17 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             if getattr(recv_obj, "routed_experts", None):
                 val = recv_obj.routed_experts[i]
                 if val is not None:
-                    if self.routed_experts_store is not None:
-                        val = self.routed_experts_store.put(val)
-                    # BatchStrOutput can be pre-encoded by the detokenizer;
+                    # BatchStrOutput is pre-encoded by the detokenizer;
                     # BatchTokenIDOutput (skip_tokenizer_init) bypasses it.
-                    from sglang.srt.layers.moe.routed_experts_capturer import (
-                        encode_routed_experts_payload,
-                    )
-
-                    val = encode_routed_experts_payload(val)
+                    if isinstance(val, torch.Tensor):
+                        val = pybase64.b64encode(val.numpy().tobytes()).decode("utf-8")
                     meta_info["routed_experts"] = val
+            if getattr(recv_obj, "indexer_topk", None):
+                val = recv_obj.indexer_topk[i]
+                if val is not None:
+                    if isinstance(val, torch.Tensor):
+                        val = pybase64.b64encode(val.numpy().tobytes()).decode("utf-8")
+                    meta_info["indexer_topk"] = val
             if getattr(recv_obj, "customized_info", None):
                 for k, v in recv_obj.customized_info.items():
                     meta_info[k] = v[i]
@@ -2423,11 +2066,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         token_logprobs_idx: List[int],
         decode_to_text: bool,
     ):
-        if isinstance(token_logprobs_val, torch.Tensor):
-            token_logprobs_val = token_logprobs_val.tolist()
-        if isinstance(token_logprobs_idx, torch.Tensor):
-            token_logprobs_idx = token_logprobs_idx.tolist()
-
         if not decode_to_text:
             return [
                 (logprob, token_id, None)
@@ -2452,7 +2090,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # We should batch all top-k tokens in all positions.
         ret = []
         for i in range(len(token_logprobs_val)):
-            if token_logprobs_val[i] is not None and len(token_logprobs_val[i]) > 0:
+            if token_logprobs_val[i]:
                 ret.append(
                     self.detokenize_logprob_tokens(
                         token_logprobs_val[i], token_logprobs_idx[i], decode_to_text
@@ -2476,37 +2114,45 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         if (
             hasattr(recv_obj, "spec_verify_ct")
             and recv_obj.spec_verify_ct[i] > 0
-            and hasattr(recv_obj, "spec_accepted_drafts")
-            and len(recv_obj.spec_accepted_drafts) > i
+            and hasattr(recv_obj, "spec_num_correct_drafts")
+            and len(recv_obj.spec_num_correct_drafts) > i
         ):
             # Total number of proposed draft tokens per request.
-            all_drafts = recv_obj.spec_verify_ct[i] * (
+            num_proposed_drafts = recv_obj.spec_verify_ct[i] * (
                 self.server_args.speculative_num_draft_tokens - 1
             )
-            accepted_drafts = recv_obj.spec_accepted_drafts[i]
+            num_correct_drafts = recv_obj.spec_num_correct_drafts[i]
 
             # Calculate per-request acceptance rate and average acceptance length.
-            if all_drafts > 0:
-                # accept_rate: accepted_drafts / total_proposed_drafts (strict count, no bonus).
-                meta_info["spec_accept_rate"] = accepted_drafts / all_drafts
+            if num_proposed_drafts > 0:
+                # accept_rate: num_correct_drafts / num_proposed_drafts (strict count, no bonus).
+                meta_info["spec_accept_rate"] = num_correct_drafts / num_proposed_drafts
                 # accept_length: completion_tokens / verify_ct (includes bonus token).
                 meta_info["spec_accept_length"] = (
                     recv_obj.completion_tokens[i] / recv_obj.spec_verify_ct[i]
                 )
 
-                meta_info["spec_accepted_drafts"] = accepted_drafts
-                meta_info["spec_proposed_drafts"] = all_drafts
+                meta_info["spec_num_correct_drafts"] = num_correct_drafts
+                meta_info["spec_num_proposed_drafts"] = num_proposed_drafts
                 meta_info["spec_verify_ct"] = recv_obj.spec_verify_ct[i]
+
+                # FIXME: backward-compat aliases, remove in next release.
+                meta_info["spec_accepted_drafts"] = num_correct_drafts
+                meta_info["spec_proposed_drafts"] = num_proposed_drafts
 
             # Acceptance histogram: tracks how many decoding steps accepted a certain number of draft tokens.
             if (
-                recv_obj.spec_acceptance_histogram
-                and len(recv_obj.spec_acceptance_histogram) > i
-                and recv_obj.spec_acceptance_histogram[i]
+                recv_obj.spec_correct_drafts_histogram
+                and len(recv_obj.spec_correct_drafts_histogram) > i
+                and recv_obj.spec_correct_drafts_histogram[i]
             ):
-                meta_info["spec_accept_histogram"] = recv_obj.spec_acceptance_histogram[
-                    i
-                ]
+                meta_info["spec_correct_drafts_histogram"] = (
+                    recv_obj.spec_correct_drafts_histogram[i]
+                )
+                # FIXME: backward-compat alias, remove in next release.
+                meta_info["spec_accept_histogram"] = (
+                    recv_obj.spec_correct_drafts_histogram[i]
+                )
 
     def _request_has_grammar(self, obj: GenerateReqInput) -> bool:
         return (
@@ -2571,6 +2217,16 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             )
 
     def dump_requests(self, state: ReqState, out_dict: dict):
+        if self.dump_requests_exclude_meta_keys and isinstance(
+            out_dict.get("meta_info"), dict
+        ):
+            exclude = self.dump_requests_exclude_meta_keys
+            if any(k in out_dict["meta_info"] for k in exclude):
+                filtered_meta = {
+                    k: v for k, v in out_dict["meta_info"].items() if k not in exclude
+                }
+                out_dict = {**out_dict, "meta_info": filtered_meta}
+
         self.dump_request_list.append(
             (
                 state.obj,
@@ -2621,7 +2277,20 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         def background_task():
             os.makedirs(os.path.dirname(filename), exist_ok=True)
             with open(filename, "wb") as f:
-                pickle.dump(to_dump_with_server_args, f)
+                try:
+                    pickle.dump(to_dump_with_server_args, f)
+                except Exception as e:
+                    # When the server is launched with --trust-remote-code,
+                    # server_args sometimes fails to pickle. Retry without
+                    # server_args so the request data still gets persisted.
+                    logger.error(
+                        f"Failed to pickle dump with server_args: {e!r}; "
+                        "retrying without server_args"
+                    )
+                    f.seek(0)
+                    f.truncate()
+                    to_dump_with_server_args["server_args"] = None
+                    pickle.dump(to_dump_with_server_args, f)
 
         asyncio.create_task(asyncio.to_thread(background_task))
 
@@ -2684,7 +2353,20 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             "launch_command": " ".join(sys.argv),
         }
         with open(filename, "wb") as f:
-            pickle.dump(data_to_dump_with_server_args, f)
+            try:
+                pickle.dump(data_to_dump_with_server_args, f)
+            except Exception as e:
+                # When the server is launched with --trust-remote-code,
+                # server_args sometimes fails to pickle. Retry without
+                # server_args so the request data still gets persisted.
+                logger.error(
+                    f"Failed to pickle dump with server_args: {e!r}; "
+                    "retrying without server_args"
+                )
+                f.seek(0)
+                f.truncate()
+                data_to_dump_with_server_args["server_args"] = None
+                pickle.dump(data_to_dump_with_server_args, f)
         logger.error(
             f"Dumped {len(self.crash_dump_request_list)} finished and {len(unfinished_requests)} unfinished requests before crash to {filename}"
         )

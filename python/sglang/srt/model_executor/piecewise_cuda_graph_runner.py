@@ -58,13 +58,10 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
     PPProxyTensors,
 )
-from sglang.srt.model_executor.forward_batch_context import set_current_forward_batch
-from sglang.srt.model_executor.cuda_graph_runner import (
-    copy_router_replay_to_cuda_graph_buffers,
-)
 from sglang.srt.model_executor.input_buffers import ForwardInputBuffers
 from sglang.srt.utils import (
     get_available_gpu_memory,
+    is_musa,
     is_npu,
     log_info_on_rank0,
     require_gathered_buffer,
@@ -76,6 +73,8 @@ logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
+
+_is_musa = is_musa()
 
 
 @dataclass
@@ -89,8 +88,6 @@ class PrefillInputBuffers(ForwardInputBuffers):
     positions: torch.Tensor
     input_embeds: Optional[torch.Tensor]
     mrope_positions: Optional[torch.Tensor]
-    router_replay_topk_ids: torch.Tensor
-    router_replay_mask: torch.Tensor
 
 
 @contextmanager
@@ -152,6 +149,13 @@ def set_torch_compile_config():
     torch._dynamo.config.accumulated_cache_size_limit = 1024
     if hasattr(torch._dynamo.config, "cache_size_limit"):
         torch._dynamo.config.cache_size_limit = 1024
+
+    if _is_musa:
+        from sglang.srt.hardware_backend.musa.utils.patch_torch import (
+            patch_fx_custom_device,
+        )
+
+        patch_fx_custom_device()
 
 
 class PiecewiseCudaGraphRunner:
@@ -244,7 +248,7 @@ class PiecewiseCudaGraphRunner:
                 (self.max_num_tokens,), dtype=self._cache_loc_dtype()
             )
             out_cache_loc_swa = (
-                torch.zeros((self.max_num_tokens,), dtype=torch.int64)
+                torch.zeros((self.max_num_tokens,), dtype=torch.int32)
                 if model_runner.is_hybrid_swa
                 else None
             )
@@ -264,23 +268,6 @@ class PiecewiseCudaGraphRunner:
                 else None
             )
             positions = torch.zeros((self.max_num_tokens,), dtype=torch.int64)
-            router_replay_num_layers = getattr(
-                self.model_runner.model_config.hf_text_config,
-                "num_hidden_layers",
-                0,
-            )
-            router_replay_top_k = getattr(
-                self.model_runner.model_config.hf_text_config,
-                "num_experts_per_tok",
-                0,
-            )
-            router_replay_topk_ids = torch.zeros(
-                (self.max_num_tokens, router_replay_num_layers, router_replay_top_k),
-                dtype=torch.int32,
-            )
-            router_replay_mask = torch.zeros(
-                (self.max_num_tokens,), dtype=torch.bool
-            )
 
             self.tbo_plugin = TboCudaGraphRunnerPlugin()
 
@@ -311,8 +298,6 @@ class PiecewiseCudaGraphRunner:
             positions=positions,
             input_embeds=input_embeds,
             mrope_positions=mrope_positions,
-            router_replay_topk_ids=router_replay_topk_ids,
-            router_replay_mask=router_replay_mask,
         )
         self.buffers.share_buffers()
 
@@ -329,8 +314,14 @@ class PiecewiseCudaGraphRunner:
             language_model = getattr(
                 self.model_runner.model, "language_model", self.model_runner.model
             )
+            layer_model = (
+                language_model.model
+                if hasattr(language_model, "model")
+                and hasattr(language_model.model, "layers")
+                else language_model
+            )
             with patch_model(
-                language_model.model, self.compile_config.compiler
+                layer_model, self.compile_config.compiler
             ) as patched_model:
 
                 # Dummy warmup for jit kernel
@@ -437,8 +428,6 @@ class PiecewiseCudaGraphRunner:
                 capture_hidden_mode=CaptureHiddenMode.NULL,
                 num_token_non_padded=None,
                 num_token_non_padded_cpu=num_tokens,
-                router_replay_topk_ids=buffers.router_replay_topk_ids[:num_tokens],
-                router_replay_mask=buffers.router_replay_mask[:num_tokens],
                 global_forward_mode=ForwardMode.EXTEND,
                 lora_ids=None,
                 return_pooled_hidden_states=self.capture_return_pooled_hidden_states,
@@ -449,19 +438,18 @@ class PiecewiseCudaGraphRunner:
         forward_batch.dp_local_start_pos = forward_batch.dp_local_num_tokens = None
         set_dp_buffer_len(None, num_tokens, forward_batch.dp_padding_mode.is_max_len())
         set_is_extend_in_batch(False)
-        with set_current_forward_batch(forward_batch):
-            with set_forward_context(
+        with set_forward_context(
+            forward_batch,
+            self.attention_layers,
+            self.quant_config,
+            self.moe_layers,
+            self.moe_fusions,
+        ):
+            _ = self.model_runner.model.forward(
+                forward_batch.input_ids,
+                forward_batch.positions,
                 forward_batch,
-                self.attention_layers,
-                self.quant_config,
-                self.moe_layers,
-                self.moe_fusions,
-            ):
-                _ = self.model_runner.model.forward(
-                    forward_batch.input_ids,
-                    forward_batch.positions,
-                    forward_batch,
-                )
+            )
 
     def _cache_loc_dtype(self):
         return torch.int64 if not is_npu() else torch.int32
@@ -500,9 +488,10 @@ class PiecewiseCudaGraphRunner:
         # Trigger CUDA graph capture for specific shapes.
         # Capture the large shapes first so that the smaller shapes
         # can reuse the memory pool allocated for the large shapes.
-        with freeze_gc(
-            self.model_runner.server_args.enable_cudagraph_gc
-        ), graph_capture() as graph_capture_context:
+        with (
+            freeze_gc(self.model_runner.server_args.enable_cudagraph_gc),
+            graph_capture() as graph_capture_context,
+        ):
             stream = graph_capture_context.stream
             with set_pcg_capture_stream(stream):
                 avail_mem = get_available_gpu_memory(
@@ -612,8 +601,6 @@ class PiecewiseCudaGraphRunner:
                 capture_hidden_mode=CaptureHiddenMode.NULL,
                 num_token_non_padded=None,
                 num_token_non_padded_cpu=num_tokens,
-                router_replay_topk_ids=buffers.router_replay_topk_ids[:num_tokens],
-                router_replay_mask=buffers.router_replay_mask[:num_tokens],
                 global_forward_mode=ForwardMode.EXTEND,
                 lora_ids=None,
                 return_pooled_hidden_states=self.capture_return_pooled_hidden_states,
@@ -639,20 +626,19 @@ class PiecewiseCudaGraphRunner:
             set_is_extend_in_batch(False)
 
             kwargs = {}
-            with set_current_forward_batch(forward_batch):
-                with set_forward_context(
+            with set_forward_context(
+                forward_batch,
+                self.attention_layers,
+                self.quant_config,
+                self.moe_layers,
+                self.moe_fusions,
+            ):
+                self.model_runner.model.forward(
+                    forward_batch.input_ids,
+                    forward_batch.positions,
                     forward_batch,
-                    self.attention_layers,
-                    self.quant_config,
-                    self.moe_layers,
-                    self.moe_fusions,
-                ):
-                    self.model_runner.model.forward(
-                        forward_batch.input_ids,
-                        forward_batch.positions,
-                        forward_batch,
-                        **kwargs,
-                    )
+                    **kwargs,
+                )
             return
 
         # run twice for warmup at the first time and cuda graph capture at the second time
@@ -690,14 +676,6 @@ class PiecewiseCudaGraphRunner:
         buffers.input_ids[:num_tokens].copy_(forward_batch.input_ids)
         buffers.positions[:num_tokens].copy_(forward_batch.positions)
         buffers.out_cache_loc[:num_tokens].copy_(forward_batch.out_cache_loc)
-        copy_router_replay_to_cuda_graph_buffers(
-            dst_topk_ids=buffers.router_replay_topk_ids,
-            dst_mask=buffers.router_replay_mask,
-            src_topk_ids=forward_batch.router_replay_topk_ids,
-            src_mask=forward_batch.router_replay_mask,
-            raw_num_token=num_tokens,
-            static_num_token=static_num_tokens,
-        )
         if buffers.out_cache_loc_swa is not None:
             buffers.out_cache_loc_swa[: self.raw_num_tokens].copy_(
                 self.model_runner.token_to_kv_pool_allocator.translate_loc_from_full_to_swa(
@@ -753,8 +731,6 @@ class PiecewiseCudaGraphRunner:
         input_embeds = (
             buffers.input_embeds[:static_num_tokens] if self.is_multimodal else None
         )
-        router_replay_topk_ids = buffers.router_replay_topk_ids[:static_num_tokens]
-        router_replay_mask = buffers.router_replay_mask[:static_num_tokens]
 
         mrope_positions = (
             buffers.mrope_positions[:, :static_num_tokens]
@@ -805,8 +781,6 @@ class PiecewiseCudaGraphRunner:
             extend_logprob_start_lens_cpu=forward_batch.extend_logprob_start_lens_cpu,
             extend_num_tokens=forward_batch.extend_num_tokens,
             extend_input_logprob_token_ids_gpu=forward_batch.extend_input_logprob_token_ids_gpu,
-            router_replay_topk_ids=router_replay_topk_ids,
-            router_replay_mask=router_replay_mask,
             positions=positions,
             global_num_tokens_gpu=forward_batch.global_num_tokens_gpu,
             global_num_tokens_for_logprob_gpu=forward_batch.global_num_tokens_for_logprob_gpu,
@@ -855,13 +829,12 @@ class PiecewiseCudaGraphRunner:
             ):
                 # Due to the dispatch kernel for MLA model, we init the metadata with original forward_batch
                 self.model_runner.attn_backend.init_forward_metadata(forward_batch)
-                with set_current_forward_batch(static_forward_batch):
-                    output = self.model_runner.model.forward(
-                        static_forward_batch.input_ids,
-                        static_forward_batch.positions,
-                        static_forward_batch,
-                        **kwargs,
-                    )
+                output = self.model_runner.model.forward(
+                    static_forward_batch.input_ids,
+                    static_forward_batch.positions,
+                    static_forward_batch,
+                    **kwargs,
+                )
                 if isinstance(output, LogitsProcessorOutput):
                     # Preserve mm_input_embeds when speculative decoding is
                     # enabled. The speculative draft's prefill path

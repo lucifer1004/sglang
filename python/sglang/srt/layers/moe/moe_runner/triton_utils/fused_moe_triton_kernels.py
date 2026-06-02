@@ -69,200 +69,6 @@ def should_enable_swap_ab(
 
 
 @triton.jit
-def _apply_routed_weight_to_cache_kernel(
-    cache_ptr,
-    topk_weights_ptr,
-    sorted_token_ids_ptr,
-    num_tokens_post_padded_ptr,
-    N: tl.constexpr,
-    total_topk_ids: tl.constexpr,
-    CACHE_SORTED: tl.constexpr,
-    stride_cm: tl.constexpr,
-    stride_cn: tl.constexpr,
-    BLOCK_SIZE_M: tl.constexpr,
-    BLOCK_SIZE_N: tl.constexpr,
-):
-    pid_m = tl.program_id(0)
-    pid_n = tl.program_id(1)
-    offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-    offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-    num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr)
-    if CACHE_SORTED:
-        row_mask = offs_m < num_tokens_post_padded
-        token_ids = tl.load(
-            sorted_token_ids_ptr + offs_m, mask=row_mask, other=total_topk_ids
-        )
-    else:
-        row_mask = offs_m < total_topk_ids
-        token_ids = offs_m
-    token_mask = row_mask & (token_ids < total_topk_ids)
-    weights = tl.load(topk_weights_ptr + token_ids, mask=token_mask, other=0.0)
-    ptrs = cache_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
-    mask = row_mask[:, None] & (offs_n[None, :] < N)
-    values = tl.load(ptrs, mask=mask, other=0.0)
-    tl.store(ptrs, values * weights[:, None], mask=mask)
-
-
-def apply_routed_weight_to_cache(
-    cache: torch.Tensor,
-    topk_weights: torch.Tensor,
-    sorted_token_ids: torch.Tensor,
-    num_tokens_post_padded: torch.Tensor,
-    cache_sorted: bool,
-) -> None:
-    assert cache.is_contiguous()
-    assert topk_weights.stride(1) == 1
-    assert sorted_token_ids.stride(0) == 1
-    n = cache.shape[-1]
-    block_size_m = 16
-    block_size_n = min(triton.next_power_of_2(n), 1024)
-    grid = (
-        triton.cdiv(cache.shape[0], block_size_m),
-        triton.cdiv(n, block_size_n),
-    )
-    _apply_routed_weight_to_cache_kernel[grid](
-        cache,
-        topk_weights,
-        sorted_token_ids,
-        num_tokens_post_padded,
-        N=n,
-        total_topk_ids=topk_weights.numel(),
-        CACHE_SORTED=cache_sorted,
-        stride_cm=cache.stride(0),
-        stride_cn=cache.stride(1),
-        BLOCK_SIZE_M=block_size_m,
-        BLOCK_SIZE_N=block_size_n,
-    )
-
-
-@triton.jit
-def _tanh_approx_f32(x):
-    return tl.inline_asm_elementwise(
-        asm="tanh.approx.f32 $0, $1;",
-        constraints="=f,f",
-        args=[x],
-        dtype=tl.float32,
-        is_pure=True,
-        pack=1,
-    )
-
-
-@triton.jit
-def _mmq_swiglu_mul_routed_weight_kernel(
-    input_ptr,
-    output_ptr,
-    topk_weights_ptr,
-    sorted_token_ids_ptr,
-    num_tokens_post_padded_ptr,
-    N: tl.constexpr,
-    total_topk_ids: tl.constexpr,
-    CACHE_SORTED: tl.constexpr,
-    GATE_UP_LAYOUT: tl.constexpr,
-    stride_im: tl.constexpr,
-    stride_in: tl.constexpr,
-    stride_om: tl.constexpr,
-    stride_on: tl.constexpr,
-    BLOCK_SIZE_M: tl.constexpr,
-    BLOCK_SIZE_N: tl.constexpr,
-):
-    pid_m = tl.program_id(0)
-    pid_n = tl.program_id(1)
-    offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-    offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-
-    num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr)
-    if CACHE_SORTED:
-        row_mask = offs_m < num_tokens_post_padded
-        token_ids = tl.load(
-            sorted_token_ids_ptr + offs_m, mask=row_mask, other=total_topk_ids
-        )
-    else:
-        row_mask = offs_m < total_topk_ids
-        token_ids = offs_m
-    token_mask = row_mask & (token_ids < total_topk_ids)
-
-    if GATE_UP_LAYOUT:
-        gate_offsets = offs_n
-        up_offsets = offs_n + N // 2
-    else:
-        up_offsets = offs_n
-        gate_offsets = offs_n + N // 2
-
-    gate = tl.load(
-        input_ptr + offs_m[:, None] * stride_im + gate_offsets[None, :] * stride_in,
-        mask=row_mask[:, None] & (offs_n[None, :] < N // 2),
-        other=0.0,
-    ).to(tl.bfloat16)
-    up = tl.load(
-        input_ptr + offs_m[:, None] * stride_im + up_offsets[None, :] * stride_in,
-        mask=row_mask[:, None] & (offs_n[None, :] < N // 2),
-        other=0.0,
-    ).to(tl.bfloat16)
-    probs = tl.load(topk_weights_ptr + token_ids, mask=token_mask, other=0.0).to(
-        tl.float32
-    )
-
-    # Match MMQ's CUDA JIT path: bf16 multiply by 0.5, tanh.approx sigmoid,
-    # round sigmoid*prob to bf16, then do the bf16 hmul chain.
-    half_gate = (gate * 0.5).to(tl.bfloat16).to(tl.float32)
-    tanh_gate = _tanh_approx_f32(half_gate)
-    sigmoid_prob = ((1.0 + tanh_gate) * 0.5 * probs[:, None]).to(tl.bfloat16)
-    values = (sigmoid_prob * gate).to(tl.bfloat16)
-    values = (values * up).to(tl.bfloat16)
-
-    output_ptrs = (
-        output_ptr + offs_m[:, None] * stride_om + offs_n[None, :] * stride_on
-    )
-    tl.store(
-        output_ptrs,
-        values,
-        mask=row_mask[:, None] & (offs_n[None, :] < N // 2),
-    )
-
-
-def mmq_swiglu_mul_routed_weight(
-    input_cache: torch.Tensor,
-    output_cache: torch.Tensor,
-    topk_weights: torch.Tensor,
-    sorted_token_ids: torch.Tensor,
-    num_tokens_post_padded: torch.Tensor,
-    cache_sorted: bool,
-    gate_up_layout: bool,
-) -> None:
-    assert input_cache.is_contiguous()
-    assert output_cache.is_contiguous()
-    assert topk_weights.stride(1) == 1
-    assert sorted_token_ids.stride(0) == 1
-    n = input_cache.shape[-1]
-    assert n % 2 == 0
-    assert output_cache.shape[-1] == n // 2
-    block_size_m = 2
-    block_size_n = 128
-    assert (n // 2) % block_size_n == 0
-    grid = (
-        triton.cdiv(input_cache.shape[0], block_size_m),
-        triton.cdiv(n // 2, block_size_n),
-    )
-    _mmq_swiglu_mul_routed_weight_kernel[grid](
-        input_cache,
-        output_cache,
-        topk_weights,
-        sorted_token_ids,
-        num_tokens_post_padded,
-        N=n,
-        total_topk_ids=topk_weights.numel(),
-        CACHE_SORTED=cache_sorted,
-        GATE_UP_LAYOUT=gate_up_layout,
-        stride_im=input_cache.stride(0),
-        stride_in=input_cache.stride(1),
-        stride_om=output_cache.stride(0),
-        stride_on=output_cache.stride(1),
-        BLOCK_SIZE_M=block_size_m,
-        BLOCK_SIZE_N=block_size_n,
-    )
-
-
-@triton.jit
 def write_zeros_to_output(
     c_ptr,
     stride_cm,
@@ -1122,6 +928,124 @@ def invoke_fused_moe_kernel(
             ROUTER_TOPK=router_topk,
             **config,
         )
+
+
+@triton.jit
+def tanh(x):
+    return 2 * tl.sigmoid(2 * x) - 1
+
+
+@triton.jit
+def _apply_activation(x, ACTIVATION_TYPE: tl.constexpr):
+    """
+    Apply activation function based on compile-time constant.
+
+    Args:
+        x: Input tensor (converted to float32 inside)
+        ACTIVATION_TYPE: Compile-time constant string ("silu" or "gelu")
+
+    Returns:
+        Activated output in the same dtype as input
+    """
+    x = x.to(tl.float32)
+    if ACTIVATION_TYPE == "silu":
+        return x * tl.sigmoid(x)
+    elif ACTIVATION_TYPE == "gelu":
+        kAlpha = 0.7978845608028654
+        return 0.5 * x * (1 + tanh(kAlpha * (x + 0.044715 * x * x * x)))
+    else:
+        raise ValueError(f"Unsupported activation: {ACTIVATION_TYPE}")
+
+
+@triton.jit
+def act_and_mul_kernel(
+    gateup_output,
+    down_input,
+    hidden_size,
+    expert_ids_ptr,
+    expert_step: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    ACTIVATION_TYPE: tl.constexpr,
+    SWIGLU_LIMIT: tl.constexpr = 0.0,
+    HAS_SWIGLU_LIMIT: tl.constexpr = False,
+):
+    """
+    Unified activation and multiply kernel that handles both sorted and unsorted routing,
+    and both SiLU and GELU activations using compile-time constants.
+    """
+    InDtype = gateup_output.dtype.element_ty
+    OutDtype = down_input.dtype.element_ty
+
+    half_hidden_size = hidden_size // 2
+    pid = tl.program_id(0)
+
+    expert_id = tl.load(expert_ids_ptr + pid // expert_step)
+
+    if expert_id == -1:
+        return
+
+    gateup_output_ptr = gateup_output + pid * hidden_size
+    down_input_ptr = down_input + pid * half_hidden_size
+    gate_output_ptr = gateup_output_ptr
+    up_output_ptr = gateup_output_ptr + half_hidden_size
+
+    for start_offset in tl.range(0, half_hidden_size, BLOCK_SIZE):
+        offset = start_offset + tl.arange(0, BLOCK_SIZE)
+        mask = offset < half_hidden_size
+
+        gate_output = tl.load(gate_output_ptr + offset, mask=mask)
+        up_output = tl.load(up_output_ptr + offset, mask=mask)
+
+        if HAS_SWIGLU_LIMIT:
+            gate_output = tl.minimum(gate_output, SWIGLU_LIMIT)
+            up_output = tl.maximum(tl.minimum(up_output, SWIGLU_LIMIT), -SWIGLU_LIMIT)
+
+        gate_output_activated = _apply_activation(gate_output, ACTIVATION_TYPE)
+        gate_output_activated = gate_output_activated.to(InDtype)
+
+        act_mul_output = gate_output_activated * up_output
+        act_mul_output = act_mul_output.to(OutDtype)
+        tl.store(down_input_ptr + offset, act_mul_output, mask=mask)
+
+
+def act_and_mul_triton(
+    gateup_output: torch.Tensor,
+    down_input: torch.Tensor,
+    config: Dict[str, Any],
+    topk_ids: Optional[torch.Tensor] = None,
+    expert_ids: Optional[torch.Tensor] = None,
+    down_moe_use_tma: bool = False,
+    activation: str = "silu",
+    swiglu_limit: Optional[float] = None,
+) -> None:
+    """
+    Args:
+        gateup_output: Input tensor containing gate and up outputs concatenated
+        down_input: Output tensor for the result
+        config: Configuration dictionary with BLOCK_SIZE_M and BLOCK_SIZE_N
+        topk_ids: Expert IDs for unsorted routing (used when down_moe_use_tma=False)
+        expert_ids: Expert IDs for sorted routing (used when down_moe_use_tma=True)
+        down_moe_use_tma: Whether to use sorted routing layout
+        activation: Activation type ("silu" or "gelu")
+        swiglu_limit: if not None, clamp gate to [-inf, L] and up to [-L, L] before activation
+                      (compiles a separate kernel variant via tl.constexpr).
+    """
+    grid = (down_input.shape[0],)
+    hidden_size = gateup_output.shape[1]
+    expert_ids_row = topk_ids.view(-1) if not down_moe_use_tma else expert_ids
+    expert_step = 1 if not down_moe_use_tma else config["BLOCK_SIZE_M"]
+    has_swiglu_limit = swiglu_limit is not None
+    act_and_mul_kernel[grid](
+        gateup_output,
+        down_input,
+        hidden_size,
+        expert_ids_row,
+        expert_step,
+        BLOCK_SIZE=512,
+        ACTIVATION_TYPE=activation,
+        SWIGLU_LIMIT=float(swiglu_limit) if has_swiglu_limit else 0.0,
+        HAS_SWIGLU_LIMIT=has_swiglu_limit,
+    )
 
 
 # _moe_sum_reduce_kernel kernel modified from https://github.com/ModelTC/lightllm/blob/main/lightllm/common/fused_moe/moe_sum_reduce.py

@@ -56,13 +56,16 @@ configure_environment() {
         [ "$(command -v python3)" = "$UV_VENV/bin/python3" ] || { echo "FATAL: python3 still resolves outside venv (got $(command -v python3))"; exit 1; }
 
         if [ -n "${GITHUB_ENV:-}" ]; then
-            echo "VIRTUAL_ENV=$UV_VENV" >> "$GITHUB_ENV"
-            echo "SGLANG_CI_VENV_PATH=$UV_VENV" >> "$GITHUB_ENV"
-            echo "BASH_ENV=$UV_VENV/env.sh" >> "$GITHUB_ENV"
+            # Self-heal: see install_rustup.sh for context on missing _runner_file_commands/.
+            mkdir -p "$(dirname "$GITHUB_ENV")" 2>/dev/null || true
+            echo "VIRTUAL_ENV=$UV_VENV" >> "$GITHUB_ENV" || true
+            echo "SGLANG_CI_VENV_PATH=$UV_VENV" >> "$GITHUB_ENV" || true
+            echo "BASH_ENV=$UV_VENV/env.sh" >> "$GITHUB_ENV" || true
             touch "$UV_VENV/env.sh"
         fi
         if [ -n "${GITHUB_PATH:-}" ]; then
-            echo "$UV_VENV/bin" >> "$GITHUB_PATH"
+            mkdir -p "$(dirname "$GITHUB_PATH")" 2>/dev/null || true
+            echo "$UV_VENV/bin" >> "$GITHUB_PATH" || true
         fi
     else
         echo "USE_VENV=0: skipping uv venv creation, installing into system Python"
@@ -277,7 +280,20 @@ install_sglang_kernel() {
     # TODO: Remove after torch 2.11 where cu13 is enabled by default
     TORCH_CUDA_VER=$(python3 -c "import torch; v=torch.version.cuda; parts=v.split('.'); print(f'cu{parts[0]}{parts[1]}')")
     echo "Detected torch CUDA version: ${TORCH_CUDA_VER}"
+    TORCHAUDIO_CUDA_VER=$(pip show torchaudio 2>/dev/null | grep "^Version:" | awk '{print $2}' | sed -n 's/.*+\(cu[0-9][0-9]*\)$/\1/p' || true)
+    TORCHVISION_CUDA_VER=$(pip show torchvision 2>/dev/null | grep "^Version:" | awk '{print $2}' | sed -n 's/.*+\(cu[0-9][0-9]*\)$/\1/p' || true)
+    REINSTALL_TORCH=false
     if [ "${TORCH_CUDA_VER}" != "${CU_VERSION}" ]; then
+        REINSTALL_TORCH=true
+    else
+        for cuda_ver in "${TORCHAUDIO_CUDA_VER}" "${TORCHVISION_CUDA_VER}"; do
+            if [ -n "${cuda_ver}" ] && [ "${cuda_ver}" != "${CU_VERSION}" ]; then
+                REINSTALL_TORCH=true
+                break
+            fi
+        done
+    fi
+    if [ "${REINSTALL_TORCH}" = true ]; then
         TORCH_VER=$(pip show torch 2>/dev/null | grep "^Version:" | awk '{print $2}' | sed 's/+.*//')
         TORCHAUDIO_VER=$(pip show torchaudio 2>/dev/null | grep "^Version:" | awk '{print $2}' | sed 's/+.*//')
         TORCHVISION_VER=$(pip show torchvision 2>/dev/null | grep "^Version:" | awk '{print $2}' | sed 's/+.*//')
@@ -285,11 +301,21 @@ install_sglang_kernel() {
         $PIP_CMD install "torch==${TORCH_VER}" "torchaudio==${TORCHAUDIO_VER}" "torchvision==${TORCHVISION_VER}" --index-url "https://download.pytorch.org/whl/${CU_VERSION}" --force-reinstall --no-deps $PIP_INSTALL_SUFFIX
     fi
 
-    # install_sglang above pulls sglang-kernel from PyPI, whose default wheel
-    # tracks one CUDA version (currently cu130). Force-reinstall from the
-    # CU_VERSION-matched sglang wheel index so runners on a different CUDA
-    # (e.g. h20 / cu129) get a wheel linked against the right libnvrtc.
-    $PIP_CMD install "sglang-kernel==${SGL_KERNEL_VERSION_FROM_SRT}" --index-url "https://docs.sglang.ai/whl/${CU_VERSION}/" --force-reinstall --no-deps $PIP_INSTALL_SUFFIX
+    if [ "${CUSTOM_BUILD_SGL_KERNEL:-}" != "true" ]; then
+        # install_sglang above pulls sglang-kernel from PyPI, whose default wheel
+        # tracks one CUDA version (currently cu130). Force-reinstall from the
+        # CU_VERSION-matched sglang wheel index so runners on a different CUDA
+        # (e.g. h20 / cu129) get a wheel linked against the right libnvrtc.
+        $PIP_CMD install "sglang-kernel==${SGL_KERNEL_VERSION_FROM_SRT}" --index-url "https://docs.sglang.ai/whl/${CU_VERSION}/" --force-reinstall --no-deps $PIP_INSTALL_SUFFIX
+    else
+        echo "CUSTOM_BUILD_SGL_KERNEL=true: keeping freshly built sgl-kernel wheel."
+    fi
+    SGL_DEEP_GEMM_VERSION=$(grep -Po -m1 '(?<=sgl-deep-gemm==)[0-9A-Za-z\.\-]+' python/pyproject.toml)
+    if [ "$CU_MAJOR" = "13" ]; then
+        $PIP_CMD install "sgl-deep-gemm==${SGL_DEEP_GEMM_VERSION}" --force-reinstall $PIP_INSTALL_SUFFIX
+    else
+        $PIP_CMD install "https://github.com/sgl-project/whl/releases/download/v${SGL_DEEP_GEMM_VERSION}/sgl_deep_gemm-${SGL_DEEP_GEMM_VERSION}+cu129-py3-none-manylinux2014_$(uname -m).whl" --force-reinstall $PIP_INSTALL_SUFFIX
+    fi
 
     mark_step_done "${FUNCNAME[0]}"
 }

@@ -8,7 +8,6 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
-from sglang.jit_kernel.ngram_ops import build_ngram_with_target_verify
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.layers.dp_attention import (
     get_attention_tp_group,
@@ -117,23 +116,30 @@ class EagleDraftInputV2Mixin:
             )
 
         page_size = batch.token_to_kv_pool_allocator.page_size
-        cur_kv_lens_cpu = []
-        nxt_kv_lens_cpu = []
-        num_needed_tokens = 0
         alloc_len_per_decode = get_alloc_len_per_decode()
-        for r in batch.reqs:
-            # Over-allocation happens here
-            x = r.kv_committed_len + 2 * alloc_len_per_decode - r.kv_allocated_len
-            cur_kv_lens_cpu.append(r.kv_allocated_len)
-            nxt_kv_lens_cpu.append(r.kv_allocated_len + x)
-            num_needed_tokens += x
-            r.kv_allocated_len += x
+        double_alloc = alloc_len_per_decode + alloc_len_per_decode
+
+        cur_kv_lens = [0] * bs
+        nxt_kv_lens = [0] * bs
+        num_needed_tokens = 0
+        for i, r in enumerate(batch.reqs):
+            cur = r.kv_allocated_len
+            # max(cur, ...) clamps so adaptive downswitch (smaller alloc_len_per_decode)
+            # cannot make nxt < cur and corrupt allocator state. kv_committed_len lags
+            # batch.seq_lens by ~1 verify in overlap mode, so we react to adaptive
+            # switches one batch later than a seq_lens-based baseline; the 2*alloc
+            # over-allocation buffer absorbs that lag.
+            nxt = max(cur, r.kv_committed_len + double_alloc)
+            cur_kv_lens[i] = cur
+            nxt_kv_lens[i] = nxt
+            num_needed_tokens += nxt - cur
+            r.kv_allocated_len = nxt
             r.decode_batch_idx += 1
             # Pre-claim bonus slot here (like normal decode); resolve subtracts 1.
             r.kv_committed_len += 1
 
-        cur_kv_lens_cpu = torch.tensor(cur_kv_lens_cpu, dtype=torch.int32, device="cpu")
-        nxt_kv_lens_cpu = torch.tensor(nxt_kv_lens_cpu, dtype=torch.int32, device="cpu")
+        cur_kv_lens_cpu = torch.tensor(cur_kv_lens, dtype=torch.int32, device="cpu")
+        nxt_kv_lens_cpu = torch.tensor(nxt_kv_lens, dtype=torch.int32, device="cpu")
 
         if page_size == 1:
             out_cache_loc = alloc_token_slots(batch.tree_cache, num_needed_tokens)
@@ -200,58 +206,14 @@ class EagleDraftInputV2Mixin:
         # Get a forward batch
         self.num_tokens_per_req = topk
         self.num_tokens_for_logprob_per_req = topk
-        batch.capture_hidden_mode = CaptureHiddenMode.LAST
+        capture_mode = (
+            CaptureHiddenMode.NULL
+            if draft_model_runner.spec_algorithm.is_standalone()
+            else CaptureHiddenMode.LAST
+        )
+        batch.capture_hidden_mode = capture_mode
         self.positions = batch.seq_lens.repeat_interleave(topk, dim=0)
-        if batch.oe_context is not None and batch.extend_seq_lens is not None:
-            extend_lens = batch.extend_seq_lens
-            if isinstance(extend_lens, torch.Tensor):
-                extend_lens = extend_lens.cpu().tolist()
-            extend_lens = [int(x) for x in extend_lens]
-            if (
-                sum(extend_lens) == int(batch.input_ids.numel())
-                and int(batch.input_ids.numel()) > len(extend_lens)
-            ):
-                batch.oe_context.refresh_for_draft_extend(
-                    batch.input_ids, extend_lens
-                )
-        saved_oe_buffer = getattr(self, "welm_mtp_oe_buffer", None)
-        if (
-            saved_oe_buffer is not None
-            and batch.oe_context is not None
-            and batch.oe_context.input_ids_buffer is not None
-        ):
-            restored = saved_oe_buffer.to(
-                device=batch.oe_context.input_ids_buffer.device,
-                dtype=batch.oe_context.input_ids_buffer.dtype,
-            )
-            if restored.numel() == batch.oe_context.input_ids_buffer.numel():
-                batch.oe_context.input_ids_buffer.copy_(
-                    restored.reshape_as(batch.oe_context.input_ids_buffer)
-                )
         forward_batch = ForwardBatch.init_new(batch, draft_model_runner)
-        if (
-            forward_batch.oe_context is not None
-            and forward_batch.extend_seq_lens_cpu is not None
-            and int(forward_batch.input_ids.numel())
-            > len(forward_batch.extend_seq_lens_cpu)
-        ):
-            forward_batch.oe_context.refresh_for_draft_extend(
-                forward_batch.input_ids,
-                [int(x) for x in forward_batch.extend_seq_lens_cpu],
-            )
-        if (
-            saved_oe_buffer is not None
-            and forward_batch.oe_context is not None
-            and forward_batch.oe_context.input_ids_buffer is not None
-        ):
-            restored = saved_oe_buffer.to(
-                device=forward_batch.oe_context.input_ids_buffer.device,
-                dtype=forward_batch.oe_context.input_ids_buffer.dtype,
-            )
-            if restored.numel() == forward_batch.oe_context.input_ids_buffer.numel():
-                forward_batch.oe_context.input_ids_buffer.copy_(
-                    restored.reshape_as(forward_batch.oe_context.input_ids_buffer)
-                )
         can_cuda_graph = cuda_graph_runner and cuda_graph_runner.can_run(forward_batch)
         return forward_batch, can_cuda_graph
 
@@ -274,7 +236,12 @@ class EagleDraftInputV2Mixin:
         batch.extend_seq_lens = [num_draft_tokens for _ in range(len(batch.seq_lens))]
         batch.extend_prefix_lens = seq_lens_cpu_.tolist()
         batch.extend_num_tokens = extend_num_tokens
-        batch.capture_hidden_mode = CaptureHiddenMode.FULL
+        capture_mode = (
+            CaptureHiddenMode.NULL
+            if draft_model_runner.spec_algorithm.is_standalone()
+            else CaptureHiddenMode.FULL
+        )
+        batch.capture_hidden_mode = capture_mode
         batch.forward_mode = (
             ForwardMode.IDLE
             if batch.forward_mode.is_idle()
@@ -309,28 +276,6 @@ class EagleVerifyInputV2Mixin:
                 draft_token_num=self.draft_token_num,
                 device=device,
             )
-            if (
-                batch.oe_context is not None
-                and batch.oe_context.input_ids_buffer is not None
-            ):
-                n_gram_tensors = [
-                    torch.empty_like(self.draft_token)
-                    for _ in batch.oe_context.input_ids_grams
-                ]
-                for idx, gram_tensor in enumerate(n_gram_tensors):
-                    n = idx + 2
-                    build_ngram_with_target_verify(
-                        gram_tensor,
-                        batch.oe_context.input_ids_buffer,
-                        self.draft_token,
-                        self.custom_mask,
-                        self.positions,
-                        batch.seq_lens,
-                        n,
-                        self.draft_token_num,
-                        batch.oe_context.buffer_size,
-                    )
-                    batch.oe_context.set_gram(n, gram_tensor)
 
             # Set mamba_track_indices for mamba prefix-cache state tracking
             if get_global_server_args().enable_mamba_extra_buffer():
@@ -351,13 +296,23 @@ class EagleVerifyInputV2Mixin:
                 batch.mamba_track_mask = None
                 batch.mamba_track_seqlens = None
 
+            # Populate seq_lens_cpu/seq_lens_sum on the verify input so that
+            # TBO's split_spec_info can slice the custom_mask correctly.
+            self.seq_lens_cpu = batch.seq_lens_cpu
+            self.seq_lens_sum = batch.seq_lens_sum
+
         # Get a forward batch
         batch.forward_mode = (
             ForwardMode.IDLE
             if batch.forward_mode.is_idle()
             else ForwardMode.TARGET_VERIFY
         )
-        batch.capture_hidden_mode = CaptureHiddenMode.FULL
+        capture_mode = (
+            CaptureHiddenMode.NULL
+            if target_worker.model_runner.spec_algorithm.is_standalone()
+            else CaptureHiddenMode.FULL
+        )
+        batch.capture_hidden_mode = capture_mode
         verify_forward_batch = ForwardBatch.init_new(batch, target_worker.model_runner)
 
         # Run attention backend plan and cuda graph preparation
@@ -387,13 +342,13 @@ class EagleVerifyInputV2Mixin:
         """
         if batch.forward_mode.is_idle():
             predict = torch.empty(0, dtype=torch.int32, device=batch.input_ids.device)
-            num_accepted_drafts = torch.empty(
+            num_correct_drafts = torch.empty(
                 0, dtype=torch.int32, device=batch.input_ids.device
             )
             accept_index = torch.empty(
                 0, dtype=torch.int32, device=batch.input_ids.device
             )
-            return predict, num_accepted_drafts, accept_index
+            return predict, num_correct_drafts, accept_index
 
         bs = len(batch.seq_lens)
         sampling_info = batch.sampling_info
@@ -435,16 +390,16 @@ class EagleVerifyInputV2Mixin:
         accept_index = torch.full(
             (bs, self.spec_steps + 1), -1, dtype=torch.int32, device=device
         )
-        num_accepted_drafts = torch.empty((bs,), dtype=torch.int32, device=device)
+        num_correct_drafts = torch.empty((bs,), dtype=torch.int32, device=device)
 
         # Sample tokens
         if sampling_info.is_all_greedy or _is_npu or _is_hip:
             target_predict = torch.argmax(next_token_logits, dim=-1)
             target_predict = target_predict.reshape(bs, self.draft_token_num)
-            predict, accept_index, num_accepted_drafts = verify_tree_greedy_func(
+            predict, accept_index, num_correct_drafts = verify_tree_greedy_func(
                 predicts=predict,  # mutable
                 accept_index=accept_index,  # mutable
-                accept_token_num=num_accepted_drafts,  # mutable
+                accept_token_num=num_correct_drafts,  # mutable
                 candidates=candidates,
                 retrieve_index=self.retrieve_index,
                 retrieve_next_token=self.retrieve_next_token,
@@ -486,7 +441,7 @@ class EagleVerifyInputV2Mixin:
             tree_speculative_sampling_target_only(
                 predicts=predict,  # mutable
                 accept_index=accept_index,  # mutable
-                accept_token_num=num_accepted_drafts,  # mutable
+                accept_token_num=num_correct_drafts,  # mutable
                 candidates=candidates,
                 # kwarg LHS retained as `retrive_*` to match sgl_kernel op schema.
                 retrive_index=self.retrieve_index,
@@ -513,30 +468,30 @@ class EagleVerifyInputV2Mixin:
             if tp_group.world_size > 1:
                 tp_group.broadcast(predict, src=0)
                 tp_group.broadcast(accept_index, src=0)
-                tp_group.broadcast(num_accepted_drafts, src=0)
+                tp_group.broadcast(num_correct_drafts, src=0)
 
         if SIMULATE_ACC_LEN > 0:
             # Do simulation
             accept_index = generate_simulated_accept_index(
                 accept_index=accept_index,
                 predict=predict,  # mutable
-                num_accepted_drafts=num_accepted_drafts,  # mutable
+                num_correct_drafts=num_correct_drafts,  # mutable
                 simulate_acc_len=SIMULATE_ACC_LEN,
                 bs=bs,
                 spec_steps=self.spec_steps,
             )
 
-        # `num_accepted_drafts` stays drafts-only inside this function; the returned
+        # `num_correct_drafts` stays drafts-only inside this function; the returned
         # tensor includes the trailing/bonus token via out-of-place +1 so the
         # name no longer flips semantics mid-function (naming doc C2).
-        return predict, num_accepted_drafts + 1, accept_index
+        return predict, num_correct_drafts + 1, accept_index
 
 
 @triton.jit
-def fill_new_verified_id(
-    verified_id,
+def fill_bonus_tokens(
+    accept_tokens,
     accept_lens,
-    new_verified_id,
+    bonus_tokens_ptr,
     num_draft_tokens: tl.constexpr,
 ):
     # NOTE: we cannot fuse any in-place operations of `accept_lens` inside this kernel
@@ -545,9 +500,9 @@ def fill_new_verified_id(
     # `accept_lens` includes the bonus token; the last accepted slot is at -1.
     accept_len = tl.load(accept_lens + pid)
 
-    verified_id_idx = num_draft_tokens * pid + accept_len - 1
-    verified_id_data = tl.load(verified_id + verified_id_idx)
-    tl.store(new_verified_id + pid, verified_id_data)
+    bonus_token_idx = num_draft_tokens * pid + accept_len - 1
+    bonus_token = tl.load(accept_tokens + bonus_token_idx)
+    tl.store(bonus_tokens_ptr + pid, bonus_token)
 
 
 @triton.jit

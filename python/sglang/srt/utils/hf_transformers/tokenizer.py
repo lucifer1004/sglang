@@ -28,13 +28,13 @@ from transformers import (
 from sglang.srt.connector import create_remote_connector
 from sglang.srt.utils import is_remote_url, logger
 from sglang.srt.utils.patch_tokenizer import patch_tokenizer
-from sglang.srt.utils.runai_utils import ObjectStorageModel, is_runai_obj_uri
 
 from ..hf_transformers_patches import _ensure_gguf_version
 from .common import (
     _resolve_local_or_cached_file,
     attach_additional_stop_token_ids,
     check_gguf_file,
+    resolve_runai_obj_uri,
 )
 from .mistral_utils import (
     _MISTRAL_TOKENIZER_REDIRECTS,
@@ -146,8 +146,7 @@ def _resolve_tokenizer_name(tokenizer_name, kwargs):
         kwargs["gguf_file"] = tokenizer_name
         tokenizer_name = Path(tokenizer_name).parent
 
-    if is_runai_obj_uri(tokenizer_name):
-        tokenizer_name = ObjectStorageModel.get_path(tokenizer_name)
+    tokenizer_name = resolve_runai_obj_uri(tokenizer_name)
 
     if is_remote_url(tokenizer_name):
         # BaseConnector implements __del__() to clean up the local dir.
@@ -255,15 +254,13 @@ def _resolve_tokenizers_backend(tokenizer_name, *args, **common_kwargs):
 
 
 def _fix_v5_tokenizer_components(tokenizer, model_name_or_path, revision=None):
-    """Fix backend components when a v5 tokenizer class overwrites them.
+    """Fix pre_tokenizer/decoder when a v5 tokenizer class overwrites them.
 
     In transformers v5, some tokenizer classes (e.g. LlamaTokenizer) have a
-    custom __init__ that rebuilds backend components from scratch
+    custom __init__ that rebuilds the pre_tokenizer and decoder from scratch
     with class-specific components, discarding the originals from tokenizer.json.
     This breaks models that specify LlamaTokenizerFast but actually use a
     different tokenizer architecture (e.g. DeepSeek-V3.2 uses ByteLevel).
-    It also breaks remote-code tokenizers whose class passes vocab/merges into
-    PreTrainedTokenizerFast: the resulting BPE backend can lose its merges.
 
     Detects the mismatch by comparing against the raw tokenizer.json and
     restores the original components when they differ.
@@ -290,34 +287,21 @@ def _fix_v5_tokenizer_components(tokenizer, model_name_or_path, revision=None):
         )
         return
 
-    def _component_changed(loaded, expected):
-        if loaded is None or expected is None:
-            return loaded is not expected
-        return repr(loaded) != repr(expected)
+    raw_pre = type(raw.pre_tokenizer).__name__ if raw.pre_tokenizer else None
+    loaded_pre = type(backend.pre_tokenizer).__name__ if backend.pre_tokenizer else None
 
-    restored = []
-    for attr in ("model", "normalizer", "pre_tokenizer", "post_processor", "decoder"):
-        loaded_component = getattr(backend, attr, None)
-        raw_component = getattr(raw, attr, None)
-        if not _component_changed(loaded_component, raw_component):
-            continue
-        try:
-            setattr(backend, attr, raw_component)
-            restored.append(attr)
-        except Exception as e:
-            logger.debug(
-                "_fix_v5_tokenizer_components: could not restore %s for %s: %s",
-                attr,
-                model_name_or_path,
-                e,
-            )
-
-    if restored:
+    if raw_pre and loaded_pre and raw_pre != loaded_pre:
         logger.info(
-            "Restored v5 tokenizer backend components for %s from tokenizer.json: %s",
+            "Fixing v5 tokenizer component mismatch for %s: "
+            "pre_tokenizer %s -> %s, decoder %s -> %s",
             model_name_or_path,
-            ", ".join(restored),
+            loaded_pre,
+            raw_pre,
+            type(backend.decoder).__name__ if backend.decoder else None,
+            type(raw.decoder).__name__ if raw.decoder else None,
         )
+        backend.pre_tokenizer = raw.pre_tokenizer
+        backend.decoder = raw.decoder
 
 
 def _fix_v5_add_bos_eos_token(tokenizer, model_name_or_path, revision=None):
