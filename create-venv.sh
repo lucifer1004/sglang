@@ -159,19 +159,27 @@ trap cleanup EXIT
 
 "${VENV_PYTHON}" - <<'PY' "${PYPROJECT_PATH}"
 import pathlib
+import re
 import sys
 
 path = pathlib.Path(sys.argv[1])
 text = path.read_text()
-replacements = {
-    '"cuda-python>=13.0",': '"cuda-python>=12,<13",',
-    '"sglang-kernel==0.4.2",': '"sglang-kernel==0.4.2.post1+cu129",',
-    '"nvidia-cutlass-dsl==4.4.2",': '"nvidia-cutlass-dsl==4.5.0",',
-}
-for old, new in replacements.items():
-    if old not in text:
-        raise SystemExit(f"expected dependency line not found in {path}: {old}")
-    text = text.replace(old, new, 1)
+
+def replace_dependency_line(text: str, package: str, replacement: str) -> str:
+    pattern = re.compile(
+        rf'(?m)^(\s*)"{re.escape(package)}(?:\[[^\]]+\])?[^"]*",(\s*(?:#.*)?)$'
+    )
+    text, count = pattern.subn(rf'\1"{replacement}",\2', text, count=1)
+    if count != 1:
+        raise SystemExit(f"expected dependency for {package!r} not found in {path}")
+    return text
+
+for package, replacement in (
+    ("cuda-python", "cuda-python>=12,<13"),
+    ("sglang-kernel", "sglang-kernel==0.4.2.post1+cu129"),
+    ("nvidia-cutlass-dsl", "nvidia-cutlass-dsl==4.5.0"),
+):
+    text = replace_dependency_line(text, package, replacement)
 path.write_text(text)
 PY
 
