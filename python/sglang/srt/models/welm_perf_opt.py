@@ -11,6 +11,7 @@ import triton.language as tl
 
 from sglang.srt.distributed import tensor_model_parallel_all_reduce
 from sglang.srt.layers.communicator import get_attn_tp_context
+from sglang.srt.layers.dp_attention import attn_tp_all_reduce
 from sglang.srt.layers.vocab_parallel_embedding import get_masked_input_and_mask
 
 logger = logging.getLogger(__name__)
@@ -468,11 +469,29 @@ def compute_welm_oe_embedding(
     oe_proj_module,
     implementation: str | None = None,
     use_triton_preprocess: bool | None = None,
-    all_reduce_fn=tensor_model_parallel_all_reduce,
+    all_reduce_fn=None,
 ) -> torch.Tensor:
-    """Compute WelmV4 OE embeddings with an OE-specific delayed-all-reduce fast path."""
+    """Compute WelmV4 OE embeddings with an OE-specific delayed-all-reduce fast path.
+
+    The default ``all_reduce_fn`` is selected at call time based on whether the
+    OE embedding modules are sharded along the attention TP group (DP attention
+    deployments) or the global TP group (pure TP deployments). This keeps the
+    collective in lock-step with how ``VocabParallelEmbedding`` partitioned the
+    vocab — using the global all-reduce on attn-TP-sharded modules under DP
+    attention would mix partials across DP groups (different input_ids per
+    group) and produce wrong results.
+    """
     if not oe_grams:
         return base_hidden_states
+
+    if all_reduce_fn is None:
+        # Pick the all-reduce primitive that matches how the OE modules were
+        # sharded. ``use_attn_tp_group`` is set when DP attention is enabled.
+        first_module = oe_embed_modules[0] if oe_embed_modules else None
+        if getattr(first_module, "use_attn_tp_group", False):
+            all_reduce_fn = attn_tp_all_reduce
+        else:
+            all_reduce_fn = tensor_model_parallel_all_reduce
 
     implementation = get_welm_oe_implementation(implementation)
     use_triton_preprocess = should_use_welm_oe_triton_preprocess(

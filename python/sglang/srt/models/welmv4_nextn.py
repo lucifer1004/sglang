@@ -272,6 +272,7 @@ class WeLMV4ModelNextN(nn.Module):
                     VocabParallelEmbedding(
                         self.oe_vocab_sizes[i],
                         self.oe_dim,
+                        use_attn_tp_group=is_dp_attention_enabled(),
                     )
                     for i in range(len(self.oe_vocab_sizes))
                 ]

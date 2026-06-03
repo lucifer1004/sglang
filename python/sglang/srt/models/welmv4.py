@@ -2432,7 +2432,7 @@ class Qwen2MoeModel(nn.Module):
                     VocabParallelEmbedding(
                         self.oe_vocab_sizes[i],
                         self.oe_dim,
-                        enable_tp=not is_dp_attention_enabled(),
+                        use_attn_tp_group=is_dp_attention_enabled(),
                     )
                     for i in range(len(self.oe_vocab_sizes))
                 ]
@@ -2451,7 +2451,7 @@ class Qwen2MoeModel(nn.Module):
                     VocabParallelEmbedding(
                         config.vocab_size,
                         config.hidden_size,
-                        enable_tp=not is_dp_attention_enabled(),
+                        use_attn_tp_group=is_dp_attention_enabled(),
                     )
                     for _ in range(self.scale_seq_times)
                 ]
@@ -2464,7 +2464,7 @@ class Qwen2MoeModel(nn.Module):
                                 VocabParallelEmbedding(
                                     self.oe_vocab_sizes[j],
                                     self.oe_dim,
-                                    enable_tp=not is_dp_attention_enabled(),
+                                    use_attn_tp_group=is_dp_attention_enabled(),
                                 )
                                 for j in range(len(self.oe_vocab_sizes))
                             ]
@@ -2488,7 +2488,7 @@ class Qwen2MoeModel(nn.Module):
             self.embed_tokens = VocabParallelEmbedding(
                 config.vocab_size,
                 config.hidden_size,
-                enable_tp=not is_dp_attention_enabled(),
+                use_attn_tp_group=is_dp_attention_enabled(),
                 prefix=add_prefix("embed_tokens", prefix),
             )
         else:
