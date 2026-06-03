@@ -45,6 +45,28 @@ class TestPrepareServerArgs(CustomTestCase):
         self.assertTrue(server_args.enable_moe_router_replay)
 
 
+class TestWelmOeArgs(unittest.TestCase):
+    def test_decode_hash_kernel_rejects_incompatible_options(self):
+        cases = [
+            ({"enable_mixed_chunk": True}, {}, "--enable-mixed-chunk"),
+            ({}, {"SGLANG_DUMP_ACTIVATIONS": "1"}, "SGLANG_DUMP_ACTIVATIONS"),
+            ({}, {"WELM_USE_PREVIOUS_PRECISION": "1"}, "WELM_USE_PREVIOUS_PRECISION"),
+        ]
+        base_env = {
+            "SGLANG_WELM_OE_IMPL": "tp_fused_decode_hash",
+            "SGLANG_DUMP_ACTIVATIONS": "0",
+            "WELM_USE_PREVIOUS_PRECISION": "0",
+        }
+
+        for kwargs, env, pattern in cases:
+            with self.subTest(pattern=pattern):
+                server_args = ServerArgs(model_path="dummy", **kwargs)
+                server_args.prepare_n_gram_inputs = True
+                with patch.dict("os.environ", {**base_env, **env}):
+                    with self.assertRaisesRegex(ValueError, pattern):
+                        server_args._handle_welm_oe_decode_hash_kernel_args()
+
+
 class TestLoadBalanceMethod(unittest.TestCase):
     def test_non_pd_defaults_to_round_robin(self):
         server_args = ServerArgs(model_path="dummy", disaggregation_mode="null")

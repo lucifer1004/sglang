@@ -61,7 +61,15 @@ from sglang.srt.layers.moe.utils import (
     should_record_nolora_graph,
 )
 from sglang.srt.layers.utils import MultiPlatformOp
-from sglang.srt.managers.schedule_batch import OverEncodingContext
+from sglang.srt.managers.schedule_batch import (
+    DecodeHashInputIdsBuffer,
+    OverEncodingContext,
+)
+from sglang.srt.models.welm_perf_opt import (
+    fill_welm_oe_decode_hash_inputs,
+    get_welm_oe_decode_hash_config,
+    should_use_welm_oe_decode_hash_kernel,
+)
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
@@ -172,6 +180,7 @@ class DecodeInputBuffers(ForwardInputBuffers):
     pp_proxy_tensors: Optional[Dict[str, torch.Tensor]]
     ngram_embedding_info: Optional["NgramEmbeddingInfo"]
     input_ids_grams: List[torch.Tensor]
+    welm_oe_decode_hashed_inputs: Optional[torch.Tensor]
     router_replay_topk_ids: torch.Tensor
     router_replay_mask: torch.Tensor
     router_replay_local_topk_ids: torch.Tensor
@@ -198,6 +207,7 @@ class DecodeInputBuffers(ForwardInputBuffers):
         cache_loc_dtype: torch.dtype,
         enable_mamba_track: bool,
         prepare_n_gram_inputs: bool,
+        welm_oe_decode_hash_num_branches: int,
         scale_seq_factor: int,
         router_replay_num_layers: int = 0,
         router_replay_top_k: int = 0,
@@ -213,6 +223,14 @@ class DecodeInputBuffers(ForwardInputBuffers):
                 ]
             else:
                 input_ids_grams = []
+            welm_oe_decode_hashed_inputs = (
+                torch.zeros(
+                    (welm_oe_decode_hash_num_branches, max_num_token),
+                    dtype=torch.int64,
+                )
+                if welm_oe_decode_hash_num_branches > 0
+                else None
+            )
             input_ids = torch.zeros((max_num_token,), dtype=torch.int64)
             input_embeds = torch.zeros((max_num_token, hidden_size), dtype=dtype)
             req_pool_indices = torch.zeros((max_bs,), dtype=torch.int64)
@@ -337,6 +355,7 @@ class DecodeInputBuffers(ForwardInputBuffers):
             pp_proxy_tensors=pp_proxy_tensors,
             ngram_embedding_info=ngram_embedding_info,
             input_ids_grams=input_ids_grams,
+            welm_oe_decode_hashed_inputs=welm_oe_decode_hashed_inputs,
             router_replay_topk_ids=router_replay_topk_ids,
             router_replay_mask=router_replay_mask,
             router_replay_local_topk_ids=router_replay_local_topk_ids,
@@ -384,7 +403,11 @@ class DecodeInputBuffers(ForwardInputBuffers):
             forward_batch.positions,
         ]
 
-        if forward_batch.oe_context is not None and len(self.input_ids_grams) > 0:
+        if (
+            forward_batch.oe_context is not None
+            and len(self.input_ids_grams) > 0
+            and not forward_batch.oe_context.has_decode_hash_prefixes()
+        ):
             for buf_gram, src_gram in zip(
                 self.input_ids_grams,
                 forward_batch.oe_context.input_ids_grams,
@@ -887,6 +910,22 @@ class CudaGraphRunner:
                     max(1, num_key_value_heads // self.attn_tp_size) * head_dim
                 )
 
+        self.welm_oe_decode_hash_config = None
+        welm_oe_decode_hash_num_branches = 0
+        if (
+            self.model_runner.server_args.prepare_n_gram_inputs
+            and self.capture_forward_mode.is_decode()
+            and should_use_welm_oe_decode_hash_kernel(
+                self.model_runner.model_config
+            )
+        ):
+            oe_grams, oe_vocab_sizes = get_welm_oe_decode_hash_config(
+                self.model_runner.model_config
+            )
+            if oe_grams and len(oe_grams) == len(oe_vocab_sizes):
+                self.welm_oe_decode_hash_config = (oe_grams, oe_vocab_sizes)
+                welm_oe_decode_hash_num_branches = len(oe_vocab_sizes)
+
         self.buffers: DecodeInputBuffers = DecodeInputBuffers.create(
             device=self.device,
             max_bs=self.max_bs,
@@ -904,6 +943,7 @@ class CudaGraphRunner:
             cache_loc_dtype=self._cache_loc_dtype(),
             enable_mamba_track=enable_mamba_track,
             prepare_n_gram_inputs=self.model_runner.server_args.prepare_n_gram_inputs,
+            welm_oe_decode_hash_num_branches=welm_oe_decode_hash_num_branches,
             scale_seq_factor=self.scale_seq_factor,
             router_replay_num_layers=getattr(
                 self.model_runner.model_config.hf_text_config,
@@ -1315,11 +1355,24 @@ class CudaGraphRunner:
         )
         if self.model_runner.server_args.prepare_n_gram_inputs:
             model_input_len = bs if self.scale_seq_factor > 1 else num_tokens
-            forward_batch.oe_context = OverEncodingContext(
-                input_ids_grams=[
-                    gram[:model_input_len] for gram in buffers.input_ids_grams
-                ],
+            use_welm_oe_decode_hash = (
+                self.capture_forward_mode.is_decode()
+                and self.welm_oe_decode_hash_config is not None
+                and buffers.welm_oe_decode_hashed_inputs is not None
             )
+            if use_welm_oe_decode_hash:
+                forward_batch.oe_context = OverEncodingContext(
+                    input_ids_buffer=DecodeHashInputIdsBuffer([])
+                )
+                forward_batch.welm_oe_decode_hashed_inputs = (
+                    buffers.welm_oe_decode_hashed_inputs[:, :num_tokens]
+                )
+            else:
+                forward_batch.oe_context = OverEncodingContext(
+                    input_ids_grams=[
+                        gram[:model_input_len] for gram in buffers.input_ids_grams
+                    ],
+                )
 
         # HiSparse: set coordinator so the hisparse code path is captured into the graph
         forward_batch.hisparse_coordinator = self.model_runner.hisparse_coordinator
@@ -1349,6 +1402,12 @@ class CudaGraphRunner:
         def run_once():
             # Clean intermediate result cache for DP attention
             forward_batch.dp_local_start_pos = forward_batch.dp_local_num_tokens = None
+            if use_welm_oe_decode_hash:
+                forward_batch.welm_oe_decode_hashed_inputs = (
+                    buffers.welm_oe_decode_hashed_inputs[:, :num_tokens]
+                )
+            else:
+                forward_batch.welm_oe_decode_hashed_inputs = None
             set_dp_buffer_len(
                 global_dp_buffer_len,
                 num_tokens,
@@ -1486,6 +1545,26 @@ class CudaGraphRunner:
         ):
             buffers.input_embeds[:raw_num_token].copy_(forward_batch.input_embeds)
             # Padded tokens aren't read, so skip zeroing them.
+        if (
+            self.welm_oe_decode_hash_config is not None
+            and buffers.welm_oe_decode_hashed_inputs is not None
+            and forward_batch.oe_context is not None
+            and forward_batch.oe_context.has_decode_hash_prefixes()
+        ):
+            oe_grams, oe_vocab_sizes = self.welm_oe_decode_hash_config
+            fill_welm_oe_decode_hash_inputs(
+                forward_batch.input_ids[:raw_num_token],
+                buffers.welm_oe_decode_hashed_inputs[:, :raw_num_token],
+                forward_batch.oe_context,
+                oe_grams,
+                oe_vocab_sizes,
+                self.model_runner.model_config.vocab_size,
+            )
+            static_num_token = bs * self.num_tokens_per_bs
+            if raw_num_token < static_num_token:
+                buffers.welm_oe_decode_hashed_inputs[
+                    :, raw_num_token:static_num_token
+                ].zero_()
         if self.enable_two_batch_overlap:
             self.tbo_plugin.replay_prepare(
                 forward_mode=self.capture_forward_mode,

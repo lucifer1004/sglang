@@ -21,6 +21,11 @@ WELM_OE_TRITON_PREPROCESS_ENV = "SGLANG_WELM_OE_TRITON_PREPROCESS"
 WELM_OE_POST_PROJ_ALL_REDUCE_ENV = "SGLANG_WELM_OE_POST_PROJ_ALL_REDUCE"
 WELM_OE_IMPL_LEGACY = "legacy"
 WELM_OE_IMPL_TP_FUSED = "tp_fused"
+WELM_OE_IMPL_TP_FUSED_DECODE_HASH = "tp_fused_decode_hash"
+WELM_OE_DECODE_HASH_INCOMPATIBLE_ENVS = (
+    "SGLANG_DUMP_ACTIVATIONS",
+    "WELM_USE_PREVIOUS_PRECISION",
+)
 SPECIALIZED_WELM_OE_GRAMS = (2, 2, 3, 3)
 SPECIALIZED_WELM_OE_BRANCHES = 4
 SPECIALIZED_WELM_OE_DIM = 512
@@ -161,14 +166,133 @@ def _compute_welm_oe_hashed_inputs_fused(
     hashed_inputs = []
     for branch_idx, vocab_size_branch in enumerate(oe_vocab_sizes):
         module = oe_embed_modules[branch_idx]
-        hashed_ids, _, _ = hash_and_localize_welm_oe_input_ids(
-            ngram_inputs[oe_grams[branch_idx] - 2],
-            vocab_size_branch,
-            module.shard_indices.org_vocab_start_index,
-            module.shard_indices.org_vocab_end_index,
-        )
+        ngram_input = ngram_inputs[oe_grams[branch_idx] - 2]
+        if hasattr(module, "shard_indices"):
+            hashed_ids, _, _ = hash_and_localize_welm_oe_input_ids(
+                ngram_input,
+                vocab_size_branch,
+                module.shard_indices.org_vocab_start_index,
+                module.shard_indices.org_vocab_end_index,
+            )
+        else:
+            hashed_ids = hash_input_ids_vectorized(ngram_input.to(torch.int64))
+            hashed_ids = (hashed_ids % vocab_size_branch).to(torch.int64)
         hashed_inputs.append(hashed_ids)
     return hashed_inputs
+
+
+def _compute_welm_oe_decode_hash_inputs(
+    *,
+    input_ids: torch.Tensor,
+    forward_batch,
+    oe_grams: Sequence[int],
+    oe_vocab_sizes: Sequence[int],
+    vocab_size: int,
+) -> list[torch.Tensor]:
+    num_branches = len(oe_vocab_sizes)
+    num_tokens = input_ids.numel()
+    cached_hashed_inputs = getattr(forward_batch, "welm_oe_decode_hashed_inputs", None)
+    if (
+        cached_hashed_inputs is not None
+        and cached_hashed_inputs.shape == (num_branches, num_tokens)
+    ):
+        return [cached_hashed_inputs[i] for i in range(num_branches)]
+
+    hashed_inputs = torch.empty(
+        (num_branches, num_tokens),
+        device=input_ids.device,
+        dtype=torch.int64,
+    )
+    forward_batch.welm_oe_decode_hashed_inputs = hashed_inputs
+
+    if num_tokens == 0:
+        return [hashed_inputs[i] for i in range(num_branches)]
+
+    fill_welm_oe_decode_hash_inputs(
+        input_ids,
+        hashed_inputs,
+        forward_batch.oe_context,
+        oe_grams,
+        oe_vocab_sizes,
+        vocab_size,
+    )
+    return [hashed_inputs[i] for i in range(num_branches)]
+
+
+def fill_welm_oe_decode_hash_inputs(
+    input_ids: torch.Tensor,
+    hashed_out: torch.Tensor,
+    oe_context,
+    oe_grams: Sequence[int],
+    oe_vocab_sizes: Sequence[int],
+    vocab_size: int,
+) -> None:
+    from sglang.jit_kernel.welm_oe import welm_oe_decode_hash_from_prefixes_cuda
+
+    if input_ids.numel() == 0:
+        return
+    prefix_rows = getattr(oe_context, "decode_hash_prefixes", None)
+    if prefix_rows is None:
+        raise RuntimeError(
+            "WeLM OE decode hash kernel path is missing CPU prefix state."
+        )
+    num_tokens = input_ids.numel()
+    for row in prefix_rows:
+        if len(row) != num_tokens:
+            raise RuntimeError(
+                "WeLM OE decode hash prefix rows must match decode tokens: "
+                f"{len(row)} vs {num_tokens}."
+            )
+    prefixes = [token for row in prefix_rows for token in row]
+    welm_oe_decode_hash_from_prefixes_cuda(
+        input_ids,
+        prefixes,
+        oe_grams,
+        oe_vocab_sizes,
+        hashed_out,
+        vocab_size,
+    )
+
+
+def _has_welm_oe_decode_hash_inputs(
+    input_ids: torch.Tensor,
+    forward_batch,
+    oe_vocab_sizes: Sequence[int],
+) -> bool:
+    oe_context = getattr(forward_batch, "oe_context", None)
+    cached_hashed_inputs = getattr(forward_batch, "welm_oe_decode_hashed_inputs", None)
+    prefix_rows = getattr(oe_context, "decode_hash_prefixes", None)
+    has_cached_hash = cached_hashed_inputs is not None
+    has_prefixes = prefix_rows is not None
+    if not has_cached_hash and not has_prefixes:
+        return False
+
+    if not should_use_welm_oe_decode_hash_kernel() or not input_ids.is_cuda:
+        raise RuntimeError(
+            "WeLM OE decode hash state is present, but the decode hash "
+            "kernel path is not enabled for this forward."
+        )
+    expected_shape = (len(oe_vocab_sizes), input_ids.numel())
+    if has_cached_hash:
+        if cached_hashed_inputs.shape != expected_shape:
+            raise RuntimeError(
+                "WeLM OE cached decode hash shape mismatch: "
+                f"{tuple(cached_hashed_inputs.shape)} vs {expected_shape}."
+            )
+        return True
+
+    if len(prefix_rows) == 0:
+        raise RuntimeError(
+            "WeLM OE decode hash graph marker is missing cached hash inputs."
+        )
+    for row in prefix_rows:
+        if len(row) != input_ids.numel():
+            raise RuntimeError(
+                "WeLM OE decode hash prefix rows must match decode tokens: "
+                f"{len(row)} vs {input_ids.numel()}."
+            )
+    return True
+
 
 def _can_use_specialized_welm_oe_lookup_concat(
     input_ids: torch.Tensor,
@@ -348,6 +472,24 @@ def compute_welm_oe_concat_local_partials(
     if not oe_grams:
         return input_ids.new_zeros((input_ids.shape[0], 0), dtype=torch.float32)
 
+    if _has_welm_oe_decode_hash_inputs(
+        input_ids,
+        forward_batch,
+        oe_vocab_sizes,
+    ):
+        hashed_inputs = _compute_welm_oe_decode_hash_inputs(
+            input_ids=input_ids,
+            forward_batch=forward_batch,
+            oe_grams=oe_grams,
+            oe_vocab_sizes=oe_vocab_sizes,
+            vocab_size=vocab_size,
+        )
+        local_embeddings = []
+        for i, _ in enumerate(oe_vocab_sizes):
+            module = oe_embed_modules[i]
+            local_embeddings.append(_lookup_local_embedding(module, hashed_inputs[i]))
+        return torch.cat(local_embeddings, dim=-1)
+
     if _can_use_specialized_welm_oe_lookup_concat(
         input_ids,
         oe_grams,
@@ -414,7 +556,10 @@ def _should_use_tp_fused_path(
     *,
     implementation: str,
 ) -> bool:
-    if implementation != WELM_OE_IMPL_TP_FUSED:
+    if implementation not in {
+        WELM_OE_IMPL_TP_FUSED,
+        WELM_OE_IMPL_TP_FUSED_DECODE_HASH,
+    }:
         return False
     if not oe_embed_modules:
         return False
@@ -432,6 +577,8 @@ def get_welm_oe_implementation(implementation: str | None = None) -> str:
         return WELM_OE_IMPL_LEGACY
     if normalized in {"tp_fused", "fused", "new", "optimized"}:
         return WELM_OE_IMPL_TP_FUSED
+    if normalized in {"tp_fused_decode_hash", "decode_hash"}:
+        return WELM_OE_IMPL_TP_FUSED_DECODE_HASH
 
     logger.warning(
         "%s=%r is invalid; falling back to %s",
@@ -442,6 +589,75 @@ def get_welm_oe_implementation(implementation: str | None = None) -> str:
     return WELM_OE_IMPL_LEGACY
 
 
+def _env_flag(name: str, default: str = "0") -> bool:
+    return os.getenv(name, default).strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _get_model_config_sequence(model_config, name: str):
+    if model_config is None:
+        return None
+    for config in (
+        getattr(model_config, "hf_text_config", None),
+        getattr(model_config, "hf_config", None),
+    ):
+        value = getattr(config, name, None)
+        if value is not None:
+            return value
+    return None
+
+
+def get_welm_oe_decode_hash_config(model_config) -> Tuple[Tuple[int, ...], Tuple[int, ...]]:
+    oe_grams = tuple(
+        int(g) for g in (_get_model_config_sequence(model_config, "oe_grams") or ())
+    )
+    oe_vocab_sizes = tuple(
+        int(v)
+        for v in (_get_model_config_sequence(model_config, "oe_vocab_sizes") or ())
+    )
+    return oe_grams, oe_vocab_sizes
+
+
+def _model_config_supports_welm_oe_decode_hash_kernel(model_config) -> bool:
+    oe_grams = _get_model_config_sequence(model_config, "oe_grams")
+    oe_vocab_sizes = _get_model_config_sequence(model_config, "oe_vocab_sizes")
+    if oe_grams is None and oe_vocab_sizes is None:
+        return True
+    if not oe_grams or not oe_vocab_sizes:
+        return False
+    if len(oe_grams) != len(oe_vocab_sizes):
+        return False
+    return all(int(g) >= 2 for g in oe_grams) and all(
+        int(v) > 0 for v in oe_vocab_sizes
+    )
+
+
+def validate_welm_oe_decode_hash_kernel_compatibility(
+    *,
+    implementation: str | None = None,
+    enable_mixed_chunk: bool = False,
+) -> bool:
+    implementation = get_welm_oe_implementation(implementation)
+    if implementation != WELM_OE_IMPL_TP_FUSED_DECODE_HASH:
+        return False
+
+    conflicts = [
+        name for name in WELM_OE_DECODE_HASH_INCOMPATIBLE_ENVS if _env_flag(name)
+    ]
+    if enable_mixed_chunk:
+        conflicts.append("--enable-mixed-chunk")
+    if conflicts:
+        raise ValueError(
+            f"{WELM_OE_IMPL_ENV}={WELM_OE_IMPL_TP_FUSED_DECODE_HASH} is "
+            f"incompatible with {', '.join(conflicts)}."
+        )
+    return True
+
+
 def should_use_welm_oe_triton_preprocess(
     use_triton_preprocess: bool | None = None,
 ) -> bool:
@@ -450,6 +666,13 @@ def should_use_welm_oe_triton_preprocess(
 
     value = os.getenv(WELM_OE_TRITON_PREPROCESS_ENV, "1").strip().lower()
     return value in {"1", "true", "yes", "on"}
+
+
+def should_use_welm_oe_decode_hash_kernel(model_config=None) -> bool:
+    return (
+        validate_welm_oe_decode_hash_kernel_compatibility()
+        and _model_config_supports_welm_oe_decode_hash_kernel(model_config)
+    )
 
 
 def should_use_welm_oe_post_proj_all_reduce() -> bool:

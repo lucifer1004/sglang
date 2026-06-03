@@ -149,6 +149,10 @@ from sglang.srt.model_executor.hook_manager import register_forward_hooks
 from sglang.srt.model_executor.model_runner_kv_cache_mixin import (
     ModelRunnerKVCacheMixin,
 )
+from sglang.srt.models.welm_perf_opt import (
+    get_welm_oe_decode_hash_config,
+    should_use_welm_oe_decode_hash_kernel,
+)
 from sglang.srt.model_executor.piecewise_cuda_graph_runner import (
     PiecewiseCudaGraphRunner,
 )
@@ -735,6 +739,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         # Init ngram embedding token table
         self.maybe_init_ngram_embedding()
+        self.maybe_warmup_welm_oe_decode_hash_kernel()
 
         # Init hisparse coordinator (must happen before CUDA graph capture)
         if self.enable_hisparse:
@@ -2733,6 +2738,27 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     module.init_buffers(
                         self.max_running_requests, chunked_prefill_size, self.device
                     )
+
+    def maybe_warmup_welm_oe_decode_hash_kernel(self):
+        if not self.server_args.prepare_n_gram_inputs:
+            return
+        if not should_use_welm_oe_decode_hash_kernel(self.model_config):
+            return
+        if torch.device(self.device).type != "cuda":
+            return
+
+        oe_grams, oe_vocab_sizes = get_welm_oe_decode_hash_config(self.model_config)
+        if not oe_grams:
+            return
+
+        from sglang.jit_kernel.welm_oe import warmup_welm_oe_decode_hash_kernel
+
+        warmup_welm_oe_decode_hash_kernel(
+            self.device,
+            history_width=max(oe_grams) - 1,
+            oe_grams=oe_grams,
+            oe_vocab_sizes=oe_vocab_sizes,
+        )
 
     def maybe_update_ngram_token_table(
         self,

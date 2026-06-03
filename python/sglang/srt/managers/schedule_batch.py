@@ -80,6 +80,10 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
 )
+from sglang.srt.models.welm_perf_opt import (
+    get_welm_oe_decode_hash_config,
+    should_use_welm_oe_decode_hash_kernel,
+)
 from sglang.srt.observability.metrics_collector import DPCooperationInfo
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import SamplingParams
@@ -732,6 +736,11 @@ class RequestStage(str, enum.Enum):
 
 
 @dataclasses.dataclass
+class DecodeHashInputIdsBuffer:
+    prefixes: List[List[int]]
+
+
+@dataclasses.dataclass
 class OverEncodingContext:
     """Context data for over-encoding (shifted input IDs for n-gram embeddings).
 
@@ -749,9 +758,13 @@ class OverEncodingContext:
     NUM_GRAMS: ClassVar[int] = 3
 
     input_ids_grams: List[torch.Tensor] = dataclasses.field(default_factory=list)
-    input_ids_buffer: Optional[torch.Tensor] = None
+    input_ids_buffer: Optional[Union[torch.Tensor, DecodeHashInputIdsBuffer]] = None
     buffer_size: int = 4
     filtered: bool = False
+    decode_hash_prefixes: Optional[List[List[int]]] = None
+    _input_ids_buffer: Optional[
+        Union[torch.Tensor, DecodeHashInputIdsBuffer]
+    ] = dataclasses.field(default=None, init=False, repr=False)
 
     # ------------------------------------------------------------------
     # Factory methods
@@ -841,6 +854,38 @@ class OverEncodingContext:
             ],
             input_ids_buffer=input_ids_buffer,
         )
+
+    @classmethod
+    def from_decode_hash_kernel(
+        cls, reqs, enable_overlap, history_width: int
+    ) -> "OverEncodingContext":
+        """Build a decode context whose OE hashes are produced on GPU."""
+        offsets = []
+        if enable_overlap:
+            for r in reqs:
+                dc = r._overlap_decode_count
+                offsets.append(1 if len(r.output_ids) > dc else 0)
+                r._overlap_decode_count = dc + 1
+        else:
+            offsets = [1] * len(reqs)
+
+        prefixes = []
+        for lag in range(1, history_width + 1):
+            row = []
+            for r, offset in zip(reqs, offsets):
+                row.append(cls._decode_history_token(r, lag + offset))
+            prefixes.append(row)
+        return cls(input_ids_buffer=DecodeHashInputIdsBuffer(prefixes))
+
+    @staticmethod
+    def _decode_history_token(req, shift: int) -> int:
+        total_len = len(req.origin_input_ids) + len(req.output_ids)
+        pos = total_len - shift
+        if pos < 0:
+            return 0
+        if pos < len(req.origin_input_ids):
+            return req.origin_input_ids[pos]
+        return req.output_ids[pos - len(req.origin_input_ids)]
 
     # ------------------------------------------------------------------
     # Merge / filter
@@ -939,6 +984,57 @@ class OverEncodingContext:
     def __len__(self) -> int:
         return len(self.input_ids_grams)
 
+    def __bool__(self) -> bool:
+        return (
+            self.has_decode_hash_prefixes()
+            or bool(self.input_ids_grams)
+            or self.input_ids_buffer is not None
+        )
+
+    def has_decode_hash_prefixes(self) -> bool:
+        return self.decode_hash_prefixes is not None
+
+    def _get_input_ids_buffer(self) -> Optional[torch.Tensor]:
+        state = getattr(self, "_input_ids_buffer", None)
+        return state if isinstance(state, torch.Tensor) else None
+
+    def _set_input_ids_buffer(
+        self, value: Optional[Union[torch.Tensor, DecodeHashInputIdsBuffer]]
+    ):
+        if value is None:
+            object.__setattr__(self, "_input_ids_buffer", None)
+            return
+        if isinstance(value, DecodeHashInputIdsBuffer):
+            if self.input_ids_buffer is not None:
+                raise ValueError(
+                    "OverEncodingContext cannot hold both materialized "
+                    "input_ids_buffer and decode hash prefixes."
+                )
+            object.__setattr__(self, "_input_ids_buffer", value)
+            return
+        if self.has_decode_hash_prefixes():
+            raise ValueError(
+                "OverEncodingContext cannot hold both materialized "
+                "input_ids_buffer and decode hash prefixes."
+            )
+        object.__setattr__(self, "_input_ids_buffer", value)
+
+    def _get_decode_hash_prefixes(self) -> Optional[List[List[int]]]:
+        state = getattr(self, "_input_ids_buffer", None)
+        if isinstance(state, DecodeHashInputIdsBuffer):
+            return state.prefixes
+        return None
+
+    def _set_decode_hash_prefixes(self, value: Optional[List[List[int]]]):
+        if value is None:
+            return
+        if self.input_ids_buffer is not None:
+            raise ValueError(
+                "OverEncodingContext cannot hold both materialized "
+                "input_ids_buffer and decode hash prefixes."
+            )
+        object.__setattr__(self, "_input_ids_buffer", DecodeHashInputIdsBuffer(value))
+
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
@@ -976,6 +1072,15 @@ class OverEncodingContext:
                 return
         object.__setattr__(self, name, value)
 
+
+OverEncodingContext.input_ids_buffer = property(
+    OverEncodingContext._get_input_ids_buffer,
+    OverEncodingContext._set_input_ids_buffer,
+)
+OverEncodingContext.decode_hash_prefixes = property(
+    OverEncodingContext._get_decode_hash_prefixes,
+    OverEncodingContext._set_decode_hash_prefixes,
+)
 
 
 
@@ -2395,6 +2500,15 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.forward_mode = ForwardMode.SPLIT_PREFILL
 
     def mix_with_running(self, running_batch: "ScheduleBatch"):
+        if (
+            running_batch.oe_context is not None
+            and running_batch.oe_context.has_decode_hash_prefixes()
+        ):
+            raise RuntimeError(
+                "WeLM OE decode hash kernel does not support mixed "
+                "prefill/decode forward. Disable --enable-mixed-chunk or use "
+                "SGLANG_WELM_OE_IMPL=tp_fused."
+            )
         self.forward_mode = ForwardMode.MIXED
         running_bs = running_batch.batch_size()
         scale = self._get_scale_seq_factor()
@@ -2673,9 +2787,19 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             )
         )
 
-        self.oe_context = OverEncodingContext.from_decode(
-            self.reqs, self.enable_overlap, self.device
-        )
+        oe_grams, _ = get_welm_oe_decode_hash_config(self.model_config)
+        if (
+            oe_grams
+            and should_use_welm_oe_decode_hash_kernel(self.model_config)
+            and torch.device(self.device).type == "cuda"
+        ):
+            self.oe_context = OverEncodingContext.from_decode_hash_kernel(
+                self.reqs, self.enable_overlap, max(oe_grams) - 1
+            )
+        else:
+            self.oe_context = OverEncodingContext.from_decode(
+                self.reqs, self.enable_overlap, self.device
+            )
 
         if self.model_config.is_encoder_decoder:
             self.prepare_encoder_info_decode()
@@ -2879,7 +3003,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if self.spec_info:
             self.spec_info.merge_batch(other.spec_info)
         if self.oe_context and other.oe_context:
-            self.oe_context.merge_buffer(other.oe_context)
+            if (
+                self.oe_context.has_decode_hash_prefixes()
+                or other.oe_context.has_decode_hash_prefixes()
+            ):
+                self.oe_context = None
+            else:
+                self.oe_context.merge_buffer(other.oe_context)
 
     def get_model_worker_batch(
         self, seq_lens_cpu_cache: Optional[torch.Tensor] = None
