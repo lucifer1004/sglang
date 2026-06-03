@@ -141,6 +141,7 @@ run_logged embed-managed-python embed_managed_python "${VENV_PATH}"
 
 REQ_DIR="$(mktemp -d)"
 REQ_FILE="${REQ_DIR}/sglang-runtime-requirements.txt"
+SGL_DEEP_GEMM_VERSION_FILE="${REQ_DIR}/sgl-deep-gemm-version.txt"
 PYPROJECT_PATH="${REPO_DIR}/python/pyproject.toml"
 PYPROJECT_BACKUP="${REQ_DIR}/pyproject.toml.orig"
 cp "${PYPROJECT_PATH}" "${PYPROJECT_BACKUP}"
@@ -183,12 +184,15 @@ for package, replacement in (
 path.write_text(text)
 PY
 
-"${VENV_PYTHON}" - <<'PY' >"${REQ_FILE}"
+"${VENV_PYTHON}" - "${SGL_DEEP_GEMM_VERSION_FILE}" <<'PY' >"${REQ_FILE}"
 import pathlib
+import sys
 import tomllib
 
+deep_gemm_version_file = pathlib.Path(sys.argv[1])
 pyproject = pathlib.Path("python/pyproject.toml")
 data = tomllib.loads(pyproject.read_text())
+deep_gemm_version = None
 for dep in data["project"]["dependencies"]:
     dep_lower = dep.strip().lower()
     if dep_lower.startswith("cuda-python"):
@@ -199,8 +203,14 @@ for dep in data["project"]["dependencies"]:
         continue
     elif dep_lower.startswith("sglang-kernel=="):
         continue
+    elif dep_lower.startswith("sgl-deep-gemm=="):
+        deep_gemm_version = dep.split("==", 1)[1].strip()
+        continue
     else:
         print(dep)
+if not deep_gemm_version:
+    raise SystemExit("expected sgl-deep-gemm dependency not found")
+deep_gemm_version_file.write_text(deep_gemm_version)
 PY
 
 run_logged install-torch-cu128 "${UV}" pip install \
@@ -214,6 +224,11 @@ run_logged install-sglang-kernel-cu129 "${UV}" pip install \
     --index-url "${SGLANG_KERNEL_INDEX_URL}" \
     "sglang-kernel==0.4.2.post1+cu129"
 run_logged install-runtime-deps "${UV}" pip install --python "${VENV_PYTHON}" -r "${REQ_FILE}"
+SGL_DEEP_GEMM_VERSION="$(cat "${SGL_DEEP_GEMM_VERSION_FILE}")"
+run_logged install-sgl-deep-gemm-cu129 "${UV}" pip install \
+    --python "${VENV_PYTHON}" \
+    "https://github.com/sgl-project/whl/releases/download/v${SGL_DEEP_GEMM_VERSION}/sgl_deep_gemm-${SGL_DEEP_GEMM_VERSION}+cu129-py3-none-manylinux2014_$(uname -m).whl" \
+    --force-reinstall
 export SETUPTOOLS_SCM_PRETEND_VERSION_FOR_SGLANG="${SGLANG_VERSION}"
 run_logged install-sglang "${UV}" pip install --python "${VENV_PYTHON}" --no-deps "${REPO_DIR}/python"
 
@@ -224,6 +239,7 @@ from importlib.metadata import version
 import pathlib
 import sysconfig
 
+import deep_gemm
 import sglang
 import torch
 
@@ -240,6 +256,7 @@ print(f"python_include={include_dir}")
 print(f"sglang={version('sglang')}")
 print(f"torch={torch.__version__}, torch_cuda={torch.version.cuda}")
 print(f"cuda-python={cuda_python}")
+print(f"deep_gemm={version('sgl-deep-gemm')}, deep_gemm_module={deep_gemm.__file__}")
 print(f"sglang_module={sglang.__file__}")
 print(f"python={__import__('sys').executable}")
 PY

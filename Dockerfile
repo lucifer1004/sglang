@@ -275,6 +275,7 @@ import tomllib
 
 pyproject = pathlib.Path("/sgl-workspace/python/pyproject.toml")
 data = tomllib.loads(pyproject.read_text())
+deep_gemm_version = None
 for dep in data["project"]["dependencies"]:
     dep_lower = dep.strip().lower()
     if dep_lower.startswith("cuda-python"):
@@ -285,12 +286,26 @@ for dep in data["project"]["dependencies"]:
         continue
     elif dep_lower.startswith("sglang-kernel=="):
         continue
+    elif dep_lower.startswith("sgl-deep-gemm=="):
+        deep_gemm_version = dep.split("==", 1)[1].strip()
+        continue
     else:
         print(dep)
+if not deep_gemm_version:
+    raise SystemExit("expected sgl-deep-gemm dependency not found")
+pathlib.Path("/tmp/sgl-deep-gemm-version.txt").write_text(deep_gemm_version)
 PY
 
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv pip install --python "${VENV_PATH}/bin/python" -r /tmp/sglang-runtime-requirements.txt
+
+RUN --mount=type=cache,target=/root/.cache/uv <<'BASH'
+set -euo pipefail
+SGL_DEEP_GEMM_VERSION="$(cat /tmp/sgl-deep-gemm-version.txt)"
+uv pip install --python "${VENV_PATH}/bin/python" \
+    "https://github.com/sgl-project/whl/releases/download/v${SGL_DEEP_GEMM_VERSION}/sgl_deep_gemm-${SGL_DEEP_GEMM_VERSION}+cu129-py3-none-manylinux2014_$(uname -m).whl" \
+    --force-reinstall
+BASH
 
 COPY sgl-model-gateway /sgl-workspace/sgl-model-gateway
 
@@ -357,6 +372,7 @@ import pathlib
 import sys
 import sysconfig
 
+import deep_gemm
 import sglang
 import torch
 
@@ -374,6 +390,7 @@ print(f"python_include={include_dir}")
 print(f"sglang={version('sglang')}")
 print(f"torch={torch.__version__}, torch_cuda={torch.version.cuda}")
 print(f"cuda-python={cuda_python}")
+print(f"deep_gemm={version('sgl-deep-gemm')}, deep_gemm_module={deep_gemm.__file__}")
 print(f"sglang_module={sglang.__file__}")
 PY
 
