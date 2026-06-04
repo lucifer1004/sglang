@@ -46,14 +46,13 @@ class TestPrepareServerArgs(CustomTestCase):
 
 
 class TestWelmOeArgs(unittest.TestCase):
-    def test_decode_hash_kernel_rejects_incompatible_options(self):
+    def test_hash_kernel_rejects_incompatible_options(self):
         cases = [
-            ({"enable_mixed_chunk": True}, {}, "--enable-mixed-chunk"),
             ({}, {"SGLANG_DUMP_ACTIVATIONS": "1"}, "SGLANG_DUMP_ACTIVATIONS"),
             ({}, {"WELM_USE_PREVIOUS_PRECISION": "1"}, "WELM_USE_PREVIOUS_PRECISION"),
         ]
         base_env = {
-            "SGLANG_WELM_OE_IMPL": "tp_fused_decode_hash",
+            "SGLANG_WELM_OE_IMPL": "fused_ngram_hash",
             "SGLANG_DUMP_ACTIVATIONS": "0",
             "WELM_USE_PREVIOUS_PRECISION": "0",
         }
@@ -64,7 +63,20 @@ class TestWelmOeArgs(unittest.TestCase):
                 server_args.prepare_n_gram_inputs = True
                 with patch.dict("os.environ", {**base_env, **env}):
                     with self.assertRaisesRegex(ValueError, pattern):
-                        server_args._handle_welm_oe_decode_hash_kernel_args()
+                        server_args._handle_welm_oe_hash_kernel_args()
+
+    def test_hash_kernel_allows_mixed_chunk(self):
+        server_args = ServerArgs(model_path="dummy", enable_mixed_chunk=True)
+        server_args.prepare_n_gram_inputs = True
+        with patch.dict(
+            "os.environ",
+            {
+                "SGLANG_WELM_OE_IMPL": "fused_ngram_hash",
+                "SGLANG_DUMP_ACTIVATIONS": "0",
+                "WELM_USE_PREVIOUS_PRECISION": "0",
+            },
+        ):
+            server_args._handle_welm_oe_hash_kernel_args()
 
 
 class TestLoadBalanceMethod(unittest.TestCase):

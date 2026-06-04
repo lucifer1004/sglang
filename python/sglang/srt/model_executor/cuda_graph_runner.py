@@ -62,13 +62,13 @@ from sglang.srt.layers.moe.utils import (
 )
 from sglang.srt.layers.utils import MultiPlatformOp
 from sglang.srt.managers.schedule_batch import (
-    DecodeHashInputIdsBuffer,
+    HashInputIdsBuffer,
     OverEncodingContext,
 )
 from sglang.srt.models.welm_perf_opt import (
-    fill_welm_oe_decode_hash_inputs,
-    get_welm_oe_decode_hash_config,
-    should_use_welm_oe_decode_hash_kernel,
+    fill_welm_oe_hash_inputs,
+    get_welm_oe_hash_config,
+    should_use_welm_oe_hash_kernel,
 )
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
@@ -406,7 +406,7 @@ class DecodeInputBuffers(ForwardInputBuffers):
         if (
             forward_batch.oe_context is not None
             and len(self.input_ids_grams) > 0
-            and not forward_batch.oe_context.has_decode_hash_prefixes()
+            and forward_batch.oe_context.hash_prefixes is None
         ):
             for buf_gram, src_gram in zip(
                 self.input_ids_grams,
@@ -915,11 +915,11 @@ class CudaGraphRunner:
         if (
             self.model_runner.server_args.prepare_n_gram_inputs
             and self.capture_forward_mode.is_decode()
-            and should_use_welm_oe_decode_hash_kernel(
+            and should_use_welm_oe_hash_kernel(
                 self.model_runner.model_config
             )
         ):
-            oe_grams, oe_vocab_sizes = get_welm_oe_decode_hash_config(
+            oe_grams, oe_vocab_sizes = get_welm_oe_hash_config(
                 self.model_runner.model_config
             )
             if oe_grams and len(oe_grams) == len(oe_vocab_sizes):
@@ -1362,7 +1362,7 @@ class CudaGraphRunner:
             )
             if use_welm_oe_decode_hash:
                 forward_batch.oe_context = OverEncodingContext(
-                    input_ids_buffer=DecodeHashInputIdsBuffer([])
+                    input_ids_buffer=HashInputIdsBuffer([])
                 )
                 forward_batch.welm_oe_decode_hashed_inputs = (
                     buffers.welm_oe_decode_hashed_inputs[:, :num_tokens]
@@ -1549,13 +1549,13 @@ class CudaGraphRunner:
             self.welm_oe_decode_hash_config is not None
             and buffers.welm_oe_decode_hashed_inputs is not None
             and forward_batch.oe_context is not None
-            and forward_batch.oe_context.has_decode_hash_prefixes()
+            and forward_batch.oe_context.hash_prefixes is not None
         ):
             oe_grams, oe_vocab_sizes = self.welm_oe_decode_hash_config
-            fill_welm_oe_decode_hash_inputs(
+            fill_welm_oe_hash_inputs(
                 forward_batch.input_ids[:raw_num_token],
                 buffers.welm_oe_decode_hashed_inputs[:, :raw_num_token],
-                forward_batch.oe_context,
+                forward_batch,
                 oe_grams,
                 oe_vocab_sizes,
                 self.model_runner.model_config.vocab_size,

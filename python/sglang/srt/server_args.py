@@ -850,7 +850,7 @@ class ServerArgs:
 
         # Apply model-specific adjustments.
         self._handle_model_specific_adjustments()
-        self._handle_welm_oe_decode_hash_kernel_args()
+        self._handle_welm_oe_hash_kernel_args()
 
         # Set kernel backends.
         self._handle_sampling_backend()
@@ -3295,17 +3295,15 @@ class ServerArgs:
             )
         return False
 
-    def _handle_welm_oe_decode_hash_kernel_args(self):
+    def _handle_welm_oe_hash_kernel_args(self):
         if not self.prepare_n_gram_inputs:
             return
 
         from sglang.srt.models.welm_perf_opt import (
-            validate_welm_oe_decode_hash_kernel_compatibility,
+            validate_welm_oe_hash_kernel_compatibility,
         )
 
-        validate_welm_oe_decode_hash_kernel_compatibility(
-            enable_mixed_chunk=self.enable_mixed_chunk
-        )
+        validate_welm_oe_hash_kernel_compatibility()
 
     def _handle_speculative_decoding(self):
         if (

@@ -4,10 +4,11 @@ import pytest
 import torch
 
 from sglang.jit_kernel.welm_oe import (
-    warmup_welm_oe_decode_hash_kernel,
-    welm_oe_decode_hash_from_prefixes_cuda,
+    warmup_welm_oe_hash_kernel,
+    welm_oe_hash_decode_from_prefixes_cuda,
+    welm_oe_hash_segments_from_prefixes_cuda,
 )
-from sglang.srt.managers.schedule_batch import OverEncodingContext
+from sglang.srt.managers.schedule_batch import HashInputIdsBuffer, OverEncodingContext
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=12, suite="stage-b-kernel-unit-1-gpu-large")
@@ -31,17 +32,32 @@ def test_welm_oe_decode_hash_context_builds_lag_major_prefixes():
         reqs, enable_overlap=False, history_width=3
     )
 
-    assert len(ctx.decode_hash_prefixes) == 3
-    assert ctx.input_ids_buffer is None
-    assert ctx.decode_hash_prefixes == [[3, 10], [2, 0], [1, 0]]
+    assert len(ctx.hash_prefixes) == 3
+    assert isinstance(ctx.input_ids_buffer, HashInputIdsBuffer)
+    assert ctx.hash_prefixes == [[3, 10], [2, 0], [1, 0]]
 
 
-def test_welm_oe_decode_hash_context_rejects_two_history_buffers():
-    with pytest.raises(ValueError, match="cannot hold both"):
-        OverEncodingContext(
-            input_ids_buffer=torch.empty(4, dtype=torch.int64),
-            decode_hash_prefixes=[[1]],
-        )
+def test_welm_oe_extend_hash_context_builds_boundary_prefixes():
+    reqs = [
+        type("Req", (), {"fill_ids": [1, 2, 3, 4]})(),
+        type("Req", (), {"fill_ids": [10, 20]})(),
+    ]
+
+    ctx = OverEncodingContext.from_extend_hash_kernel(
+        reqs, logical_prefix_lens=[2, 0], history_width=3
+    )
+
+    assert isinstance(ctx.input_ids_buffer, HashInputIdsBuffer)
+    assert ctx.hash_prefixes == [[2, 0], [1, 0], [0, 0]]
+
+
+def test_welm_oe_hash_context_merges_prefix_rows_for_mixed_batch():
+    lhs = OverEncodingContext(input_ids_buffer=HashInputIdsBuffer([[1, 2], [3, 4]]))
+    rhs = OverEncodingContext(input_ids_buffer=HashInputIdsBuffer([[5], [6]]))
+
+    lhs.merge_buffer(rhs)
+
+    assert lhs.hash_prefixes == [[1, 2, 5], [3, 4, 6]]
 
 
 def _reference_decode_hash(
@@ -75,7 +91,8 @@ def _reference_decode_hash(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_welm_oe_decode_hash_dynamic_prefixes_and_config():
+@pytest.mark.parametrize("input_dtype", [torch.int64, torch.int32])
+def test_welm_oe_decode_hash_dynamic_prefixes_and_config(input_dtype):
     device = "cuda"
     vocab_size = 32017
     oe_grams = (2, 3, 4)
@@ -101,12 +118,12 @@ def test_welm_oe_decode_hash_dynamic_prefixes_and_config():
         vocab_size,
     )
 
-    input_ids = input_ids_cpu.to(device)
+    input_ids = input_ids_cpu.to(device=device, dtype=input_dtype)
     hashed_out = torch.empty(
         (len(oe_grams), input_ids.numel()), dtype=torch.int64, device=device
     )
 
-    welm_oe_decode_hash_from_prefixes_cuda(
+    welm_oe_hash_decode_from_prefixes_cuda(
         input_ids,
         prefixes,
         oe_grams,
@@ -143,7 +160,7 @@ def test_welm_oe_decode_hash_accepts_graph_buffer_view():
     hashed_out = graph_buffer[:, : input_ids.numel()]
 
     assert not hashed_out.is_contiguous()
-    welm_oe_decode_hash_from_prefixes_cuda(
+    welm_oe_hash_decode_from_prefixes_cuda(
         input_ids,
         prefixes,
         oe_grams,
@@ -156,9 +173,108 @@ def test_welm_oe_decode_hash_accepts_graph_buffer_view():
     assert torch.equal(hashed_out.cpu(), expected_hash)
 
 
+def _reference_segment_hash(
+    input_ids,
+    extend_start_loc,
+    extend_seq_lens,
+    prefixes,
+    oe_grams,
+    oe_vocab_sizes,
+    vocab_size,
+):
+    mask = 0xFFFFFFFF
+    hashed = torch.empty((len(oe_grams), input_ids.numel()), dtype=torch.int64)
+    num_segments = len(extend_seq_lens)
+    history_width = len(prefixes) // num_segments
+
+    for segment_idx, (start, seg_len) in enumerate(
+        zip(extend_start_loc, extend_seq_lens)
+    ):
+        for local_pos in range(seg_len):
+            token_idx = start + local_pos
+            input_id = int(input_ids[token_idx].item()) & mask
+            for branch_idx, (gram, oe_vocab_size) in enumerate(
+                zip(oe_grams, oe_vocab_sizes)
+            ):
+                running_ids = input_id
+                vocab_power = vocab_size & mask
+                for lag in range(1, gram):
+                    if local_pos >= lag:
+                        prev = int(input_ids[token_idx - lag].item()) & mask
+                    else:
+                        prefix_lag = lag - local_pos - 1
+                        prev = (
+                            int(prefixes[prefix_lag * num_segments + segment_idx])
+                            & mask
+                        )
+                    running_ids = (running_ids + prev * vocab_power) & mask
+                    vocab_power = (vocab_power * vocab_size) & mask
+                hashed[branch_idx, token_idx] = (
+                    (running_ids * 2654435761) & mask
+                ) % oe_vocab_size
+
+    assert history_width >= max(oe_grams) - 1
+    return hashed
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_welm_oe_decode_hash_warmup_uses_model_width():
-    warmup_welm_oe_decode_hash_kernel(
+@pytest.mark.parametrize("input_dtype", [torch.int64, torch.int32])
+def test_welm_oe_segment_hash_dynamic_prefixes_and_config(input_dtype):
+    device = "cuda"
+    vocab_size = 32017
+    oe_grams = (2, 3, 4)
+    oe_vocab_sizes = (257, 263, 269)
+
+    input_ids_cpu = torch.tensor([3, 4, 5, 20, 30, 40], dtype=torch.int64)
+    extend_start_loc_cpu = [0, 3]
+    extend_seq_lens_cpu = [3, 3]
+    prefixes = [
+        2,
+        10,
+        1,
+        0,
+        0,
+        0,
+    ]
+    expected_hash = _reference_segment_hash(
+        input_ids_cpu,
+        extend_start_loc_cpu,
+        extend_seq_lens_cpu,
+        prefixes,
+        oe_grams,
+        oe_vocab_sizes,
+        vocab_size,
+    )
+
+    input_ids = input_ids_cpu.to(device=device, dtype=input_dtype)
+    extend_start_loc = torch.tensor(
+        extend_start_loc_cpu, dtype=torch.int32, device=device
+    )
+    extend_seq_lens = torch.tensor(
+        extend_seq_lens_cpu, dtype=torch.int32, device=device
+    )
+    hashed_out = torch.empty(
+        (len(oe_grams), input_ids.numel()), dtype=torch.int64, device=device
+    )
+
+    welm_oe_hash_segments_from_prefixes_cuda(
+        input_ids,
+        extend_start_loc,
+        extend_seq_lens,
+        prefixes,
+        oe_grams,
+        oe_vocab_sizes,
+        hashed_out,
+        vocab_size,
+    )
+    torch.cuda.synchronize()
+
+    assert torch.equal(hashed_out.cpu(), expected_hash)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_welm_oe_hash_warmup_uses_model_width():
+    warmup_welm_oe_hash_kernel(
         "cuda",
         history_width=3,
         oe_grams=(2, 3, 4),
