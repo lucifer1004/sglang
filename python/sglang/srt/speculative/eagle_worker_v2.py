@@ -34,6 +34,10 @@ from sglang.srt.managers.schedule_batch import ModelWorkerBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardBatch
+from sglang.srt.models.welm_perf_opt import (
+    get_welm_oe_hash_config,
+    should_use_welm_oe_hash_kernel,
+)
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseDraftWorker, BaseSpecWorker
 from sglang.srt.speculative.draft_utils import DraftBackendFactory
@@ -467,6 +471,412 @@ class EagleDraftWorker(BaseDraftWorker):
         ).repeat_interleave(self.topk)
         return topk_cs_index.flatten() // self.topk + parent_offsets
 
+    def _should_use_welmv4_mtp_oe_hash_kernel(self) -> bool:
+        return self._is_welmv4_mtp_draft_model() and should_use_welm_oe_hash_kernel(
+            self.draft_runner.model_config
+        )
+
+    def _welmv4_mtp_oe_hash_config(self) -> Tuple[Tuple[int, ...], Tuple[int, ...], int]:
+        oe_grams, oe_vocab_sizes = get_welm_oe_hash_config(
+            self.draft_runner.model_config
+        )
+        if not oe_grams:
+            return oe_grams, oe_vocab_sizes, 0
+        # Target-verify sees the current verified token both in draft_token_ids
+        # and in the rolling history state. Keep one extra column so the target
+        # verify hash kernel can skip that current-token column and still read
+        # max_gram - 1 tokens before it, matching the legacy rolling buffer.
+        return oe_grams, oe_vocab_sizes, max(int(g) for g in oe_grams)
+
+    def _welmv4_mtp_oe_prefix_width(self) -> int:
+        oe_grams, _, _ = self._welmv4_mtp_oe_hash_config()
+        return max((int(g) for g in oe_grams), default=1) - 1
+
+    @staticmethod
+    def _flatten_welmv4_mtp_hash_prefixes(prefix_rows) -> list[int]:
+        return [int(token) for row in prefix_rows for token in row]
+
+    @staticmethod
+    def _welmv4_mtp_hash_prefix_rows_from_context(
+        oe_context,
+        history_width: int,
+    ) -> list[list[int]]:
+        prefix_rows = getattr(oe_context, "hash_prefixes", None)
+        if prefix_rows is None:
+            raise RuntimeError(
+                "WeLMV4 MTP fused OE hash path requires CPU prefix rows at "
+                "stage entry."
+            )
+        rows = [list(row) for row in prefix_rows[:history_width]]
+        if not rows:
+            return rows
+        while len(rows) < history_width:
+            rows.append([0] * len(rows[0]))
+        return rows
+
+    @staticmethod
+    def _welmv4_mtp_prefix_rows_from_reqs(
+        reqs,
+        prefix_width: int,
+        skip_latest_output: bool,
+    ) -> list[list[int]]:
+        if prefix_width <= 0:
+            return []
+        rows = []
+        for lag in range(1, prefix_width + 1):
+            row = []
+            for req in reqs:
+                ids = req.origin_input_ids + req.output_ids
+                pos = len(ids) - lag - (1 if skip_latest_output else 0)
+                row.append(ids[pos] if pos >= 0 else 0)
+            rows.append(row)
+        return rows
+
+    def _init_welmv4_mtp_oe_history_from_context(
+        self,
+        oe_context,
+        *,
+        device: torch.device,
+        first_token_ids: Optional[torch.Tensor] = None,
+        out: Optional[torch.Tensor] = None,
+        prefix_rows: Optional[list[list[int]]] = None,
+    ) -> Optional[torch.Tensor]:
+        if not self._should_use_welmv4_mtp_oe_hash_kernel() or oe_context is None:
+            return None
+        _, _, history_width = self._welmv4_mtp_oe_hash_config()
+        if history_width <= 0:
+            return None
+        if prefix_rows is None:
+            prefix_rows = self._welmv4_mtp_hash_prefix_rows_from_context(
+                oe_context,
+                history_width,
+            )
+        else:
+            prefix_rows = [list(row) for row in prefix_rows[:history_width]]
+            if prefix_rows:
+                while len(prefix_rows) < history_width:
+                    prefix_rows.append([0] * len(prefix_rows[0]))
+        batch_size = len(prefix_rows[0]) if prefix_rows else 0
+        if batch_size == 0:
+            return None
+        if out is None:
+            out = torch.empty(
+                (batch_size, history_width), device=device, dtype=torch.int64
+            )
+        elif out.shape[0] < batch_size or out.shape[1] != history_width:
+            raise RuntimeError(
+                "WeLMV4 MTP OE history output has incompatible shape: "
+                f"{tuple(out.shape)} vs ({batch_size}, {history_width})."
+            )
+        history_out = out[:batch_size]
+        flat_prefixes = self._flatten_welmv4_mtp_hash_prefixes(prefix_rows)
+        from sglang.jit_kernel.welm_oe import (
+            welm_oe_hash_mtp_init_history_from_prefixes_cuda,
+        )
+
+        if first_token_ids is not None:
+            if first_token_ids.numel() != batch_size:
+                raise RuntimeError(
+                    "WeLMV4 MTP OE first-token count mismatch: "
+                    f"{first_token_ids.numel()} vs {batch_size}."
+                )
+        welm_oe_hash_mtp_init_history_from_prefixes_cuda(
+            flat_prefixes,
+            history_out,
+            first_token_ids=first_token_ids,
+        )
+        return history_out
+
+    def _get_welmv4_mtp_hash_out(
+        self,
+        forward_batch: ForwardBatch,
+        input_ids: torch.Tensor,
+        num_branches: int,
+    ) -> torch.Tensor:
+        num_tokens = int(input_ids.numel())
+        buffer = getattr(forward_batch, "welm_mtp_oe_hash_out", None)
+        if (
+            buffer is not None
+            and buffer.shape[0] == num_branches
+            and buffer.shape[1] >= num_tokens
+        ):
+            return buffer[:, :num_tokens]
+        return torch.empty(
+            (num_branches, num_tokens), device=input_ids.device, dtype=torch.int64
+        )
+
+    def _get_welmv4_mtp_next_history_out(
+        self,
+        forward_batch: ForwardBatch,
+        rows: int,
+        history_width: int,
+        *,
+        step_idx: Optional[int] = None,
+    ) -> torch.Tensor:
+        if step_idx is not None:
+            work_buffers = getattr(forward_batch, "welm_mtp_oe_work_history", None)
+            if work_buffers:
+                buffer = work_buffers[step_idx % len(work_buffers)]
+                if buffer.shape[0] >= rows and buffer.shape[1] == history_width:
+                    return buffer[:rows]
+        buffer = getattr(forward_batch, "welm_mtp_oe_next_history", None)
+        if (
+            buffer is not None
+            and buffer.shape[0] >= rows
+            and buffer.shape[1] == history_width
+        ):
+            return buffer[:rows]
+        return torch.empty((rows, history_width), device=self.device, dtype=torch.int64)
+
+    def _prepare_welmv4_mtp_draft_decode_entry_history(
+        self,
+        forward_batch: ForwardBatch,
+        draft_input: EagleDraftInput,
+    ) -> Optional[torch.Tensor]:
+        if (
+            not self._should_use_welmv4_mtp_oe_hash_kernel()
+            or forward_batch.forward_mode.is_idle()
+        ):
+            return None
+        history_state = getattr(draft_input, "welm_mtp_oe_history_state", None)
+        if history_state is not None:
+            forward_batch.spec_info.welm_mtp_oe_history_state = history_state
+            return history_state
+        first_token_ids = getattr(draft_input, "verified_id", None)
+        if first_token_ids is None:
+            raise RuntimeError(
+                "WeLMV4 MTP fused OE hash draft-decode path requires verified_id."
+            )
+        prefix_rows = getattr(draft_input, "welm_mtp_oe_prefix_rows", None)
+        history_state = self._init_welmv4_mtp_oe_history_from_context(
+            forward_batch.oe_context,
+            device=forward_batch.input_ids.device,
+            first_token_ids=first_token_ids,
+            prefix_rows=prefix_rows,
+        )
+        if history_state is None:
+            raise RuntimeError(
+                "WeLMV4 MTP fused OE hash draft-decode path is missing CPU "
+                "prefix state."
+            )
+        draft_input.welm_mtp_oe_history_state = history_state
+        forward_batch.spec_info.welm_mtp_oe_history_state = history_state
+        return history_state
+
+    def _prepare_welmv4_mtp_segment_hash_inputs_from_prefixes(
+        self,
+        forward_batch: ForwardBatch,
+    ) -> None:
+        from sglang.jit_kernel.welm_oe import welm_oe_hash_segments_from_prefixes_cuda
+
+        input_ids = forward_batch.input_ids
+        oe_grams, oe_vocab_sizes, _ = self._welmv4_mtp_oe_hash_config()
+        hashed_out = self._get_welmv4_mtp_hash_out(
+            forward_batch, input_ids, len(oe_vocab_sizes)
+        )
+        num_segments = int(forward_batch.extend_seq_lens.numel())
+        prefix_width = self._welmv4_mtp_oe_prefix_width()
+        prefixes = [0] * (prefix_width * num_segments)
+        extend_seq_lens_cpu = getattr(forward_batch, "extend_seq_lens_cpu", None)
+        if extend_seq_lens_cpu is not None:
+            real_num_tokens = sum(int(x) for x in extend_seq_lens_cpu)
+            if real_num_tokens < input_ids.numel():
+                hashed_out[:, real_num_tokens:].zero_()
+        welm_oe_hash_segments_from_prefixes_cuda(
+            input_ids,
+            forward_batch.extend_start_loc,
+            forward_batch.extend_seq_lens,
+            prefixes,
+            oe_grams,
+            oe_vocab_sizes,
+            hashed_out,
+            self.draft_runner.model_config.vocab_size,
+        )
+        forward_batch.welm_oe_decode_hashed_inputs = hashed_out
+
+    def _compute_welmv4_mtp_target_verify_hash_inputs(
+        self,
+        input_ids: torch.Tensor,
+        tree_mask: torch.Tensor,
+        seq_lens: torch.Tensor,
+        history_state: torch.Tensor,
+        draft_token_num: int,
+    ) -> torch.Tensor:
+        from sglang.jit_kernel.welm_oe import (
+            welm_oe_hash_mtp_target_verify_from_history_cuda,
+        )
+
+        oe_grams, oe_vocab_sizes, _ = self._welmv4_mtp_oe_hash_config()
+        batch_size = int(seq_lens.numel())
+        real_num_tokens = batch_size * int(draft_token_num)
+        hashed_out = torch.empty(
+            (len(oe_vocab_sizes), int(input_ids.numel())),
+            device=input_ids.device,
+            dtype=torch.int64,
+        )
+        if real_num_tokens < input_ids.numel():
+            hashed_out[:, real_num_tokens:].zero_()
+        welm_oe_hash_mtp_target_verify_from_history_cuda(
+            input_ids[:real_num_tokens],
+            tree_mask,
+            seq_lens,
+            history_state[:batch_size],
+            oe_grams,
+            oe_vocab_sizes,
+            hashed_out[:, :real_num_tokens],
+            self.target_worker.model_config.vocab_size,
+            int(draft_token_num),
+        )
+        return hashed_out
+
+    def _prepare_welmv4_mtp_target_verify_hash_inputs(
+        self,
+        forward_batch: ForwardBatch,
+        history_state: Optional[torch.Tensor],
+    ) -> None:
+        if (
+            not self._should_use_welmv4_mtp_oe_hash_kernel()
+            or history_state is None
+            or forward_batch.forward_mode.is_idle()
+        ):
+            return
+        spec_info = forward_batch.spec_info
+        forward_batch.welm_oe_decode_hashed_inputs = (
+            self._compute_welmv4_mtp_target_verify_hash_inputs(
+                forward_batch.input_ids,
+                spec_info.custom_mask,
+                forward_batch.seq_lens,
+                history_state,
+                int(spec_info.draft_token_num),
+            )
+        )
+
+    def _precompute_welmv4_mtp_target_verify_hash_inputs(
+        self,
+        verify_input: EagleVerifyInput,
+        batch: ModelWorkerBatch,
+    ) -> None:
+        history_state = getattr(verify_input, "welm_mtp_oe_history_state", None)
+        if (
+            not self._should_use_welmv4_mtp_oe_hash_kernel()
+            or history_state is None
+            or batch.forward_mode.is_idle()
+        ):
+            return
+        verify_input.welm_mtp_oe_hashed_inputs = (
+            self._compute_welmv4_mtp_target_verify_hash_inputs(
+                verify_input.draft_token,
+                verify_input.custom_mask,
+                batch.seq_lens,
+                history_state,
+                int(verify_input.draft_token_num),
+            )
+        )
+
+    def _prepare_welmv4_mtp_draft_extend_hash_inputs(
+        self,
+        forward_batch: ForwardBatch,
+        accept_lens: torch.Tensor,
+        accepted_draft_token_ids: Optional[torch.Tensor],
+        entry_history_state: Optional[torch.Tensor],
+    ) -> Optional[torch.Tensor]:
+        if (
+            not self._should_use_welmv4_mtp_oe_hash_kernel()
+            or forward_batch.forward_mode.is_idle()
+        ):
+            return None
+        if accepted_draft_token_ids is None:
+            raise RuntimeError(
+                "WeLMV4 MTP fused OE hash draft-extend path requires accepted "
+                "draft token ids from target verify."
+            )
+        if entry_history_state is None:
+            raise RuntimeError(
+                "WeLMV4 MTP fused OE hash draft-extend path is missing entry "
+                "history state."
+            )
+        from sglang.jit_kernel.welm_oe import (
+            welm_oe_hash_mtp_draft_extend_after_verify_from_history_cuda,
+        )
+
+        input_ids = forward_batch.input_ids
+        oe_grams, oe_vocab_sizes, history_width = self._welmv4_mtp_oe_hash_config()
+        batch_size = int(accept_lens.numel())
+        draft_token_num = self.speculative_num_draft_tokens
+        hashed_out = self._get_welmv4_mtp_hash_out(
+            forward_batch, input_ids, len(oe_vocab_sizes)
+        )
+        next_history = self._get_welmv4_mtp_next_history_out(
+            forward_batch,
+            batch_size,
+            history_width,
+        )
+        welm_oe_hash_mtp_draft_extend_after_verify_from_history_cuda(
+            input_ids,
+            accepted_draft_token_ids.reshape(batch_size, -1),
+            accept_lens,
+            entry_history_state[:batch_size],
+            oe_grams,
+            oe_vocab_sizes,
+            hashed_out,
+            next_history,
+            self.draft_runner.model_config.vocab_size,
+            draft_token_num,
+        )
+        forward_batch.welm_oe_decode_hashed_inputs = hashed_out
+        return next_history
+
+    def _prepare_welmv4_mtp_draft_decode_hash_inputs(
+        self,
+        forward_batch: ForwardBatch,
+        input_ids: torch.Tensor,
+        entry_history_state: torch.Tensor,
+        draft_history_state: Optional[torch.Tensor],
+        selected_parent_indices: Optional[torch.Tensor],
+        base_query_count: int,
+        step_idx: int,
+    ) -> torch.Tensor:
+        from sglang.jit_kernel.welm_oe import (
+            welm_oe_hash_mtp_draft_decode_from_history_cuda,
+        )
+
+        oe_grams, oe_vocab_sizes, history_width = self._welmv4_mtp_oe_hash_config()
+        source_history = (
+            entry_history_state if draft_history_state is None else draft_history_state
+        )
+        use_parent = selected_parent_indices is not None
+        if selected_parent_indices is None:
+            parent_indices = getattr(forward_batch, "welm_mtp_oe_parent_scratch", None)
+            if parent_indices is None or parent_indices.numel() < input_ids.numel():
+                parent_indices = torch.empty(
+                    (input_ids.numel(),), device=input_ids.device, dtype=torch.int64
+                )
+        else:
+            parent_indices = selected_parent_indices.to(dtype=torch.int64)
+        hashed_out = self._get_welmv4_mtp_hash_out(
+            forward_batch, input_ids, len(oe_vocab_sizes)
+        )
+        next_history = self._get_welmv4_mtp_next_history_out(
+            forward_batch,
+            int(input_ids.numel()),
+            history_width,
+            step_idx=step_idx,
+        )
+        welm_oe_hash_mtp_draft_decode_from_history_cuda(
+            input_ids,
+            source_history,
+            parent_indices,
+            oe_grams,
+            oe_vocab_sizes,
+            hashed_out,
+            next_history,
+            self.draft_runner.model_config.vocab_size,
+            base_query_count,
+            use_parent,
+        )
+        forward_batch.welm_oe_decode_hashed_inputs = hashed_out
+        return next_history
+
     def _forward_welmv4_mtp_base_kv_decode(self, forward_batch: ForwardBatch):
         graph_runner_backup = self.draft_runner.graph_runner
         had_base_kv_attr = hasattr(forward_batch, "welm_mtp_use_base_kv_cache")
@@ -707,10 +1117,11 @@ class EagleDraftWorker(BaseDraftWorker):
         draft_input.topk_p, draft_input.topk_index = fast_topk(probs, self.topk, dim=-1)
         draft_input.hidden_states = logits_output.hidden_states
         if self._is_welmv4_mtp_draft_model() and forward_batch is not None:
-            oe_context = getattr(forward_batch, "oe_context", None)
-            if oe_context is not None and oe_context.input_ids_buffer is not None:
-                oe_buffer = oe_context.input_ids_buffer.detach().clone()
-                draft_input.welm_mtp_oe_buffer = oe_buffer
+            if not self._should_use_welmv4_mtp_oe_hash_kernel():
+                oe_context = getattr(forward_batch, "oe_context", None)
+                if oe_context is not None and oe_context.input_ids_buffer is not None:
+                    oe_buffer = oe_context.input_ids_buffer.detach().clone()
+                    draft_input.welm_mtp_oe_buffer = oe_buffer
             if welmv4_mtp_base_positions is None:
                 welmv4_mtp_base_positions = self._get_welmv4_mtp_base_positions(
                     forward_batch
@@ -831,6 +1242,22 @@ class EagleDraftWorker(BaseDraftWorker):
             self.topk,
             self.speculative_num_steps,
         )
+        if (
+            self._should_use_welmv4_mtp_oe_hash_kernel()
+            and not model_worker_batch.forward_mode.is_idle()
+            and not hasattr(draft_input, "welm_mtp_oe_history_state")
+        ):
+            draft_input.welm_mtp_oe_prefix_rows = (
+                self._welmv4_mtp_prefix_rows_from_reqs(
+                    model_worker_batch.reqs,
+                    self._welmv4_mtp_oe_prefix_width(),
+                    skip_latest_output=not hasattr(draft_input, "future_indices"),
+                )
+            )
+        self._prepare_welmv4_mtp_draft_decode_entry_history(
+            forward_batch,
+            draft_input,
+        )
 
         # Run draft
         if can_cuda_graph:
@@ -908,7 +1335,7 @@ class EagleDraftWorker(BaseDraftWorker):
             position_buf,
         )
 
-        return EagleVerifyInput(
+        verify_input = EagleVerifyInput(
             draft_token=draft_tokens,
             custom_mask=tree_mask,
             positions=position,
@@ -923,6 +1350,14 @@ class EagleDraftWorker(BaseDraftWorker):
             seq_lens_sum=None,
             seq_lens_cpu=None,
         )
+        if (
+            self._should_use_welmv4_mtp_oe_hash_kernel()
+            and hasattr(draft_input, "welm_mtp_oe_history_state")
+        ):
+            verify_input.welm_mtp_oe_history_state = (
+                draft_input.welm_mtp_oe_history_state
+            )
+        return verify_input
 
     def draft_forward(self, forward_batch: ForwardBatch):
         # Parse args
@@ -939,9 +1374,29 @@ class EagleDraftWorker(BaseDraftWorker):
         if self.hot_token_id is not None:
             topk_index = self.hot_token_id[topk_index]
         is_welmv4_mtp = self._is_welmv4_mtp_draft_model()
+        use_welmv4_mtp_oe_hash = (
+            is_welmv4_mtp
+            and self._should_use_welmv4_mtp_oe_hash_kernel()
+            and not forward_batch.forward_mode.is_idle()
+        )
         welmv4_mtp_base_positions = None
         welmv4_mtp_draft_oe_buffer = None
+        welmv4_mtp_entry_oe_history = None
+        welmv4_mtp_draft_oe_history = None
         if is_welmv4_mtp and not forward_batch.forward_mode.is_idle():
+            if use_welmv4_mtp_oe_hash:
+                welmv4_mtp_entry_oe_history = getattr(
+                    spec_info, "welm_mtp_oe_history_state", None
+                )
+                if welmv4_mtp_entry_oe_history is None:
+                    welmv4_mtp_entry_oe_history = getattr(
+                        forward_batch, "welm_mtp_oe_entry_history_state", None
+                    )
+                if welmv4_mtp_entry_oe_history is None:
+                    raise RuntimeError(
+                        "WeLMV4 MTP fused OE hash draft-decode path is missing "
+                        "entry history state."
+                    )
             welmv4_mtp_base_positions = spec_info.welm_mtp_base_positions
             if welmv4_mtp_base_positions is None:
                 welmv4_mtp_base_positions = (forward_batch.seq_lens - 1).to(
@@ -1011,15 +1466,28 @@ class EagleDraftWorker(BaseDraftWorker):
                 selected_parent_indices = self._get_welmv4_mtp_selected_parent_indices(
                     i, tree_info, input_ids.device
                 )
-                welmv4_mtp_draft_oe_buffer = (
-                    self._prepare_welmv4_mtp_draft_decode_oe_context(
-                        forward_batch,
-                        input_ids,
-                        welmv4_mtp_draft_oe_buffer,
-                        selected_parent_indices,
-                        base_query_count,
+                if use_welmv4_mtp_oe_hash:
+                    welmv4_mtp_draft_oe_history = (
+                        self._prepare_welmv4_mtp_draft_decode_hash_inputs(
+                            forward_batch,
+                            input_ids,
+                            welmv4_mtp_entry_oe_history,
+                            welmv4_mtp_draft_oe_history,
+                            selected_parent_indices,
+                            base_query_count,
+                            i,
+                        )
                     )
-                )
+                else:
+                    welmv4_mtp_draft_oe_buffer = (
+                        self._prepare_welmv4_mtp_draft_decode_oe_context(
+                            forward_batch,
+                            input_ids,
+                            welmv4_mtp_draft_oe_buffer,
+                            selected_parent_indices,
+                            base_query_count,
+                        )
+                    )
                 restore_mtp_metadata = self._init_welmv4_mtp_base_kv_decode_metadata(
                     forward_batch, base_query_count
                 )
@@ -1110,6 +1578,10 @@ class EagleDraftWorker(BaseDraftWorker):
         """
         # Construct input_ids
         if not batch.forward_mode.is_idle():
+            use_welmv4_mtp_oe_hash = (
+                self._should_use_welmv4_mtp_oe_hash_kernel()
+                and batch.oe_context is not None
+            )
             pt = 0
             for i, extend_len in enumerate(batch.extend_seq_lens):
                 input_ids = batch.input_ids[pt : pt + extend_len]
@@ -1117,7 +1589,7 @@ class EagleDraftWorker(BaseDraftWorker):
                     (input_ids[1:], next_token_ids[i].reshape(1))
                 )
                 pt += extend_len
-            if batch.oe_context is not None:
+            if batch.oe_context is not None and not use_welmv4_mtp_oe_hash:
                 batch.oe_context.refresh_for_draft_extend(
                     batch.input_ids,
                     [int(x) for x in batch.extend_seq_lens],
@@ -1139,6 +1611,11 @@ class EagleDraftWorker(BaseDraftWorker):
         # Run forward
         forward_batch = ForwardBatch.init_new(batch, self.draft_runner)
         forward_batch.return_logprob = False
+        if (
+            self._should_use_welmv4_mtp_oe_hash_kernel()
+            and batch.oe_context is not None
+        ):
+            self._prepare_welmv4_mtp_segment_hash_inputs_from_prefixes(forward_batch)
         if mm_input_embeds is not None:
             forward_batch.mm_input_embeds = mm_input_embeds
         if _WELM_MTP_DUMP_ENABLED:
@@ -1166,6 +1643,10 @@ class EagleDraftWorker(BaseDraftWorker):
         self, batch: ModelWorkerBatch, batch_result: GenerationBatchResult
     ):
         next_draft_input = batch_result.next_draft_input
+        welmv4_mtp_oe_entry_history = getattr(
+            getattr(batch, "spec_info", None), "welm_mtp_oe_history_state", None
+        )
+        welmv4_mtp_oe_next_history = None
         # Batch 2: Draft extend
         draft_hidden_states = next_draft_input.hidden_states
         if draft_hidden_states is None:
@@ -1211,6 +1692,20 @@ class EagleDraftWorker(BaseDraftWorker):
             oe_context = getattr(forward_batch, "oe_context", None)
             if (
                 self._is_welmv4_mtp_draft_model()
+                and self._should_use_welmv4_mtp_oe_hash_kernel()
+            ):
+                welmv4_mtp_oe_next_history = (
+                    self._prepare_welmv4_mtp_draft_extend_hash_inputs(
+                        forward_batch,
+                        batch_result.accept_lens,
+                        getattr(
+                            batch_result, "welm_mtp_accepted_draft_token_ids", None
+                        ),
+                        welmv4_mtp_oe_entry_history,
+                    )
+                )
+            elif (
+                self._is_welmv4_mtp_draft_model()
                 and oe_context is not None
                 and oe_context.input_ids_buffer is not None
             ):
@@ -1226,6 +1721,8 @@ class EagleDraftWorker(BaseDraftWorker):
             torch.get_device_module(self.device).current_stream().wait_stream(
                 self.plan_stream
             )
+        if welmv4_mtp_oe_next_history is not None:
+            next_draft_input.welm_mtp_oe_history_state = welmv4_mtp_oe_next_history
 
         if forward_batch.spec_info.num_accepted_drafts is None:
             # `batch_result.accept_lens` already includes the bonus token, so use it
@@ -1555,6 +2052,10 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 # work, not all queued main_stream operations.
                 if self.plan_stream and hasattr(self, "_draft_done_event"):
                     self.plan_stream.wait_event(self._draft_done_event)
+                self.draft_worker._precompute_welmv4_mtp_target_verify_hash_inputs(
+                    verify_input,
+                    batch,
+                )
                 verify_forward_batch, can_run_cuda_graph = (
                     verify_input.prepare_for_v2_verify(
                         self.req_to_token_pool,
@@ -1579,6 +2080,12 @@ class EAGLEWorkerV2(BaseSpecWorker):
                         if can_run_cuda_graph
                         else None
                     ),
+                )
+
+            if getattr(verify_input, "welm_mtp_oe_hashed_inputs", None) is None:
+                self.draft_worker._prepare_welmv4_mtp_target_verify_hash_inputs(
+                    verify_forward_batch,
+                    getattr(verify_input, "welm_mtp_oe_history_state", None),
                 )
 
             # Prepare grammar data on CPU if needed
@@ -1635,8 +2142,17 @@ class EAGLEWorkerV2(BaseSpecWorker):
         has_welmv4_mtp_oe_context = (
             self.draft_worker._is_welmv4_mtp_draft_model()
             and not batch.forward_mode.is_idle()
-            and getattr(batch, "oe_context", None) is not None
-            and batch.oe_context.input_ids_buffer is not None
+            and (
+                (
+                    getattr(batch, "oe_context", None) is not None
+                    and batch.oe_context.input_ids_buffer is not None
+                )
+                or (
+                    self.draft_worker._should_use_welmv4_mtp_oe_hash_kernel()
+                    and getattr(verify_input, "welm_mtp_oe_history_state", None)
+                    is not None
+                )
+            )
         )
         if has_welmv4_mtp_oe_context:
             accepted_mask = accept_index >= 0
@@ -1688,7 +2204,6 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     **verify_dump_extra,
                 },
             )
-
         # Update mamba state for hybrid GDN models after verification
         if (
             self.target_worker.model_runner.hybrid_gdn_config is not None

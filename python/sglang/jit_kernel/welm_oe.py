@@ -31,12 +31,28 @@ def _jit_welm_oe_hash_module() -> Module:
         cuda_files=["welm/oe_decode_hash.cuh"],
         cuda_wrappers=[
             (
+                "welm_oe_hash_mtp_init_history_from_prefixes",
+                "WelmOeHashMtpInitHistoryFromPrefixes::run",
+            ),
+            (
                 "welm_oe_hash_decode_from_prefixes",
                 "WelmOeHashDecodeFromPrefixes::run",
             ),
             (
                 "welm_oe_hash_segments_from_prefixes",
                 "WelmOeHashSegmentsFromPrefixes::run",
+            ),
+            (
+                "welm_oe_hash_mtp_target_verify_from_history",
+                "WelmOeHashMtpTargetVerifyFromHistory::run",
+            ),
+            (
+                "welm_oe_hash_mtp_draft_extend_after_verify_from_history",
+                "WelmOeHashMtpDraftExtendAfterVerifyFromHistory::run",
+            ),
+            (
+                "welm_oe_hash_mtp_draft_decode_from_history",
+                "WelmOeHashMtpDraftDecodeFromHistory::run",
             ),
         ],
     )
@@ -85,6 +101,36 @@ def welm_oe_hash_decode_from_prefixes_cuda(
     )
 
 
+def welm_oe_hash_mtp_init_history_from_prefixes_cuda(
+    prefixes: Sequence[int],
+    history_out: torch.Tensor,
+    first_token_ids: torch.Tensor | None = None,
+) -> None:
+    """Initialize compact MTP OE history from CPU prefix rows.
+
+    Args:
+        prefixes: CPU sequence with flattened shape ``[history_width, bs]``.
+            ``prefixes[(lag - 1) * bs + i]`` is the token ``lag`` positions
+            before request ``i`` enters the MTP stage.
+        history_out: ``int64`` CUDA tensor with shape ``[bs, history_width]``.
+            The last column is the immediate previous token.
+        first_token_ids: Optional CUDA tensor with shape ``[bs]``. When set,
+            the kernel appends this already-verified token as the last history
+            column and shifts prefix rows one column earlier.
+    """
+    module = _jit_welm_oe_hash_module()
+    _log_hash_kernel_call_once("mtp_init_history_from_prefixes")
+    has_first_token = first_token_ids is not None
+    if first_token_ids is None:
+        first_token_ids = history_out
+    module.welm_oe_hash_mtp_init_history_from_prefixes(
+        first_token_ids,
+        _shape(prefixes),
+        history_out,
+        int(has_first_token),
+    )
+
+
 def welm_oe_hash_segments_from_prefixes_cuda(
     input_ids: torch.Tensor,
     extend_start_loc: torch.Tensor,
@@ -130,6 +176,98 @@ def welm_oe_hash_segments_from_prefixes_cuda(
     )
 
 
+def welm_oe_hash_mtp_target_verify_from_history_cuda(
+    draft_token_ids: torch.Tensor,
+    tree_mask: torch.Tensor,
+    seq_lens: torch.Tensor,
+    history_state: torch.Tensor,
+    oe_grams: Sequence[int],
+    oe_vocab_sizes: Sequence[int],
+    hashed_out: torch.Tensor,
+    vocab_size: int,
+    draft_token_num: int,
+) -> None:
+    """Compute target-verify OE hashes from compact GPU history state."""
+    module = _jit_welm_oe_hash_module()
+    _log_hash_kernel_call_once("mtp_target_verify_from_history")
+    module.welm_oe_hash_mtp_target_verify_from_history(
+        draft_token_ids,
+        tree_mask,
+        seq_lens,
+        history_state,
+        _shape(oe_grams),
+        _shape(oe_vocab_sizes),
+        hashed_out,
+        int(vocab_size),
+        int(draft_token_num),
+    )
+
+
+def welm_oe_hash_mtp_draft_extend_after_verify_from_history_cuda(
+    input_ids: torch.Tensor,
+    accepted_draft_token_ids: torch.Tensor,
+    accept_lens: torch.Tensor,
+    entry_history: torch.Tensor,
+    oe_grams: Sequence[int],
+    oe_vocab_sizes: Sequence[int],
+    hashed_out: torch.Tensor,
+    next_history_state: torch.Tensor,
+    vocab_size: int,
+    draft_token_num: int,
+) -> None:
+    """Compute MTP draft-extend hashes and next compact history.
+
+    ``entry_history`` has shape ``[bs, history_width]`` and already includes
+    the current verified token in its last column. ``accept_lens`` includes the
+    bonus token. ``next_history_state`` receives the compact history for the
+    next draft entry after applying the accepted draft tail and selected bonus
+    token.
+    """
+    module = _jit_welm_oe_hash_module()
+    _log_hash_kernel_call_once("mtp_draft_extend_after_verify_from_history")
+    module.welm_oe_hash_mtp_draft_extend_after_verify_from_history(
+        input_ids,
+        accepted_draft_token_ids,
+        accept_lens,
+        entry_history,
+        _shape(oe_grams),
+        _shape(oe_vocab_sizes),
+        hashed_out,
+        next_history_state,
+        int(vocab_size),
+        int(draft_token_num),
+    )
+
+
+def welm_oe_hash_mtp_draft_decode_from_history_cuda(
+    input_ids: torch.Tensor,
+    history_state: torch.Tensor,
+    parent_indices: torch.Tensor,
+    oe_grams: Sequence[int],
+    oe_vocab_sizes: Sequence[int],
+    hashed_out: torch.Tensor,
+    next_history_state: torch.Tensor,
+    vocab_size: int,
+    base_query_count: int,
+    use_parent: bool,
+) -> None:
+    """Compute MTP draft-decode hashes and per-candidate next history state."""
+    module = _jit_welm_oe_hash_module()
+    _log_hash_kernel_call_once("mtp_draft_decode_from_history")
+    module.welm_oe_hash_mtp_draft_decode_from_history(
+        input_ids,
+        history_state,
+        parent_indices,
+        _shape(oe_grams),
+        _shape(oe_vocab_sizes),
+        hashed_out,
+        next_history_state,
+        int(vocab_size),
+        int(base_query_count),
+        int(use_parent),
+    )
+
+
 def warmup_welm_oe_hash_kernel(
     device: torch.device | str = "cuda",
     *,
@@ -141,10 +279,20 @@ def warmup_welm_oe_hash_kernel(
         return
 
     max_gram = max(int(g) for g in oe_grams)
-    history_width = max(int(history_width), max_gram - 1)
-    prefixes = [0] * history_width
+    prefix_width = max(int(history_width), max_gram - 1)
+    mtp_history_width = max(prefix_width + 1, max_gram)
+    prefixes = [0] * prefix_width
+    history_prefixes = [0] * mtp_history_width
     input_ids = torch.zeros((1,), dtype=torch.int64, device=device)
+    history_state = torch.zeros(
+        (1, mtp_history_width), dtype=torch.int64, device=device
+    )
     hashed_out = torch.empty((len(oe_grams), 1), dtype=torch.int64, device=device)
+
+    welm_oe_hash_mtp_init_history_from_prefixes_cuda(history_prefixes, history_state)
+    welm_oe_hash_mtp_init_history_from_prefixes_cuda(
+        history_prefixes, history_state, first_token_ids=input_ids
+    )
 
     welm_oe_hash_decode_from_prefixes_cuda(
         input_ids,
@@ -166,4 +314,45 @@ def warmup_welm_oe_hash_kernel(
         oe_vocab_sizes,
         hashed_out,
         vocab_size=1,
+    )
+    tree_mask = torch.ones((2,), dtype=torch.bool, device=device)
+    seq_lens = torch.ones((1,), dtype=torch.int64, device=device)
+    welm_oe_hash_mtp_target_verify_from_history_cuda(
+        input_ids,
+        tree_mask,
+        seq_lens,
+        history_state,
+        oe_grams,
+        oe_vocab_sizes,
+        hashed_out,
+        vocab_size=1,
+        draft_token_num=1,
+    )
+    accepted = torch.zeros((1, 1), dtype=torch.int64, device=device)
+    accept_lens = torch.ones((1,), dtype=torch.int64, device=device)
+    next_history_state = torch.empty_like(history_state)
+    welm_oe_hash_mtp_draft_extend_after_verify_from_history_cuda(
+        input_ids,
+        accepted,
+        accept_lens,
+        history_state,
+        oe_grams,
+        oe_vocab_sizes,
+        hashed_out,
+        next_history_state,
+        vocab_size=1,
+        draft_token_num=1,
+    )
+    parent_indices = torch.zeros((1,), dtype=torch.int64, device=device)
+    welm_oe_hash_mtp_draft_decode_from_history_cuda(
+        input_ids,
+        history_state,
+        parent_indices,
+        oe_grams,
+        oe_vocab_sizes,
+        hashed_out,
+        next_history_state,
+        vocab_size=1,
+        base_query_count=1,
+        use_parent=False,
     )

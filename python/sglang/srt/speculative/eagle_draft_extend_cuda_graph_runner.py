@@ -10,6 +10,7 @@ import torch
 
 from sglang.srt.layers.dp_attention import DpPaddingMode, set_dp_buffer_len
 from sglang.srt.managers.schedule_batch import OverEncodingContext
+from sglang.srt.models.welm_perf_opt import get_welm_oe_hash_config
 from sglang.srt.model_executor.cuda_graph_runner import (
     CUDA_GRAPH_CAPTURE_FAILED_MSG,
     CudaGraphRunner,
@@ -229,7 +230,15 @@ class EAGLEDraftExtendCudaGraphRunner:
                 ),
                 dtype=torch.float,
             )
-            if self.model_runner.server_args.prepare_n_gram_inputs:
+            use_welm_mtp_oe_hash = getattr(
+                self.eagle_worker,
+                "_should_use_welmv4_mtp_oe_hash_kernel",
+                lambda: False,
+            )()
+            if (
+                self.model_runner.server_args.prepare_n_gram_inputs
+                and not use_welm_mtp_oe_hash
+            ):
                 self.ngram_input_ids = OverEncodingContext(
                     input_ids_grams=[
                         torch.zeros((self.max_num_token,), dtype=torch.int64)
@@ -241,6 +250,16 @@ class EAGLEDraftExtendCudaGraphRunner:
                 )
             else:
                 self.ngram_input_ids = None
+
+            if use_welm_mtp_oe_hash:
+                oe_grams, oe_vocab_sizes = get_welm_oe_hash_config(
+                    self.model_runner.model_config
+                )
+                self.welm_mtp_oe_hash_out = torch.zeros(
+                    (len(oe_vocab_sizes), self.max_num_token), dtype=torch.int64
+                )
+            else:
+                self.welm_mtp_oe_hash_out = None
 
             mirrored_kv_indices = None
             self.welm_mtp_mirror_kv_states = None
@@ -584,7 +603,7 @@ class EAGLEDraftExtendCudaGraphRunner:
 
         self.deepep_adapter.capture(is_extend_in_batch=True)
 
-        if self.ngram_input_ids is not None:
+        if self.ngram_input_ids is not None and self.welm_mtp_oe_hash_out is None:
             buffer = self.ngram_input_ids.input_ids_buffer[
                 : bs * self.ngram_input_ids.buffer_size
             ]
@@ -627,6 +646,10 @@ class EAGLEDraftExtendCudaGraphRunner:
             padded_static_len=self.padded_static_len,
             oe_context=current_ngram_input_ids,
         )
+        if self.welm_mtp_oe_hash_out is not None:
+            forward_batch.welm_oe_decode_hashed_inputs = (
+                self.welm_mtp_oe_hash_out[:, :num_tokens]
+            )
 
         self.draft_extend_attn_backend.init_forward_metadata_capture_cuda_graph(
             bs=bs,
@@ -789,13 +812,27 @@ class EAGLEDraftExtendCudaGraphRunner:
             self.extend_seq_lens_cpu[raw_bs:bs] = [self.num_tokens_per_bs] * (
                 bs - raw_bs
             )
-        self._copy_ngram_inputs(
-            forward_batch,
-            raw_bs,
-            bs,
-            num_tokens,
-            bs * self.num_tokens_per_bs,
-        )
+        if self.welm_mtp_oe_hash_out is None:
+            self._copy_ngram_inputs(
+                forward_batch,
+                raw_bs,
+                bs,
+                num_tokens,
+                bs * self.num_tokens_per_bs,
+            )
+        if self.welm_mtp_oe_hash_out is not None:
+            cached_hash = getattr(forward_batch, "welm_oe_decode_hashed_inputs", None)
+            if cached_hash is None:
+                raise RuntimeError(
+                    "WeLMV4 MTP fused OE hash draft-extend graph replay is "
+                    "missing cached hash inputs."
+                )
+            self.welm_mtp_oe_hash_out[:, :num_tokens].copy_(
+                cached_hash[:, :num_tokens]
+            )
+            graph_num_tokens = bs * self.num_tokens_per_bs
+            if num_tokens < graph_num_tokens:
+                self.welm_mtp_oe_hash_out[:, num_tokens:graph_num_tokens].zero_()
         forward_batch.spec_info.extend_seq_lens_cpu = list(
             self.extend_seq_lens_cpu[:bs]
         )

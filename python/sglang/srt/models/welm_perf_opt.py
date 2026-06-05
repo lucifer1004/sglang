@@ -254,12 +254,19 @@ def fill_welm_oe_hash_inputs(
         return
     oe_context = getattr(forward_batch, "oe_context", None)
     prefix_rows = getattr(oe_context, "hash_prefixes", None)
+
+    forward_mode = getattr(forward_batch, "forward_mode", None)
+    if forward_mode is not None and forward_mode.is_target_verify():
+        raise RuntimeError(
+            "WeLM OE fused target-verify requires precomputed hashed inputs "
+            "from MTP history state; CPU prefix fallback is not supported."
+        )
+
     if prefix_rows is None:
         raise RuntimeError(
             "WeLM OE hash kernel path is missing CPU prefix state."
         )
 
-    forward_mode = getattr(forward_batch, "forward_mode", None)
     if forward_mode is not None and forward_mode.is_decode():
         num_segments = input_ids.numel()
         for row in prefix_rows:

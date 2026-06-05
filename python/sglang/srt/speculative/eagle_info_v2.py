@@ -312,6 +312,7 @@ class EagleVerifyInputV2Mixin:
             if (
                 batch.oe_context is not None
                 and batch.oe_context.input_ids_buffer is not None
+                and batch.oe_context.hash_prefixes is None
             ):
                 n_gram_tensors = [
                     torch.empty_like(self.draft_token)
@@ -359,6 +360,9 @@ class EagleVerifyInputV2Mixin:
         )
         batch.capture_hidden_mode = CaptureHiddenMode.FULL
         verify_forward_batch = ForwardBatch.init_new(batch, target_worker.model_runner)
+        cached_welm_oe_hash = getattr(self, "welm_mtp_oe_hashed_inputs", None)
+        if cached_welm_oe_hash is not None:
+            verify_forward_batch.welm_oe_decode_hashed_inputs = cached_welm_oe_hash
 
         # Run attention backend plan and cuda graph preparation
         can_run_cuda_graph = bool(

@@ -914,7 +914,13 @@ class CudaGraphRunner:
         welm_oe_decode_hash_num_branches = 0
         if (
             self.model_runner.server_args.prepare_n_gram_inputs
-            and self.capture_forward_mode.is_decode()
+            and (
+                self.capture_forward_mode.is_decode()
+                or (
+                    self.capture_forward_mode.is_target_verify()
+                    and self.model_runner.spec_algorithm.is_speculative()
+                )
+            )
             and should_use_welm_oe_hash_kernel(
                 self.model_runner.model_config
             )
@@ -1356,8 +1362,7 @@ class CudaGraphRunner:
         if self.model_runner.server_args.prepare_n_gram_inputs:
             model_input_len = bs if self.scale_seq_factor > 1 else num_tokens
             use_welm_oe_decode_hash = (
-                self.capture_forward_mode.is_decode()
-                and self.welm_oe_decode_hash_config is not None
+                self.welm_oe_decode_hash_config is not None
                 and buffers.welm_oe_decode_hashed_inputs is not None
             )
             if use_welm_oe_decode_hash:
@@ -1545,7 +1550,23 @@ class CudaGraphRunner:
         ):
             buffers.input_embeds[:raw_num_token].copy_(forward_batch.input_embeds)
             # Padded tokens aren't read, so skip zeroing them.
+        cached_welm_oe_hash_inputs = getattr(
+            forward_batch, "welm_oe_decode_hashed_inputs", None
+        )
         if (
+            self.welm_oe_decode_hash_config is not None
+            and buffers.welm_oe_decode_hashed_inputs is not None
+            and cached_welm_oe_hash_inputs is not None
+        ):
+            buffers.welm_oe_decode_hashed_inputs[:, :raw_num_token].copy_(
+                cached_welm_oe_hash_inputs[:, :raw_num_token]
+            )
+            static_num_token = bs * self.num_tokens_per_bs
+            if raw_num_token < static_num_token:
+                buffers.welm_oe_decode_hashed_inputs[
+                    :, raw_num_token:static_num_token
+                ].zero_()
+        elif (
             self.welm_oe_decode_hash_config is not None
             and buffers.welm_oe_decode_hashed_inputs is not None
             and forward_batch.oe_context is not None

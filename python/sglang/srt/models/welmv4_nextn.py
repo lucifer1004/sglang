@@ -21,7 +21,11 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.models.welm_perf_opt import hash_input_ids_vectorized
+from sglang.srt.models.welm_perf_opt import (
+    compute_welm_oe_embedding,
+    hash_input_ids_vectorized,
+    should_use_welm_oe_hash_kernel,
+)
 import sglang.srt.models.welmv4 as welmv4_module
 from sglang.srt.models.welmv4 import (
     Qwen2MoeDecoderLayer,
@@ -339,7 +343,28 @@ class WeLMV4ModelNextN(nn.Module):
         else:
             hidden_states = input_embeds
 
-        if len(self.oe_grams) > 0:
+        use_fused_hash = (
+            len(self.oe_grams) > 0
+            and not dump_enabled
+            and should_use_welm_oe_hash_kernel()
+        )
+        if use_fused_hash and input_ids.numel() > 0:
+            if getattr(forward_batch, "welm_oe_decode_hashed_inputs", None) is None:
+                raise RuntimeError(
+                    "WeLMV4 MTP fused OE hash path is enabled but cached hash "
+                    "inputs are missing."
+                )
+            hidden_states = compute_welm_oe_embedding(
+                input_ids=input_ids,
+                forward_batch=forward_batch,
+                base_hidden_states=hidden_states,
+                oe_grams=self.oe_grams,
+                oe_vocab_sizes=self.oe_vocab_sizes,
+                vocab_size=self.vocab_size,
+                oe_embed_modules=self.oe_embed,
+                oe_proj_module=self.oe_gate_up_proj,
+            )
+        elif len(self.oe_grams) > 0:
             input_ids_ngram = []
             input_ids_ngram_tmp = input_ids
             max_n = max(self.oe_grams)
