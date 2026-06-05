@@ -646,7 +646,7 @@ class EAGLEDraftCudaGraphRunner:
         buffers.topk_index[:raw_bs].copy_(forward_batch.spec_info.topk_index)
         buffers.hidden_states[:raw_bs].copy_(forward_batch.spec_info.hidden_states)
         buffers.req_pool_indices[:raw_bs].copy_(forward_batch.req_pool_indices)
-        if buffers.welm_mtp_oe_entry_history is not None:
+        if buffers.welm_mtp_oe_entry_history is not None and raw_bs > 0:
             history_state = getattr(
                 forward_batch.spec_info, "welm_mtp_oe_history_state", None
             )

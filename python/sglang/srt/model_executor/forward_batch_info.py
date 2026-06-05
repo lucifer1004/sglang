@@ -1036,6 +1036,17 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 self._pad_tensor_to_size(gram, num_tokens)
                 for gram in oe_context.input_ids_grams
             ]
+        welm_oe_hash = getattr(self, "welm_oe_decode_hashed_inputs", None)
+        if welm_oe_hash is not None and welm_oe_hash.shape[1] < num_tokens:
+            self.welm_oe_decode_hashed_inputs = torch.cat(
+                [
+                    welm_oe_hash,
+                    welm_oe_hash.new_zeros(
+                        welm_oe_hash.shape[0], num_tokens - welm_oe_hash.shape[1]
+                    ),
+                ],
+                dim=1,
+            )
 
         if self.mrope_positions is not None:
             self.mrope_positions = torch.cat(

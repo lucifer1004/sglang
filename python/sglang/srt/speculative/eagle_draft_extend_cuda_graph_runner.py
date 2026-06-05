@@ -820,7 +820,7 @@ class EAGLEDraftExtendCudaGraphRunner:
                 num_tokens,
                 bs * self.num_tokens_per_bs,
             )
-        if self.welm_mtp_oe_hash_out is not None:
+        if self.welm_mtp_oe_hash_out is not None and num_tokens > 0:
             cached_hash = getattr(forward_batch, "welm_oe_decode_hashed_inputs", None)
             if cached_hash is None:
                 raise RuntimeError(

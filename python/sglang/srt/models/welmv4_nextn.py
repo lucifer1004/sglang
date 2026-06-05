@@ -91,6 +91,53 @@ def _mtp_dump_enabled() -> bool:
     return _MTP_DUMP_ENABLED
 
 
+def _update_mtp_kv_mirror_dp_metadata(
+    forward_batch: ForwardBatch, new_local_num_tokens: int
+) -> None:
+    if (
+        not is_dp_attention_enabled()
+        or welm_use_previous_precision()
+        or getattr(forward_batch, "global_num_tokens_gpu", None) is None
+    ):
+        return
+
+    from sglang.srt.layers.dp_attention import (
+        get_attention_dp_rank,
+        set_dp_buffer_len,
+    )
+
+    dp_rank = get_attention_dp_rank()
+    scale = max(getattr(forward_batch, "scale_seq_factor", 1), 1)
+    if scale > 1:
+        new_global_num_tokens_gpu = forward_batch.global_num_tokens_gpu // scale
+        forward_batch.global_num_tokens_gpu.copy_(new_global_num_tokens_gpu)
+        new_global_num_tokens = [int(x) for x in new_global_num_tokens_gpu.tolist()]
+        if forward_batch.global_num_tokens_cpu is not None:
+            forward_batch.global_num_tokens_cpu = new_global_num_tokens
+    else:
+        forward_batch.global_num_tokens_gpu[dp_rank] = new_local_num_tokens
+        new_global_num_tokens = None
+
+    forward_batch.dp_local_start_pos = None
+    forward_batch.dp_local_num_tokens = None
+    if new_global_num_tokens is not None:
+        if forward_batch.dp_padding_mode.is_max_len():
+            global_dp_buffer_len = max(new_global_num_tokens) * len(
+                new_global_num_tokens
+            )
+        else:
+            global_dp_buffer_len = sum(new_global_num_tokens)
+        forward_batch.global_dp_buffer_len = global_dp_buffer_len
+    else:
+        global_dp_buffer_len = forward_batch.global_dp_buffer_len
+    set_dp_buffer_len(
+        global_dp_buffer_len,
+        new_local_num_tokens,
+        forward_batch.dp_padding_mode.is_max_len(),
+        new_global_num_tokens,
+    )
+
+
 def _mtp_dump_dir() -> Path:
     root = os.environ.get("SGLANG_DUMP_MTP_ACTIVATIONS_DIR", "./sglang_mtp_dump")
     rank = os.environ.get("RANK", "0")
@@ -411,8 +458,16 @@ class WeLMV4ModelNextN(nn.Module):
                 forward_batch,
                 first_contract=main_first_contract,
             )
+            if first_contract:
+                _update_mtp_kv_mirror_dp_metadata(
+                    forward_batch, hidden_states.shape[0]
+                )
 
-        if hidden_states.shape[0] == 0:
+        needs_empty_dp_collectives = (
+            is_dp_attention_enabled()
+            and getattr(forward_batch, "global_num_tokens_gpu", None) is not None
+        )
+        if hidden_states.shape[0] == 0 and not needs_empty_dp_collectives:
             # KV-mirror contraction can select no active rows for this draft
             # extend chunk. Avoid running zero-token decoder kernels; the caller
             # scatters this empty result back to the logical batch shape.
@@ -442,6 +497,9 @@ class WeLMV4ModelNextN(nn.Module):
                 )
                 final_experts_output = getattr(layer, "final_mlp_experts_output", None)
                 final_shared_output = getattr(layer, "final_mlp_shared_output", None)
+
+        if hidden_states.shape[0] == 0:
+            return hidden_states, hidden_states
 
         hidden_states_for_next_mtp = None
         if not forward_batch.forward_mode.is_idle():
