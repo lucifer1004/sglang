@@ -185,7 +185,7 @@ def replace_dependency_line(text: str, package: str, replacement: str) -> str:
 
 for package, replacement in (
     ("cuda-python", "cuda-python>=12,<13"),
-    ("sglang-kernel", "sglang-kernel==0.4.2.post1+cu129"),
+    ("sglang-kernel", "sglang-kernel==0.4.2.post2+cu129"),
     ("nvidia-cutlass-dsl", "nvidia-cutlass-dsl==4.5.0"),
 ):
     text = replace_dependency_line(text, package, replacement)
@@ -267,7 +267,7 @@ PY
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv pip install --python "${VENV_PATH}/bin/python" \
         --index-url "${SGLANG_KERNEL_INDEX_URL}" \
-        "sglang-kernel==0.4.2.post1+cu129"
+        "sglang-kernel==0.4.2.post2+cu129"
 
 RUN "${VENV_PATH}/bin/python" - <<'PY' > /tmp/sglang-runtime-requirements.txt
 import pathlib
@@ -355,7 +355,7 @@ def replace_dependency_line(text: str, package: str, replacement: str) -> str:
 
 for package, replacement in (
     ("cuda-python", "cuda-python>=12,<13"),
-    ("sglang-kernel", "sglang-kernel==0.4.2.post1+cu129"),
+    ("sglang-kernel", "sglang-kernel==0.4.2.post2+cu129"),
     ("nvidia-cutlass-dsl", "nvidia-cutlass-dsl==4.5.0"),
 ):
     text = replace_dependency_line(text, package, replacement)

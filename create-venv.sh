@@ -177,7 +177,7 @@ def replace_dependency_line(text: str, package: str, replacement: str) -> str:
 
 for package, replacement in (
     ("cuda-python", "cuda-python>=12,<13"),
-    ("sglang-kernel", "sglang-kernel==0.4.2.post1+cu129"),
+    ("sglang-kernel", "sglang-kernel==0.4.2.post2+cu129"),
     ("nvidia-cutlass-dsl", "nvidia-cutlass-dsl==4.5.0"),
 ):
     text = replace_dependency_line(text, package, replacement)
@@ -222,7 +222,7 @@ run_logged install-torch-cu128 "${UV}" pip install \
 run_logged install-sglang-kernel-cu129 "${UV}" pip install \
     --python "${VENV_PYTHON}" \
     --index-url "${SGLANG_KERNEL_INDEX_URL}" \
-    "sglang-kernel==0.4.2.post1+cu129"
+    "sglang-kernel==0.4.2.post2+cu129"
 run_logged install-runtime-deps "${UV}" pip install --python "${VENV_PYTHON}" -r "${REQ_FILE}"
 SGL_DEEP_GEMM_VERSION="$(cat "${SGL_DEEP_GEMM_VERSION_FILE}")"
 run_logged install-sgl-deep-gemm-cu129 "${UV}" pip install \
