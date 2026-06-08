@@ -180,7 +180,6 @@ class DecodeInputBuffers(ForwardInputBuffers):
     encoder_lens: Optional[torch.Tensor]
     pp_proxy_tensors: Optional[Dict[str, torch.Tensor]]
     ngram_embedding_info: Optional["NgramEmbeddingInfo"]
-    input_ids_grams: List[torch.Tensor]
     welm_oe_decode_hashed_inputs: Optional[torch.Tensor]
     router_replay_topk_ids: torch.Tensor
     router_replay_mask: torch.Tensor
@@ -207,7 +206,6 @@ class DecodeInputBuffers(ForwardInputBuffers):
         num_tokens_per_bs: int,
         cache_loc_dtype: torch.dtype,
         enable_mamba_track: bool,
-        prepare_n_gram_inputs: bool,
         welm_oe_decode_hash_num_branches: int,
         scale_seq_factor: int,
         router_replay_num_layers: int = 0,
@@ -218,12 +216,6 @@ class DecodeInputBuffers(ForwardInputBuffers):
         is_hybrid_swa: bool = False,
     ) -> "DecodeInputBuffers":
         with torch.device(device):
-            if prepare_n_gram_inputs:
-                input_ids_grams = [
-                    torch.zeros((max_num_token,), dtype=torch.int64) for _ in range(3)
-                ]
-            else:
-                input_ids_grams = []
             welm_oe_decode_hashed_inputs = (
                 torch.zeros(
                     (welm_oe_decode_hash_num_branches, max_num_token),
@@ -353,7 +345,6 @@ class DecodeInputBuffers(ForwardInputBuffers):
             global_num_tokens_for_logprob_gpu=global_num_tokens_for_logprob_gpu,
             pp_proxy_tensors=pp_proxy_tensors,
             ngram_embedding_info=ngram_embedding_info,
-            input_ids_grams=input_ids_grams,
             welm_oe_decode_hashed_inputs=welm_oe_decode_hashed_inputs,
             router_replay_topk_ids=router_replay_topk_ids,
             router_replay_mask=router_replay_mask,
@@ -401,18 +392,6 @@ class DecodeInputBuffers(ForwardInputBuffers):
             forward_batch.out_cache_loc,
             forward_batch.positions,
         ]
-
-        if (
-            forward_batch.oe_context is not None
-            and len(self.input_ids_grams) > 0
-            and forward_batch.oe_context.hash_prefixes is None
-        ):
-            for buf_gram, src_gram in zip(
-                self.input_ids_grams,
-                forward_batch.oe_context.input_ids_grams,
-            ):
-                copy_len = min(buf_gram.shape[0], src_gram.shape[0])
-                buf_gram[:copy_len].copy_(src_gram[:copy_len])
 
         if self.ngram_embedding_info is not None:
             ngram_embedding_info = forward_batch.ngram_embedding_info
@@ -946,7 +925,6 @@ class CudaGraphRunner:
             num_tokens_per_bs=self.num_tokens_per_bs,
             cache_loc_dtype=self._cache_loc_dtype(),
             enable_mamba_track=enable_mamba_track,
-            prepare_n_gram_inputs=self.model_runner.server_args.prepare_n_gram_inputs,
             welm_oe_decode_hash_num_branches=welm_oe_decode_hash_num_branches,
             scale_seq_factor=self.scale_seq_factor,
             router_replay_num_layers=getattr(
@@ -1364,7 +1342,6 @@ class CudaGraphRunner:
             lora_ids=lora_ids,
         )
         if self.model_runner.server_args.prepare_n_gram_inputs:
-            model_input_len = bs if self.scale_seq_factor > 1 else num_tokens
             use_welm_oe_decode_hash = (
                 self.welm_oe_decode_hash_config is not None
                 and buffers.welm_oe_decode_hashed_inputs is not None
@@ -1377,10 +1354,9 @@ class CudaGraphRunner:
                     buffers.welm_oe_decode_hashed_inputs[:, :num_tokens]
                 )
             else:
-                forward_batch.oe_context = OverEncodingContext(
-                    input_ids_grams=[
-                        gram[:model_input_len] for gram in buffers.input_ids_grams
-                    ],
+                raise RuntimeError(
+                    "WeLM OE CUDA graph requires decode hash buffers. "
+                    "Materialized n-gram fallback is no longer supported."
                 )
 
         # HiSparse: set coordinator so the hisparse code path is captured into the graph

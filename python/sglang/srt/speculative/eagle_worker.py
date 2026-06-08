@@ -650,67 +650,6 @@ class EAGLEWorker(TpModelWorker):
     def _should_disable_welmv4_mtp_target_verify_graph(self) -> bool:
         return self._is_welmv4_mtp_draft_model() and self.topk > 1
 
-    def _prepare_welmv4_mtp_draft_decode_oe_context(
-        self,
-        forward_batch: ForwardBatch,
-        input_ids: torch.Tensor,
-        draft_oe_buffer: Optional[torch.Tensor],
-        selected_parent_indices: Optional[torch.Tensor] = None,
-        base_query_count: Optional[int] = None,
-    ) -> Optional[torch.Tensor]:
-        oe_context = getattr(forward_batch, "oe_context", None)
-        if oe_context is None or oe_context.input_ids_buffer is None:
-            return draft_oe_buffer
-
-        num_queries = input_ids.numel()
-        buffer_size = oe_context.buffer_size
-        if draft_oe_buffer is None:
-            buffer_batch_size = oe_context.input_ids_buffer.numel() // buffer_size
-            base_buffer = oe_context.input_ids_buffer.view(
-                buffer_batch_size, buffer_size
-            )
-            if (
-                base_query_count is not None
-                and base_query_count <= buffer_batch_size
-                and num_queries % base_query_count == 0
-            ):
-                draft_oe_buffer = (
-                    base_buffer[:base_query_count]
-                    .repeat_interleave(num_queries // base_query_count, dim=0)
-                    .clone()
-                )
-            else:
-                if buffer_batch_size < num_queries:
-                    raise RuntimeError(
-                        "WeLMV4 MTP draft OE buffer is smaller than the draft batch: "
-                        f"{buffer_batch_size=} {num_queries=}"
-                    )
-                draft_oe_buffer = base_buffer[:num_queries].clone()
-        elif selected_parent_indices is not None:
-            draft_oe_buffer = draft_oe_buffer[selected_parent_indices.to(torch.long)]
-        elif draft_oe_buffer.shape[0] != num_queries:
-            if draft_oe_buffer.shape[0] < num_queries:
-                raise RuntimeError(
-                    "WeLMV4 MTP local draft OE buffer is smaller than the draft batch: "
-                    f"buffer_batch_size={draft_oe_buffer.shape[0]} {num_queries=}"
-                )
-            draft_oe_buffer = draft_oe_buffer[:num_queries]
-
-        for idx in range(len(oe_context.input_ids_grams)):
-            n = idx + 2
-            if n - 1 <= buffer_size:
-                ngram = draft_oe_buffer[:, -(n - 1)].contiguous()
-            else:
-                ngram = input_ids.new_zeros((num_queries,), dtype=torch.int64)
-            oe_context.set_gram(n, ngram.to(dtype=torch.int64))
-
-        input_ids_column = input_ids.to(dtype=draft_oe_buffer.dtype).view(
-            num_queries, 1
-        )
-        if buffer_size == 1:
-            return input_ids_column
-        return torch.cat([draft_oe_buffer[:, 1:], input_ids_column], dim=1)
-
     def forward_batch_generation(self, batch: ScheduleBatch) -> GenerationBatchResult:
         """Run speculative decoding forward.
 
@@ -1104,7 +1043,6 @@ class EAGLEWorker(TpModelWorker):
             topk_index = self.hot_token_id[topk_index]
         is_welmv4_mtp = self._is_welmv4_mtp_draft_model()
         welmv4_mtp_base_positions = None
-        welmv4_mtp_draft_oe_buffer = None
         if is_welmv4_mtp and not forward_batch.forward_mode.is_idle():
             welmv4_mtp_base_positions = spec_info.welm_mtp_base_positions
             if welmv4_mtp_base_positions is None:
@@ -1182,15 +1120,6 @@ class EAGLEWorker(TpModelWorker):
                 ).to(dtype=step_positions.dtype)
                 selected_parent_indices = self._get_welmv4_mtp_selected_parent_indices(
                     i, tree_info, input_ids.device
-                )
-                welmv4_mtp_draft_oe_buffer = (
-                    self._prepare_welmv4_mtp_draft_decode_oe_context(
-                        forward_batch,
-                        input_ids,
-                        welmv4_mtp_draft_oe_buffer,
-                        selected_parent_indices,
-                        base_query_count,
-                    )
                 )
                 restore_mtp_metadata = self._init_welmv4_mtp_base_kv_decode_metadata(
                     forward_batch, base_query_count

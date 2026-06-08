@@ -21,11 +21,7 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.models.welm_perf_opt import (
-    compute_welm_oe_embedding,
-    hash_input_ids_vectorized,
-    should_use_welm_oe_hash_kernel,
-)
+from sglang.srt.models.welm_perf_opt import compute_welm_oe_embedding
 import sglang.srt.models.welmv4 as welmv4_module
 from sglang.srt.models.welmv4 import (
     Qwen2MoeDecoderLayer,
@@ -390,16 +386,10 @@ class WeLMV4ModelNextN(nn.Module):
         else:
             hidden_states = input_embeds
 
-        use_fused_hash = (
-            len(self.oe_grams) > 0
-            and not dump_enabled
-            and should_use_welm_oe_hash_kernel()
-        )
-        if use_fused_hash and input_ids.numel() > 0:
+        if len(self.oe_grams) > 0 and input_ids.numel() > 0:
             if getattr(forward_batch, "welm_oe_decode_hashed_inputs", None) is None:
                 raise RuntimeError(
-                    "WeLMV4 MTP fused OE hash path is enabled but cached hash "
-                    "inputs are missing."
+                    "WeLMV4 MTP OE requires cached CUDA hash inputs."
                 )
             hidden_states = compute_welm_oe_embedding(
                 input_ids=input_ids,
@@ -411,33 +401,6 @@ class WeLMV4ModelNextN(nn.Module):
                 oe_embed_modules=self.oe_embed,
                 oe_proj_module=self.oe_gate_up_proj,
             )
-        elif len(self.oe_grams) > 0:
-            input_ids_ngram = []
-            input_ids_ngram_tmp = input_ids
-            max_n = max(self.oe_grams)
-            if getattr(forward_batch, "oe_context", None) is not None:
-                input_ids_gram_n = []
-                for n in range(2, max_n + 1):
-                    gram = forward_batch.oe_context.get_gram(n)
-                    input_ids_gram_n.append(
-                        gram if gram is not None else torch.zeros_like(input_ids)
-                    )
-            else:
-                zero_ids = torch.zeros_like(input_ids)
-                input_ids_gram_n = [zero_ids for _ in range(max_n - 1)]
-            for g in range(1, max_n):
-                input_ids_ngram_tmp = input_ids_ngram_tmp + input_ids_gram_n[g - 1] * (
-                    self.vocab_size**g
-                )
-                input_ids_ngram.append(hash_input_ids_vectorized(input_ids_ngram_tmp))
-
-            emb_ngram = []
-            for i, vs in enumerate(self.oe_vocab_sizes):
-                input_ids_ngram_hashed_tmp = input_ids_ngram[self.oe_grams[i] - 2] % vs
-                emb_ngram_tmp = self.oe_embed[i](input_ids_ngram_hashed_tmp)
-                emb_ngram.append(emb_ngram_tmp)
-            emb_new, _ = self.oe_gate_up_proj(torch.cat(emb_ngram, dim=-1))
-            hidden_states = (hidden_states + emb_new) / 2.0
 
         if (
             _welm_should_contract_kv_mirror(forward_batch)

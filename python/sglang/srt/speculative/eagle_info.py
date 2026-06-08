@@ -6,10 +6,6 @@ from typing import Any, Dict, List, Optional, Tuple
 import torch
 import torch.nn.functional as F
 
-from sglang.jit_kernel.ngram_ops import (
-    assign_ngram_input_ids_draft_extend_after_decode,
-    build_ngram_with_target_verify,
-)
 from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.environ import envs
@@ -49,7 +45,6 @@ from sglang.srt.speculative.spec_utils import (
     get_target_cache_loc,
 )
 from sglang.srt.utils import is_cuda, is_musa, next_power_of_2
-from sglang.srt.utils.over_encoding_utils import update_ngram_buffer_from_segments
 
 if is_cuda() or is_musa():
     from sgl_kernel import (
@@ -156,29 +151,6 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             batch.out_cache_loc,
             bs,
         )
-        if (
-            batch.oe_context is not None
-            and batch.oe_context.input_ids_buffer is not None
-        ):
-            n_gram_tensors = [
-                torch.empty_like(self.draft_token)
-                for _ in batch.oe_context.input_ids_grams
-            ]
-            for idx, gram_tensor in enumerate(n_gram_tensors):
-                n = idx + 2
-                build_ngram_with_target_verify(
-                    gram_tensor,
-                    batch.oe_context.input_ids_buffer,
-                    self.draft_token,
-                    self.custom_mask,
-                    self.positions,
-                    batch.seq_lens,
-                    n,
-                    self.draft_token_num,
-                    batch.oe_context.buffer_size,
-                )
-                batch.oe_context.set_gram(n, gram_tensor)
-
         if get_global_server_args().enable_mamba_extra_buffer():
             batch.mamba_track_indices = torch.tensor(
                 [
@@ -648,9 +620,6 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 unfinished_num_accepted_drafts = num_accepted_drafts[
                     unfinished_index_device
                 ]
-                if batch.oe_context is not None:
-                    batch.oe_context.filter_buffer(unfinished_index_device)
-
                 draft_input = EagleDraftInput(
                     hidden_states=batch.spec_info.hidden_states[
                         unfinished_accept_index
@@ -754,12 +723,6 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
             )
             pt += extend_len
 
-        if batch.oe_context is not None:
-            batch.oe_context.refresh_for_draft_extend(
-                batch.input_ids,
-                batch.extend_lens,
-            )
-
     @classmethod
     def create_idle_input(
         cls,
@@ -831,33 +794,6 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
             next_power_of_2(max(speculative_num_steps + 1, len(batch.seq_lens))),
         )
         batch.input_ids = batch.input_ids.to(torch.int64)
-        if (
-            batch.oe_context is not None
-            and batch.oe_context.input_ids_buffer is not None
-        ):
-            buffer = batch.oe_context.input_ids_buffer
-            buffer_size = batch.oe_context.buffer_size
-            num_accepted_tokens = self.num_accepted_tokens.to(torch.int32)
-            for idx in range(len(batch.oe_context.input_ids_grams)):
-                n = idx + 2
-                n_gram = torch.empty_like(batch.input_ids, dtype=torch.int64)
-                assign_ngram_input_ids_draft_extend_after_decode(
-                    batch.input_ids,
-                    buffer,
-                    n_gram,
-                    num_accepted_tokens,
-                    n,
-                    buffer_size,
-                    False,
-                )
-                batch.oe_context.set_gram(n, n_gram)
-            update_ngram_buffer_from_segments(
-                batch.input_ids,
-                buffer,
-                batch.extend_lens,
-                buffer_size,
-            )
-
     def generate_attn_arg_prefill(
         self,
         req_pool_indices: torch.Tensor,

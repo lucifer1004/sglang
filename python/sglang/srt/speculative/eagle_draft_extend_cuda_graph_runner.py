@@ -9,7 +9,6 @@ from typing import TYPE_CHECKING, Callable, Optional
 import torch
 
 from sglang.srt.layers.dp_attention import DpPaddingMode, set_dp_buffer_len
-from sglang.srt.managers.schedule_batch import OverEncodingContext
 from sglang.srt.models.welm_perf_opt import get_welm_oe_hash_config
 from sglang.srt.model_executor.cuda_graph_runner import (
     CUDA_GRAPH_CAPTURE_FAILED_MSG,
@@ -235,22 +234,6 @@ class EAGLEDraftExtendCudaGraphRunner:
                 "_should_use_welmv4_mtp_oe_hash_kernel",
                 lambda: False,
             )()
-            if (
-                self.model_runner.server_args.prepare_n_gram_inputs
-                and not use_welm_mtp_oe_hash
-            ):
-                self.ngram_input_ids = OverEncodingContext(
-                    input_ids_grams=[
-                        torch.zeros((self.max_num_token,), dtype=torch.int64)
-                        for _ in range(3)
-                    ],
-                    input_ids_buffer=torch.zeros(
-                        (self.max_bs * OverEncodingContext.buffer_size), dtype=torch.int64
-                    ),
-                )
-            else:
-                self.ngram_input_ids = None
-
             if use_welm_mtp_oe_hash:
                 oe_grams, oe_vocab_sizes = get_welm_oe_hash_config(
                     self.model_runner.model_config
@@ -259,6 +242,12 @@ class EAGLEDraftExtendCudaGraphRunner:
                     (len(oe_vocab_sizes), self.max_num_token), dtype=torch.int64
                 )
             else:
+                if self.model_runner.server_args.prepare_n_gram_inputs:
+                    raise RuntimeError(
+                        "WeLM MTP OE draft-extend CUDA graph requires the hash "
+                        "kernel. Materialized n-gram fallback is no longer "
+                        "supported."
+                    )
                 self.welm_mtp_oe_hash_out = None
 
             mirrored_kv_indices = None
@@ -448,60 +437,6 @@ class EAGLEDraftExtendCudaGraphRunner:
             mirrored_kv_indices
         )
 
-    def _copy_ngram_inputs(
-        self,
-        forward_batch: ForwardBatch,
-        raw_bs: int,
-        bs: int,
-        raw_num_tokens: int,
-        graph_num_tokens: int,
-    ):
-        if self.ngram_input_ids is None:
-            return
-
-        for gram in self.ngram_input_ids.input_ids_grams:
-            gram[:graph_num_tokens].zero_()
-        graph_buffer_len = bs * self.ngram_input_ids.buffer_size
-        self.ngram_input_ids.input_ids_buffer[:graph_buffer_len].zero_()
-
-        oe_context = getattr(forward_batch, "oe_context", None)
-        if oe_context is None:
-            return
-
-        if len(oe_context.input_ids_grams) != len(
-            self.ngram_input_ids.input_ids_grams
-        ):
-            raise RuntimeError(
-                "Draft-extend CUDA graph OE gram count mismatch: "
-                f"{len(oe_context.input_ids_grams)} vs "
-                f"{len(self.ngram_input_ids.input_ids_grams)}"
-            )
-
-        for dst_gram, src_gram in zip(
-            self.ngram_input_ids.input_ids_grams,
-            oe_context.input_ids_grams,
-        ):
-            if src_gram is None or src_gram.numel() < raw_num_tokens:
-                raise RuntimeError(
-                    "Draft-extend CUDA graph OE gram buffer is shorter than input: "
-                    f"gram_len={None if src_gram is None else src_gram.numel()} "
-                    f"{raw_num_tokens=}"
-                )
-            dst_gram[:raw_num_tokens].copy_(src_gram[:raw_num_tokens])
-
-        if oe_context.input_ids_buffer is None:
-            return
-        raw_buffer_len = raw_bs * self.ngram_input_ids.buffer_size
-        if oe_context.input_ids_buffer.numel() < raw_buffer_len:
-            raise RuntimeError(
-                "Draft-extend CUDA graph OE rolling buffer is shorter than batch: "
-                f"buffer_len={oe_context.input_ids_buffer.numel()} "
-                f"{raw_buffer_len=}"
-            )
-        self.ngram_input_ids.input_ids_buffer[:raw_buffer_len].copy_(
-            oe_context.input_ids_buffer[:raw_buffer_len]
-        )
-
     def _capture_init(self, run_once_fn):
         for _ in range(2):
             torch.cuda.synchronize()
@@ -603,19 +538,6 @@ class EAGLEDraftExtendCudaGraphRunner:
 
         self.deepep_adapter.capture(is_extend_in_batch=True)
 
-        if self.ngram_input_ids is not None and self.welm_mtp_oe_hash_out is None:
-            buffer = self.ngram_input_ids.input_ids_buffer[
-                : bs * self.ngram_input_ids.buffer_size
-            ]
-            current_ngram_input_ids = OverEncodingContext(
-                input_ids_grams=[
-                    gram[:num_tokens] for gram in self.ngram_input_ids.input_ids_grams
-                ],
-                input_ids_buffer=buffer,
-            )
-        else:
-            current_ngram_input_ids = None
-
         # Forward batch
         forward_batch = ForwardBatch(
             forward_mode=self.forward_mode,
@@ -644,7 +566,7 @@ class EAGLEDraftExtendCudaGraphRunner:
             capture_hidden_mode=CaptureHiddenMode.LAST,
             attn_backend=self.draft_extend_attn_backend,
             padded_static_len=self.padded_static_len,
-            oe_context=current_ngram_input_ids,
+            oe_context=None,
         )
         if self.welm_mtp_oe_hash_out is not None:
             forward_batch.welm_oe_decode_hashed_inputs = (
@@ -811,14 +733,6 @@ class EAGLEDraftExtendCudaGraphRunner:
         if bs > raw_bs:
             self.extend_seq_lens_cpu[raw_bs:bs] = [self.num_tokens_per_bs] * (
                 bs - raw_bs
-            )
-        if self.welm_mtp_oe_hash_out is None:
-            self._copy_ngram_inputs(
-                forward_batch,
-                raw_bs,
-                bs,
-                num_tokens,
-                bs * self.num_tokens_per_bs,
             )
         if self.welm_mtp_oe_hash_out is not None and num_tokens > 0:
             cached_hash = getattr(forward_batch, "welm_oe_decode_hashed_inputs", None)

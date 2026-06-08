@@ -1038,12 +1038,6 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 self.router_replay_mask, num_tokens, value=0
             )
 
-        oe_context = getattr(self, "oe_context", None)
-        if oe_context is not None and oe_context.input_ids_grams is not None:
-            oe_context.input_ids_grams = [
-                self._pad_tensor_to_size(gram, num_tokens)
-                for gram in oe_context.input_ids_grams
-            ]
         welm_oe_hash = getattr(self, "welm_oe_decode_hashed_inputs", None)
         if welm_oe_hash is not None and welm_oe_hash.shape[1] < num_tokens:
             self.welm_oe_decode_hashed_inputs = torch.cat(

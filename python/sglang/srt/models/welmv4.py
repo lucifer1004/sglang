@@ -321,13 +321,6 @@ def _welm_start_dump_pass() -> None:
     _WELM_DUMP_PROCESS_DIR.mkdir(parents=True, exist_ok=True)
 
 
-def hash_input_ids_vectorized(input_ids: torch.Tensor) -> torch.Tensor:
-    ids = input_ids.to(torch.int64)
-    result = ids * 2654435761
-    result = result & 0xFFFFFFFF
-    return result.to(input_ids.dtype)
-
-
 def _welm_kv_mirror_pp_key(layer_idx: int, suffix: str) -> str:
     return f"{WELM_KV_MIRROR_PP_KEY_PREFIX}.{layer_idx}.{suffix}"
 
@@ -2541,59 +2534,16 @@ class Qwen2MoeModel(nn.Module):
         if oe_up_proj_module is None:
             oe_up_proj_module = self.oe_gate_up_proj
 
-        dump_oe = _WELM_DUMP_ENABLED
-        # When WELM_USE_PREVIOUS_PRECISION is set we must reproduce the
-        # main_v056 numerics bit-for-bit. The perf-branch fast path
-        # (compute_welm_oe_embedding -> TP-fused / triton-preprocess /
-        # delayed all-reduce) reorders bf16 reductions, so fall back to the
-        # explicit inline implementation that mirrors main_v056's
-        # _compute_oe_embedding.
-        if not dump_oe and not welm_use_previous_precision():
-            return compute_welm_oe_embedding(
-                input_ids=input_ids,
-                forward_batch=forward_batch,
-                base_hidden_states=base_hidden_states,
-                oe_grams=self.oe_grams,
-                oe_vocab_sizes=self.oe_vocab_sizes,
-                vocab_size=self.vocab_size,
-                oe_embed_modules=oe_embed_modules,
-                oe_proj_module=oe_up_proj_module,
-            )
-
-        if dump_oe:
-            _welm_dump_tensor("model.oe.input_ids", input_ids)
-            _welm_dump_tensor("model.oe.base_hidden_states", base_hidden_states)
-
-        oe_context = getattr(forward_batch, "oe_context", None)
-        input_ids_ngram = []
-        input_ids_ngram_tmp = input_ids
-        for g in range(1, max(self.oe_grams)):
-            gram_tensor = oe_context.get_gram(g + 1)
-            if gram_tensor is not None:
-                if dump_oe:
-                    _welm_dump_tensor(f"model.oe.gram{g + 1}.ids", gram_tensor)
-                input_ids_ngram_tmp = input_ids_ngram_tmp + gram_tensor * (
-                    self.vocab_size**g
-                )
-            input_ids_ngram.append(hash_input_ids_vectorized(input_ids_ngram_tmp))
-
-        emb_ngram = []
-        for i, vs in enumerate(self.oe_vocab_sizes):
-            input_ids_ngram_hashed_tmp = input_ids_ngram[self.oe_grams[i] - 2] % vs
-            if dump_oe:
-                _welm_dump_tensor(
-                    f"model.oe.vocab{i}.hashed_ids", input_ids_ngram_hashed_tmp
-                )
-            emb_ngram_tmp = oe_embed_modules[i](input_ids_ngram_hashed_tmp)
-            if dump_oe:
-                _welm_dump_tensor(f"model.oe.vocab{i}.embedding", emb_ngram_tmp)
-            emb_ngram.append(emb_ngram_tmp)
-        emb_new, _ = oe_up_proj_module(torch.cat(emb_ngram, dim=-1))
-        hidden_states = (base_hidden_states + emb_new) / 2.0
-        if dump_oe:
-            _welm_dump_tensor("model.oe.projected", emb_new)
-            _welm_dump_tensor("model.oe.output", hidden_states)
-        return hidden_states
+        return compute_welm_oe_embedding(
+            input_ids=input_ids,
+            forward_batch=forward_batch,
+            base_hidden_states=base_hidden_states,
+            oe_grams=self.oe_grams,
+            oe_vocab_sizes=self.oe_vocab_sizes,
+            vocab_size=self.vocab_size,
+            oe_embed_modules=oe_embed_modules,
+            oe_proj_module=oe_up_proj_module,
+        )
 
     def _expand_scale_seq(self, input_ids, forward_batch, hidden_states):
         """Expand hidden_states from (T, D) to (T * scale, D) by interleaving

@@ -485,7 +485,7 @@ class EagleDraftWorker(BaseDraftWorker):
         # Target-verify sees the current verified token both in draft_token_ids
         # and in the rolling history state. Keep one extra column so the target
         # verify hash kernel can skip that current-token column and still read
-        # max_gram - 1 tokens before it, matching the legacy rolling buffer.
+        # max_gram - 1 tokens before it.
         return oe_grams, oe_vocab_sizes, max(int(g) for g in oe_grams)
 
     def _welmv4_mtp_oe_prefix_width(self) -> int:
@@ -897,215 +897,6 @@ class EagleDraftWorker(BaseDraftWorker):
             else:
                 delattr(forward_batch, "welm_mtp_use_base_kv_cache")
 
-    def _prepare_welmv4_mtp_draft_decode_oe_context(
-        self,
-        forward_batch: ForwardBatch,
-        input_ids: torch.Tensor,
-        draft_oe_buffer: Optional[torch.Tensor],
-        selected_parent_indices: Optional[torch.Tensor] = None,
-        base_query_count: Optional[int] = None,
-    ) -> Optional[torch.Tensor]:
-        oe_context = getattr(forward_batch, "oe_context", None)
-        if oe_context is None or oe_context.input_ids_buffer is None:
-            return draft_oe_buffer
-        saved_oe_buffer = getattr(
-            getattr(forward_batch, "spec_info", None),
-            "welm_mtp_oe_buffer",
-            None,
-        )
-        if (
-            saved_oe_buffer is not None
-            and saved_oe_buffer.numel() == oe_context.input_ids_buffer.numel()
-        ):
-            oe_context.input_ids_buffer.copy_(
-                saved_oe_buffer.to(
-                    device=oe_context.input_ids_buffer.device,
-                    dtype=oe_context.input_ids_buffer.dtype,
-                ).reshape_as(oe_context.input_ids_buffer)
-            )
-
-        num_queries = input_ids.numel()
-        buffer_size = oe_context.buffer_size
-        if draft_oe_buffer is None:
-            buffer_batch_size = oe_context.input_ids_buffer.numel() // buffer_size
-            base_buffer = oe_context.input_ids_buffer.view(
-                buffer_batch_size, buffer_size
-            )
-            if (
-                base_query_count is not None
-                and base_query_count <= buffer_batch_size
-                and num_queries % base_query_count == 0
-            ):
-                draft_oe_buffer = (
-                    base_buffer[:base_query_count]
-                    .repeat_interleave(num_queries // base_query_count, dim=0)
-                    .clone()
-                )
-            else:
-                if buffer_batch_size < num_queries:
-                    raise RuntimeError(
-                        "WeLMV4 MTP draft OE buffer is smaller than the draft batch: "
-                        f"{buffer_batch_size=} {num_queries=}"
-                    )
-                draft_oe_buffer = base_buffer[:num_queries].clone()
-        elif selected_parent_indices is not None:
-            draft_oe_buffer = draft_oe_buffer[selected_parent_indices.to(torch.long)]
-        elif draft_oe_buffer.shape[0] != num_queries:
-            if draft_oe_buffer.shape[0] < num_queries:
-                raise RuntimeError(
-                    "WeLMV4 MTP local draft OE buffer is smaller than the draft batch: "
-                    f"buffer_batch_size={draft_oe_buffer.shape[0]} {num_queries=}"
-                )
-            draft_oe_buffer = draft_oe_buffer[:num_queries]
-
-        if getattr(forward_batch, "welm_mtp_graph_oe_context_prepared", False):
-            for idx, gram_buffer in enumerate(oe_context.input_ids_grams):
-                n = idx + 2
-                if n - 1 <= buffer_size:
-                    ngram = draft_oe_buffer[:, -(n - 1)].contiguous()
-                else:
-                    ngram = input_ids.new_zeros((num_queries,), dtype=torch.int64)
-                if gram_buffer is not None and gram_buffer.shape[0] >= num_queries:
-                    gram_buffer[:num_queries].copy_(ngram.to(dtype=gram_buffer.dtype))
-                else:
-                    oe_context.set_gram(n, ngram.to(dtype=torch.int64))
-            input_ids_column = input_ids.to(dtype=draft_oe_buffer.dtype).view(
-                num_queries, 1
-            )
-            if buffer_size == 1:
-                return input_ids_column
-            return torch.cat([draft_oe_buffer[:, 1:], input_ids_column], dim=1)
-
-        for idx in range(len(oe_context.input_ids_grams)):
-            n = idx + 2
-            if n - 1 <= buffer_size:
-                ngram = draft_oe_buffer[:, -(n - 1)].contiguous()
-            else:
-                ngram = input_ids.new_zeros((num_queries,), dtype=torch.int64)
-            oe_context.set_gram(n, ngram.to(dtype=torch.int64))
-
-        input_ids_column = input_ids.to(dtype=draft_oe_buffer.dtype).view(
-            num_queries, 1
-        )
-        if buffer_size == 1:
-            return input_ids_column
-        return torch.cat([draft_oe_buffer[:, 1:], input_ids_column], dim=1)
-
-    def _prepare_welmv4_mtp_draft_extend_oe_context(
-        self,
-        forward_batch: ForwardBatch,
-        input_ids: torch.Tensor,
-        select_index: torch.Tensor,
-        accept_lens: torch.Tensor,
-        accepted_draft_token_ids: Optional[torch.Tensor],
-    ) -> None:
-        oe_context = getattr(forward_batch, "oe_context", None)
-        if (
-            oe_context is None
-            or oe_context.input_ids_buffer is None
-            or accepted_draft_token_ids is None
-        ):
-            return
-
-        if input_ids.numel() == 0 or accept_lens.numel() == 0:
-            return
-        buffer_size = oe_context.buffer_size
-        num_reqs = int(accept_lens.numel())
-        flat_token_count = int(input_ids.numel())
-        if oe_context.input_ids_buffer.numel() < num_reqs * buffer_size:
-            raise RuntimeError(
-                "WeLMV4 MTP draft-extend OE buffer is smaller than the request batch: "
-                f"buffer_len={oe_context.input_ids_buffer.numel()} "
-                f"required={num_reqs * buffer_size}"
-            )
-
-        num_draft_tokens = self.speculative_num_draft_tokens
-        if flat_token_count != num_reqs * num_draft_tokens:
-            raise RuntimeError(
-                "WeLMV4 MTP draft-extend OE input length does not match extend_lens: "
-                f"input_len={flat_token_count} expected={num_reqs * num_draft_tokens}"
-            )
-
-        history_buffer = oe_context.input_ids_buffer[: num_reqs * buffer_size].view(
-            num_reqs, buffer_size
-        )
-        accepted_rows = accepted_draft_token_ids.reshape(num_reqs, -1)
-        accepted_width = accepted_rows.shape[1]
-        if accepted_width == 0:
-            raise RuntimeError(
-                "WeLMV4 MTP accepted draft token buffer is empty."
-            )
-
-        # Keep this preparation GPU-only. Copying accept_lens to CPU here
-        # serializes target verify and draft-extend on every decode step.
-        accepted_order = torch.arange(
-            accepted_width, device=accepted_rows.device, dtype=torch.long
-        )
-        accepted_sort_keys = torch.where(
-            accepted_rows >= 0, accepted_order, accepted_order + accepted_width
-        )
-        accepted_compact = accepted_rows.gather(
-            1, torch.argsort(accepted_sort_keys, dim=1)
-        )
-        accepted_tail = accepted_compact[:, 1:].to(
-            device=history_buffer.device,
-            dtype=history_buffer.dtype,
-        )
-        max_extra_lens = max(0, accepted_width - 1)
-        extra_lens = torch.clamp(
-            accept_lens[:num_reqs].to(device=history_buffer.device, dtype=torch.long)
-            - 1,
-            min=0,
-            max=max_extra_lens,
-        )
-        history_with_accepted = torch.cat([history_buffer, accepted_tail], dim=1)
-        history_offsets = extra_lens[:, None] + torch.arange(
-            buffer_size, device=history_buffer.device, dtype=torch.long
-        )
-        history_after_accept = torch.gather(
-            history_with_accepted, 1, history_offsets
-        )
-
-        input_ids_flat = input_ids.reshape(-1).to(dtype=torch.int64)
-        input_ids_matrix = input_ids.reshape(num_reqs, num_draft_tokens).to(
-            dtype=history_after_accept.dtype
-        )
-        ngram_source = torch.cat([history_after_accept, input_ids_matrix], dim=1)
-        for idx, gram in enumerate(oe_context.input_ids_grams):
-            if gram is None:
-                continue
-            n = idx + 2
-            shift = n - 1
-            if gram.numel() >= flat_token_count:
-                gram_out = gram[:flat_token_count]
-            else:
-                gram_out = torch.empty(
-                    (flat_token_count,), device=input_ids.device, dtype=torch.int64
-                )
-                oe_context.set_gram(n, gram_out)
-
-            values = ngram_source[
-                :, buffer_size - shift : buffer_size - shift + num_draft_tokens
-            ].reshape(-1)
-            gram_out[:flat_token_count].copy_(values.to(dtype=gram_out.dtype))
-
-        oe_context.input_ids_buffer[: num_reqs * buffer_size].copy_(
-            history_after_accept.reshape(-1).to(dtype=oe_context.input_ids_buffer.dtype)
-        )
-        selected_indices = select_index[:num_reqs].to(
-            device=input_ids.device, dtype=torch.long
-        )
-        selected_tokens = input_ids_flat.index_select(0, selected_indices).to(
-            device=oe_context.input_ids_buffer.device,
-            dtype=oe_context.input_ids_buffer.dtype,
-        )
-        buffer_rows = oe_context.input_ids_buffer[: num_reqs * buffer_size].view(
-            num_reqs, buffer_size
-        )
-        buffer_rows.copy_(
-            torch.cat([buffer_rows[:, 1:], selected_tokens[:, None]], dim=1)
-        )
-
     def _capture_for_decode(
         self,
         logits_output,
@@ -1117,11 +908,6 @@ class EagleDraftWorker(BaseDraftWorker):
         draft_input.topk_p, draft_input.topk_index = fast_topk(probs, self.topk, dim=-1)
         draft_input.hidden_states = logits_output.hidden_states
         if self._is_welmv4_mtp_draft_model() and forward_batch is not None:
-            if not self._should_use_welmv4_mtp_oe_hash_kernel():
-                oe_context = getattr(forward_batch, "oe_context", None)
-                if oe_context is not None and oe_context.input_ids_buffer is not None:
-                    oe_buffer = oe_context.input_ids_buffer.detach().clone()
-                    draft_input.welm_mtp_oe_buffer = oe_buffer
             if welmv4_mtp_base_positions is None:
                 welmv4_mtp_base_positions = self._get_welmv4_mtp_base_positions(
                     forward_batch
@@ -1242,10 +1028,17 @@ class EagleDraftWorker(BaseDraftWorker):
             self.topk,
             self.speculative_num_steps,
         )
+        cached_mtp_oe_history = getattr(
+            draft_input, "welm_mtp_oe_history_state", None
+        )
+        needs_mtp_oe_history_reinit = (
+            cached_mtp_oe_history is None
+            or cached_mtp_oe_history.shape[0] != forward_batch.batch_size
+        )
         if (
             self._should_use_welmv4_mtp_oe_hash_kernel()
             and not model_worker_batch.forward_mode.is_idle()
-            and not hasattr(draft_input, "welm_mtp_oe_history_state")
+            and needs_mtp_oe_history_reinit
         ):
             draft_input.welm_mtp_oe_prefix_rows = (
                 self._welmv4_mtp_prefix_rows_from_reqs(
@@ -1254,6 +1047,8 @@ class EagleDraftWorker(BaseDraftWorker):
                     skip_latest_output=not hasattr(draft_input, "future_indices"),
                 )
             )
+            if cached_mtp_oe_history is not None:
+                delattr(draft_input, "welm_mtp_oe_history_state")
         self._prepare_welmv4_mtp_draft_decode_entry_history(
             forward_batch,
             draft_input,
@@ -1380,7 +1175,6 @@ class EagleDraftWorker(BaseDraftWorker):
             and not forward_batch.forward_mode.is_idle()
         )
         welmv4_mtp_base_positions = None
-        welmv4_mtp_draft_oe_buffer = None
         welmv4_mtp_entry_oe_history = None
         welmv4_mtp_draft_oe_history = None
         if is_welmv4_mtp and not forward_batch.forward_mode.is_idle():
@@ -1476,16 +1270,6 @@ class EagleDraftWorker(BaseDraftWorker):
                             selected_parent_indices,
                             base_query_count,
                             i,
-                        )
-                    )
-                else:
-                    welmv4_mtp_draft_oe_buffer = (
-                        self._prepare_welmv4_mtp_draft_decode_oe_context(
-                            forward_batch,
-                            input_ids,
-                            welmv4_mtp_draft_oe_buffer,
-                            selected_parent_indices,
-                            base_query_count,
                         )
                     )
                 restore_mtp_metadata = self._init_welmv4_mtp_base_kv_decode_metadata(
@@ -1589,11 +1373,6 @@ class EagleDraftWorker(BaseDraftWorker):
                     (input_ids[1:], next_token_ids[i].reshape(1))
                 )
                 pt += extend_len
-            if batch.oe_context is not None and not use_welmv4_mtp_oe_hash:
-                batch.oe_context.refresh_for_draft_extend(
-                    batch.input_ids,
-                    [int(x) for x in batch.extend_seq_lens],
-                )
 
         # Construct spec_info
         next_draft_input = EagleDraftInput(
@@ -1704,19 +1483,6 @@ class EagleDraftWorker(BaseDraftWorker):
                         welmv4_mtp_oe_entry_history,
                     )
                 )
-            elif (
-                self._is_welmv4_mtp_draft_model()
-                and oe_context is not None
-                and oe_context.input_ids_buffer is not None
-            ):
-                self._prepare_welmv4_mtp_draft_extend_oe_context(
-                    forward_batch,
-                    batch_result.next_token_ids,
-                    select_index,
-                    batch_result.accept_lens,
-                    getattr(batch_result, "welm_mtp_accepted_draft_token_ids", None),
-                )
-
         if self.plan_stream:
             torch.get_device_module(self.device).current_stream().wait_stream(
                 self.plan_stream

@@ -8,7 +8,6 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
-from sglang.jit_kernel.ngram_ops import build_ngram_with_target_verify
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.layers.dp_attention import (
     get_attention_tp_group,
@@ -202,56 +201,7 @@ class EagleDraftInputV2Mixin:
         self.num_tokens_for_logprob_per_req = topk
         batch.capture_hidden_mode = CaptureHiddenMode.LAST
         self.positions = batch.seq_lens.repeat_interleave(topk, dim=0)
-        if batch.oe_context is not None and batch.extend_seq_lens is not None:
-            extend_lens = batch.extend_seq_lens
-            if isinstance(extend_lens, torch.Tensor):
-                extend_lens = extend_lens.cpu().tolist()
-            extend_lens = [int(x) for x in extend_lens]
-            if (
-                sum(extend_lens) == int(batch.input_ids.numel())
-                and int(batch.input_ids.numel()) > len(extend_lens)
-            ):
-                batch.oe_context.refresh_for_draft_extend(
-                    batch.input_ids, extend_lens
-                )
-        saved_oe_buffer = getattr(self, "welm_mtp_oe_buffer", None)
-        if (
-            saved_oe_buffer is not None
-            and batch.oe_context is not None
-            and batch.oe_context.input_ids_buffer is not None
-        ):
-            restored = saved_oe_buffer.to(
-                device=batch.oe_context.input_ids_buffer.device,
-                dtype=batch.oe_context.input_ids_buffer.dtype,
-            )
-            if restored.numel() == batch.oe_context.input_ids_buffer.numel():
-                batch.oe_context.input_ids_buffer.copy_(
-                    restored.reshape_as(batch.oe_context.input_ids_buffer)
-                )
         forward_batch = ForwardBatch.init_new(batch, draft_model_runner)
-        if (
-            forward_batch.oe_context is not None
-            and forward_batch.extend_seq_lens_cpu is not None
-            and int(forward_batch.input_ids.numel())
-            > len(forward_batch.extend_seq_lens_cpu)
-        ):
-            forward_batch.oe_context.refresh_for_draft_extend(
-                forward_batch.input_ids,
-                [int(x) for x in forward_batch.extend_seq_lens_cpu],
-            )
-        if (
-            saved_oe_buffer is not None
-            and forward_batch.oe_context is not None
-            and forward_batch.oe_context.input_ids_buffer is not None
-        ):
-            restored = saved_oe_buffer.to(
-                device=forward_batch.oe_context.input_ids_buffer.device,
-                dtype=forward_batch.oe_context.input_ids_buffer.dtype,
-            )
-            if restored.numel() == forward_batch.oe_context.input_ids_buffer.numel():
-                forward_batch.oe_context.input_ids_buffer.copy_(
-                    restored.reshape_as(forward_batch.oe_context.input_ids_buffer)
-                )
         can_cuda_graph = cuda_graph_runner and cuda_graph_runner.can_run(forward_batch)
         return forward_batch, can_cuda_graph
 
@@ -309,30 +259,6 @@ class EagleVerifyInputV2Mixin:
                 draft_token_num=self.draft_token_num,
                 device=device,
             )
-            if (
-                batch.oe_context is not None
-                and batch.oe_context.input_ids_buffer is not None
-                and batch.oe_context.hash_prefixes is None
-            ):
-                n_gram_tensors = [
-                    torch.empty_like(self.draft_token)
-                    for _ in batch.oe_context.input_ids_grams
-                ]
-                for idx, gram_tensor in enumerate(n_gram_tensors):
-                    n = idx + 2
-                    build_ngram_with_target_verify(
-                        gram_tensor,
-                        batch.oe_context.input_ids_buffer,
-                        self.draft_token,
-                        self.custom_mask,
-                        self.positions,
-                        batch.seq_lens,
-                        n,
-                        self.draft_token_num,
-                        batch.oe_context.buffer_size,
-                    )
-                    batch.oe_context.set_gram(n, gram_tensor)
-
             # Set mamba_track_indices for mamba prefix-cache state tracking
             if get_global_server_args().enable_mamba_extra_buffer():
                 mapping = (

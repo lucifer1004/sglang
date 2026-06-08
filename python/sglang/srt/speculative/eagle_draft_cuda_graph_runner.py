@@ -26,7 +26,6 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
 )
 from sglang.srt.model_executor.input_buffers import ForwardInputBuffers
-from sglang.srt.managers.schedule_batch import OverEncodingContext
 from sglang.srt.models.welm_perf_opt import get_welm_oe_hash_config
 from sglang.srt.speculative.eagle_info import EagleDraftInput
 from sglang.srt.speculative.spec_utils import maybe_detect_nan, maybe_detect_oob
@@ -59,8 +58,6 @@ class EagleDraftInputBuffers(ForwardInputBuffers):
     topk_p: torch.Tensor
     topk_index: torch.Tensor
     hidden_states: torch.Tensor
-    ngram_input_ids: Optional[list[torch.Tensor]]
-    ngram_input_ids_buffer: Optional[torch.Tensor]
     welm_mtp_oe_hash_out: Optional[torch.Tensor]
     welm_mtp_oe_entry_history: Optional[torch.Tensor]
     welm_mtp_oe_work_history_a: Optional[torch.Tensor]
@@ -158,21 +155,6 @@ class EAGLEDraftCudaGraphRunner:
                 "_should_use_welmv4_mtp_oe_hash_kernel",
                 lambda: False,
             )()
-            if (
-                self.model_runner.server_args.prepare_n_gram_inputs
-                and not use_welm_mtp_oe_hash
-            ):
-                ngram_input_ids = [
-                    torch.zeros((self.max_num_token,), dtype=torch.int64)
-                    for _ in range(3)
-                ]
-                ngram_input_ids_buffer = torch.zeros(
-                    (self.max_bs * OverEncodingContext.buffer_size,), dtype=torch.int64
-                )
-            else:
-                ngram_input_ids = None
-                ngram_input_ids_buffer = None
-
             if use_welm_mtp_oe_hash:
                 oe_grams, oe_vocab_sizes = get_welm_oe_hash_config(
                     self.model_runner.model_config
@@ -194,6 +176,11 @@ class EAGLEDraftCudaGraphRunner:
                     (self.max_num_token,), dtype=torch.int64
                 )
             else:
+                if self.model_runner.server_args.prepare_n_gram_inputs:
+                    raise RuntimeError(
+                        "WeLM MTP OE CUDA graph requires the hash kernel. "
+                        "Materialized n-gram fallback is no longer supported."
+                    )
                 welm_mtp_oe_hash_out = None
                 welm_mtp_oe_entry_history = None
                 welm_mtp_oe_work_history_a = None
@@ -230,8 +217,6 @@ class EAGLEDraftCudaGraphRunner:
             topk_p=topk_p,
             topk_index=topk_index,
             hidden_states=hidden_states,
-            ngram_input_ids=ngram_input_ids,
-            ngram_input_ids_buffer=ngram_input_ids_buffer,
             welm_mtp_oe_hash_out=welm_mtp_oe_hash_out,
             welm_mtp_oe_entry_history=welm_mtp_oe_entry_history,
             welm_mtp_oe_work_history_a=welm_mtp_oe_work_history_a,
@@ -416,19 +401,6 @@ class EAGLEDraftCudaGraphRunner:
         hidden_states = buffers.hidden_states[:num_seqs]
         topk_p = buffers.topk_p[:num_seqs]
         topk_index = buffers.topk_index[:num_seqs]
-        use_welm_mtp_oe_hash = buffers.welm_mtp_oe_hash_out is not None
-        if buffers.ngram_input_ids_buffer is not None and not use_welm_mtp_oe_hash:
-            current_ngram_input_ids = OverEncodingContext(
-                input_ids_grams=[
-                    gram[:num_tokens] for gram in buffers.ngram_input_ids
-                ],
-                input_ids_buffer=buffers.ngram_input_ids_buffer[
-                    : num_seqs * OverEncodingContext.buffer_size
-                ],
-            )
-        else:
-            current_ngram_input_ids = None
-
         if self.require_mlp_tp_gather:
             buffers.global_num_tokens_gpu.copy_(
                 torch.tensor(
@@ -503,7 +475,7 @@ class EAGLEDraftCudaGraphRunner:
             capture_hidden_mode=(
                 spec_info.capture_hidden_mode if spec_info else CaptureHiddenMode.NULL
             ),
-            oe_context=current_ngram_input_ids,
+            oe_context=None,
         )
         if getattr(
             self.eagle_worker, "_is_welmv4_mtp_draft_model", lambda: False
@@ -587,7 +559,6 @@ class EAGLEDraftCudaGraphRunner:
 
         raw_bs = forward_batch.batch_size
         raw_num_token = raw_bs * self.num_tokens_per_bs
-        use_welm_mtp_oe_hash = buffers.welm_mtp_oe_hash_out is not None
 
         # Pad
         if self.require_mlp_tp_gather:
@@ -611,11 +582,6 @@ class EAGLEDraftCudaGraphRunner:
             buffers.topk_index.zero_()
             buffers.hidden_states.zero_()
             buffers.req_pool_indices.zero_()
-            if buffers.ngram_input_ids_buffer is not None:
-                buffers.ngram_input_ids_buffer.zero_()
-            if buffers.ngram_input_ids is not None:
-                for gram in buffers.ngram_input_ids:
-                    gram.zero_()
             if buffers.welm_mtp_oe_hash_out is not None:
                 buffers.welm_mtp_oe_hash_out.zero_()
                 buffers.welm_mtp_oe_entry_history.zero_()
@@ -655,52 +621,16 @@ class EAGLEDraftCudaGraphRunner:
                     "WeLMV4 MTP fused OE hash draft graph replay is missing "
                     "entry history state."
                 )
+            if history_state.shape[0] != raw_bs:
+                raise RuntimeError(
+                    "WeLMV4 MTP fused OE hash draft graph replay history row "
+                    f"count mismatch: {history_state.shape[0]} vs {raw_bs}."
+                )
             buffers.welm_mtp_oe_entry_history[:raw_bs].copy_(
                 history_state[:raw_bs]
             )
             if bs > raw_bs:
                 buffers.welm_mtp_oe_entry_history[raw_bs:bs].zero_()
-        if buffers.ngram_input_ids_buffer is not None and not use_welm_mtp_oe_hash:
-            raw_buffer_len = raw_bs * OverEncodingContext.buffer_size
-            saved_oe_buffer = getattr(
-                getattr(forward_batch, "spec_info", None),
-                "welm_mtp_oe_buffer",
-                None,
-            )
-            oe_context = getattr(forward_batch, "oe_context", None)
-            if saved_oe_buffer is not None and saved_oe_buffer.numel() >= raw_buffer_len:
-                buffers.ngram_input_ids_buffer[:raw_buffer_len].copy_(
-                    saved_oe_buffer[:raw_buffer_len].to(
-                        device=buffers.ngram_input_ids_buffer.device,
-                        dtype=buffers.ngram_input_ids_buffer.dtype,
-                    )
-                )
-            elif oe_context is not None and oe_context.input_ids_buffer is not None:
-                buffers.ngram_input_ids_buffer[:raw_buffer_len].copy_(
-                    oe_context.input_ids_buffer[:raw_buffer_len]
-                )
-            else:
-                buffers.ngram_input_ids_buffer[:raw_buffer_len].zero_()
-            if buffers.ngram_input_ids is not None:
-                source_buffer = buffers.ngram_input_ids_buffer[
-                    :raw_buffer_len
-                ].view(raw_bs, OverEncodingContext.buffer_size)
-                for idx, gram_buffer in enumerate(buffers.ngram_input_ids):
-                    n = idx + 2
-                    if n - 1 <= OverEncodingContext.buffer_size:
-                        gram = source_buffer[:, -(n - 1)]
-                    else:
-                        gram = torch.zeros(
-                            (raw_bs,),
-                            device=gram_buffer.device,
-                            dtype=gram_buffer.dtype,
-                        )
-                    if self.num_tokens_per_bs != 1:
-                        gram = gram.repeat_interleave(self.num_tokens_per_bs)
-                    gram_buffer[:raw_num_token].copy_(
-                        gram.to(device=gram_buffer.device, dtype=gram_buffer.dtype)
-                    )
-
         # TODO(ch-wan): support num_token_non_padded
         if self.require_gathered_buffer:
             buffers.global_num_tokens_gpu.fill_(bs * self.num_tokens_per_bs)
