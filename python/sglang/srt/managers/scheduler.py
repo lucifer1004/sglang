@@ -964,6 +964,16 @@ class Scheduler(
         else:
             self.decode_offload_manager = None
 
+        # Propagate scale_seq_factor to tree_cache for correct KV cache sizing
+        scale_seq_times = getattr(self.model_config.hf_config, "scale_seq_times", 0)
+        if scale_seq_times > 0:
+            self.tree_cache.scale_seq_factor = scale_seq_times + 1
+            # The radix tree doesn't fully support 1:N key-value mapping for
+            # scale_seq yet. Downgrade the idle memory check to warning level
+            # to avoid false-positive crash on the small one-time init leak.
+            if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE.get():
+                envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE.set(False)
+
         embedding_cache_size = envs.SGLANG_VLM_CACHE_SIZE_MB.get()
         init_mm_embedding_cache(embedding_cache_size * 1024 * 1024)
 
@@ -1979,7 +1989,9 @@ class Scheduler(
             return False
 
         if not self.spec_algorithm.is_none():
-            req.set_finish_with_abort("router replay does not support speculative decode")
+            req.set_finish_with_abort(
+                "router replay does not support speculative decode"
+            )
             self.init_req_max_new_tokens(req)
             self._add_request_to_queue(req)
             return False
@@ -2909,7 +2921,9 @@ class Scheduler(
             and not (new_batch.return_logprob or self.running_batch.return_logprob)
             # mix_with_running cats input_ids but not input_embeds — shapes would mismatch
             and new_batch.input_embeds is None
-            and not (new_batch.has_router_replay() or self.running_batch.has_router_replay())
+            and not (
+                new_batch.has_router_replay() or self.running_batch.has_router_replay()
+            )
         ):
             # TODO (lianmin): support return_logprob + mixed chunked prefill
             self.running_batch.filter_batch(v1_spec_info_filtered=True)
@@ -3605,7 +3619,9 @@ class Scheduler(
     def abort_request(self, recv_req: AbortReq):
         # todo hisparse, release resources for abort requests in hisparse coordinator
         # [DIAG] log abort entry
-        _running_rids = [r.rid for r in self.running_batch.reqs] if self.running_batch else []
+        _running_rids = (
+            [r.rid for r in self.running_batch.reqs] if self.running_batch else []
+        )
         _waiting_ct = len(self.waiting_queue)
         logger.warning(
             f"[DIAG] scheduler.abort_request called: rid={recv_req.rid}, abort_all={recv_req.abort_all}, "
@@ -3708,7 +3724,9 @@ class Scheduler(
                 # Abort method 3: set `to_finish`
                 # The request will still run one decode forward pass.
                 # Then we reuse all existing code to clean up the KV cache allocation.
-                logger.warning(f"[DIAG] Abort running request (method 3): {req.rid=}, finished={req.finished()}")
+                logger.warning(
+                    f"[DIAG] Abort running request (method 3): {req.rid=}, finished={req.finished()}"
+                )
                 req.to_finish = FINISH_ABORT()
 
     def _pause_engine(self) -> Tuple[List[Req], int]:

@@ -576,8 +576,16 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         ):
             ret.positions = ret.spec_info.positions
 
+        # For scale_seq decode, override forward_mode so that the extend
+        # metadata branch below is taken (the attention backend needs
+        # extend_start_loc / extend_seq_lens to write multiple KV entries).
+        if ret.forward_mode.is_decode() and ret.scale_seq_factor > 1:
+            ret.forward_mode = ForwardMode.TARGET_VERIFY
+
         # Init position information
-        if ret.forward_mode.is_decode() or ret.forward_mode.is_target_verify():
+        if ret.forward_mode.is_decode() or (
+            ret.forward_mode.is_target_verify() and ret.spec_info is not None
+        ):
             if ret.positions is None:
                 ret.positions = clamp_position(batch.seq_lens)
         else:

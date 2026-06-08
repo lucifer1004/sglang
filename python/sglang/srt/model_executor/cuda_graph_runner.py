@@ -65,11 +65,7 @@ from sglang.srt.managers.schedule_batch import (
     HashInputIdsBuffer,
     OverEncodingContext,
 )
-from sglang.srt.models.welm_perf_opt import (
-    fill_welm_oe_hash_inputs,
-    get_welm_oe_hash_config,
-    should_use_welm_oe_hash_kernel,
-)
+from sglang.srt.model_executor.forward_batch_context import set_current_forward_batch
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
@@ -79,8 +75,12 @@ from sglang.srt.model_executor.forward_batch_info import (
     compute_local_num_token_non_padded,
     enable_num_token_non_padded,
 )
-from sglang.srt.model_executor.forward_batch_context import set_current_forward_batch
 from sglang.srt.model_executor.input_buffers import ForwardInputBuffers
+from sglang.srt.models.welm_perf_opt import (
+    fill_welm_oe_hash_inputs,
+    get_welm_oe_hash_config,
+    should_use_welm_oe_hash_kernel,
+)
 from sglang.srt.multiplex.pdmux_context import get_current_stream_idx, get_stream_groups
 from sglang.srt.utils import (
     empty_context,
@@ -129,6 +129,7 @@ def _welm_kv_mirror_packed_len(numel: int) -> int:
     while (numel + pad_len) % tp_size == 0:
         pad_len += 1
     return numel + pad_len
+
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -283,9 +284,7 @@ class DecodeInputBuffers(ForwardInputBuffers):
             if pp_size > 1:
                 pp_proxy_tensors = {
                     "hidden_states": torch.zeros((max_bs, hidden_size), dtype=dtype),
-                    "residual": torch.zeros(
-                        (max_bs, hidden_size), dtype=torch.float32
-                    ),
+                    "residual": torch.zeros((max_bs, hidden_size), dtype=torch.float32),
                 }
                 if kv_mirror_imitated_layers and kv_mirror_tensor_size:
                     for layer_idx in kv_mirror_imitated_layers:
@@ -504,7 +503,9 @@ class DecodeInputBuffers(ForwardInputBuffers):
 
             from sglang.srt.layers.dp_attention import dp_gather_partial
 
-            global_static_num_token = static_num_token * self.global_num_tokens_gpu.numel()
+            global_static_num_token = (
+                static_num_token * self.global_num_tokens_gpu.numel()
+            )
             old_global_num_tokens_gpu = forward_batch.global_num_tokens_gpu
             old_dp_padding_mode = forward_batch.dp_padding_mode
             old_dp_local_start_pos = forward_batch.dp_local_start_pos
@@ -888,10 +889,7 @@ class CudaGraphRunner:
         hf_config = self.model_runner.model_config.hf_config
         kv_mirror_imitated_layers = []
         kv_mirror_tensor_size = None
-        if (
-            self.pp_size > 1
-            and self.model_runner.server_args.enable_welm_kv_mirror_opt
-        ):
+        if self.pp_size > 1 and self.model_runner.server_args.enable_welm_kv_mirror_opt:
             num_hidden_layers = getattr(hf_config, "num_hidden_layers", 0)
             kv_mirror_imitated_layers = [
                 int(layer_idx)
@@ -1222,7 +1220,10 @@ class CudaGraphRunner:
         num_tokens = bs * self.num_tokens_per_bs
 
         # Graph inputs
-        input_ids = buffers.input_ids[:num_tokens]
+        # For scale_seq, the model takes bs input tokens and internally
+        # expands to bs*scale hidden states. input_ids must be bs, not num_tokens.
+        model_input_len = bs if self.scale_seq_factor > 1 else num_tokens
+        input_ids = buffers.input_ids[:model_input_len]
         req_pool_indices = buffers.req_pool_indices[:bs]
         seq_lens = buffers.seq_lens[:bs]
         seq_lens_cpu = buffers.seq_lens_cpu[:bs]
@@ -1233,7 +1234,10 @@ class CudaGraphRunner:
         else:
             encoder_lens = None
         mrope_positions = buffers.mrope_positions[:, :num_tokens]
-        next_token_logits_buffer = buffers.next_token_logits_buffer[:num_tokens]
+        # For scale_seq, the model contracts hidden_states from num_tokens
+        # back to bs before logits computation.
+        logits_buffer_len = model_input_len if self.scale_seq_factor > 1 else num_tokens
+        next_token_logits_buffer = buffers.next_token_logits_buffer[:logits_buffer_len]
 
         # Adjust for attention TP if needed (matching replay path in
         # populate_from_forward_batch).
@@ -1661,17 +1665,23 @@ class CudaGraphRunner:
         output = self.output_buffers[graph_key]
 
         if isinstance(output, LogitsProcessorOutput):
+            # For scale_seq, the model internally contracts hidden_states
+            # from (bs*scale, D) to (bs, D) before logits. The effective
+            # logits output size is raw_bs, not raw_num_token.
+            logits_num_token = (
+                self.raw_bs if self.scale_seq_factor > 1 else self.raw_num_token
+            )
             if self.is_dllm:
                 next_token_logits = None
                 full_logits = (
-                    output.full_logits[: self.raw_num_token]
+                    output.full_logits[:logits_num_token]
                     if output.full_logits is not None
                     else None
                 )
             else:
                 full_logits = None
                 next_token_logits = (
-                    output.next_token_logits[: self.raw_num_token]
+                    output.next_token_logits[:logits_num_token]
                     if output.next_token_logits is not None
                     else None
                 )
@@ -1682,13 +1692,15 @@ class CudaGraphRunner:
                 if isinstance(kv_mirror_states, dict):
                     model_specific_states["welm_kv_mirror_states"] = {
                         layer_idx: tuple(
-                            tensor[: self.raw_num_token]
-                            if (
-                                isinstance(tensor, torch.Tensor)
-                                and tensor.shape
-                                and tensor.shape[0] >= self.raw_num_token
+                            (
+                                tensor[: self.raw_num_token]
+                                if (
+                                    isinstance(tensor, torch.Tensor)
+                                    and tensor.shape
+                                    and tensor.shape[0] >= self.raw_num_token
+                                )
+                                else tensor
                             )
-                            else tensor
                             for tensor in tensors
                         )
                         for layer_idx, tensors in kv_mirror_states.items()
@@ -1716,9 +1728,8 @@ class CudaGraphRunner:
                     continue
 
                 shape = output.tensors.get(f"{key}.shape")
-                if (
-                    shape is not None
-                    and key.startswith(f"{WELM_KV_MIRROR_PP_KEY_PREFIX}.")
+                if shape is not None and key.startswith(
+                    f"{WELM_KV_MIRROR_PP_KEY_PREFIX}."
                 ):
                     replay_shape = (self.raw_num_token, *tuple(shape[1:]))
                     packed_len = _welm_kv_mirror_packed_len(math.prod(replay_shape))
