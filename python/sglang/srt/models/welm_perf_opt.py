@@ -605,6 +605,121 @@ def should_use_welm_oe_post_proj_all_reduce() -> bool:
     return value in {"1", "true", "yes", "on"}
 
 
+def welm_embeddings(
+    *,
+    input_ids: torch.Tensor,
+    forward_batch,
+    embed_tokens,
+    oe_grams: Sequence[int],
+    oe_vocab_sizes: Sequence[int],
+    vocab_size: int,
+    oe_embed_modules,
+    oe_proj_module,
+    scale_seq_times: int,
+    scale_seq_embed_tokens_list=None,
+    scale_seq_oe_embed_list=None,
+    scale_seq_oe_up_proj_list=None,
+    input_embeds: torch.Tensor | None = None,
+    skip_oe_fusion: bool = False,
+) -> torch.Tensor:
+    """Compute the WelmV4 input embeddings consumed by the decoder stack.
+
+    This mirrors the embedding block at the head of ``Qwen2MoeModel.forward``
+    (the logic that runs before ``model_forward_maybe_tbo`` on the first PP
+    rank): token embedding lookup, optional over-encoding (OE) fusion, and
+    optional scale-seq expansion. It is a free function with no ``model``
+    parameter so the forward, split-forward, and VLM call sites can share the
+    same embedding pipeline by passing in the relevant submodules and
+    config values directly.
+
+    Args:
+        input_ids: Token ids for the current batch.
+        forward_batch: The active ``ForwardBatch`` (carries ``oe_context``).
+        embed_tokens: ``VocabParallelEmbedding`` for the base token table.
+        oe_grams: OE n-gram sizes; when empty OE fusion is skipped entirely.
+        oe_vocab_sizes: Per-branch OE vocab sizes.
+        vocab_size: Base token vocab size.
+        oe_embed_modules: Main OE embedding module list (matches ``oe_grams``).
+            May be ``None`` when ``oe_grams`` is empty.
+        oe_proj_module: Main OE projection ``ReplicatedLinear``.
+            May be ``None`` when ``oe_grams`` is empty.
+        scale_seq_times: Number of additional scale-seq embedding groups.
+        scale_seq_embed_tokens_list: ``nn.ModuleList`` of base embeddings, one
+            per scale-seq group. Required when ``scale_seq_times > 0``.
+        scale_seq_oe_embed_list: ``nn.ModuleList[nn.ModuleList]`` of OE
+            embeddings, one outer entry per scale-seq group. Required when
+            ``scale_seq_times > 0`` and ``oe_grams`` is non-empty.
+        scale_seq_oe_up_proj_list: ``nn.ModuleList`` of OE projection
+            ``ReplicatedLinear`` modules, one per scale-seq group. Required
+            when ``scale_seq_times > 0`` and ``oe_grams`` is non-empty.
+        input_embeds: Optional precomputed token embeddings (e.g. for VLM
+            paths). When provided, ``embed_tokens`` is skipped.
+        skip_oe_fusion: If True, skip OE fusion on the main embedding path
+            (scale-seq groups always get OE when configured, matching the
+            historical behavior).
+
+    Returns:
+        ``hidden_states`` ready to feed into the decoder layers.
+    """
+    # Lazy import: ``welmv4`` imports this module at top level, so we defer
+    # access to its module-level dump helpers to avoid a circular import.
+    from sglang.srt.models.welmv4 import _WELM_DUMP_ENABLED, _welm_dump_tensor
+
+    if input_embeds is None:
+        hidden_states = embed_tokens(input_ids)
+    else:
+        hidden_states = input_embeds
+    if _WELM_DUMP_ENABLED:
+        _welm_dump_tensor("model.embed_tokens.output", hidden_states)
+
+    has_oe = (
+        len(oe_grams) > 0 and getattr(forward_batch, "oe_context", None) is not None
+    )
+
+    if has_oe and not skip_oe_fusion:
+        hidden_states = compute_welm_oe_embedding(
+            input_ids=input_ids,
+            forward_batch=forward_batch,
+            base_hidden_states=hidden_states,
+            oe_grams=oe_grams,
+            oe_vocab_sizes=oe_vocab_sizes,
+            vocab_size=vocab_size,
+            oe_embed_modules=oe_embed_modules,
+            oe_proj_module=oe_proj_module,
+        )
+
+    if scale_seq_times > 0:
+        # Expand hidden_states from (T, D) to (T * scale, D) by interleaving
+        # main embedding with scale_seq embeddings.
+        # Layout per original token i:
+        #   [main_emb_i, scale_seq_1_emb_i, ..., scale_seq_N_emb_i]
+        scale = scale_seq_times + 1
+        T = hidden_states.shape[0]
+        D = hidden_states.shape[1]
+        hidden_states = hidden_states.unsqueeze(1)  # (T, 1, D)
+        hidden_states_list = [hidden_states]
+        for s in range(scale_seq_times):
+            hs_s = scale_seq_embed_tokens_list[s](input_ids)  # (T, D)
+            if has_oe:
+                hs_s = compute_welm_oe_embedding(
+                    input_ids=input_ids,
+                    forward_batch=forward_batch,
+                    base_hidden_states=hs_s,
+                    oe_grams=oe_grams,
+                    oe_vocab_sizes=oe_vocab_sizes,
+                    vocab_size=vocab_size,
+                    oe_embed_modules=scale_seq_oe_embed_list[s],
+                    oe_proj_module=scale_seq_oe_up_proj_list[s],
+                )
+            hs_s = hs_s.unsqueeze(1)  # (T, 1, D)
+            hidden_states_list.append(hs_s)
+        # (T, scale, D) -> (T * scale, D)
+        hidden_states = torch.cat(hidden_states_list, dim=1)
+        hidden_states = hidden_states.reshape(T * scale, D).contiguous()
+
+    return hidden_states
+
+
 def compute_welm_oe_embedding(
     *,
     input_ids: torch.Tensor,

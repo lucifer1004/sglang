@@ -92,6 +92,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTe
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.welm_perf_opt import (
     compute_welm_oe_embedding,
+    welm_embeddings,
 )
 from sglang.srt.server_args import get_global_server_args
 
@@ -2590,26 +2591,28 @@ class Qwen2MoeModel(nn.Module):
         if _WELM_DUMP_ENABLED:
             _welm_start_dump_pass()
         if self.pp_group.is_first_rank:
-            if input_embeds is None:
-                hidden_states = self.embed_tokens(input_ids)
-            else:
-                hidden_states = input_embeds
-            if _WELM_DUMP_ENABLED:
-                _welm_dump_tensor("model.embed_tokens.output", hidden_states)
-
-            if (
-                len(self.oe_grams) > 0
-                and not skip_oe_fusion
-                and getattr(forward_batch, "oe_context", None)
-            ):
-                hidden_states = self._compute_oe_embedding(
-                    input_ids, forward_batch, hidden_states
-                )
-
-            if self.scale_seq_times > 0:
-                hidden_states = self._expand_scale_seq(
-                    input_ids, forward_batch, hidden_states
-                )
+            hidden_states = welm_embeddings(
+                input_ids=input_ids,
+                forward_batch=forward_batch,
+                embed_tokens=self.embed_tokens,
+                oe_grams=self.oe_grams,
+                oe_vocab_sizes=self.oe_vocab_sizes,
+                vocab_size=self.vocab_size,
+                oe_embed_modules=getattr(self, "oe_embed", None),
+                oe_proj_module=getattr(self, "oe_gate_up_proj", None),
+                scale_seq_times=self.scale_seq_times,
+                scale_seq_embed_tokens_list=getattr(
+                    self, "scale_seq_embed_tokens_list", None
+                ),
+                scale_seq_oe_embed_list=getattr(
+                    self, "scale_seq_oe_embed_list", None
+                ),
+                scale_seq_oe_up_proj_list=getattr(
+                    self, "scale_seq_oe_up_proj_list", None
+                ),
+                input_embeds=input_embeds,
+                skip_oe_fusion=skip_oe_fusion,
+            )
             residual = None
             kv_mirror_states = _empty_welm_kv_mirror_states()
         else:
@@ -2855,22 +2858,27 @@ class WeLMV4MoeForCausalLM(nn.Module):
         start, end = split_interval
         # embed
         if start == 0:
-            if input_embeds is None:
-                forward_batch.hidden_states = self.model.embed_tokens(input_ids)
-            else:
-                forward_batch.hidden_states = input_embeds
-
-            if len(self.model.oe_grams) > 0 and getattr(
-                forward_batch, "oe_context", None
-            ):
-                forward_batch.hidden_states = self.model._compute_oe_embedding(
-                    input_ids, forward_batch, forward_batch.hidden_states
-                )
-
-            if self.model.scale_seq_times > 0:
-                forward_batch.hidden_states = self.model._expand_scale_seq(
-                    input_ids, forward_batch, forward_batch.hidden_states
-                )
+            forward_batch.hidden_states = welm_embeddings(
+                input_ids=input_ids,
+                forward_batch=forward_batch,
+                embed_tokens=self.model.embed_tokens,
+                oe_grams=self.model.oe_grams,
+                oe_vocab_sizes=self.model.oe_vocab_sizes,
+                vocab_size=self.model.vocab_size,
+                oe_embed_modules=getattr(self.model, "oe_embed", None),
+                oe_proj_module=getattr(self.model, "oe_gate_up_proj", None),
+                scale_seq_times=self.model.scale_seq_times,
+                scale_seq_embed_tokens_list=getattr(
+                    self.model, "scale_seq_embed_tokens_list", None
+                ),
+                scale_seq_oe_embed_list=getattr(
+                    self.model, "scale_seq_oe_embed_list", None
+                ),
+                scale_seq_oe_up_proj_list=getattr(
+                    self.model, "scale_seq_oe_up_proj_list", None
+                ),
+                input_embeds=input_embeds,
+            )
             forward_batch.kv_mirror_states = _empty_welm_kv_mirror_states()
         elif not hasattr(forward_batch, "kv_mirror_states"):
             forward_batch.kv_mirror_states = _empty_welm_kv_mirror_states()
