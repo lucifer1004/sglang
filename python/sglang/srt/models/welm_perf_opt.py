@@ -225,7 +225,13 @@ def fill_welm_oe_hash_inputs(
     prefix_rows = getattr(oe_context, "hash_prefixes", None)
 
     forward_mode = getattr(forward_batch, "forward_mode", None)
-    if forward_mode is not None and forward_mode.is_target_verify():
+    is_target_verify = forward_mode is not None and forward_mode.is_target_verify()
+    is_scale_seq_pseudo_target_verify = (
+        is_target_verify
+        and getattr(forward_batch, "spec_info", None) is None
+        and max(getattr(forward_batch, "scale_seq_factor", 1), 1) > 1
+    )
+    if is_target_verify and not is_scale_seq_pseudo_target_verify:
         raise RuntimeError(
             "WeLM OE fused target-verify requires precomputed hashed inputs "
             "from MTP history state; CPU prefix fallback is not supported."
@@ -262,6 +268,17 @@ def fill_welm_oe_hash_inputs(
             "extend_seq_lens."
         )
     extend_seq_lens_cpu = _extend_seq_lens_cpu_list(forward_batch)
+    # In scale_seq mode the OE hash kernel is invoked with bs-sized
+    # input_ids (one input token per request) before the model expands
+    # hidden_states by scale_seq_factor. forward_batch.extend_seq_lens
+    # / extend_start_loc still reflect the post-expansion num_tokens
+    # view (= sum * scale), so rescale the segment metadata so it
+    # matches input_ids.numel().
+    scale_seq_factor = max(getattr(forward_batch, "scale_seq_factor", 1), 1)
+    if scale_seq_factor > 1:
+        extend_seq_lens_cpu = [x // scale_seq_factor for x in extend_seq_lens_cpu]
+        extend_start_loc = extend_start_loc // scale_seq_factor
+        extend_seq_lens = extend_seq_lens // scale_seq_factor
     num_segments = len(extend_seq_lens_cpu)
     real_num_tokens = sum(extend_seq_lens_cpu)
     if real_num_tokens > input_ids.numel():
