@@ -19,6 +19,12 @@ logger = logging.getLogger(__name__)
 WELM_OE_IMPL_ENV = "SGLANG_WELM_OE_IMPL"
 WELM_OE_TRITON_PREPROCESS_ENV = "SGLANG_WELM_OE_TRITON_PREPROCESS"
 WELM_OE_POST_PROJ_ALL_REDUCE_ENV = "SGLANG_WELM_OE_POST_PROJ_ALL_REDUCE"
+# Fuses token embedding + concat OE embedding + oe_gate_up_proj GEMM + all-reduce
+# into a single mk CUDA kernel. Only kicks in for low-batch decode and when
+# all shape/world-size constraints match mk's supported instantiations. mk is
+# imported lazily so that environments without mk installed still work as long
+# as this env is left disabled.
+WELM_OE_FUSED_DECODE_GEMM_ENV = "SGLANG_WELM_OE_FUSED_DECODE_GEMM"
 WELM_OE_IMPL_FUSED_NGRAM_HASH = "fused_ngram_hash"
 WELM_OE_HASH_INCOMPATIBLE_ENVS = (
     "SGLANG_DUMP_ACTIVATIONS",
@@ -29,6 +35,18 @@ SPECIALIZED_WELM_OE_BRANCHES = 4
 SPECIALIZED_WELM_OE_DIM = 512
 DEFAULT_SPECIALIZED_WELM_OE_EMBED_BLOCK_D = 512
 DEFAULT_SPECIALIZED_WELM_OE_EMBED_NUM_WARPS = 1
+
+# mk fused decode embedding-GEMM-all-reduce limits (mirroring mk's static
+# asserts; kept here so we can fast-fail without paying the import cost).
+_MK_FUSED_DECODE_GEMM_MAX_BATCH = 32
+_MK_FUSED_DECODE_GEMM_SUPPORTED_HIDDEN = frozenset(((1024, 256), (2048, 512)))
+_MK_FUSED_DECODE_GEMM_SUPPORTED_WORLD_SIZES = frozenset((2, 4, 8))
+_MK_FUSED_DECODE_GEMM_NGRAMS = (2, 2, 3, 3)
+# Cached lazy import handle. Tuple of (kernels_module, params_cls,
+# all_reduce_fn, ngram_spec_cls, supported_fn) once successfully imported.
+# Set to ``False`` after a failed import so we only warn once.
+_MK_FUSED_DECODE_GEMM_HANDLE = None
+_MK_FUSED_DECODE_GEMM_NGRAM_SPEC_CACHE = None
 
 
 @triton.jit
@@ -605,6 +623,397 @@ def should_use_welm_oe_post_proj_all_reduce() -> bool:
     return value in {"1", "true", "yes", "on"}
 
 
+def should_use_welm_oe_fused_decode_gemm() -> bool:
+    """Whether ``SGLANG_WELM_OE_FUSED_DECODE_GEMM`` opts in to the mk fused path.
+
+    The actual decision still depends on runtime shape/state checks performed
+    by :func:`_try_apply_welm_oe_fused_decode_gemm` — this only reflects the
+    user intent expressed via the environment variable.
+    """
+    return _env_flag(WELM_OE_FUSED_DECODE_GEMM_ENV, default="0")
+
+
+# Warnings about the fused decode path are deliberately rate-limited: once the
+# precondition is missed it stays missed for the lifetime of the process, so
+# logging on every forward would spam the server log.
+_WELM_OE_FUSED_DECODE_GEMM_WARNED: set[str] = set()
+_WELM_OE_FUSED_DECODE_GEMM_PROBE_STATE: dict[str, float] = {}
+
+
+def _warn_welm_oe_fused_disabled_once(message: str, *args) -> None:
+    """Emit a single warning about the fused decode path being disabled.
+
+    Subsequent calls with the same ``message`` template are dropped.
+    """
+    if message in _WELM_OE_FUSED_DECODE_GEMM_WARNED:
+        return
+    _WELM_OE_FUSED_DECODE_GEMM_WARNED.add(message)
+    logger.warning(
+        f"{WELM_OE_FUSED_DECODE_GEMM_ENV}=1 disabled: {message}", *args
+    )
+
+
+def _load_mk_fused_decode_gemm():
+    """Lazy-import the mk fused decode embedding-GEMM-all-reduce entry point.
+
+    Returns ``None`` if mk is not installed (or fails to import). The first
+    failure is logged at WARNING level; subsequent calls return ``None`` silently
+    so a misconfigured environment does not flood the logs.
+    """
+    global _MK_FUSED_DECODE_GEMM_HANDLE
+    if _MK_FUSED_DECODE_GEMM_HANDLE is False:
+        return None
+    if _MK_FUSED_DECODE_GEMM_HANDLE is not None:
+        return _MK_FUSED_DECODE_GEMM_HANDLE
+    try:
+        from mk.kernels import (  # type: ignore[import-not-found]
+            FusedDecodeNGramHashEmbeddingGemmAllReduceParams,
+            NGramSpec,
+            fused_decode_ngram_hash_embedding_gemm_all_reduce,
+            is_fused_decode_ngram_hash_embedding_gemm_supported,
+        )
+    except Exception as exc:  # pragma: no cover - import failure path
+        logger.warning(
+            "%s=1 requested but mk fused decode GEMM is unavailable: %s. "
+            "Falling back to the unfused embedding path.",
+            WELM_OE_FUSED_DECODE_GEMM_ENV,
+            exc,
+        )
+        _MK_FUSED_DECODE_GEMM_HANDLE = False
+        return None
+    _MK_FUSED_DECODE_GEMM_HANDLE = (
+        FusedDecodeNGramHashEmbeddingGemmAllReduceParams,
+        NGramSpec,
+        fused_decode_ngram_hash_embedding_gemm_all_reduce,
+        is_fused_decode_ngram_hash_embedding_gemm_supported,
+    )
+    return _MK_FUSED_DECODE_GEMM_HANDLE
+
+
+def _build_mk_ngram_spec(
+    ngram_spec_cls,
+    oe_grams: Sequence[int],
+    oe_vocab_sizes: Sequence[int],
+):
+    """Build (and cache) the mk ``NGramSpec`` tuple for the OE branches.
+
+    The OE n-gram layout is fixed by the model config and does not change
+    per-forward, so we memoize the tuple to avoid re-allocating namedtuples on
+    every decode step.
+    """
+    global _MK_FUSED_DECODE_GEMM_NGRAM_SPEC_CACHE
+    cache_key = (tuple(oe_grams), tuple(oe_vocab_sizes))
+    cached = _MK_FUSED_DECODE_GEMM_NGRAM_SPEC_CACHE
+    if cached is not None and cached[0] == cache_key:
+        return cached[1]
+    specs = tuple(
+        ngram_spec_cls(int(n), int(v)) for n, v in zip(oe_grams, oe_vocab_sizes)
+    )
+    _MK_FUSED_DECODE_GEMM_NGRAM_SPEC_CACHE = (cache_key, specs)
+    return specs
+
+
+def _try_apply_welm_oe_fused_decode_gemm(
+    *,
+    input_ids: torch.Tensor,
+    forward_batch,
+    embed_tokens,
+    oe_grams: Sequence[int],
+    oe_vocab_sizes: Sequence[int],
+    oe_embed_modules,
+    oe_proj_module,
+) -> torch.Tensor | None:
+    """Run the mk fused decode embedding-GEMM-all-reduce kernel if applicable.
+
+    Returns the post-reduce hidden states tensor on success, or ``None`` when
+    any precondition (decode mode, low batch, supported shape, ...) is not met
+    — in which case the caller falls back to the unfused embedding path.
+    """
+    def _bail(reason: str) -> None:
+        # Each distinct reason logs at most once per process. We dedupe on the
+        # full reason text rather than the format template so the user can see
+        # every precondition that ever blocked the fused path.
+        key = f"precondition:{reason}"
+        if key in _WELM_OE_FUSED_DECODE_GEMM_WARNED:
+            return
+        _WELM_OE_FUSED_DECODE_GEMM_WARNED.add(key)
+        logger.warning(
+            "%s=1 disabled: precondition not met: %s.",
+            WELM_OE_FUSED_DECODE_GEMM_ENV,
+            reason,
+        )
+
+    if oe_embed_modules is None or oe_proj_module is None:
+        _bail("oe modules not present")
+        return None
+    forward_mode = getattr(forward_batch, "forward_mode", None)
+    if forward_mode is None or not forward_mode.is_decode():
+        _bail(f"not a decode forward (mode={forward_mode!r})")
+        return None
+
+    # mk hard-asserts batch ∈ [1, 32]; sglang's decode tokens-per-step covers
+    # this for typical low-batch deployments.
+    batch_size = int(input_ids.numel())
+    if batch_size <= 0 or batch_size > _MK_FUSED_DECODE_GEMM_MAX_BATCH:
+        _bail(f"batch_size={batch_size} out of [1, {_MK_FUSED_DECODE_GEMM_MAX_BATCH}]")
+        return None
+
+    if tuple(oe_grams) != _MK_FUSED_DECODE_GEMM_NGRAMS:
+        _bail(f"oe_grams={tuple(oe_grams)} != {_MK_FUSED_DECODE_GEMM_NGRAMS}")
+        return None
+    if len(oe_vocab_sizes) != SPECIALIZED_WELM_OE_BRANCHES:
+        _bail(f"len(oe_vocab_sizes)={len(oe_vocab_sizes)} != {SPECIALIZED_WELM_OE_BRANCHES}")
+        return None
+    if len(oe_embed_modules) != SPECIALIZED_WELM_OE_BRANCHES:
+        _bail(f"len(oe_embed_modules)={len(oe_embed_modules)}")
+        return None
+
+    # OE projection must be a bias-less ReplicatedLinear sized
+    # (hidden_size, 4 * oe_dim) — anything else (e.g. quantized, biased) means
+    # the fused kernel's math contract no longer holds.
+    proj_weight = getattr(oe_proj_module, "weight", None)
+    if proj_weight is None or proj_weight.dim() != 2:
+        _bail("oe_gate_up_proj.weight missing or not 2D")
+        return None
+    if getattr(oe_proj_module, "bias", None) is not None:
+        _warn_welm_oe_fused_disabled_once(
+            "oe_gate_up_proj has a bias term, which the fused decode kernel "
+            "does not support."
+        )
+        return None
+
+    input_hidden_size = int(proj_weight.shape[0])
+    hash_hidden_size = int(proj_weight.shape[1] // SPECIALIZED_WELM_OE_BRANCHES)
+    if (
+        input_hidden_size,
+        hash_hidden_size,
+    ) not in _MK_FUSED_DECODE_GEMM_SUPPORTED_HIDDEN:
+        _bail(
+            f"unsupported (input_hidden_size, hash_hidden_size)="
+            f"({input_hidden_size}, {hash_hidden_size})"
+        )
+        return None
+
+    # OE module sharding determines which process group's all-reduce the
+    # kernel must run; mismatch with embed_tokens' sharding would mix partials.
+    first_oe = oe_embed_modules[0]
+    use_attn_tp_group = bool(getattr(first_oe, "use_attn_tp_group", False))
+    if bool(getattr(embed_tokens, "use_attn_tp_group", False)) != use_attn_tp_group:
+        _bail("embed_tokens / oe_embed sharded on different TP groups")
+        return None
+    world_size = int(getattr(first_oe, "tp_size", 1) or 1)
+    if world_size not in _MK_FUSED_DECODE_GEMM_SUPPORTED_WORLD_SIZES:
+        _bail(f"world_size={world_size} not in {{2, 4, 8}}")
+        return None
+
+    # Scattered attention-TP inputs would feed only the local-rank slice into
+    # the kernel, but mk expects the unscattered token ids. Bail out and let
+    # the unfused path (which handles scatter explicitly) take over.
+    if get_attn_tp_context().input_scattered:
+        _bail("attention-TP input is scattered")
+        return None
+
+    oe_context = getattr(forward_batch, "oe_context", None)
+    prefix_rows = getattr(oe_context, "hash_prefixes", None)
+    if not prefix_rows:
+        _bail("forward_batch.oe_context.hash_prefixes is empty/None")
+        return None
+    if len(prefix_rows) < (max(oe_grams) - 1):
+        _bail(
+            f"len(prefix_rows)={len(prefix_rows)} < max(oe_grams)-1={max(oe_grams) - 1}"
+        )
+        return None
+    for row in prefix_rows:
+        if len(row) != batch_size:
+            _bail(
+                f"prefix row width {len(row)} != batch_size {batch_size}"
+            )
+            return None
+
+    # Embedding tables must be plain bf16 vocab-parallel shards aligned with
+    # mk's ``(partition_size, hidden)`` contract. ``VocabParallelEmbedding``
+    # rounds the underlying allocation up to the next ``padding_size *
+    # world_size`` and stores the full padded shard locally; we pass that
+    # whole tensor through and tell mk the partition size separately so it
+    # can use the same boundaries when masking out-of-shard hashes. Quantized
+    # tables are not supported.
+    embed_weight = getattr(embed_tokens, "weight", None)
+    if embed_weight is None or embed_weight.dtype is not torch.bfloat16:
+        _bail("embed_tokens.weight missing or not bf16")
+        return None
+    if embed_weight.dim() != 2 or embed_weight.shape[1] != input_hidden_size:
+        _bail(
+            f"embed_tokens.weight has unexpected shape "
+            f"{tuple(embed_weight.shape)}"
+        )
+        return None
+    embed_shard_indices = getattr(embed_tokens, "shard_indices", None)
+    if embed_shard_indices is not None and (
+        embed_shard_indices.num_added_elements_padded != 0
+    ):
+        # Added vocab (e.g. extra trained tokens after the base vocab) breaks
+        # the simple ``vocab_size / world_size`` contract mk validates against.
+        _bail("embed_tokens has nonzero added-vocab padding")
+        return None
+    if not embed_weight.is_contiguous():
+        _bail("embed_tokens.weight not contiguous")
+        return None
+    embed_table_vocab = int(
+        getattr(embed_tokens, "org_vocab_size", embed_weight.shape[0] * world_size)
+    )
+    if embed_weight.shape[0] * world_size != embed_table_vocab:
+        # mk's ``input_embedding_table`` validation expects an exact
+        # ``vocab_size / world_size`` shard. For the WeLMV4 base vocab
+        # (155648) with TP=4 there is no padding, so this is normally a
+        # no-op; bail out instead of silently mis-sharding when it isn't.
+        _bail(
+            f"embed_tokens.weight rows {embed_weight.shape[0]} * world {world_size} "
+            f"!= org_vocab {embed_table_vocab} (padded base vocab not supported)"
+        )
+        return None
+    embed_table = embed_weight
+
+    hash_tables: list[torch.Tensor] = []
+    # mk supports a separate ``embedding_partition_size`` parameter so that
+    # sglang can keep its native VocabParallelEmbedding sharding (which pads
+    # vocab to a multiple of ``DEFAULT_VOCAB_PADDING_SIZE * world_size``)
+    # while mk still applies the correct hash modulus. We resolve it from the
+    # actual local OE shard rows; all four branches must agree (they do under
+    # WeLMV4: the four ``oe_vocab_sizes`` differ by 8 each but pad to the same
+    # 64-multiple shard width).
+    embedding_partition_size: int | None = None
+    for i, module in enumerate(oe_embed_modules):
+        weight = getattr(module, "weight", None)
+        if weight is None or weight.dtype is not torch.bfloat16:
+            _bail("oe_embed[i].weight missing or not bf16")
+            return None
+        if weight.dim() != 2 or weight.shape[1] != hash_hidden_size:
+            _bail(
+                f"oe_embed[i].weight unexpected shape {tuple(weight.shape)}"
+            )
+            return None
+        shard_indices = getattr(module, "shard_indices", None)
+        if shard_indices is not None and (
+            shard_indices.num_added_elements_padded != 0
+        ):
+            _bail("oe_embed[i] has nonzero added-vocab padding")
+            return None
+        local_partition = int(weight.shape[0])
+        if embedding_partition_size is None:
+            embedding_partition_size = local_partition
+        elif embedding_partition_size != local_partition:
+            _bail(
+                f"oe_embed[i].weight partition rows {local_partition} != "
+                f"first branch's {embedding_partition_size}"
+            )
+            return None
+        if not weight.is_contiguous():
+            _bail("oe_embed[i].weight not contiguous")
+            return None
+        hash_tables.append(weight)
+
+    handle = _load_mk_fused_decode_gemm()
+    if handle is None:
+        return None
+    (
+        params_cls,
+        ngram_spec_cls,
+        run_fused,
+        is_supported,
+    ) = handle
+    ngram_spec = _build_mk_ngram_spec(ngram_spec_cls, oe_grams, oe_vocab_sizes)
+    if not is_supported(
+        input_hidden_size,
+        hash_hidden_size,
+        world_size,
+        batch_size,
+        ngram_spec,
+        embedding_partition_size,
+    ):
+        _bail(
+            f"mk reports unsupported "
+            f"(in={input_hidden_size}, hash={hash_hidden_size}, "
+            f"world={world_size}, b={batch_size}, "
+            f"partition={embedding_partition_size})"
+        )
+        return None
+
+    # Resolve the right process group: OE / embed sharded along the attention
+    # TP group means the all-reduce must run on attn-TP, not the global TP.
+    if use_attn_tp_group:
+        from sglang.srt.layers.dp_attention import get_attention_tp_group
+
+        process_group = get_attention_tp_group().device_group
+    else:
+        from sglang.srt.distributed import get_tp_group
+
+        process_group = get_tp_group().device_group
+
+    if not proj_weight.is_contiguous() or proj_weight.dtype is not torch.bfloat16:
+        _bail("oe_gate_up_proj.weight not contiguous bf16")
+        return None
+    # mk requires 16-byte alignment on the GEMM weight; ReplicatedLinear gives
+    # us a fresh contiguous bf16 tensor so this is normally fine, but verify.
+    if proj_weight.data_ptr() % 16 != 0:
+        _bail("oe_gate_up_proj.weight not 16B-aligned")
+        return None
+
+    input_ids_int64 = (
+        input_ids if input_ids.dtype is torch.int64 else input_ids.to(torch.int64)
+    )
+    if not input_ids_int64.is_contiguous():
+        input_ids_int64 = input_ids_int64.contiguous()
+
+    # mk takes prefixes as a per-token list of lag-major ints; reuse the
+    # cached oe_context rows (lag-major already; outer index = lag, inner =
+    # token). Convert to mk's ``Sequence[Sequence[int]]`` layout (per-token
+    # rows of length max_history).
+    max_history = max(int(spec.n) for spec in ngram_spec) - 1
+    per_token_prefixes = [
+        [int(prefix_rows[lag][token]) for lag in range(max_history)]
+        for token in range(batch_size)
+    ]
+
+    params = params_cls(
+        input_ids=input_ids_int64,
+        prefixes=per_token_prefixes,
+        input_embedding_table=embed_table,
+        hash_embedding_tables=hash_tables,
+        weight=proj_weight,
+        process_group=process_group,
+        vocab_size=embed_table_vocab,
+        ngram_spec=ngram_spec,
+        input_hidden_size=input_hidden_size,
+        hash_hidden_size=hash_hidden_size,
+        world_size=world_size,
+        embedding_partition_size=embedding_partition_size,
+    )
+    try:
+        result = run_fused(params)
+    except Exception as exc:  # pragma: no cover - mk runtime failure path
+        logger.warning(
+            "mk fused decode embedding-GEMM-all-reduce raised %r; falling back "
+            "to the unfused path for this step.",
+            exc,
+        )
+        return None
+    if "fused_kernel_fired" not in _WELM_OE_FUSED_DECODE_GEMM_WARNED:
+        # One-time positive signal so we can confirm in the server log that the
+        # opt-in actually took effect (very useful for catching silent fallback).
+        _WELM_OE_FUSED_DECODE_GEMM_WARNED.add("fused_kernel_fired")
+        logger.info(
+            "%s=1 active: mk fused decode embedding-GEMM-all-reduce engaged "
+            "(input_hidden_size=%d, hash_hidden_size=%d, world_size=%d, "
+            "batch_size=%d).",
+            WELM_OE_FUSED_DECODE_GEMM_ENV,
+            input_hidden_size,
+            hash_hidden_size,
+            world_size,
+            batch_size,
+        )
+    return result
+
+
 def welm_embeddings(
     *,
     input_ids: torch.Tensor,
@@ -665,16 +1074,92 @@ def welm_embeddings(
     # access to its module-level dump helpers to avoid a circular import.
     from sglang.srt.models.welmv4 import _WELM_DUMP_ENABLED, _welm_dump_tensor
 
+    has_oe = (
+        len(oe_grams) > 0 and getattr(forward_batch, "oe_context", None) is not None
+    )
+
+    # Fused fast path: a single mk kernel covers token embedding lookup +
+    # OE-branch hash lookups + concat + oe_gate_up_proj GEMM + all-reduce, and
+    # is enabled only for low-batch decode where every shape/world-size check
+    # passes. ``scale_seq_times`` interleaves multiple embeddings per token,
+    # which the fused kernel does not model — keep the unfused path for that.
+    if (
+        has_oe
+        and not skip_oe_fusion
+        and input_embeds is None
+        and should_use_welm_oe_fused_decode_gemm()
+    ):
+        if scale_seq_times != 0:
+            _warn_welm_oe_fused_disabled_once(
+                "scale_seq_times=%d is not supported; "
+                "fused decode embedding GEMM stays disabled.",
+                scale_seq_times,
+            )
+        else:
+            fused_hidden = _try_apply_welm_oe_fused_decode_gemm(
+                input_ids=input_ids,
+                forward_batch=forward_batch,
+                embed_tokens=embed_tokens,
+                oe_grams=oe_grams,
+                oe_vocab_sizes=oe_vocab_sizes,
+                oe_embed_modules=oe_embed_modules,
+                oe_proj_module=oe_proj_module,
+            )
+            if fused_hidden is not None:
+                # Optional numerical probe: when
+                # ``SGLANG_WELM_OE_FUSED_DECODE_GEMM_PROBE=1`` is set, compute
+                # the unfused reference on every fused call and log the
+                # worst-ever max-abs / rel diff. Useful for catching a kernel
+                # regression in production traffic without paying the cost on
+                # the hot path by default.
+                if _env_flag("SGLANG_WELM_OE_FUSED_DECODE_GEMM_PROBE", "0"):
+                    try:
+                        ref_base = embed_tokens(input_ids)
+                        ref = compute_welm_oe_embedding(
+                            input_ids=input_ids,
+                            forward_batch=forward_batch,
+                            base_hidden_states=ref_base,
+                            oe_grams=oe_grams,
+                            oe_vocab_sizes=oe_vocab_sizes,
+                            vocab_size=vocab_size,
+                            oe_embed_modules=oe_embed_modules,
+                            oe_proj_module=oe_proj_module,
+                        )
+                        max_abs = float(
+                            (ref.float() - fused_hidden.float()).abs().max().item()
+                        )
+                        max_ref = float(ref.float().abs().max().item())
+                        prev = _WELM_OE_FUSED_DECODE_GEMM_PROBE_STATE.get(
+                            "max_abs", 0.0
+                        )
+                        if max_abs > prev:
+                            _WELM_OE_FUSED_DECODE_GEMM_PROBE_STATE["max_abs"] = max_abs
+                            logger.info(
+                                "fused vs unfused embedding probe NEW WORST: "
+                                "max_abs_diff=%.6g max_ref=%.6g rel=%.6g "
+                                "shape=%s input_ids[0]=%s",
+                                max_abs,
+                                max_ref,
+                                max_abs / max_ref if max_ref > 0 else 0.0,
+                                tuple(fused_hidden.shape),
+                                int(input_ids[0].item())
+                                if input_ids.numel() > 0
+                                else None,
+                            )
+                    except Exception as exc:  # pragma: no cover - probe is best-effort
+                        if "probe_failed" not in _WELM_OE_FUSED_DECODE_GEMM_WARNED:
+                            _WELM_OE_FUSED_DECODE_GEMM_WARNED.add("probe_failed")
+                            logger.warning("fused embedding probe failed: %r", exc)
+                if _WELM_DUMP_ENABLED:
+                    _welm_dump_tensor("model.embed_tokens.output", fused_hidden)
+                return fused_hidden
+
     if input_embeds is None:
         hidden_states = embed_tokens(input_ids)
     else:
         hidden_states = input_embeds
     if _WELM_DUMP_ENABLED:
         _welm_dump_tensor("model.embed_tokens.output", hidden_states)
-
-    has_oe = (
-        len(oe_grams) > 0 and getattr(forward_batch, "oe_context", None) is not None
-    )
 
     if has_oe and not skip_oe_fusion:
         hidden_states = compute_welm_oe_embedding(
