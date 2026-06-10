@@ -1162,12 +1162,23 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             return routed_experts
 
         fmt = routed_experts.get("format")
+        if fmt == "shm":
+            # Client pre-staged the trace file on every server node (see
+            # 3b_prefetch_to_shm.py). Pass through unchanged; scheduler's
+            # _validate_router_replay_request will mmap the file zero-copy.
+            # No Redis is touched on the inference hot path at all.
+            return routed_experts
         if fmt == "remote":
-            tensor = self._decode_remote_routed_experts_tensor(routed_experts).to(
-                dtype=torch.int32
-            )
-            tensor._sglang_router_replay_trusted = True
-            return tensor
+            # PERF: defer the actual Redis fetch + np.frombuffer copy to the
+            # scheduler. tokenizer_manager just passes the small ref dict
+            # (~250 bytes) across the ZMQ boundary instead of pickling the
+            # full ~64 MB tensor (which is also broadcast via gloo to every
+            # TP rank). The scheduler will detect the dict in
+            # `_validate_router_replay_request` and resolve it via its own
+            # RoutedExpertsStore handle. The trusted flag is inherent to
+            # remote refs (they were produced by a prior capture run we
+            # control, so range/shape are already known).
+            return routed_experts
         if fmt != "remote_masked_dense":
             raise ValueError(f"Unsupported routed_experts payload format: {fmt!r}")
 

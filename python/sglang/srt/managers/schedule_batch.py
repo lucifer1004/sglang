@@ -254,8 +254,24 @@ def build_router_replay_extend_batch(
     else:
         topk_ids = torch.cat(slices, dim=0)
     topk_ids = topk_ids.to(device=device, non_blocking=True)
-    mask = torch.ones((topk_ids.shape[0],), dtype=torch.bool, device=device)
-    return topk_ids, mask
+    # PERF: hoist per-layer cleanup (originally done num_layers times per step in
+    # `_apply_router_replay_from_forward_batch`) to per-step. Concretely:
+    #   - replace -1 sentinels (input region after push_traces_to_redis.py) with 0,
+    #     so `scores.gather(1, forced_ids)` in `_gather_router_replay_weights` is
+    #     always safe regardless of `mask` value.
+    #   - tighten mask: a row is only valid if EVERY (layer, top_k) entry is >= 0.
+    # This eliminates 5 per-layer kernel launches (ge×2, all, where, zeros_like,
+    # mask &) per decode step in topk.py, ~240 fewer kernels per step at 48-layer
+    # 80B / ~465 fewer at 93-layer 600B.
+    if topk_ids.numel() > 0:
+        valid_per_row = (topk_ids >= 0).all(dim=tuple(range(1, topk_ids.ndim)))
+        # Use clamp_min_ over torch.where(...zeros_like...): single in-place op.
+        topk_ids = topk_ids.clamp_min_(0)
+    else:
+        valid_per_row = torch.ones(
+            (topk_ids.shape[0],), dtype=torch.bool, device=device
+        )
+    return topk_ids, valid_per_row
 
 
 def build_router_replay_decode_batch(
@@ -271,7 +287,9 @@ def build_router_replay_decode_batch(
         )
 
     slices = []
-    masks = []
+    all_valid = True
+    has_overrun = False
+    overrun_indices: List[int] = []
     for i, req in enumerate(reqs):
         trace = req.router_replay_experts
         trace_pos = (
@@ -280,18 +298,38 @@ def build_router_replay_decode_batch(
         if trace_pos >= trace.shape[0]:
             if _is_router_replay_decode_overrun(req, trace_pos):
                 slices.append(torch.zeros_like(trace[:1]))
-                masks.append(False)
+                all_valid = False
+                has_overrun = True
+                overrun_indices.append(i)
                 continue
             raise _router_replay_short_trace_error(
                 req, trace_pos, trace_pos + 1, trace.shape[0]
             )
         slices.append(trace[trace_pos : trace_pos + 1])
-        masks.append(True)
 
     if len(slices) == 0:
         return None, None
     topk_ids = torch.cat(slices, dim=0).to(device=device, non_blocking=True)
-    mask = torch.tensor(masks, dtype=torch.bool, device=device)
+    # PERF: avoid `torch.tensor([True]*N, dtype=bool, device=cuda)` which forces
+    # a sync H->D copy on the hot path (~6-14 ms per decode step on TP=8 DP=4
+    # 80B with c=32). The common case is "all-valid" (every req still has trace
+    # data left), so allocate the mask directly on the GPU. Only fall back to
+    # an H->D copy when at least one request has overrun.
+    if not has_overrun:
+        mask = torch.ones((len(slices),), dtype=torch.bool, device=device)
+    else:
+        # Build the bool mask on CPU (cheap), then async-copy to GPU.
+        cpu_mask = torch.ones((len(slices),), dtype=torch.bool)
+        if overrun_indices:
+            cpu_mask[overrun_indices] = False
+        mask = cpu_mask.to(device=device, non_blocking=True)
+    # PERF: hoist per-layer cleanup to per-step (see extend variant above for
+    # rationale). For decode the per-row count equals batch size, so this loop
+    # body runs once per decode step regardless of num_layers.
+    if topk_ids.numel() > 0:
+        valid_per_row = (topk_ids >= 0).all(dim=tuple(range(1, topk_ids.ndim)))
+        mask = mask & valid_per_row
+        topk_ids = topk_ids.clamp_min_(0)
     return topk_ids, mask
 
 
@@ -2526,6 +2564,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # Update fields
         self.input_ids = self.output_ids
         self.output_ids = None
+        # Router replay trace_pos must equal the position whose MoE forward
+        # is being executed in THIS decode step. Capture writes routing for
+        # the token at sequence position `in_len + k` (slot req_to_token[p]).
+        # `seq_lens_cpu` is incremented by `scale` LATER in this function
+        # (see `self.seq_lens_cpu.add_(scale)` below), so its current value
+        # is exactly the position about to be processed.
         trace_positions = (self.seq_lens_cpu // scale).tolist()
         self.router_replay_topk_ids, self.router_replay_mask = (
             build_router_replay_decode_batch(

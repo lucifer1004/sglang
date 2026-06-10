@@ -505,7 +505,16 @@ class DecodeInputBuffers(ForwardInputBuffers):
                 static_num_token=static_num_token,
             )
 
-            from sglang.srt.layers.dp_attention import dp_gather_partial
+            # NOTE(replay+dp-attn): use dp_gather_REPLICATE rather than
+            # dp_gather_partial here. router_replay_topk_ids/mask are
+            # replicated across attn-TP ranks within a DP rank, so the all-
+            # reduce that backs dp_gather would otherwise SUM identical TP
+            # copies (e.g. expert id 510 + 510 = 1020) and produce
+            # out-of-range expert ids that crash `scores.gather(1,
+            # forced_ids)` in _gather_router_replay_weights.  Replicate semantics
+            # contribute only from attn_tp_rank==0 so the all-reduce returns a
+            # single copy.
+            from sglang.srt.layers.dp_attention import dp_gather_replicate
 
             global_static_num_token = (
                 static_num_token * self.global_num_tokens_gpu.numel()
@@ -521,17 +530,21 @@ class DecodeInputBuffers(ForwardInputBuffers):
                 )
                 forward_batch.dp_local_start_pos = None
                 forward_batch.dp_local_num_tokens = None
-                dp_gather_partial(
+                # Zero the slice BEFORE the all-reduce: dp_gather_replicate
+                # sums across the TP group, so any stale non-zero data on
+                # non-rank-0 attn_tp ranks would otherwise be summed in.
+                self.router_replay_topk_ids[:global_static_num_token].zero_()
+                dp_gather_replicate(
                     self.router_replay_topk_ids[:global_static_num_token],
                     self.router_replay_local_topk_ids[:static_num_token],
                     forward_batch,
                 )
-                global_mask_i32 = torch.empty(
+                global_mask_i32 = torch.zeros(
                     (global_static_num_token,),
                     dtype=torch.int32,
                     device=self.router_replay_mask.device,
                 )
-                dp_gather_partial(
+                dp_gather_replicate(
                     global_mask_i32,
                     self.router_replay_local_mask[:static_num_token].to(torch.int32),
                     forward_batch,

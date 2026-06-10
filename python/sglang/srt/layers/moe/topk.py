@@ -1246,8 +1246,11 @@ def _apply_router_replay_from_forward_batch(
             return topk_weights, topk_ids
         forced_ids = forced_ids[last_q_indices]
         mask = mask[last_q_indices]
-    mask = mask & forced_ids.ge(0).all(dim=1)
-    forced_ids = torch.where(forced_ids.ge(0), forced_ids, torch.zeros_like(forced_ids))
+    # PERF: per-layer cleanup (`mask & forced_ids.ge(0).all(dim=1)` and
+    # `torch.where(forced_ids.ge(0), forced_ids, zeros_like)`) used to live here
+    # but was hoisted to `build_router_replay_{extend,decode}_batch` so it runs
+    # once per step instead of num_layers times. forced_ids is guaranteed
+    # non-negative and `mask` already reflects per-row all-layer validity.
     return apply_router_replay_topk_override(
         router_logits=router_logits,
         topk_weights=topk_weights,

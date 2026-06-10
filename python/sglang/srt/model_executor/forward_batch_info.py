@@ -966,17 +966,28 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         self.global_num_tokens_gpu.copy_(global_num_tokens_pinned, non_blocking=True)
 
         if self.router_replay_topk_ids is not None:
-            from sglang.srt.layers.dp_attention import dp_gather_partial
+            # NOTE(replay+dp-attn): router_replay_topk_ids is REPLICATED across
+            # attention-TP ranks within the same DP rank (every TP rank in a DP
+            # rank holds the same per-request expert ids). The DP gather is
+            # implemented as `inplace_all_reduce` (sum) across the full TP
+            # group, so calling `dp_gather_partial` here would DOUBLE the
+            # values for each DP rank (sum of two identical TP copies),
+            # producing out-of-range expert ids that crash the downstream
+            # `scores.gather(1, forced_ids)` in _gather_router_replay_weights.
+            # Use `dp_gather_replicate` instead, which only contributes from
+            # attn_tp_rank==0 — matching the replication semantics — so the
+            # sum yields exactly one copy of each DP rank's data.
+            from sglang.srt.layers.dp_attention import dp_gather_replicate
 
-            gathered_topk_ids = self.router_replay_topk_ids.new_empty(
+            gathered_topk_ids = self.router_replay_topk_ids.new_zeros(
                 (self.global_dp_buffer_len, *self.router_replay_topk_ids.shape[1:])
             )
-            dp_gather_partial(gathered_topk_ids, self.router_replay_topk_ids, self)
+            dp_gather_replicate(gathered_topk_ids, self.router_replay_topk_ids, self)
             self.router_replay_topk_ids = gathered_topk_ids
 
             replay_mask_i32 = self.router_replay_mask.to(torch.int32)
-            gathered_mask_i32 = replay_mask_i32.new_empty((self.global_dp_buffer_len,))
-            dp_gather_partial(gathered_mask_i32, replay_mask_i32, self)
+            gathered_mask_i32 = replay_mask_i32.new_zeros((self.global_dp_buffer_len,))
+            dp_gather_replicate(gathered_mask_i32, replay_mask_i32, self)
             self.router_replay_mask = gathered_mask_i32.to(torch.bool)
 
         TboForwardBatchPreparer.prepare(
