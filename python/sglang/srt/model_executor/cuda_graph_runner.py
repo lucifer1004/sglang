@@ -25,7 +25,7 @@ import os
 from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import partial
-from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, Union
 
 import torch
 import tqdm
@@ -181,6 +181,12 @@ class DecodeInputBuffers(ForwardInputBuffers):
     pp_proxy_tensors: Optional[Dict[str, torch.Tensor]]
     ngram_embedding_info: Optional["NgramEmbeddingInfo"]
     welm_oe_decode_hashed_inputs: Optional[torch.Tensor]
+    # Persistent output buffer for the mk fused decode embedding-GEMM kernel
+    # under cuda graph capture. Sized to mk's max supported batch (32) so the
+    # buckets bs ∈ {1,2,...,32} can each take a slice that's the EXACT same
+    # data_ptr() the captured graph baked in. ``None`` when the runner won't
+    # use the prepared mk path (env off, mk missing, OE not configured, etc.).
+    welm_oe_fused_decode_output: Optional[torch.Tensor]
     router_replay_topk_ids: torch.Tensor
     router_replay_mask: torch.Tensor
     router_replay_local_topk_ids: torch.Tensor
@@ -214,6 +220,8 @@ class DecodeInputBuffers(ForwardInputBuffers):
         kv_mirror_tensor_size: Optional[int] = None,
         ne_token_table: Optional[torch.Tensor] = None,
         is_hybrid_swa: bool = False,
+        welm_oe_fused_decode_output_max_bs: int = 0,
+        welm_oe_fused_decode_output_hidden_size: int = 0,
     ) -> "DecodeInputBuffers":
         with torch.device(device):
             welm_oe_decode_hashed_inputs = (
@@ -222,6 +230,22 @@ class DecodeInputBuffers(ForwardInputBuffers):
                     dtype=torch.int64,
                 )
                 if welm_oe_decode_hash_num_branches > 0
+                else None
+            )
+            # Persistent output for the mk fused decode + all-reduce kernel
+            # under cuda graph capture. Cap rows at mk's max batch (32);
+            # buckets > 32 use the eager captured fused path which doesn't
+            # touch this buffer. dtype is bf16 because mk requires it.
+            welm_oe_fused_decode_output = (
+                torch.zeros(
+                    (
+                        welm_oe_fused_decode_output_max_bs,
+                        welm_oe_fused_decode_output_hidden_size,
+                    ),
+                    dtype=torch.bfloat16,
+                )
+                if welm_oe_fused_decode_output_max_bs > 0
+                and welm_oe_fused_decode_output_hidden_size > 0
                 else None
             )
             input_ids = torch.zeros((max_num_token,), dtype=torch.int64)
@@ -346,6 +370,7 @@ class DecodeInputBuffers(ForwardInputBuffers):
             pp_proxy_tensors=pp_proxy_tensors,
             ngram_embedding_info=ngram_embedding_info,
             welm_oe_decode_hashed_inputs=welm_oe_decode_hashed_inputs,
+            welm_oe_fused_decode_output=welm_oe_fused_decode_output,
             router_replay_topk_ids=router_replay_topk_ids,
             router_replay_mask=router_replay_mask,
             router_replay_local_topk_ids=router_replay_local_topk_ids,
@@ -889,15 +914,6 @@ class CudaGraphRunner:
 
         self.welm_oe_decode_hash_config = None
         welm_oe_decode_hash_num_branches = 0
-        # scale_seq forces capture_forward_mode -> TARGET_VERIFY even when
-        # speculative decoding is disabled (see scale_seq_factor block above).
-        # That pseudo-target-verify case still needs decode hash buffers, so
-        # admit it explicitly here.
-        is_scale_seq_pseudo_tv = (
-            self.scale_seq_factor > 1
-            and self.capture_forward_mode.is_target_verify()
-            and not self.model_runner.spec_algorithm.is_speculative()
-        )
         if (
             self.model_runner.server_args.prepare_n_gram_inputs
             and (
@@ -906,7 +922,6 @@ class CudaGraphRunner:
                     self.capture_forward_mode.is_target_verify()
                     and self.model_runner.spec_algorithm.is_speculative()
                 )
-                or is_scale_seq_pseudo_tv
             )
             and should_use_welm_oe_hash_kernel(
                 self.model_runner.model_config
@@ -919,6 +934,81 @@ class CudaGraphRunner:
                 self.welm_oe_decode_hash_config = (oe_grams, oe_vocab_sizes)
                 welm_oe_decode_hash_num_branches = len(oe_vocab_sizes)
 
+        # Eligibility for the mk graph-friendly fused decode path. Discovery
+        # only runs the structural shape check (no ForwardBatch needed); the
+        # per-bucket prepare happens after buffers are allocated. Gates that
+        # short-circuit eligibility BEFORE we allocate the static output
+        # buffer keep memory clean for non-WeLM models.
+        self._welm_oe_fused_config: Optional[Any] = None
+        self._welm_oe_prepared_handles: Dict[int, Any] = {}
+        self._welm_oe_fused_eligible = False
+        welm_oe_fused_max_bs = 0
+        welm_oe_fused_hidden_size = 0
+        _welm_eligibility_gates = {
+            "welm_oe_decode_hash_config_set": self.welm_oe_decode_hash_config is not None,
+            "num_tokens_per_bs_eq_1": self.num_tokens_per_bs == 1,
+            "no_dp_attention": not self.model_runner.server_args.enable_dp_attention,
+            "no_pdmux": not getattr(
+                self.model_runner.server_args, "enable_pdmux", False
+            ),
+            "decode_capture_mode": bool(self.capture_forward_mode.is_decode()),
+        }
+        if all(_welm_eligibility_gates.values()):
+            # Lazy import — keeps cuda_graph_runner.py independent of mk for
+            # non-WeLM models even when this file is imported eagerly.
+            from sglang.srt.models.welm_perf_opt import (
+                discover_welm_oe_fused_decode_modules,
+                should_use_welm_oe_fused_decode_gemm,
+            )
+
+            if should_use_welm_oe_fused_decode_gemm():
+                try:
+                    self._welm_oe_fused_config = (
+                        discover_welm_oe_fused_decode_modules(
+                            self.model_runner.model
+                        )
+                    )
+                except Exception as exc:  # defensive: discovery failures fall back
+                    logger.warning(
+                        "WeLM OE fused-decode discovery failed: %r; staying on the "
+                        "eager captured path.",
+                        exc,
+                    )
+                    self._welm_oe_fused_config = None
+                if self._welm_oe_fused_config is not None:
+                    self._welm_oe_fused_eligible = True
+                    welm_oe_fused_max_bs = 32
+                    welm_oe_fused_hidden_size = (
+                        self._welm_oe_fused_config.input_hidden_size
+                    )
+                    logger.info(
+                        "WeLM OE fused-decode: eligibility passed; will "
+                        "prepare per-bucket mk handles for cuda graph capture "
+                        "(input_hidden_size=%d, hash_hidden_size=%d, "
+                        "world_size=%d, partition_size=%d).",
+                        self._welm_oe_fused_config.input_hidden_size,
+                        self._welm_oe_fused_config.hash_hidden_size,
+                        self._welm_oe_fused_config.world_size,
+                        self._welm_oe_fused_config.embedding_partition_size,
+                    )
+                else:
+                    logger.info(
+                        "WeLM OE fused-decode: discover returned None "
+                        "(unsupported topology); staying on the eager "
+                        "captured path."
+                    )
+        else:
+            failing = [k for k, v in _welm_eligibility_gates.items() if not v]
+            if (
+                # Only log when the env is set — non-WeLM deployments don't
+                # need to see this.
+                self.welm_oe_decode_hash_config is not None
+            ):
+                logger.info(
+                    "WeLM OE fused-decode: cuda-graph prepared path skipped "
+                    "(failing gates: %s).",
+                    ", ".join(failing) or "none",
+                )
         self.buffers: DecodeInputBuffers = DecodeInputBuffers.create(
             device=self.device,
             max_bs=self.max_bs,
@@ -953,8 +1043,41 @@ class CudaGraphRunner:
                 model_runner.token_table if self.use_ngram_embedding else None
             ),
             is_hybrid_swa=model_runner.is_hybrid_swa,
+            welm_oe_fused_decode_output_max_bs=welm_oe_fused_max_bs,
+            welm_oe_fused_decode_output_hidden_size=welm_oe_fused_hidden_size,
         )
         self.buffers.share_buffers()
+
+        # Build per-bucket Prepared mk handles BEFORE capture. mk's prepare
+        # does symm-mem rendezvous + workspace allocation; both must happen
+        # outside ``torch.cuda.graph(...)`` capture.
+        if (
+            self._welm_oe_fused_eligible
+            and self._welm_oe_fused_config is not None
+            and self.buffers.welm_oe_fused_decode_output is not None
+        ):
+            from sglang.srt.models.welm_perf_opt import (
+                prepare_welm_oe_fused_decode_handle,
+            )
+
+            for bs in self.capture_bs:
+                if not (1 <= int(bs) <= 32):
+                    continue
+                static_input_ids = self.buffers.input_ids[: int(bs)]
+                static_output = self.buffers.welm_oe_fused_decode_output[: int(bs)]
+                handle = prepare_welm_oe_fused_decode_handle(
+                    config=self._welm_oe_fused_config,
+                    static_input_ids=static_input_ids,
+                    static_output=static_output,
+                    runtime_batch_size=int(bs),
+                )
+                if handle is not None:
+                    self._welm_oe_prepared_handles[int(bs)] = handle
+            if not self._welm_oe_prepared_handles:
+                # Every bucket got rejected by mk (e.g. unsupported shape) —
+                # disable eligibility so capture/replay don't try to dispatch
+                # to a non-existent handle.
+                self._welm_oe_fused_eligible = False
 
         self.tbo_plugin = TboCudaGraphRunnerPlugin()
 
@@ -1356,24 +1479,44 @@ class CudaGraphRunner:
                 self.welm_oe_decode_hash_config is not None
                 and buffers.welm_oe_decode_hashed_inputs is not None
             )
-            # In scale_seq mode the OE hash inputs are bs-sized (one per
-            # request) even though the captured graph runs num_tokens =
-            # bs * scale_seq_factor. Slice the buffer accordingly.
-            oe_capture_token = (
-                bs if self.scale_seq_factor > 1 else num_tokens
-            )
             if use_welm_oe_decode_hash:
                 forward_batch.oe_context = OverEncodingContext(
                     input_ids_buffer=HashInputIdsBuffer([])
                 )
                 forward_batch.welm_oe_decode_hashed_inputs = (
-                    buffers.welm_oe_decode_hashed_inputs[:, :oe_capture_token]
+                    buffers.welm_oe_decode_hashed_inputs[:, :num_tokens]
                 )
             else:
                 raise RuntimeError(
                     "WeLM OE CUDA graph requires decode hash buffers. "
                     "Materialized n-gram fallback is no longer supported."
                 )
+
+        # mk fused decode + all-reduce: when a Prepared handle exists for
+        # this batch bucket, attach it to forward_batch alongside the
+        # persistent (bs, input_hidden_size) bf16 output buffer that mk
+        # baked into its captured launch. The model code in welm_perf_opt
+        # short-circuits to ``handle.launch()`` and returns the output
+        # tensor directly; the captured graph reads this exact slice.
+        prepared_handle = (
+            self._welm_oe_prepared_handles.get(int(bs))
+            if self._welm_oe_fused_eligible
+            else None
+        )
+        if (
+            prepared_handle is not None
+            and buffers.welm_oe_fused_decode_output is not None
+            and num_tokens <= 32
+        ):
+            forward_batch.welm_oe_fused_prepared = prepared_handle
+            forward_batch.welm_oe_fused_output = (
+                buffers.welm_oe_fused_decode_output[:num_tokens]
+            )
+            use_welm_oe_fused_prepared = True
+        else:
+            forward_batch.welm_oe_fused_prepared = None
+            forward_batch.welm_oe_fused_output = None
+            use_welm_oe_fused_prepared = False
 
         # HiSparse: set coordinator so the hisparse code path is captured into the graph
         forward_batch.hisparse_coordinator = self.model_runner.hisparse_coordinator
@@ -1405,10 +1548,18 @@ class CudaGraphRunner:
             forward_batch.dp_local_start_pos = forward_batch.dp_local_num_tokens = None
             if use_welm_oe_decode_hash:
                 forward_batch.welm_oe_decode_hashed_inputs = (
-                    buffers.welm_oe_decode_hashed_inputs[:, :oe_capture_token]
+                    buffers.welm_oe_decode_hashed_inputs[:, :num_tokens]
                 )
             else:
                 forward_batch.welm_oe_decode_hashed_inputs = None
+            if use_welm_oe_fused_prepared:
+                forward_batch.welm_oe_fused_prepared = prepared_handle
+                forward_batch.welm_oe_fused_output = (
+                    buffers.welm_oe_fused_decode_output[:num_tokens]
+                )
+            else:
+                forward_batch.welm_oe_fused_prepared = None
+                forward_batch.welm_oe_fused_output = None
             set_dp_buffer_len(
                 global_dp_buffer_len,
                 num_tokens,
@@ -1549,25 +1700,60 @@ class CudaGraphRunner:
         cached_welm_oe_hash_inputs = getattr(
             forward_batch, "welm_oe_decode_hashed_inputs", None
         )
-        # In scale_seq mode the model takes bs-sized input_ids and the OE
-        # hash inputs are also bs-sized, while the static buffer is sized
-        # for the expanded view (max_bs * scale_seq_factor). Slice the hash
-        # buffers using raw_bs / bs instead of raw_num_token /
-        # bs*num_tokens_per_bs so we don't overrun forward_batch.input_ids.
-        is_scale_seq_replay = self.scale_seq_factor > 1
-        oe_active_token = raw_bs if is_scale_seq_replay else raw_num_token
-        oe_static_token = bs if is_scale_seq_replay else bs * self.num_tokens_per_bs
+        # Precedence branch: if the runner has a prepared mk fused-decode
+        # handle for this bucket, refresh its prefix buffer (host-side write
+        # + stream-ordered H2D copy) and dispatch the prepared handle to the
+        # captured graph. Skips the welm_oe_decode_hashed_inputs fill — mk
+        # computes its own hashed lookups internally.
+        prepared_handle = (
+            self._welm_oe_prepared_handles.get(int(bs))
+            if self._welm_oe_fused_eligible
+            else None
+        )
         if (
+            prepared_handle is not None
+            and buffers.welm_oe_fused_decode_output is not None
+            and raw_num_token <= 32
+            and bs <= 32
+        ):
+            from sglang.srt.models.welm_perf_opt import (
+                build_welm_oe_fused_prefix_list,
+            )
+
+            prefix_rows = build_welm_oe_fused_prefix_list(
+                forward_batch=forward_batch,
+                runtime_batch_size=int(bs),
+                max_history=int(prepared_handle.max_history),
+            )
+            try:
+                prepared_handle.set_prefixes(prefix_rows)
+            except Exception as exc:
+                # Hard failure mid-replay would crash the request; degrade by
+                # disabling the prepared handle for this step. The captured
+                # graph still reads stale prefix bytes — but since the graph
+                # was captured with the prepared path, falling back here
+                # produces wrong outputs. Surface loudly.
+                logger.error(
+                    "WeLM OE fused decode set_prefixes failed at replay: %r",
+                    exc,
+                )
+                raise
+            forward_batch.welm_oe_fused_prepared = prepared_handle
+            forward_batch.welm_oe_fused_output = (
+                buffers.welm_oe_fused_decode_output[:bs]
+            )
+        elif (
             self.welm_oe_decode_hash_config is not None
             and buffers.welm_oe_decode_hashed_inputs is not None
             and cached_welm_oe_hash_inputs is not None
         ):
-            buffers.welm_oe_decode_hashed_inputs[:, :oe_active_token].copy_(
-                cached_welm_oe_hash_inputs[:, :oe_active_token]
+            buffers.welm_oe_decode_hashed_inputs[:, :raw_num_token].copy_(
+                cached_welm_oe_hash_inputs[:, :raw_num_token]
             )
-            if oe_active_token < oe_static_token:
+            static_num_token = bs * self.num_tokens_per_bs
+            if raw_num_token < static_num_token:
                 buffers.welm_oe_decode_hashed_inputs[
-                    :, oe_active_token:oe_static_token
+                    :, raw_num_token:static_num_token
                 ].zero_()
         elif (
             self.welm_oe_decode_hash_config is not None
@@ -1577,16 +1763,17 @@ class CudaGraphRunner:
         ):
             oe_grams, oe_vocab_sizes = self.welm_oe_decode_hash_config
             fill_welm_oe_hash_inputs(
-                forward_batch.input_ids[:oe_active_token],
-                buffers.welm_oe_decode_hashed_inputs[:, :oe_active_token],
+                forward_batch.input_ids[:raw_num_token],
+                buffers.welm_oe_decode_hashed_inputs[:, :raw_num_token],
                 forward_batch,
                 oe_grams,
                 oe_vocab_sizes,
                 self.model_runner.model_config.vocab_size,
             )
-            if oe_active_token < oe_static_token:
+            static_num_token = bs * self.num_tokens_per_bs
+            if raw_num_token < static_num_token:
                 buffers.welm_oe_decode_hashed_inputs[
-                    :, oe_active_token:oe_static_token
+                    :, raw_num_token:static_num_token
                 ].zero_()
         if self.enable_two_batch_overlap:
             self.tbo_plugin.replay_prepare(

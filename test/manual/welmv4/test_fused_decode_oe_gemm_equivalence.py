@@ -139,13 +139,12 @@ def _launch_server(
         "0.8",
         "--enable-over-encoding",
         "--disable-radix-cache",
-        # The mk fused decode embedding-GEMM-all-reduce kernel hashes
-        # ``input_ids`` itself, but with CUDA graphs enabled sglang strips
-        # the unhashed prefixes from the OE context and hands the model only
-        # pre-hashed buckets — so the fused path silently no-ops. Disable the
-        # graph here so both servers exercise the same forward code path and
-        # the on-server actually engages mk.
-        "--disable-cuda-graph",
+        # cuda graph is enabled here on purpose — the integration runs the
+        # mk fused decode kernel inside the captured graph via
+        # PreparedFusedDecodeNGramHashEmbeddingGemmAllReduce. With cuda graph
+        # off the eager fused_decode_*_all_reduce path is exercised instead;
+        # both modes should produce equivalent decode tokens within bf16
+        # noise.
         "--sampling-defaults",
         "openai",
     ]

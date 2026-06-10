@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
+from dataclasses import dataclass
 from typing import Sequence, Tuple
 
 import torch
@@ -676,6 +677,12 @@ def _load_mk_fused_decode_gemm():
     Returns ``None`` if mk is not installed (or fails to import). The first
     failure is logged at WARNING level; subsequent calls return ``None`` silently
     so a misconfigured environment does not flood the logs.
+
+    Tuple layout: ``(params_cls, ngram_spec_cls, run_fused, is_supported,
+    prepare_fn, prepared_cls)``. The last two are the CUDA-graph-friendly
+    handle helpers; ``prepare_fn`` is ``None`` on older mk builds that
+    pre-date the graph support, in which case the prepared path stays
+    disabled even with the env on.
     """
     global _MK_FUSED_DECODE_GEMM_HANDLE
     if _MK_FUSED_DECODE_GEMM_HANDLE is False:
@@ -698,11 +705,25 @@ def _load_mk_fused_decode_gemm():
         )
         _MK_FUSED_DECODE_GEMM_HANDLE = False
         return None
+    # Optional graph-friendly helpers — present only on mk >= the commit that
+    # introduced ``prepare_fused_decode_ngram_hash_embedding_gemm_all_reduce``.
+    # We tolerate older builds by leaving these as None and surfacing the
+    # missing symbol in :func:`prepare_welm_oe_fused_decode_handle`.
+    try:
+        from mk.kernels import (  # type: ignore[import-not-found]
+            PreparedFusedDecodeNGramHashEmbeddingGemmAllReduce,
+            prepare_fused_decode_ngram_hash_embedding_gemm_all_reduce,
+        )
+    except (ImportError, AttributeError):
+        prepare_fused_decode_ngram_hash_embedding_gemm_all_reduce = None
+        PreparedFusedDecodeNGramHashEmbeddingGemmAllReduce = None
     _MK_FUSED_DECODE_GEMM_HANDLE = (
         FusedDecodeNGramHashEmbeddingGemmAllReduceParams,
         NGramSpec,
         fused_decode_ngram_hash_embedding_gemm_all_reduce,
         is_fused_decode_ngram_hash_embedding_gemm_supported,
+        prepare_fused_decode_ngram_hash_embedding_gemm_all_reduce,
+        PreparedFusedDecodeNGramHashEmbeddingGemmAllReduce,
     )
     return _MK_FUSED_DECODE_GEMM_HANDLE
 
@@ -746,6 +767,19 @@ def _try_apply_welm_oe_fused_decode_gemm(
     any precondition (decode mode, low batch, supported shape, ...) is not met
     — in which case the caller falls back to the unfused embedding path.
     """
+    # Fast path: cuda_graph_runner pre-built a CUDA-graph-friendly Prepared
+    # handle for this batch bucket. The handle owns persistent GPU/host
+    # buffers (prefixes, output) whose pointers were baked into the captured
+    # graph; refreshing the prefixes is done in cuda_graph_runner.replay_prepare
+    # OUTSIDE the graph, and ``handle.launch()`` is the only thing captured
+    # inside the graph. We do not re-validate shapes / re-resolve modules here
+    # — the runner already validated everything at prepare time.
+    prepared = getattr(forward_batch, "welm_oe_fused_prepared", None)
+    fused_output = getattr(forward_batch, "welm_oe_fused_output", None)
+    if prepared is not None and fused_output is not None:
+        prepared.launch()
+        return fused_output
+
     def _bail(reason: str) -> None:
         # Each distinct reason logs at most once per process. We dedupe on the
         # full reason text rather than the format template so the user can see
@@ -937,6 +971,8 @@ def _try_apply_welm_oe_fused_decode_gemm(
         ngram_spec_cls,
         run_fused,
         is_supported,
+        _prepare_fn,
+        _prepared_cls,
     ) = handle
     ngram_spec = _build_mk_ngram_spec(ngram_spec_cls, oe_grams, oe_vocab_sizes)
     if not is_supported(
@@ -1029,6 +1065,430 @@ def _try_apply_welm_oe_fused_decode_gemm(
             batch_size,
         )
     return result
+
+
+# ----------------------------------------------------------------------
+# CUDA-graph-friendly entry points
+# ----------------------------------------------------------------------
+#
+# The functions below feed mk's ``prepare_fused_decode_ngram_hash_embedding_gemm
+# _all_reduce`` API. cuda_graph_runner builds one Prepared handle per captured
+# decode batch size at runner-init time; the captured graph then only invokes
+# ``prepared.launch()`` and the per-step prefix update is done OUTSIDE the
+# graph in ``replay_prepare`` via :func:`build_welm_oe_fused_prefix_list` +
+# ``handle.set_prefixes(...)``. Eligibility / shape gates duplicate the eager
+# logic in :func:`_try_apply_welm_oe_fused_decode_gemm` because the runner
+# cannot construct a real ``ForwardBatch`` at init time, only a model handle.
+# Keeping the duplication explicit is intentional — the eager path remains
+# the primary fallback for everything we don't capture (bs > 32, MTP,
+# DP-attn, scale_seq, --disable-cuda-graph, env off, mk missing).
+
+
+@dataclass
+class WelmOEFusedDecodeConfig:
+    """Stable per-runner shape/topology bundle for the mk fused decode kernel.
+
+    All fields are derived from model construction state and the resolved
+    process group; none of them depend on per-step input. Discovery is
+    therefore safe to run once at ``CudaGraphRunner.__init__`` time and the
+    result reused for every captured batch bucket.
+    """
+
+    embed_tokens: object  # the VocabParallelEmbedding for the base vocab
+    oe_embed_modules: tuple
+    oe_proj_module: object
+    process_group: object
+    world_size: int
+    rank: int
+    vocab_size: int  # base ``org_vocab_size`` of embed_tokens
+    input_hidden_size: int
+    hash_hidden_size: int
+    embedding_partition_size: int
+    oe_grams: tuple
+    oe_vocab_sizes: tuple
+
+
+def discover_welm_oe_fused_decode_modules(
+    model,
+) -> "WelmOEFusedDecodeConfig | None":
+    """Resolve the fused-decode topology for ``model`` or return ``None``.
+
+    Mirrors the structural checks in :func:`_try_apply_welm_oe_fused_decode_gemm`
+    but is purely structural (no ``ForwardBatch``, no ``input_ids``). Returns
+    a :class:`WelmOEFusedDecodeConfig` on success.
+    """
+    def _trace(reason: str) -> None:
+        # Each distinct reason logs at most once per process so a misconfigured
+        # WeLM deployment surfaces every gate that ever blocked the prepared
+        # path, while a non-WeLM model — which fails at the first gate — only
+        # emits a single line.
+        key = f"discover_trace:{reason}"
+        if key in _WELM_OE_FUSED_DECODE_GEMM_WARNED:
+            return
+        _WELM_OE_FUSED_DECODE_GEMM_WARNED.add(key)
+        logger.info(
+            "WeLM OE fused-decode discover rejected: %s", reason
+        )
+
+    embed_tokens = getattr(model, "embed_tokens", None) or getattr(
+        getattr(model, "model", None), "embed_tokens", None
+    )
+    oe_embed_modules = getattr(model, "oe_embed", None) or getattr(
+        getattr(model, "model", None), "oe_embed", None
+    )
+    oe_proj_module = getattr(model, "oe_gate_up_proj", None) or getattr(
+        getattr(model, "model", None), "oe_gate_up_proj", None
+    )
+    if (
+        embed_tokens is None
+        or oe_embed_modules is None
+        or oe_proj_module is None
+    ):
+        _trace(
+            f"missing modules (embed_tokens={embed_tokens is not None}, "
+            f"oe_embed={oe_embed_modules is not None}, "
+            f"oe_gate_up_proj={oe_proj_module is not None})"
+        )
+        return None
+
+    # Match the eager path's shape/topology contract.
+    proj_weight = getattr(oe_proj_module, "weight", None)
+    if proj_weight is None or proj_weight.dim() != 2:
+        _trace("oe_gate_up_proj.weight missing or not 2D")
+        return None
+    if getattr(oe_proj_module, "bias", None) is not None:
+        _trace("oe_gate_up_proj has bias")
+        return None
+    if not proj_weight.is_contiguous() or proj_weight.dtype is not torch.bfloat16:
+        _trace(
+            f"oe_gate_up_proj.weight contiguous={proj_weight.is_contiguous()} "
+            f"dtype={proj_weight.dtype}"
+        )
+        return None
+    if proj_weight.data_ptr() % 16 != 0:
+        _trace("oe_gate_up_proj.weight not 16B-aligned")
+        return None
+
+    input_hidden_size = int(proj_weight.shape[0])
+    hash_hidden_size = int(proj_weight.shape[1] // SPECIALIZED_WELM_OE_BRANCHES)
+    if (
+        input_hidden_size,
+        hash_hidden_size,
+    ) not in _MK_FUSED_DECODE_GEMM_SUPPORTED_HIDDEN:
+        _trace(
+            f"unsupported (input_hidden_size, hash_hidden_size)=("
+            f"{input_hidden_size}, {hash_hidden_size})"
+        )
+        return None
+
+    if oe_embed_modules is None:
+        _trace("oe_embed is None")
+        return None
+    try:
+        oe_embed_modules_count = len(oe_embed_modules)
+    except TypeError:
+        _trace("oe_embed is not iterable")
+        return None
+    if oe_embed_modules_count == 0:
+        _trace("oe_embed is empty")
+        return None
+    if oe_embed_modules_count != SPECIALIZED_WELM_OE_BRANCHES:
+        _trace(
+            f"oe_embed has {oe_embed_modules_count} branches != "
+            f"{SPECIALIZED_WELM_OE_BRANCHES}"
+        )
+        return None
+
+    first_oe = oe_embed_modules[0]
+    use_attn_tp_group = bool(getattr(first_oe, "use_attn_tp_group", False))
+    if bool(getattr(embed_tokens, "use_attn_tp_group", False)) != use_attn_tp_group:
+        _trace("embed_tokens / oe_embed sharded on different TP groups")
+        return None
+    world_size = int(getattr(first_oe, "tp_size", 1) or 1)
+    if world_size not in _MK_FUSED_DECODE_GEMM_SUPPORTED_WORLD_SIZES:
+        _trace(f"world_size={world_size} not in {{2,4,8}}")
+        return None
+
+    embed_weight = getattr(embed_tokens, "weight", None)
+    if embed_weight is None or embed_weight.dtype is not torch.bfloat16:
+        _trace("embed_tokens.weight missing or not bf16")
+        return None
+    if embed_weight.dim() != 2 or embed_weight.shape[1] != input_hidden_size:
+        _trace(
+            f"embed_tokens.weight shape {tuple(embed_weight.shape)} doesn't "
+            f"match input_hidden_size={input_hidden_size}"
+        )
+        return None
+    if not embed_weight.is_contiguous():
+        _trace("embed_tokens.weight not contiguous")
+        return None
+    embed_shard_indices = getattr(embed_tokens, "shard_indices", None)
+    if embed_shard_indices is not None and (
+        embed_shard_indices.num_added_elements_padded != 0
+    ):
+        _trace("embed_tokens has nonzero added-vocab padding")
+        return None
+    embed_table_vocab = int(
+        getattr(embed_tokens, "org_vocab_size", embed_weight.shape[0] * world_size)
+    )
+    if embed_weight.shape[0] * world_size != embed_table_vocab:
+        _trace(
+            f"embed_tokens shard rows {embed_weight.shape[0]} * world {world_size} "
+            f"!= org_vocab {embed_table_vocab}"
+        )
+        return None
+
+    embedding_partition_size: int | None = None
+    for i, module in enumerate(oe_embed_modules):
+        weight = getattr(module, "weight", None)
+        if weight is None or weight.dtype is not torch.bfloat16:
+            _trace(f"oe_embed[{i}].weight missing or not bf16")
+            return None
+        if weight.dim() != 2 or weight.shape[1] != hash_hidden_size:
+            _trace(
+                f"oe_embed[{i}].weight unexpected shape {tuple(weight.shape)}"
+            )
+            return None
+        if not weight.is_contiguous():
+            _trace(f"oe_embed[{i}].weight not contiguous")
+            return None
+        shard_indices = getattr(module, "shard_indices", None)
+        if shard_indices is not None and (
+            shard_indices.num_added_elements_padded != 0
+        ):
+            _trace(f"oe_embed[{i}] has nonzero added-vocab padding")
+            return None
+        local_partition = int(weight.shape[0])
+        if embedding_partition_size is None:
+            embedding_partition_size = local_partition
+        elif embedding_partition_size != local_partition:
+            _trace(
+                f"oe_embed partitions disagree: "
+                f"{embedding_partition_size} vs {local_partition}"
+            )
+            return None
+
+    if embedding_partition_size is None:
+        _trace("embedding_partition_size is None after loop")
+        return None
+
+    # Resolve OE config (oe_grams / oe_vocab_sizes) from the model_config.
+    model_config = getattr(model, "config", None) or getattr(
+        getattr(model, "model", None), "config", None
+    )
+    oe_grams = tuple(int(g) for g in getattr(model_config, "oe_grams", ()) or ())
+    oe_vocab_sizes = tuple(
+        int(v) for v in getattr(model_config, "oe_vocab_sizes", ()) or ()
+    )
+    if (
+        tuple(oe_grams) != _MK_FUSED_DECODE_GEMM_NGRAMS
+        or len(oe_vocab_sizes) != SPECIALIZED_WELM_OE_BRANCHES
+    ):
+        _trace(
+            f"unsupported config: oe_grams={oe_grams} "
+            f"oe_vocab_sizes={oe_vocab_sizes}"
+        )
+        return None
+
+    # Resolve the right process_group: OE / embed sharded along the attention
+    # TP group means the all-reduce must run on attn-TP, not the global TP.
+    try:
+        if use_attn_tp_group:
+            from sglang.srt.layers.dp_attention import get_attention_tp_group
+
+            coord = get_attention_tp_group()
+        else:
+            from sglang.srt.distributed import get_tp_group
+
+            coord = get_tp_group()
+    except Exception as exc:
+        _trace(f"failed to resolve process group coordinator: {exc!r}")
+        return None
+    process_group = getattr(coord, "device_group", None)
+    if process_group is None:
+        _trace("coordinator has no device_group")
+        return None
+
+    try:
+        import torch.distributed as dist
+
+        if not dist.is_initialized():
+            _trace("torch.distributed is not initialized")
+            return None
+        rank = int(dist.get_rank(process_group))
+        pg_world = int(dist.get_world_size(process_group))
+    except Exception as exc:
+        _trace(f"failed to read rank/world_size from PG: {exc!r}")
+        return None
+    if pg_world != world_size:
+        _trace(
+            f"process_group world {pg_world} != module tp_size {world_size}"
+        )
+        return None
+
+    return WelmOEFusedDecodeConfig(
+        embed_tokens=embed_tokens,
+        oe_embed_modules=tuple(oe_embed_modules),
+        oe_proj_module=oe_proj_module,
+        process_group=process_group,
+        world_size=world_size,
+        rank=rank,
+        vocab_size=embed_table_vocab,
+        input_hidden_size=input_hidden_size,
+        hash_hidden_size=hash_hidden_size,
+        embedding_partition_size=embedding_partition_size,
+        oe_grams=tuple(oe_grams),
+        oe_vocab_sizes=tuple(oe_vocab_sizes),
+    )
+
+
+def prepare_welm_oe_fused_decode_handle(
+    *,
+    config: WelmOEFusedDecodeConfig,
+    static_input_ids: torch.Tensor,
+    static_output: torch.Tensor,
+    runtime_batch_size: int,
+):
+    """Build one mk Prepared handle for ``runtime_batch_size`` decode tokens.
+
+    ``static_input_ids`` and ``static_output`` MUST be persistent GPU tensors
+    whose ``data_ptr()`` is stable for the lifetime of every cuda graph that
+    will capture ``handle.launch()``. cuda_graph_runner satisfies this by
+    slicing the per-runner ``DecodeInputBuffers`` buffers (which themselves
+    live for the runner's lifetime).
+
+    Returns ``None`` if mk is missing, the prepared API isn't exported yet,
+    or mk rejects the (shape, world, batch) tuple. The runner then falls
+    back to the eager path inside the captured graph for that bucket.
+    """
+    if runtime_batch_size <= 0 or runtime_batch_size > _MK_FUSED_DECODE_GEMM_MAX_BATCH:
+        return None
+    if static_input_ids.numel() < runtime_batch_size:
+        return None
+    if static_output.shape != (runtime_batch_size, config.input_hidden_size):
+        return None
+    if static_output.dtype is not torch.bfloat16 or not static_output.is_contiguous():
+        return None
+
+    handle = _load_mk_fused_decode_gemm()
+    if handle is None:
+        return None
+    (
+        _params_cls,
+        ngram_spec_cls,
+        _run_fused,
+        is_supported,
+        prepare_fn,
+        _prepared_cls,
+    ) = handle
+    if prepare_fn is None:
+        # Older mk build without the graph-friendly API; the runner caller
+        # treats this as ineligibility and stays on the eager captured path.
+        if "prepare_api_missing" not in _WELM_OE_FUSED_DECODE_GEMM_WARNED:
+            _WELM_OE_FUSED_DECODE_GEMM_WARNED.add("prepare_api_missing")
+            logger.warning(
+                "%s=1 cannot use cuda graph: installed mk lacks "
+                "prepare_fused_decode_ngram_hash_embedding_gemm_all_reduce; "
+                "upgrade mk to enable graph capture of the fused embedding.",
+                WELM_OE_FUSED_DECODE_GEMM_ENV,
+            )
+        return None
+
+    ngram_spec = _build_mk_ngram_spec(
+        ngram_spec_cls, config.oe_grams, config.oe_vocab_sizes
+    )
+    if not is_supported(
+        config.input_hidden_size,
+        config.hash_hidden_size,
+        config.world_size,
+        runtime_batch_size,
+        ngram_spec,
+        config.embedding_partition_size,
+    ):
+        return None
+
+    try:
+        prepared = prepare_fn(
+            input_ids=static_input_ids,
+            input_embedding_table=config.embed_tokens.weight,
+            hash_embedding_tables=tuple(
+                m.weight for m in config.oe_embed_modules
+            ),
+            weight=config.oe_proj_module.weight,
+            output=static_output,
+            process_group=config.process_group,
+            runtime_batch_size=runtime_batch_size,
+            vocab_size=config.vocab_size,
+            ngram_spec=ngram_spec,
+            input_hidden_size=config.input_hidden_size,
+            hash_hidden_size=config.hash_hidden_size,
+            world_size=config.world_size,
+            embedding_partition_size=config.embedding_partition_size,
+        )
+    except Exception as exc:
+        # Broad except per audit: includes MKConfigError, RuntimeError from
+        # NCCL/symm-mem rendezvous, CUDA OOM. Any failure here just means
+        # this bucket falls through to the eager captured path.
+        logger.warning(
+            "%s=1: failed to prepare mk fused decode for bs=%d: %r; "
+            "this batch size will use the eager captured fused path.",
+            WELM_OE_FUSED_DECODE_GEMM_ENV,
+            runtime_batch_size,
+            exc,
+        )
+        return None
+
+    if (
+        f"prepared_engaged_bs{runtime_batch_size}"
+        not in _WELM_OE_FUSED_DECODE_GEMM_WARNED
+    ):
+        _WELM_OE_FUSED_DECODE_GEMM_WARNED.add(
+            f"prepared_engaged_bs{runtime_batch_size}"
+        )
+        logger.info(
+            "%s=1 active: mk fused decode embedding-GEMM-all-reduce prepared "
+            "for cuda graph (bs=%d, in=%d, hash=%d, world=%d, partition=%d).",
+            WELM_OE_FUSED_DECODE_GEMM_ENV,
+            runtime_batch_size,
+            config.input_hidden_size,
+            config.hash_hidden_size,
+            config.world_size,
+            config.embedding_partition_size,
+        )
+    return prepared
+
+
+def build_welm_oe_fused_prefix_list(
+    *,
+    forward_batch,
+    runtime_batch_size: int,
+    max_history: int,
+) -> list[list[int]]:
+    """Build a ``list[list[int]]`` of prefix tokens for ``handle.set_prefixes``.
+
+    Inner length is exactly ``max_history`` (mk pads missing slots with 0
+    automatically, but we standardize for predictable host writes). Outer
+    length is exactly ``runtime_batch_size``. When ``oe_context`` or
+    ``hash_prefixes`` is missing (e.g. very first decode step before any
+    history accumulates), every inner list is empty; mk zero-fills the
+    pinned host buffer in that case.
+    """
+    oe_context = getattr(forward_batch, "oe_context", None)
+    prefix_rows = getattr(oe_context, "hash_prefixes", None) if oe_context is not None else None
+    if not prefix_rows:
+        return [[] for _ in range(runtime_batch_size)]
+    avail_history = min(max_history, len(prefix_rows))
+    rows = []
+    for token_idx in range(runtime_batch_size):
+        row = []
+        for lag in range(avail_history):
+            lag_row = prefix_rows[lag]
+            if lag_row is None or token_idx >= len(lag_row):
+                # Missing prefix at this lag — mk fills with 0.
+                continue
+            row.append(int(lag_row[token_idx]))
+        rows.append(row)
+    return rows
 
 
 def welm_embeddings(
@@ -1128,8 +1588,16 @@ def welm_embeddings(
                 # the unfused reference on every fused call and log the
                 # worst-ever max-abs / rel diff. Useful for catching a kernel
                 # regression in production traffic without paying the cost on
-                # the hot path by default.
-                if _env_flag("SGLANG_WELM_OE_FUSED_DECODE_GEMM_PROBE", "0"):
+                # the hot path by default. Skipped under cuda graph capture
+                # (would bake unfused reference kernels into the graph and
+                # blow up the capture region) and under cuda graph replay
+                # (the host-side recompute would race against the captured
+                # graph's reads of the static buffers).
+                if (
+                    _env_flag("SGLANG_WELM_OE_FUSED_DECODE_GEMM_PROBE", "0")
+                    and not torch.cuda.is_current_stream_capturing()
+                    and getattr(forward_batch, "welm_oe_fused_prepared", None) is None
+                ):
                     try:
                         ref_base = embed_tokens(input_ids)
                         ref = compute_welm_oe_embedding(
