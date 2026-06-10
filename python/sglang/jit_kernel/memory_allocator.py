@@ -11,6 +11,7 @@ Uses ctypes to call the CUDA runtime directly — no JIT compilation needed.
 from __future__ import annotations
 
 import ctypes
+import os
 from functools import lru_cache
 from typing import Tuple, Union
 
@@ -34,6 +35,9 @@ _DTYPE_SIZE = {
     torch.bool: 1,
 }
 
+_COMPACT_MEMORY_PATH = "/proc/sys/vm/compact_memory"
+_CUDA_MALLOC_HOST_RETRY_LOCK = "/tmp/sglang_cuda_malloc_host_retry.lock"
+
 
 def _element_size(dtype: torch.dtype) -> int:
     if dtype in _DTYPE_SIZE:
@@ -46,6 +50,42 @@ def _numel(sizes) -> int:
     for s in sizes:
         n *= s
     return n
+
+
+def _cuda_malloc_host(cudart, total_bytes: int):
+    host_ptr = ctypes.c_void_p(0)
+    err = cudart.cudaMallocHost(ctypes.byref(host_ptr), ctypes.c_size_t(total_bytes))
+    return err, host_ptr
+
+
+def _compact_memory() -> None:
+    with open(_COMPACT_MEMORY_PATH, "w") as f:
+        f.write("1\n")
+
+
+# Memory compaction is a host-wide operation. Serialize fallback retries so
+# multiple TP workers do not compact memory concurrently after the same failure.
+def _retry_cuda_malloc_host_after_compaction(cudart, total_bytes: int):
+    import fcntl
+
+    os.makedirs(os.path.dirname(_CUDA_MALLOC_HOST_RETRY_LOCK), exist_ok=True)
+    with open(_CUDA_MALLOC_HOST_RETRY_LOCK, "a+") as lock_file:
+        fcntl.flock(lock_file, fcntl.LOCK_EX)
+        try:
+            err, host_ptr = _cuda_malloc_host(cudart, total_bytes)
+            if err == 0:
+                return err, host_ptr, None
+
+            compact_error = None
+            try:
+                _compact_memory()
+            except OSError as e:
+                compact_error = e
+
+            err, host_ptr = _cuda_malloc_host(cudart, total_bytes)
+            return err, host_ptr, compact_error
+        finally:
+            fcntl.flock(lock_file, fcntl.LOCK_UN)
 
 
 @lru_cache()
@@ -90,13 +130,28 @@ def custom_empty(
     cudart = _get_cudart()
     torch.cuda.set_device(device_id)
 
-    host_ptr = ctypes.c_void_p(0)
-    err = cudart.cudaMallocHost(ctypes.byref(host_ptr), ctypes.c_size_t(total_bytes))
+    err, host_ptr = _cuda_malloc_host(cudart, total_bytes)
     if err != 0:
-        raise RuntimeError(
-            f"cudaMallocHost failed with error code {err} "
-            f"(requested {total_bytes} bytes)"
-        )
+        first_err = err
+        try:
+            err, host_ptr, compact_error = _retry_cuda_malloc_host_after_compaction(
+                cudart, total_bytes
+            )
+        except Exception as e:
+            raise RuntimeError(
+                f"cudaMallocHost failed with error code {first_err} "
+                f"(requested {total_bytes} bytes); retry after memory "
+                f"compaction could not run: {e}"
+            ) from e
+        if err != 0:
+            error_msg = (
+                f"cudaMallocHost failed with error code {first_err} "
+                f"(requested {total_bytes} bytes); retry after memory "
+                f"compaction failed with error code {err}"
+            )
+            if compact_error is not None:
+                error_msg += f"; memory compaction failed: {compact_error}"
+            raise RuntimeError(error_msg)
     ptr = host_ptr.value
 
     def _free_host(p, _cudart=cudart, _c_void_p=ctypes.c_void_p):
