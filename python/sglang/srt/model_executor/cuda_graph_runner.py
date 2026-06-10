@@ -927,6 +927,14 @@ class CudaGraphRunner:
 
         self.welm_oe_decode_hash_config = None
         welm_oe_decode_hash_num_branches = 0
+        # scale_seq captures as TARGET_VERIFY even without speculative decoding
+        # because one input token expands into multiple KV writes. Its OE hash
+        # inputs are still decode-style, bs-sized inputs.
+        is_scale_seq_pseudo_tv = (
+            self.scale_seq_factor > 1
+            and self.capture_forward_mode.is_target_verify()
+            and not self.model_runner.spec_algorithm.is_speculative()
+        )
         if (
             self.model_runner.server_args.prepare_n_gram_inputs
             and (
@@ -935,6 +943,7 @@ class CudaGraphRunner:
                     self.capture_forward_mode.is_target_verify()
                     and self.model_runner.spec_algorithm.is_speculative()
                 )
+                or is_scale_seq_pseudo_tv
             )
             and should_use_welm_oe_hash_kernel(
                 self.model_runner.model_config
@@ -1486,18 +1495,20 @@ class CudaGraphRunner:
             router_replay_mask=buffers.router_replay_mask[:router_replay_num_tokens],
             global_forward_mode=self.capture_forward_mode,
             lora_ids=lora_ids,
+            scale_seq_factor=self.scale_seq_factor,
         )
         if self.model_runner.server_args.prepare_n_gram_inputs:
             use_welm_oe_decode_hash = (
                 self.welm_oe_decode_hash_config is not None
                 and buffers.welm_oe_decode_hashed_inputs is not None
             )
+            oe_capture_token = model_input_len
             if use_welm_oe_decode_hash:
                 forward_batch.oe_context = OverEncodingContext(
                     input_ids_buffer=HashInputIdsBuffer([])
                 )
                 forward_batch.welm_oe_decode_hashed_inputs = (
-                    buffers.welm_oe_decode_hashed_inputs[:, :num_tokens]
+                    buffers.welm_oe_decode_hashed_inputs[:, :oe_capture_token]
                 )
             else:
                 raise RuntimeError(
@@ -1561,7 +1572,7 @@ class CudaGraphRunner:
             forward_batch.dp_local_start_pos = forward_batch.dp_local_num_tokens = None
             if use_welm_oe_decode_hash:
                 forward_batch.welm_oe_decode_hashed_inputs = (
-                    buffers.welm_oe_decode_hashed_inputs[:, :num_tokens]
+                    buffers.welm_oe_decode_hashed_inputs[:, :oe_capture_token]
                 )
             else:
                 forward_batch.welm_oe_decode_hashed_inputs = None
@@ -1713,6 +1724,12 @@ class CudaGraphRunner:
         cached_welm_oe_hash_inputs = getattr(
             forward_batch, "welm_oe_decode_hashed_inputs", None
         )
+        # In scale_seq mode, forward_batch.input_ids and OE hash inputs are
+        # bs-sized, while raw_num_token/static_num_token describe the expanded
+        # KV-write view. Keep hash buffer copies aligned with input_ids.
+        is_scale_seq_replay = self.scale_seq_factor > 1
+        oe_active_token = raw_bs if is_scale_seq_replay else raw_num_token
+        oe_static_token = bs if is_scale_seq_replay else bs * self.num_tokens_per_bs
         # Precedence branch: if the runner has a prepared mk fused-decode
         # handle for this bucket, refresh its prefix buffer (host-side write
         # + stream-ordered H2D copy) and dispatch the prepared handle to the
@@ -1760,13 +1777,12 @@ class CudaGraphRunner:
             and buffers.welm_oe_decode_hashed_inputs is not None
             and cached_welm_oe_hash_inputs is not None
         ):
-            buffers.welm_oe_decode_hashed_inputs[:, :raw_num_token].copy_(
-                cached_welm_oe_hash_inputs[:, :raw_num_token]
+            buffers.welm_oe_decode_hashed_inputs[:, :oe_active_token].copy_(
+                cached_welm_oe_hash_inputs[:, :oe_active_token]
             )
-            static_num_token = bs * self.num_tokens_per_bs
-            if raw_num_token < static_num_token:
+            if oe_active_token < oe_static_token:
                 buffers.welm_oe_decode_hashed_inputs[
-                    :, raw_num_token:static_num_token
+                    :, oe_active_token:oe_static_token
                 ].zero_()
         elif (
             self.welm_oe_decode_hash_config is not None
@@ -1776,17 +1792,16 @@ class CudaGraphRunner:
         ):
             oe_grams, oe_vocab_sizes = self.welm_oe_decode_hash_config
             fill_welm_oe_hash_inputs(
-                forward_batch.input_ids[:raw_num_token],
-                buffers.welm_oe_decode_hashed_inputs[:, :raw_num_token],
+                forward_batch.input_ids[:oe_active_token],
+                buffers.welm_oe_decode_hashed_inputs[:, :oe_active_token],
                 forward_batch,
                 oe_grams,
                 oe_vocab_sizes,
                 self.model_runner.model_config.vocab_size,
             )
-            static_num_token = bs * self.num_tokens_per_bs
-            if raw_num_token < static_num_token:
+            if oe_active_token < oe_static_token:
                 buffers.welm_oe_decode_hashed_inputs[
-                    :, raw_num_token:static_num_token
+                    :, oe_active_token:oe_static_token
                 ].zero_()
         if self.enable_two_batch_overlap:
             self.tbo_plugin.replay_prepare(
