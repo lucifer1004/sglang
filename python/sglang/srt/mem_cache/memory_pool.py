@@ -106,9 +106,16 @@ def _set_kv_buffer_impl(
         if k_rows.shape[0] == 1:
             k_rows = k_rows.expand(index_count, -1)
             v_rows = v_rows.expand(index_count, -1)
-        else:
+        elif k_rows.shape[0] > index_count:
             k_rows = k_rows[:index_count]
             v_rows = v_rows[:index_count]
+        else:
+            raise RuntimeError(
+                "KV cache store row/index mismatch: "
+                f"k_rows={k_rows.shape[0]}, v_rows={v_rows.shape[0]}, "
+                f"indices={index_count}, row_dim={row_dim}. "
+                "This would read past the source KV tensor in the JIT store_cache kernel."
+            )
 
     row_bytes = row_dim * store_dtype.itemsize
     if (_is_cuda or _is_hip) and same_kv_dim and can_use_store_cache(row_bytes):

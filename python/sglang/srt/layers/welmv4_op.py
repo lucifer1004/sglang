@@ -811,6 +811,7 @@ def _welmv4_inplace_rope_kernel(
     position_ptr: tl.tensor,
     cos_sin_cache_ptr: tl.tensor,
     last_index_ptr: tl.tensor,
+    query_position_ptr: tl.tensor,
     N: int,
     BS: int,
     q_token_stride: tl.constexpr,
@@ -844,8 +845,11 @@ def _welmv4_inplace_rope_kernel(
         )
         if last_index_ptr is not None:
             if token_id < BS:
-                position_id = tl.load(last_index_ptr + token_id)
-                position_id = tl.load(position_ptr + position_id)
+                if query_position_ptr is not None:
+                    position_id = tl.load(query_position_ptr + token_id)
+                else:
+                    position_id = tl.load(last_index_ptr + token_id)
+                    position_id = tl.load(position_ptr + position_id)
                 cos_sin_cache = tl.load(
                     cos_sin_cache_ptr + position_id * rope_dim + cos_off
                 )
@@ -898,6 +902,7 @@ class WelmV4InplaceRotaryEmbedding(RotaryEmbedding):
         offsets: Optional[torch.Tensor] = None,
         fused_set_kv_buffer_arg: Optional[FusedSetKVBufferArg] = None,
         last_index: Optional[torch.Tensor] = None,
+        last_query_positions: Optional[torch.Tensor] = None,
     ):
         query_num_heads = query.shape[-1] // self.head_size
         key_num_heads = key.shape[-1] // self.head_size
@@ -916,7 +921,18 @@ class WelmV4InplaceRotaryEmbedding(RotaryEmbedding):
                 # same selected rows as Q. The Triton kernel loops over
                 # positions and always writes K, so pass the contracted
                 # positions in this case instead of the full extend positions.
-                positions = positions[last_index]
+                if last_query_positions is not None:
+                    if last_query_positions.shape[0] != last_index.numel():
+                        raise ValueError(
+                            "WelmV4InplaceRotaryEmbedding expects "
+                            "last_query_positions to match last_index length; "
+                            f"got query_positions={last_query_positions.shape[0]}, "
+                            f"last_index_tokens={last_index.numel()}."
+                        )
+                    positions = last_query_positions
+                    last_query_positions = None
+                else:
+                    positions = positions[last_index]
                 last_index = None
             elif key.shape[0] != positions.shape[0]:
                 raise ValueError(
@@ -935,6 +951,7 @@ class WelmV4InplaceRotaryEmbedding(RotaryEmbedding):
             positions,
             self.cos_sin_cache,
             last_index,
+            last_query_positions,
             N,
             BS,
             query.stride(0),

@@ -214,6 +214,7 @@ def welm_oe_hash_mtp_draft_extend_after_verify_from_history_cuda(
     next_history_state: torch.Tensor,
     vocab_size: int,
     draft_token_num: int,
+    use_entry_history_for_extend_hash_prefix: bool = False,
 ) -> None:
     """Compute MTP draft-extend hashes and next compact history.
 
@@ -236,6 +237,7 @@ def welm_oe_hash_mtp_draft_extend_after_verify_from_history_cuda(
         next_history_state,
         int(vocab_size),
         int(draft_token_num),
+        int(use_entry_history_for_extend_hash_prefix),
     )
 
 

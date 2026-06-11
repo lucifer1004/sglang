@@ -292,6 +292,7 @@ __global__ void welm_oe_hash_mtp_draft_extend_after_verify_from_history_kernel(
     int64_t* __restrict__ next_history_state,
     int32_t draft_token_num,
     int32_t accepted_width,
+    int32_t use_entry_history_for_extend_hash_prefix,
     WelmOeHashRuntimeParams params) {
   const int32_t seq_id = static_cast<int32_t>(blockIdx.x);
   if (seq_id >= params.num_segments) return;
@@ -340,14 +341,19 @@ __global__ void welm_oe_hash_mtp_draft_extend_after_verify_from_history_kernel(
         if (local_pos >= lag) {
           prev = static_cast<uint32_t>(input_ids[token_idx - lag]);
         } else {
-          prev = get_after_accept_history_token(
-              entry_history,
-              accepted_draft_token_ids,
-              accept_lens,
-              seq_id,
-              history_width,
-              accepted_width,
-              lag - local_pos);
+          if (use_entry_history_for_extend_hash_prefix) {
+            prev = get_history_state_token(
+                entry_history, seq_id, history_width, lag - local_pos);
+          } else {
+            prev = get_after_accept_history_token(
+                entry_history,
+                accepted_draft_token_ids,
+                accept_lens,
+                seq_id,
+                history_width,
+                accepted_width,
+                lag - local_pos);
+          }
         }
         running_ids += prev * vocab_power;
         vocab_power *= params.vocab_size;
@@ -582,6 +588,7 @@ void launch_welm_oe_hash_mtp_draft_extend_after_verify_from_history(
     int64_t* next_history_state,
     int32_t draft_token_num,
     int32_t accepted_width,
+    int32_t use_entry_history_for_extend_hash_prefix,
     const tvm::ffi::Shape& oe_grams,
     const tvm::ffi::Shape& oe_vocab_sizes,
     size_t batch_size,
@@ -606,6 +613,7 @@ void launch_welm_oe_hash_mtp_draft_extend_after_verify_from_history(
       next_history_state,
       draft_token_num,
       accepted_width,
+      use_entry_history_for_extend_hash_prefix,
       params);
 }
 
@@ -1073,7 +1081,8 @@ struct WelmOeHashMtpDraftExtendAfterVerifyFromHistory {
       tvm::ffi::TensorView hashed_out,
       tvm::ffi::TensorView next_history_state,
       int64_t vocab_size,
-      int64_t draft_token_num) {
+      int64_t draft_token_num,
+      int64_t use_entry_history_for_extend_hash_prefix) {
     using namespace host;
 
     SymbolicSize N = {"num_tokens"};
@@ -1156,6 +1165,7 @@ struct WelmOeHashMtpDraftExtendAfterVerifyFromHistory {
         static_cast<int64_t*>(next_history_state.data_ptr()),                \
         static_cast<int32_t>(draft_token_num),                               \
         static_cast<int32_t>(accepted_width),                                \
+        static_cast<int32_t>(use_entry_history_for_extend_hash_prefix),       \
         oe_grams,                                                            \
         oe_vocab_sizes,                                                      \
         batch_size,                                                          \

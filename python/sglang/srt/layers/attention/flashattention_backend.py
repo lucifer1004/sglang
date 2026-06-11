@@ -875,6 +875,17 @@ class FlashAttentionBackend(AttentionBackend):
                     if not layer.is_cross_attention
                     else forward_batch.encoder_out_cache_loc
                 )
+                custom_last_cache_loc = getattr(
+                    forward_batch, "custom_last_cache_loc", None
+                )
+                if (
+                    not layer.is_cross_attention
+                    and getattr(forward_batch, "welm_kv_mirror_contracted", False)
+                    and custom_last_cache_loc is not None
+                    and k.shape[0] != cache_loc.numel()
+                    and k.shape[0] == custom_last_cache_loc.numel()
+                ):
+                    cache_loc = custom_last_cache_loc
                 if not self.use_mla:
                     forward_batch.token_to_kv_pool.set_kv_buffer(
                         layer, cache_loc, k, v, layer.k_scale, layer.v_scale

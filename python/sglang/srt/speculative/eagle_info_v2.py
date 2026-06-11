@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -35,6 +36,14 @@ from sglang.srt.speculative.spec_utils import (
     SIMULATE_ACC_LEN,
     generate_simulated_accept_index,
 )
+from sglang.srt.speculative.welmv4_mtp_sampling import (
+    welm_mtp_batch_base_positions,
+    welm_mtp_deterministic_uniforms,
+    welm_mtp_sample_from_weights_with_uniform,
+    welmv4_mtp_fused_topk_softmax_sample,
+    welmv4_mtp_fused_verify_top1_dense_target,
+    welmv4_mtp_fused_verify_top1_sparse,
+)
 from sglang.srt.utils.common import is_cuda, is_hip, is_musa, is_npu, next_power_of_2
 
 _is_cuda = is_cuda()
@@ -55,6 +64,267 @@ if is_cuda() or is_musa():
         top_p_renorm_prob,
         tree_speculative_sampling_target_only,
     )
+
+
+_WELM_MTP_VERIFY_SAMPLING_TOPK_ENV = "SGLANG_WELM_MTP_VERIFY_SAMPLING_TOPK"
+_WELM_MTP_VERIFY_FUSED_REJECT_ENV = "SGLANG_WELM_MTP_VERIFY_FUSED_REJECT"
+
+
+def _env_flag(name: str, default: str = "0") -> bool:
+    return os.environ.get(name, default).strip().lower() in {
+        "1",
+        "true",
+        "on",
+        "yes",
+    }
+
+
+def _welm_mtp_verify_sampling_topk() -> int:
+    value = os.environ.get(_WELM_MTP_VERIFY_SAMPLING_TOPK_ENV, "0")
+    try:
+        return max(0, int(value))
+    except ValueError:
+        return 0
+
+
+def _welm_mtp_verify_fused_reject_enabled() -> bool:
+    return _env_flag(_WELM_MTP_VERIFY_FUSED_REJECT_ENV, "1")
+
+
+def verify_top1_chain_with_draft_probs_v2(
+    predicts: torch.Tensor,
+    accept_index: torch.Tensor,
+    accept_token_num: torch.Tensor,
+    candidates: torch.Tensor,
+    retrieve_index: torch.Tensor,
+    retrieve_next_token: torch.Tensor,
+    target_probs: torch.Tensor,
+    draft_probs: torch.Tensor | None = None,
+    draft_topk_indices: torch.Tensor | None = None,
+    draft_topk_values: torch.Tensor | None = None,
+    uniforms: torch.Tensor | None = None,
+) -> None:
+    bs = candidates.shape[0]
+    spec_steps = accept_index.shape[1]
+    eps = torch.finfo(target_probs.dtype).tiny
+
+    def get_q(b: int, local_idx: int, token_id: int) -> torch.Tensor:
+        if draft_probs is not None:
+            return draft_probs[b, local_idx, token_id]
+        indices = draft_topk_indices[b, local_idx]
+        values = draft_topk_values[b, local_idx]
+        return torch.where(indices == token_id, values, torch.zeros_like(values)).sum()
+
+    def get_residual_probs(b: int, local_idx: int) -> torch.Tensor:
+        if draft_probs is not None:
+            return torch.clamp(
+                target_probs[b, local_idx] - draft_probs[b, local_idx],
+                min=0,
+            )
+        residual_probs = target_probs[b, local_idx].clone()
+        residual_probs[draft_topk_indices[b, local_idx]] -= draft_topk_values[
+            b, local_idx
+        ]
+        return torch.clamp(residual_probs, min=0)
+
+    for b in range(bs):
+        local_parent_idx = 0
+        parent_predict_idx = int(retrieve_index[b, local_parent_idx].item())
+        accept_index[b, 0] = parent_predict_idx
+        accepted = 0
+
+        for step in range(1, spec_steps):
+            next_local_idx = int(retrieve_next_token[b, local_parent_idx].item())
+            if next_local_idx < 0:
+                break
+
+            draft_token_id = int(candidates[b, next_local_idx].item())
+            p = target_probs[b, local_parent_idx, draft_token_id]
+            q = get_q(b, local_parent_idx, draft_token_id)
+            accept_prob = torch.clamp(p / torch.clamp(q, min=eps), max=1.0)
+            accept_coin = (
+                uniforms[b, step - 1]
+                if uniforms is not None
+                else torch.rand((), dtype=torch.float32, device=target_probs.device)
+            )
+            if (accept_coin <= accept_prob).item():
+                predicts[parent_predict_idx] = draft_token_id
+                accepted += 1
+                child_predict_idx = int(retrieve_index[b, next_local_idx].item())
+                accept_index[b, accepted] = child_predict_idx
+                local_parent_idx = next_local_idx
+                parent_predict_idx = child_predict_idx
+            else:
+                residual_probs = get_residual_probs(b, local_parent_idx)
+                if (residual_probs.sum() <= 0).item():
+                    residual_probs = target_probs[b, local_parent_idx]
+                predicts[parent_predict_idx] = (
+                    welm_mtp_sample_from_weights_with_uniform(
+                        residual_probs, uniforms[b, spec_steps - 1]
+                    ).to(dtype=torch.int32)
+                    if uniforms is not None
+                    else torch.multinomial(residual_probs, num_samples=1)
+                    .to(dtype=torch.int32)
+                    .squeeze(0)
+                )
+                break
+        else:
+            predicts[parent_predict_idx] = (
+                welm_mtp_sample_from_weights_with_uniform(
+                    target_probs[b, local_parent_idx], uniforms[b, spec_steps - 1]
+                ).to(dtype=torch.int32)
+                if uniforms is not None
+                else torch.multinomial(
+                    target_probs[b, local_parent_idx], num_samples=1
+                )
+                .to(dtype=torch.int32)
+                .squeeze(0)
+            )
+
+        accept_token_num[b] = accepted
+
+
+def verify_top1_chain_with_sparse_target_probs_v2_vectorized(
+    predicts: torch.Tensor,
+    accept_index: torch.Tensor,
+    accept_token_num: torch.Tensor,
+    candidates: torch.Tensor,
+    retrieve_index: torch.Tensor,
+    retrieve_next_token: torch.Tensor,
+    target_topk_indices: torch.Tensor,
+    target_topk_values: torch.Tensor,
+    draft_topk_indices: torch.Tensor,
+    draft_topk_values: torch.Tensor,
+    uniforms: torch.Tensor | None = None,
+) -> None:
+    bs, draft_token_num = candidates.shape
+    num_draft_steps = min(accept_index.shape[1] - 1, draft_token_num - 1)
+    device = candidates.device
+
+    def gather_2d(values: torch.Tensor, index: torch.Tensor) -> torch.Tensor:
+        return values.gather(1, index.view(bs, 1)).squeeze(1)
+
+    def gather_3d(values: torch.Tensor, index: torch.Tensor) -> torch.Tensor:
+        return values.gather(
+            1, index.view(bs, 1, 1).expand(-1, 1, values.shape[-1])
+        ).squeeze(1)
+
+    chain_nodes = [torch.zeros((bs,), dtype=torch.long, device=device)]
+    parent_nodes = []
+    child_nodes = []
+    draft_token_ids = []
+    accept_probs = []
+
+    for _ in range(num_draft_steps):
+        parent = chain_nodes[-1]
+        child = gather_2d(retrieve_next_token, parent).to(dtype=torch.long)
+        valid_child = child >= 0
+        safe_child = child.clamp(min=0)
+        parent_nodes.append(parent)
+        child_nodes.append(safe_child)
+        chain_nodes.append(safe_child)
+
+        token_id = gather_2d(candidates, safe_child).to(dtype=torch.long)
+        draft_token_ids.append(token_id)
+
+        target_indices = gather_3d(target_topk_indices, parent)
+        target_values = gather_3d(target_topk_values, parent)
+        draft_indices = gather_3d(draft_topk_indices, parent)
+        draft_values = gather_3d(draft_topk_values, parent)
+
+        p = torch.where(
+            target_indices == token_id.view(bs, 1),
+            target_values,
+            torch.zeros_like(target_values),
+        ).sum(dim=1)
+        q = torch.where(
+            draft_indices == token_id.view(bs, 1),
+            draft_values,
+            torch.zeros_like(draft_values),
+        ).sum(dim=1)
+        eps = torch.finfo(target_values.dtype).tiny
+        accept_prob = torch.clamp(p / torch.clamp(q, min=eps), max=1.0)
+        accept_probs.append(
+            torch.where(valid_child, accept_prob, torch.zeros_like(accept_prob))
+        )
+        chain_nodes[-1] = torch.where(valid_child, safe_child, parent)
+
+    if not accept_probs:
+        accept_token_num.zero_()
+        return
+
+    accept_prob_tensor = torch.stack(accept_probs, dim=1)
+    accept_coins = (
+        uniforms[:, :num_draft_steps]
+        if uniforms is not None
+        else torch.rand_like(accept_prob_tensor, dtype=torch.float32)
+    )
+    accept_each = accept_coins <= accept_prob_tensor
+    prefix_accept = torch.cumprod(accept_each.to(dtype=torch.int32), dim=1).bool()
+    accepted_count = prefix_accept.to(dtype=torch.int32).sum(dim=1)
+
+    accept_index[:, 0] = retrieve_index[:, 0].to(dtype=accept_index.dtype)
+    neg_one = torch.full((bs,), -1, dtype=accept_index.dtype, device=device)
+    for step, child in enumerate(child_nodes):
+        child_predict_idx = gather_2d(retrieve_index, child).to(
+            dtype=accept_index.dtype
+        )
+        accept_index[:, step + 1] = torch.where(
+            prefix_accept[:, step], child_predict_idx, neg_one
+        )
+
+    predict_indices_to_write = []
+    predict_values_to_write = []
+    for step, parent in enumerate(parent_nodes):
+        parent_predict_idx = gather_2d(retrieve_index, parent).to(dtype=torch.long)
+        mask = prefix_accept[:, step]
+        predict_indices_to_write.append(parent_predict_idx[mask])
+        predict_values_to_write.append(
+            draft_token_ids[step][mask].to(dtype=predicts.dtype)
+        )
+
+    chain_tensor = torch.stack(chain_nodes, dim=1)
+    sample_parent = chain_tensor.gather(
+        1, accepted_count.to(dtype=torch.long).view(bs, 1)
+    ).squeeze(1)
+    sample_predict_idx = gather_2d(retrieve_index, sample_parent).to(dtype=torch.long)
+
+    target_indices = gather_3d(target_topk_indices, sample_parent)
+    target_values = gather_3d(target_topk_values, sample_parent)
+    draft_indices = gather_3d(draft_topk_indices, sample_parent)
+    draft_values = gather_3d(draft_topk_values, sample_parent)
+    q_on_target = (
+        (target_indices.unsqueeze(2) == draft_indices.unsqueeze(1))
+        .to(dtype=draft_values.dtype)
+        .mul(draft_values.unsqueeze(1))
+        .sum(dim=2)
+    )
+    residual_values = torch.clamp(target_values - q_on_target, min=0)
+    residual_sum = residual_values.sum(dim=1, keepdim=True)
+    use_residual = (accepted_count < num_draft_steps) & (residual_sum.squeeze(1) > 0)
+    sample_values = torch.where(
+        use_residual.view(bs, 1), residual_values, target_values
+    )
+    sample_total = torch.clamp(sample_values.sum(dim=1, keepdim=True), min=1.0e-30)
+    sample_threshold = (
+        uniforms[:, num_draft_steps : num_draft_steps + 1]
+        if uniforms is not None
+        else torch.rand((bs, 1), dtype=torch.float32, device=device)
+    ) * sample_total
+    cdf = torch.cumsum(sample_values, dim=1)
+    sample_pos = torch.sum(cdf < sample_threshold, dim=1, keepdim=True).clamp(
+        max=sample_values.shape[1] - 1
+    )
+    sampled_token = (
+        target_indices.gather(1, sample_pos).squeeze(1).to(dtype=predicts.dtype)
+    )
+    predict_indices_to_write.append(sample_predict_idx)
+    predict_values_to_write.append(sampled_token)
+
+    write_indices = torch.cat(predict_indices_to_write, dim=0)
+    write_values = torch.cat(predict_values_to_write, dim=0)
+    predicts[write_indices] = write_values
+    accept_token_num.copy_(accepted_count.to(dtype=accept_token_num.dtype))
 
 
 @triton.jit
@@ -244,6 +514,7 @@ class EagleVerifyInputV2Mixin:
         req_to_token_pool: ReqToTokenPool,
         batch: ModelWorkerBatch,
         target_worker: TpModelWorker,
+        prepare_attn_backend: bool = True,
     ):
         if not batch.forward_mode.is_idle():
             # Assign cache locations
@@ -295,13 +566,16 @@ class EagleVerifyInputV2Mixin:
             target_worker.model_runner.graph_runner
             and target_worker.model_runner.graph_runner.can_run(verify_forward_batch)
         )
-        if can_run_cuda_graph:
-            target_worker.model_runner.graph_runner.replay_prepare(verify_forward_batch)
-        else:
-            if not batch.forward_mode.is_idle():
-                target_worker.model_runner.attn_backend.init_forward_metadata(
+        if prepare_attn_backend:
+            if can_run_cuda_graph:
+                target_worker.model_runner.graph_runner.replay_prepare(
                     verify_forward_batch
                 )
+            else:
+                if not batch.forward_mode.is_idle():
+                    target_worker.model_runner.attn_backend.init_forward_metadata(
+                        verify_forward_batch
+                    )
 
         return verify_forward_batch, can_run_cuda_graph
 
@@ -366,6 +640,8 @@ class EagleVerifyInputV2Mixin:
             (bs, self.spec_steps + 1), -1, dtype=torch.int32, device=device
         )
         num_accepted_drafts = torch.empty((bs,), dtype=torch.int32, device=device)
+        verify_base_positions = None
+        verify_uniforms = None
 
         # Sample tokens
         if sampling_info.is_all_greedy or _is_npu or _is_hip:
@@ -383,53 +659,101 @@ class EagleVerifyInputV2Mixin:
                 topk=self.topk,
             )
         else:
+            if getattr(sampling_info, "sampling_seed", None) is not None:
+                verify_base_positions = welm_mtp_batch_base_positions(
+                    getattr(batch, "positions", None),
+                    batch_size=bs,
+                    draft_token_num=self.draft_token_num,
+                )
+                verify_uniforms = welm_mtp_deterministic_uniforms(
+                    sampling_info=sampling_info,
+                    positions=verify_base_positions,
+                    batch_size=bs,
+                    width=accept_index.shape[1],
+                    salt=1000,
+                )
+            verify_sampling_topk = _welm_mtp_verify_sampling_topk()
+            use_sparse_verify_topk = (
+                verify_sampling_topk > 0
+                and self.topk == 1
+                and not getattr(sampling_info, "need_top_p_sampling", False)
+                and self.draft_topk_indices is not None
+                and self.draft_topk_values is not None
+            )
+
             # Apply temperature and get target probs
             expanded_temperature = torch.repeat_interleave(
                 sampling_info.temperatures, self.draft_token_num, dim=0
             )  # (bs * num_draft_tokens, 1)
 
-            target_probs = F.softmax(
-                next_token_logits / expanded_temperature, dim=-1
-            )  # (bs * num_draft_tokens, vocab_size)
-            target_probs = top_k_renorm_prob(
-                target_probs,
-                torch.repeat_interleave(
-                    sampling_info.top_ks, self.draft_token_num, dim=0
-                ),
-            )  # (bs * num_draft_tokens, vocab_size)
-            target_probs = top_p_renorm_prob(
-                target_probs,
-                torch.repeat_interleave(
-                    sampling_info.top_ps, self.draft_token_num, dim=0
-                ),
-            )
-            target_probs = target_probs.reshape(bs, self.draft_token_num, -1)
-            draft_probs = torch.zeros_like(target_probs)
+            if use_sparse_verify_topk:
+                k = min(int(verify_sampling_topk), int(next_token_logits.shape[-1]))
+                target_topk = None
+                if _is_cuda and not getattr(
+                    sampling_info, "need_top_p_sampling", False
+                ):
+                    uniform = (
+                        torch.full(
+                            (next_token_logits.shape[0], 1),
+                            0.5,
+                            dtype=torch.float32,
+                            device=next_token_logits.device,
+                        )
+                        if verify_uniforms is not None
+                        else torch.empty(
+                            (next_token_logits.shape[0], 1),
+                            dtype=torch.float32,
+                            device=next_token_logits.device,
+                        )
+                    )
+                    if verify_uniforms is None:
+                        uniform.uniform_()
+                    try:
+                        target_topk = welmv4_mtp_fused_topk_softmax_sample(
+                            next_token_logits,
+                            expanded_temperature,
+                            uniform,
+                            k,
+                        )
+                    except Exception:
+                        target_topk = None
 
-            # coins for rejection sampling
-            coins = torch.rand_like(candidates, dtype=torch.float32, device=device)
-            # coins for final sampling
-            coins_for_final_sampling = torch.rand(
-                (bs,), dtype=torch.float32, device=device
-            )
-
-            tree_speculative_sampling_target_only(
-                predicts=predict,  # mutable
-                accept_index=accept_index,  # mutable
-                accept_token_num=num_accepted_drafts,  # mutable
-                candidates=candidates,
-                # kwarg LHS retained as `retrive_*` to match sgl_kernel op schema.
-                retrive_index=self.retrieve_index,
-                retrive_next_token=self.retrieve_next_token,
-                retrive_next_sibling=self.retrieve_next_sibling,
-                uniform_samples=coins,
-                uniform_samples_for_final_sampling=coins_for_final_sampling,
-                target_probs=target_probs,
-                draft_probs=draft_probs,
-                threshold_single=get_global_server_args().speculative_accept_threshold_single,
-                threshold_acc=get_global_server_args().speculative_accept_threshold_acc,
-                deterministic=True,
-            )
+                if target_topk is not None:
+                    _, _, target_topk_indices, target_topk_values = target_topk
+                else:
+                    target_topk_logits, target_topk_indices = torch.topk(
+                        next_token_logits / expanded_temperature,
+                        k=k,
+                        dim=-1,
+                        sorted=False,
+                    )
+                    target_topk_values = F.softmax(target_topk_logits, dim=-1)
+                target_topk_indices = target_topk_indices.reshape(
+                    bs, self.draft_token_num, k
+                )
+                target_topk_values = target_topk_values.reshape(
+                    bs, self.draft_token_num, k
+                )
+                target_probs = None
+            else:
+                target_probs = F.softmax(
+                    next_token_logits / expanded_temperature, dim=-1
+                )  # (bs * num_draft_tokens, vocab_size)
+                if getattr(sampling_info, "need_top_k_sampling", True):
+                    target_probs = top_k_renorm_prob(
+                        target_probs,
+                        torch.repeat_interleave(
+                            sampling_info.top_ks, self.draft_token_num, dim=0
+                        ),
+                    )  # (bs * num_draft_tokens, vocab_size)
+                if getattr(sampling_info, "need_top_p_sampling", False):
+                    target_probs = top_p_renorm_prob(
+                        target_probs,
+                        torch.repeat_interleave(
+                            sampling_info.top_ps, self.draft_token_num, dim=0
+                        ),
+                    )
+                target_probs = target_probs.reshape(bs, self.draft_token_num, -1)
 
             # Sync sampling results across TP ranks: different GPUs may
             # produce slightly different target_probs due to floating-point
@@ -440,6 +764,138 @@ class EagleVerifyInputV2Mixin:
                 if is_dp_attention_enabled()
                 else get_tp_group()
             )
+            if self.topk == 1 and (
+                self.draft_probs is not None or self.draft_topk_indices is not None
+            ):
+                draft_probs = (
+                    self.draft_probs.to(dtype=torch.float32, device=device).contiguous()
+                    if self.draft_probs is not None
+                    else None
+                )
+                draft_topk_indices = (
+                    self.draft_topk_indices.to(device=device).contiguous()
+                    if self.draft_topk_indices is not None
+                    else None
+                )
+                draft_topk_values = (
+                    self.draft_topk_values.to(
+                        dtype=torch.float32, device=device
+                    ).contiguous()
+                    if self.draft_topk_values is not None
+                    else None
+                )
+                if use_sparse_verify_topk:
+                    fused_verify_done = False
+                    if _is_cuda and _welm_mtp_verify_fused_reject_enabled():
+                        try:
+                            fused_verify_done = welmv4_mtp_fused_verify_top1_sparse(
+                                predicts=predict,
+                                accept_index=accept_index,
+                                accept_token_num=num_accepted_drafts,
+                                candidates=candidates,
+                                retrieve_index=self.retrieve_index,
+                                retrieve_next_token=self.retrieve_next_token,
+                                target_topk_indices=target_topk_indices,
+                                target_topk_values=target_topk_values,
+                                draft_topk_indices=draft_topk_indices,
+                                draft_topk_values=draft_topk_values,
+                                uniforms=verify_uniforms,
+                            )
+                        except Exception:
+                            fused_verify_done = False
+                    if not fused_verify_done:
+                        verify_top1_chain_with_sparse_target_probs_v2_vectorized(
+                            predicts=predict,
+                            accept_index=accept_index,
+                            accept_token_num=num_accepted_drafts,
+                            candidates=candidates,
+                            retrieve_index=self.retrieve_index,
+                            retrieve_next_token=self.retrieve_next_token,
+                            target_topk_indices=target_topk_indices,
+                            target_topk_values=target_topk_values,
+                            draft_topk_indices=draft_topk_indices,
+                            draft_topk_values=draft_topk_values,
+                            uniforms=verify_uniforms,
+                        )
+                else:
+                    fused_verify_done = False
+                    if (
+                        draft_probs is None
+                        and _is_cuda
+                        and _welm_mtp_verify_fused_reject_enabled()
+                    ):
+                        try:
+                            fused_verify_done = (
+                                welmv4_mtp_fused_verify_top1_dense_target(
+                                    predicts=predict,
+                                    accept_index=accept_index,
+                                    accept_token_num=num_accepted_drafts,
+                                    candidates=candidates,
+                                    retrieve_index=self.retrieve_index,
+                                    retrieve_next_token=self.retrieve_next_token,
+                                    target_probs=target_probs,
+                                    draft_topk_indices=draft_topk_indices,
+                                    draft_topk_values=draft_topk_values,
+                                    uniforms=verify_uniforms,
+                                )
+                            )
+                        except Exception:
+                            fused_verify_done = False
+                    if not fused_verify_done:
+                        verify_top1_chain_with_draft_probs_v2(
+                            predicts=predict,
+                            accept_index=accept_index,
+                            accept_token_num=num_accepted_drafts,
+                            candidates=candidates,
+                            retrieve_index=self.retrieve_index,
+                            retrieve_next_token=self.retrieve_next_token,
+                            target_probs=target_probs,
+                            draft_probs=draft_probs,
+                            draft_topk_indices=draft_topk_indices,
+                            draft_topk_values=draft_topk_values,
+                            uniforms=verify_uniforms,
+                        )
+            else:
+                draft_probs = torch.zeros_like(target_probs)
+
+                # coins for rejection sampling
+                tree_uniforms = welm_mtp_deterministic_uniforms(
+                    sampling_info=sampling_info,
+                    positions=verify_base_positions,
+                    batch_size=bs,
+                    width=self.draft_token_num + 1,
+                    salt=2000,
+                )
+                coins = (
+                    tree_uniforms[:, : self.draft_token_num]
+                    if tree_uniforms is not None
+                    else torch.rand_like(candidates, dtype=torch.float32, device=device)
+                )
+                # coins for final sampling
+                coins_for_final_sampling = (
+                    tree_uniforms[:, self.draft_token_num]
+                    if tree_uniforms is not None
+                    else torch.rand((bs,), dtype=torch.float32, device=device)
+                )
+
+                tree_speculative_sampling_target_only(
+                    predicts=predict,  # mutable
+                    accept_index=accept_index,  # mutable
+                    accept_token_num=num_accepted_drafts,  # mutable
+                    candidates=candidates,
+                    # kwarg LHS retained as `retrive_*` to match sgl_kernel op schema.
+                    retrive_index=self.retrieve_index,
+                    retrive_next_token=self.retrieve_next_token,
+                    retrive_next_sibling=self.retrieve_next_sibling,
+                    uniform_samples=coins,
+                    uniform_samples_for_final_sampling=coins_for_final_sampling,
+                    target_probs=target_probs,
+                    draft_probs=draft_probs,
+                    threshold_single=get_global_server_args().speculative_accept_threshold_single,
+                    threshold_acc=get_global_server_args().speculative_accept_threshold_acc,
+                    deterministic=True,
+                )
+
             if tp_group.world_size > 1:
                 tp_group.broadcast(predict, src=0)
                 tp_group.broadcast(accept_index, src=0)

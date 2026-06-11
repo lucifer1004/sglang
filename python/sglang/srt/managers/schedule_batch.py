@@ -2694,6 +2694,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if keep_indices is None or len(keep_indices) == 0:
             # Filter out all requests
             self.reqs = []
+            self.spec_info = None
             return
 
         if len(keep_indices) == len(self.reqs):
@@ -2855,6 +2856,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             encoder_lens=self.encoder_lens,
             encoder_lens_cpu=self.encoder_lens_cpu,
             encoder_out_cache_loc=self.encoder_out_cache_loc,
+            chunked_req=self.chunked_req,
             lora_ids=[req.lora_id for req in self.reqs],
             sampling_info=self.sampling_info,
             input_embeds=self.input_embeds,
@@ -3136,6 +3138,7 @@ class ModelWorkerBatch:
     # For constrained decoding
     # FIXME(lsyin): remove this after fully overlap grammar
     reqs: Optional[List[Req]] = None
+    chunked_req: Optional[Req] = None
     has_grammar: bool = False
 
     # Over Encoding

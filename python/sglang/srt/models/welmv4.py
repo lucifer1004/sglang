@@ -623,7 +623,7 @@ def _get_kv_mirror_pair_maps(
     num_hidden_layers: int,
     num_nextn_predict_layers: int,
     is_nextn: bool,
-) -> Tuple[Dict[int, int], Dict[int, int]]:
+) -> Tuple[Dict[int, int], Dict[int, List[int]]]:
     valid_pairs = []
     for mirror, imitated in zip(kv_mirror_layers, kv_mirror_imitated_layers):
         if is_nextn:
@@ -639,10 +639,10 @@ def _get_kv_mirror_pair_maps(
         if mirror_valid and imitated_valid:
             valid_pairs.append((mirror, imitated))
     mirror_to_imitated = dict(valid_pairs)
-    imitated_to_mirror = {
-        imitated: mirror for mirror, imitated in mirror_to_imitated.items()
-    }
-    return mirror_to_imitated, imitated_to_mirror
+    imitated_to_mirrors: Dict[int, List[int]] = {}
+    for mirror, imitated in valid_pairs:
+        imitated_to_mirrors.setdefault(imitated, []).append(mirror)
+    return mirror_to_imitated, imitated_to_mirrors
 
 
 WelmQkvProjectionOutput = Tuple[
@@ -860,6 +860,37 @@ class ImitateQkvKvProjection(BaseWelmQkvProjection):
         return q, k, v, hidden_states
 
 
+class ImitateQkvMultiBankKvProjection(BaseWelmQkvProjection):
+    def __init__(self, mirror_layer_indices: List[int], **kwargs) -> None:
+        self.mirror_layer_indices = mirror_layer_indices
+        num_banks = len(mirror_layer_indices)
+        shard_layout = ("q", "k1", "v1") + tuple(
+            shard for i in range(num_banks) for shard in (f"k2_{i}", f"v2_{i}")
+        )
+        super().__init__(shard_layout=shard_layout, **kwargs)
+
+    def forward(
+        self,
+        attn: "Qwen2MoeAttention",
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        kv_mirror_states: Dict[int, Tuple[torch.Tensor, torch.Tensor]],
+    ) -> WelmQkvProjectionOutput:
+        qkv = self._apply_qkv(hidden_states)
+        num_banks = len(self.mirror_layer_indices)
+        splits = [attn.q_size, attn.kv_size, attn.kv_size] + [attn.kv_size] * (
+            2 * num_banks
+        )
+        parts = qkv.split(splits, dim=-1)
+        q, k, v = parts[0], parts[1], parts[2]
+        for i, mirror_idx in enumerate(self.mirror_layer_indices):
+            kv_mirror_states[mirror_idx] = (
+                parts[3 + 2 * i],
+                parts[3 + 2 * i + 1],
+            )
+        return q, k, v, hidden_states
+
+
 class MirrorQProjection(BaseWelmQkvProjection):
     def __init__(self, imitated_layer_idx: int, **kwargs) -> None:
         super().__init__(shard_layout=("q",), **kwargs)
@@ -904,9 +935,12 @@ class MirrorQProjection(BaseWelmQkvProjection):
 
 
 class NextnMirrorQProjection(BaseWelmQkvProjection):
-    def __init__(self, imitated_layer_idx: int, **kwargs) -> None:
+    def __init__(
+        self, imitated_layer_idx: int, mirror_layer_idx: int = None, **kwargs
+    ) -> None:
         super().__init__(**kwargs)
         self.imitated_layer_idx = imitated_layer_idx
+        self.mirror_layer_idx = mirror_layer_idx
 
     def forward(
         self,
@@ -949,10 +983,16 @@ class NextnMirrorQProjection(BaseWelmQkvProjection):
                     hidden_states, forward_batch, first_contract=first_contract
                 )
 
-        kv_activation = kv_mirror_states.pop(self.imitated_layer_idx, None)
+        pop_key = (
+            self.mirror_layer_idx
+            if self.mirror_layer_idx is not None
+            else self.imitated_layer_idx
+        )
+        kv_activation = kv_mirror_states.pop(pop_key, None)
         if kv_activation is None:
             raise RuntimeError(
-                f"Missing mirrored KV activation for nextn imitated_layer_idx={self.imitated_layer_idx}"
+                f"Missing mirrored KV activation for nextn pop_key={pop_key} "
+                f"(imitated={self.imitated_layer_idx}, mirror={self.mirror_layer_idx})"
             )
 
         k, v = kv_activation
@@ -1734,7 +1774,7 @@ class Qwen2MoeAttention(nn.Module):
             get_global_server_args().enable_welm_kv_mirror_opt
             and self.kv_mirror_layer_idx in self.kv_mirror_layers
         )
-        mirror_to_imitated, imitated_to_mirror = _get_kv_mirror_pair_maps(
+        mirror_to_imitated, imitated_to_mirrors = _get_kv_mirror_pair_maps(
             self.kv_mirror_layers,
             self.kv_mirror_imitated_layers,
             num_hidden_layers=total_layer_num,
@@ -1743,19 +1783,36 @@ class Qwen2MoeAttention(nn.Module):
         )
         if self.kv_mirror_layer_idx in mirror_to_imitated:
             projection_cls = NextnMirrorQProjection if is_nextn else MirrorQProjection
-            self.qkv_proj = projection_cls(
+            proj_kwargs = dict(
                 imitated_layer_idx=mirror_to_imitated[self.kv_mirror_layer_idx],
                 **qkv_proj_kwargs,
             )
-        elif self.kv_mirror_layer_idx in imitated_to_mirror:
-            self.qkv_proj = ImitateQkvKvProjection(
-                mirror_layer_idx=imitated_to_mirror[self.kv_mirror_layer_idx],
-                **qkv_proj_kwargs,
-            )
+            if is_nextn:
+                source_idx = mirror_to_imitated[self.kv_mirror_layer_idx]
+                if (
+                    source_idx in imitated_to_mirrors
+                    and len(imitated_to_mirrors[source_idx]) > 1
+                ):
+                    proj_kwargs["mirror_layer_idx"] = self.kv_mirror_layer_idx
+            self.qkv_proj = projection_cls(**proj_kwargs)
+        elif self.kv_mirror_layer_idx in imitated_to_mirrors:
+            mirror_list = imitated_to_mirrors[self.kv_mirror_layer_idx]
+            if len(mirror_list) == 1:
+                self.qkv_proj = ImitateQkvKvProjection(
+                    mirror_layer_idx=mirror_list[0],
+                    **qkv_proj_kwargs,
+                )
+            else:
+                self.qkv_proj = ImitateQkvMultiBankKvProjection(
+                    mirror_layer_indices=mirror_list,
+                    **qkv_proj_kwargs,
+                )
         else:
             self.qkv_proj = StandardQkvProjection(**qkv_proj_kwargs)
-        if get_global_server_args().speculative_algorithm is not None:
+        if is_nextn:
             self.need_clear_kv_cache = self.layer_idx == num_nextn_predict_layers - 1
+        elif get_global_server_args().speculative_algorithm is not None:
+            self.need_clear_kv_cache = False
         else:
             self.need_clear_kv_cache = self.layer_idx == total_layer_num - 1
         self.is_nextn = is_nextn
@@ -1869,11 +1926,39 @@ class Qwen2MoeAttention(nn.Module):
                 and self.kv_mirror_layer_idx in self.kv_mirror_layers
                 and q.shape[0] == forward_batch.custom_last_index.numel()
             ):
+                last_query_positions = getattr(
+                    forward_batch, "welm_mtp_query_positions", None
+                )
+                if last_query_positions is not None:
+                    last_query_positions = last_query_positions.to(
+                        device=positions.device, dtype=positions.dtype
+                    )
+                    active_indices = getattr(
+                        forward_batch, "kv_mirror_active_batch_indices", None
+                    )
+                    output_size = getattr(forward_batch, "kv_mirror_output_size", None)
+                    if (
+                        active_indices is not None
+                        and output_size is not None
+                        and last_query_positions.shape[0] == output_size
+                        and active_indices.numel() != output_size
+                    ):
+                        last_query_positions = last_query_positions[active_indices]
+                    if (
+                        last_query_positions.shape[0]
+                        != forward_batch.custom_last_index.numel()
+                    ):
+                        raise RuntimeError(
+                            "WeLMV4 MTP merged query positions shape mismatch: "
+                            f"{last_query_positions.shape[0]} vs "
+                            f"{forward_batch.custom_last_index.numel()}."
+                        )
                 self.rotary_emb.forward_cuda(
                     positions,
                     q,
                     k_for_rope,
                     last_index=forward_batch.custom_last_index,
+                    last_query_positions=last_query_positions,
                 )
             else:
                 self.rotary_emb.forward_cuda(positions, q, k_for_rope)
@@ -2326,23 +2411,27 @@ class Qwen2MoeDecoderLayer(nn.Module):
         use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
             forward_batch
         )
+        can_use_final_components = (
+            not use_previous_precision
+            and self.is_final_layer
+            and residual is not None
+            and getattr(self.mlp, "tp_size", 1) == 1
+            and not is_dp_attention_enabled()
+        )
+        return_mlp_components = (
+            dump_this_layer
+            if use_previous_precision
+            else dump_this_layer or can_use_final_components
+        )
         mlp_output = self.mlp(
             hidden_states,
             hidden_states_fp32,
             forward_batch,
             use_reduce_scatter,
-            return_components=(
-                dump_this_layer
-                if use_previous_precision
-                else dump_this_layer or self.is_final_layer
-            ),
+            return_components=return_mlp_components,
             skip_component_output=(
-                not use_previous_precision
-                and self.is_final_layer
-                and residual is not None
+                can_use_final_components
                 and not dump_this_layer
-                and getattr(self.mlp, "tp_size", 1) == 1
-                and not is_dp_attention_enabled()
             ),
         )
         experts_output = None
@@ -3004,19 +3093,26 @@ class WeLMV4MoeForCausalLM(nn.Module):
             if layer_id is None:
                 return False
             if ".self_attn.k_proj." in name:
-                pair_shard_id = "k2"
+                base_shard = "k2"
             elif ".self_attn.v_proj." in name:
-                pair_shard_id = "v2"
+                base_shard = "v2"
             else:
                 return False
             imitated_layer_idx = mirror_to_imitated.get(layer_id)
             if imitated_layer_idx is None:
                 return False
             pair_attn = attn_by_kv_mirror_layer_idx.get(imitated_layer_idx)
-            if not (
-                pair_attn is not None
-                and isinstance(pair_attn.qkv_proj, ImitateQkvKvProjection)
-            ):
+            if pair_attn is None:
+                return False
+            if isinstance(pair_attn.qkv_proj, ImitateQkvMultiBankKvProjection):
+                try:
+                    bank_idx = pair_attn.qkv_proj.mirror_layer_indices.index(layer_id)
+                except ValueError:
+                    return False
+                pair_shard_id = f"{base_shard}_{bank_idx}"
+            elif isinstance(pair_attn.qkv_proj, ImitateQkvKvProjection):
+                pair_shard_id = base_shard
+            else:
                 return False
             pair_param = (
                 pair_attn.qkv_proj.bias
@@ -3035,6 +3131,14 @@ class WeLMV4MoeForCausalLM(nn.Module):
                 "enorm",
                 "hnorm",
             ]
+            is_welm_mtp_nextn = bool(
+                getattr(self.config, "architectures", [None])[0]
+                == "WeLMV4MoeForCausalLMNextN"
+            )
+            expected_nextn_steps = set(range(int(num_nextn_layers)))
+            seen_nextn_projector_steps = set()
+            seen_nextn_decoder_steps = set()
+            extra_nextn_steps = set()
 
         for name, loaded_weight in weights:
             if not is_nextn:
@@ -3064,6 +3168,8 @@ class WeLMV4MoeForCausalLM(nn.Module):
                     <= layer_idx
                     < num_target_layers + num_nextn_layers
                 ):
+                    if is_welm_mtp_nextn and layer_idx >= num_target_layers:
+                        extra_nextn_steps.add(layer_idx - num_target_layers)
                     continue
                 # if not name.startswith(nextn_layer_prefix):
                 #     continue
@@ -3075,11 +3181,23 @@ class WeLMV4MoeForCausalLM(nn.Module):
                 # For nextn specific weights
                 for weight_name in nextn_spec_weight_names:
                     if weight_name in name:
-                        name = ".".join(["model", *name_list[3:]])
+                        if is_welm_mtp_nextn:
+                            step = layer_idx - num_target_layers
+                            seen_nextn_projector_steps.add(step)
+                            remainder = ".".join(name_list[3:])
+                            if "shared_head.norm" in remainder:
+                                remainder = remainder.replace(
+                                    "shared_head.norm", "ln_f"
+                                )
+                            name = f"model.projectors.{step}.{remainder}"
+                        else:
+                            name = ".".join(["model", *name_list[3:]])
                         is_decoder = False
                         break
                 # For decoder layer weights
                 if is_decoder:
+                    if is_welm_mtp_nextn:
+                        seen_nextn_decoder_steps.add(layer_idx - num_target_layers)
                     name = ".".join(
                         [
                             "model",
@@ -3142,7 +3260,10 @@ class WeLMV4MoeForCausalLM(nn.Module):
                 if (
                     current_attn is not None
                     and isinstance(current_attn, Qwen2MoeAttention)
-                    and isinstance(current_attn.qkv_proj, ImitateQkvKvProjection)
+                    and isinstance(
+                        current_attn.qkv_proj,
+                        (ImitateQkvKvProjection, ImitateQkvMultiBankKvProjection),
+                    )
                     and shard_id in ("k", "v")
                 ):
                     effective_shard_id = "k1" if shard_id == "k" else "v1"
@@ -3162,9 +3283,27 @@ class WeLMV4MoeForCausalLM(nn.Module):
                     pair_attn = attn_by_kv_mirror_layer_idx.get(
                         current_attn.qkv_proj.imitated_layer_idx
                     )
+                    pair_shard_id = None
                     if pair_attn is not None and isinstance(
+                        pair_attn.qkv_proj, ImitateQkvMultiBankKvProjection
+                    ):
+                        try:
+                            bank_idx = pair_attn.qkv_proj.mirror_layer_indices.index(
+                                current_attn.kv_mirror_layer_idx
+                            )
+                        except ValueError:
+                            bank_idx = None
+                        if bank_idx is not None:
+                            pair_shard_id = (
+                                f"k2_{bank_idx}"
+                                if shard_id == "k"
+                                else f"v2_{bank_idx}"
+                            )
+                    elif pair_attn is not None and isinstance(
                         pair_attn.qkv_proj, ImitateQkvKvProjection
                     ):
+                        pair_shard_id = "k2" if shard_id == "k" else "v2"
+                    if pair_shard_id is not None:
                         pair_param = (
                             pair_attn.qkv_proj.bias
                             if name.endswith(".bias")
@@ -3174,7 +3313,7 @@ class WeLMV4MoeForCausalLM(nn.Module):
                             pair_param.weight_loader(
                                 pair_param,
                                 loaded_weight,
-                                "k2" if shard_id == "k" else "v2",
+                                pair_shard_id,
                             )
                 break
             else:
@@ -3214,6 +3353,40 @@ class WeLMV4MoeForCausalLM(nn.Module):
                             weight_loader(param, loaded_weight)
                     else:
                         logger.warning(f"Parameter {name} not found in params_dict")
+
+        if is_nextn and is_welm_mtp_nextn:
+            missing_projector_steps = expected_nextn_steps - seen_nextn_projector_steps
+            missing_decoder_steps = expected_nextn_steps - seen_nextn_decoder_steps
+            if num_nextn_layers == 1:
+                if missing_projector_steps or missing_decoder_steps:
+                    raise ValueError(
+                        "WeLM MTP V1 checkpoint layout does not match the "
+                        "single physical MTP layer. "
+                        f"missing_projector_steps={sorted(missing_projector_steps)}, "
+                        f"missing_decoder_steps={sorted(missing_decoder_steps)}."
+                    )
+                if extra_nextn_steps:
+                    raise ValueError(
+                        "WeLM MTP V1 config expects exactly one physical MTP "
+                        "layer, but checkpoint contains extra nextn steps: "
+                        f"{sorted(extra_nextn_steps)}."
+                    )
+            else:
+                if missing_projector_steps or missing_decoder_steps:
+                    raise ValueError(
+                        "WeLM MTP V2 checkpoint layout does not match "
+                        "num_nextn_predict_layers. "
+                        f"missing_projector_steps={sorted(missing_projector_steps)}, "
+                        f"missing_decoder_steps={sorted(missing_decoder_steps)}, "
+                        f"num_nextn_predict_layers={num_nextn_layers}."
+                    )
+                if extra_nextn_steps:
+                    raise ValueError(
+                        "WeLM MTP V2 checkpoint contains more nextn steps than "
+                        "num_nextn_predict_layers: "
+                        f"extra_steps={sorted(extra_nextn_steps)}, "
+                        f"num_nextn_predict_layers={num_nextn_layers}."
+                    )
 
     def get_embed_and_head(self):
         return [

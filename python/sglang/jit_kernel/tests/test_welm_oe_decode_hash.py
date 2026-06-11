@@ -7,7 +7,9 @@ import torch
 from sglang.jit_kernel.welm_oe import (
     warmup_welm_oe_hash_kernel,
     welm_oe_hash_decode_from_prefixes_cuda,
+    welm_oe_hash_mtp_draft_decode_from_history_cuda,
     welm_oe_hash_mtp_draft_extend_after_verify_from_history_cuda,
+    welm_oe_hash_mtp_target_verify_from_history_cuda,
     welm_oe_hash_segments_from_prefixes_cuda,
 )
 from sglang.srt.managers.schedule_batch import HashInputIdsBuffer, OverEncodingContext
@@ -245,6 +247,7 @@ def _reference_draft_extend_after_verify_hash_from_history(
     oe_vocab_sizes,
     vocab_size,
     draft_token_num,
+    use_entry_history_for_extend_hash_prefix=False,
 ):
     mask = 0xFFFFFFFF
     num_segments = len(accept_lens)
@@ -281,21 +284,143 @@ def _reference_draft_extend_after_verify_hash_from_history(
                     if local_pos >= lag:
                         prev = int(input_ids[token_idx - lag].item()) & mask
                     else:
-                        prev = (
-                            _accepted_history_token(
-                                entry_history,
-                                accepted_row,
-                                accept_lens[seq_id],
-                                seq_id,
-                                lag - local_pos,
+                        if use_entry_history_for_extend_hash_prefix:
+                            history_lag = lag - local_pos
+                            col = history_width - history_lag
+                            prev = (
+                                int(entry_history[seq_id, col].item())
+                                if 0 <= col < history_width
+                                else 0
+                            ) & mask
+                        else:
+                            prev = (
+                                _accepted_history_token(
+                                    entry_history,
+                                    accepted_row,
+                                    accept_lens[seq_id],
+                                    seq_id,
+                                    lag - local_pos,
+                                )
+                                & mask
                             )
-                            & mask
-                        )
                     running_ids = (running_ids + prev * vocab_power) & mask
                     vocab_power = (vocab_power * vocab_size) & mask
                 hashed[branch_idx, token_idx] = (
                     (running_ids * 2654435761) & mask
                 ) % oe_vocab_size
+
+    return hashed, next_history
+
+
+def _hash_ngram(input_id, history_tokens, oe_grams, oe_vocab_sizes, vocab_size):
+    mask = 0xFFFFFFFF
+    values = []
+    for gram, oe_vocab_size in zip(oe_grams, oe_vocab_sizes):
+        running_ids = int(input_id) & mask
+        vocab_power = vocab_size & mask
+        for lag in range(1, gram):
+            prev = int(history_tokens(lag)) & mask
+            running_ids = (running_ids + prev * vocab_power) & mask
+            vocab_power = (vocab_power * vocab_size) & mask
+        values.append(((running_ids * 2654435761) & mask) % oe_vocab_size)
+    return values
+
+
+def _reference_target_verify_hash_from_history(
+    draft_token_ids,
+    tree_mask,
+    seq_lens,
+    entry_history,
+    oe_grams,
+    oe_vocab_sizes,
+    vocab_size,
+    draft_token_num,
+):
+    hashed = torch.empty((len(oe_grams), draft_token_ids.numel()), dtype=torch.int64)
+    history_width = entry_history.shape[1]
+    mask_offset = 0
+
+    for seq_id, seq_len in enumerate(seq_lens):
+        mask_len = int(seq_len) + draft_token_num
+        row_tokens = draft_token_ids[
+            seq_id * draft_token_num : (seq_id + 1) * draft_token_num
+        ]
+        for local_token_idx in range(draft_token_num):
+            row_mask_offset = mask_offset + local_token_idx * mask_len
+            local_mask = tree_mask[row_mask_offset : row_mask_offset + mask_len]
+
+            def history_token(lag):
+                target_gram = lag + 1
+                for pos in range(mask_len - 1, int(seq_len) - 1, -1):
+                    if bool(local_mask[pos]):
+                        target_gram -= 1
+                        if target_gram == 0:
+                            return int(row_tokens[pos - int(seq_len)].item())
+                col = history_width - target_gram - 1
+                if col < 0 or col >= history_width:
+                    return 0
+                return int(entry_history[seq_id, col].item())
+
+            token_idx = seq_id * draft_token_num + local_token_idx
+            hashed[:, token_idx] = torch.tensor(
+                _hash_ngram(
+                    int(draft_token_ids[token_idx].item()),
+                    history_token,
+                    oe_grams,
+                    oe_vocab_sizes,
+                    vocab_size,
+                ),
+                dtype=torch.int64,
+            )
+        mask_offset += draft_token_num * mask_len
+
+    return hashed
+
+
+def _reference_draft_decode_hash_from_history(
+    input_ids,
+    history_state,
+    parent_indices,
+    oe_grams,
+    oe_vocab_sizes,
+    vocab_size,
+    base_query_count,
+    use_parent,
+):
+    hashed = torch.empty((len(oe_grams), input_ids.numel()), dtype=torch.int64)
+    history_width = history_state.shape[1]
+    next_history = torch.empty((input_ids.numel(), history_width), dtype=torch.int64)
+    repeat = max(1, input_ids.numel() // max(1, base_query_count))
+
+    for token_idx in range(input_ids.numel()):
+        source_row = (
+            int(parent_indices[token_idx].item())
+            if use_parent
+            else int(token_idx) // repeat
+        )
+
+        for col in range(history_width):
+            if col + 1 == history_width:
+                next_history[token_idx, col] = int(input_ids[token_idx].item())
+            else:
+                next_history[token_idx, col] = history_state[source_row, col + 1]
+
+        def history_token(lag):
+            col = history_width - lag
+            if col < 0 or col >= history_width:
+                return 0
+            return int(history_state[source_row, col].item())
+
+        hashed[:, token_idx] = torch.tensor(
+            _hash_ngram(
+                int(input_ids[token_idx].item()),
+                history_token,
+                oe_grams,
+                oe_vocab_sizes,
+                vocab_size,
+            ),
+            dtype=torch.int64,
+        )
 
     return hashed, next_history
 
@@ -373,7 +498,13 @@ def test_welm_oe_segment_hash_dynamic_prefixes_and_config(input_dtype):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @pytest.mark.parametrize("input_dtype", [torch.int64, torch.int32])
-def test_welm_oe_draft_extend_after_verify_hash_from_history(input_dtype):
+@pytest.mark.parametrize(
+    "use_entry_history_for_extend_hash_prefix",
+    [False, True],
+)
+def test_welm_oe_draft_extend_after_verify_hash_from_history(
+    input_dtype, use_entry_history_for_extend_hash_prefix
+):
     device = "cuda"
     vocab_size = 32017
     oe_grams = (2, 3, 4)
@@ -406,6 +537,7 @@ def test_welm_oe_draft_extend_after_verify_hash_from_history(input_dtype):
             oe_vocab_sizes,
             vocab_size,
             draft_token_num,
+            use_entry_history_for_extend_hash_prefix,
         )
     )
 
@@ -429,6 +561,132 @@ def test_welm_oe_draft_extend_after_verify_hash_from_history(input_dtype):
         next_history,
         vocab_size,
         draft_token_num,
+        use_entry_history_for_extend_hash_prefix,
+    )
+    torch.cuda.synchronize()
+
+    assert torch.equal(hashed_out.cpu(), expected_hash)
+    assert torch.equal(next_history.cpu(), expected_history)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("input_dtype", [torch.int64, torch.int32])
+def test_welm_oe_target_verify_hash_from_history(input_dtype):
+    device = "cuda"
+    vocab_size = 32017
+    oe_grams = (2, 3, 4)
+    oe_vocab_sizes = (257, 263, 269)
+    draft_token_num = 4
+
+    draft_token_ids_cpu = torch.tensor(
+        [100, 101, 102, 103, 200, 201, 202, 203],
+        dtype=torch.int64,
+    )
+    seq_lens_cpu = [5, 7]
+    entry_history_cpu = torch.tensor(
+        [
+            [10, 11, 12, 100],
+            [20, 21, 22, 200],
+        ],
+        dtype=torch.int64,
+    )
+
+    mask_rows = []
+    for seq_len in seq_lens_cpu:
+        mask_len = seq_len + draft_token_num
+        for local_token_idx in range(draft_token_num):
+            row = [False] * mask_len
+            for draft_idx in range(local_token_idx + 1):
+                row[seq_len + draft_idx] = True
+            mask_rows.extend(row)
+    tree_mask_cpu = torch.tensor(mask_rows, dtype=torch.bool)
+    expected_hash = _reference_target_verify_hash_from_history(
+        draft_token_ids_cpu,
+        tree_mask_cpu,
+        seq_lens_cpu,
+        entry_history_cpu,
+        oe_grams,
+        oe_vocab_sizes,
+        vocab_size,
+        draft_token_num,
+    )
+
+    draft_token_ids = draft_token_ids_cpu.to(device=device, dtype=input_dtype)
+    tree_mask = tree_mask_cpu.to(device=device)
+    seq_lens = torch.tensor(seq_lens_cpu, dtype=torch.int64, device=device)
+    entry_history = entry_history_cpu.to(device=device)
+    hashed_out = torch.empty(
+        (len(oe_grams), draft_token_ids.numel()), dtype=torch.int64, device=device
+    )
+
+    welm_oe_hash_mtp_target_verify_from_history_cuda(
+        draft_token_ids,
+        tree_mask,
+        seq_lens,
+        entry_history,
+        oe_grams,
+        oe_vocab_sizes,
+        hashed_out,
+        vocab_size,
+        draft_token_num,
+    )
+    torch.cuda.synchronize()
+
+    assert torch.equal(hashed_out.cpu(), expected_hash)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("input_dtype", [torch.int64, torch.int32])
+@pytest.mark.parametrize("use_parent", [False, True])
+def test_welm_oe_draft_decode_hash_from_history(input_dtype, use_parent):
+    device = "cuda"
+    vocab_size = 32017
+    oe_grams = (2, 3, 4)
+    oe_vocab_sizes = (257, 263, 269)
+
+    input_ids_cpu = torch.tensor([31, 32, 33, 41, 42, 43], dtype=torch.int64)
+    history_state_cpu = torch.tensor(
+        [
+            [10, 11, 12, 13],
+            [20, 21, 22, 23],
+            [30, 31, 32, 33],
+        ],
+        dtype=torch.int64,
+    )
+    parent_indices_cpu = torch.tensor([0, 2, 1, 1, 0, 2], dtype=torch.int64)
+    base_query_count = 2
+    expected_hash, expected_history = _reference_draft_decode_hash_from_history(
+        input_ids_cpu,
+        history_state_cpu,
+        parent_indices_cpu,
+        oe_grams,
+        oe_vocab_sizes,
+        vocab_size,
+        base_query_count,
+        use_parent,
+    )
+
+    input_ids = input_ids_cpu.to(device=device, dtype=input_dtype)
+    history_state = history_state_cpu.to(device=device)
+    parent_indices = parent_indices_cpu.to(device=device)
+    hashed_out = torch.empty(
+        (len(oe_grams), input_ids.numel()), dtype=torch.int64, device=device
+    )
+    next_history = torch.empty(
+        (input_ids.numel(), history_state.shape[1]), dtype=torch.int64, device=device
+    )
+
+    welm_oe_hash_mtp_draft_decode_from_history_cuda(
+        input_ids,
+        history_state,
+        parent_indices,
+        oe_grams,
+        oe_vocab_sizes,
+        hashed_out,
+        next_history,
+        vocab_size,
+        base_query_count,
+        use_parent,
     )
     torch.cuda.synchronize()
 

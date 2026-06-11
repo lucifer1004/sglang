@@ -43,6 +43,7 @@ class GenerationBatchResult:
     # FIXME(lsyin): maybe move to a better place?
     # sync path: forward stream -> output processor
     accept_lens: Optional[torch.Tensor] = None
+    spec_accept_index: Optional[torch.Tensor] = None
     welm_mtp_accepted_draft_token_ids: Optional[torch.Tensor] = None
 
     # relay path: forward stream -> next step forward

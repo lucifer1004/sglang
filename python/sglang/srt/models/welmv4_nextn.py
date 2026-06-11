@@ -22,6 +22,7 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.models.welm_perf_opt import compute_welm_oe_embedding
+from sglang.srt.models.welm_mtp_version import WelmMTPVersion, get_welm_mtp_version
 import sglang.srt.models.welmv4 as welmv4_module
 from sglang.srt.models.welmv4 import (
     Qwen2MoeDecoderLayer,
@@ -295,6 +296,19 @@ def _flush_mtp_graph_dump_pass(
     return written_dirs
 
 
+class MTPProjector(nn.Module):
+    def __init__(self, config: PretrainedConfig) -> None:
+        super().__init__()
+        self.enorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.hnorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.eh_proj = nn.Linear(2 * config.hidden_size, config.hidden_size, bias=True)
+        self.ln_f = (
+            RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            if welm_use_previous_precision()
+            else WelmV4FusedRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        )
+
+
 class WeLMV4ModelNextN(nn.Module):
     def __init__(
         self,
@@ -305,6 +319,9 @@ class WeLMV4ModelNextN(nn.Module):
         super().__init__()
         self.config = config
         self.vocab_size = config.vocab_size
+        self.welm_mtp_version = get_welm_mtp_version(config)
+        self.num_physical_mtp_layers = int(config.num_nextn_predict_layers)
+        self.num_nextn_predict_layers = self.num_physical_mtp_layers
 
         self.embed_tokens = None
         self.oe_embed = None
@@ -331,11 +348,9 @@ class WeLMV4ModelNextN(nn.Module):
                 quant_config=None,
             )
 
-        self.enorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.hnorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-
-        self.eh_proj = nn.Linear(2 * config.hidden_size, config.hidden_size, bias=True)
-
+        self.projectors = nn.ModuleList(
+            [MTPProjector(config) for _ in range(self.num_physical_mtp_layers)]
+        )
         self.alt_stream = torch.cuda.Stream() if _is_cuda else None
 
         layer_name = "decoder"
@@ -355,43 +370,42 @@ class WeLMV4ModelNextN(nn.Module):
                     prefix=add_prefix(layer_name, prefix),
                     alt_stream=self.alt_stream,
                 )
-                for i in range(config.num_nextn_predict_layers)
+                for i in range(self.num_physical_mtp_layers)
             ]
         )
 
-        self.shared_head = nn.Module()
-        self.shared_head.norm = (
-            RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-            if welm_use_previous_precision()
-            else WelmV4FusedRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        )
+    def _get_physical_step_idx(self, step_idx: int) -> int:
+        if step_idx < 0:
+            raise RuntimeError(
+                f"WeLM MTP logical step index must be non-negative, got {step_idx}."
+            )
+        if self.welm_mtp_version == WelmMTPVersion.V1:
+            return 0
+        if step_idx >= self.num_physical_mtp_layers:
+            raise RuntimeError(
+                "WeLM MTP logical step index is out of physical layer range: "
+                f"{step_idx} vs {self.num_physical_mtp_layers}."
+            )
+        return step_idx
 
-    def forward(
+    def _get_projector(self, step_idx: int) -> MTPProjector:
+        return self.projectors[self._get_physical_step_idx(step_idx)]
+
+    def _apply_oe_embedding(
         self,
         input_ids: torch.Tensor,
-        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
-        input_embeds: torch.Tensor = None,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        *,
+        hashed_inputs: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if len(self.oe_grams) == 0 or input_ids.numel() == 0:
+            return hidden_states
 
-        dump_enabled = _MTP_DUMP_ENABLED
-        main_hidden_states = forward_batch.spec_info.hidden_states
-        if dump_enabled:
-            _dump_tensor("model.mtp.0.input_ids", input_ids)
-            _dump_tensor("model.mtp.0.positions", positions)
-            _dump_tensor("model.mtp.0.main_hidden_in", main_hidden_states)
-
-        if input_embeds is None:
-            hidden_states = self.embed_tokens(input_ids)
-        else:
-            hidden_states = input_embeds
-
-        if len(self.oe_grams) > 0 and input_ids.numel() > 0:
+        if hashed_inputs is None:
             if getattr(forward_batch, "welm_oe_decode_hashed_inputs", None) is None:
-                raise RuntimeError(
-                    "WeLMV4 MTP OE requires cached CUDA hash inputs."
-                )
-            hidden_states = compute_welm_oe_embedding(
+                raise RuntimeError("WeLMV4 MTP OE requires cached CUDA hash inputs.")
+            return compute_welm_oe_embedding(
                 input_ids=input_ids,
                 forward_batch=forward_batch,
                 base_hidden_states=hidden_states,
@@ -402,6 +416,156 @@ class WeLMV4ModelNextN(nn.Module):
                 oe_proj_module=self.oe_gate_up_proj,
             )
 
+        had_attr = hasattr(forward_batch, "welm_oe_decode_hashed_inputs")
+        previous = getattr(forward_batch, "welm_oe_decode_hashed_inputs", None)
+        forward_batch.welm_oe_decode_hashed_inputs = hashed_inputs
+        try:
+            return compute_welm_oe_embedding(
+                input_ids=input_ids,
+                forward_batch=forward_batch,
+                base_hidden_states=hidden_states,
+                oe_grams=self.oe_grams,
+                oe_vocab_sizes=self.oe_vocab_sizes,
+                vocab_size=self.vocab_size,
+                oe_embed_modules=self.oe_embed,
+                oe_proj_module=self.oe_gate_up_proj,
+            )
+        finally:
+            if had_attr:
+                forward_batch.welm_oe_decode_hashed_inputs = previous
+            else:
+                delattr(forward_batch, "welm_oe_decode_hashed_inputs")
+
+    def _build_merged_query_embedding_only(
+        self,
+        forward_batch: ForwardBatch,
+        device: torch.device,
+    ) -> Optional[torch.Tensor]:
+        if not getattr(forward_batch, "welm_mtp_merge_kv_fill_draft", False):
+            return None
+        if not _welm_should_contract_kv_mirror(forward_batch):
+            return None
+
+        _welm_init_kv_mirror_last_q_indices(forward_batch)
+        query_input_ids = getattr(forward_batch, "welm_mtp_query_input_ids", None)
+        if query_input_ids is None:
+            raise RuntimeError("Missing merged WeLMV4 MTP query input ids.")
+        query_input_ids = query_input_ids.to(device=device, dtype=torch.int64)
+
+        active_indices = getattr(forward_batch, "kv_mirror_active_batch_indices", None)
+        output_size = getattr(forward_batch, "kv_mirror_output_size", None)
+        if (
+            active_indices is not None
+            and output_size is not None
+            and query_input_ids.shape[0] == output_size
+            and active_indices.numel() != output_size
+        ):
+            query_input_ids = query_input_ids[active_indices]
+
+        expected_rows = forward_batch.custom_last_index.numel()
+        if query_input_ids.shape[0] != expected_rows:
+            raise RuntimeError(
+                "Merged WeLMV4 MTP query input shape does not match active "
+                f"last-query rows: {query_input_ids.shape[0]} vs {expected_rows}."
+            )
+
+        query_hidden = self.embed_tokens(query_input_ids)
+        query_hashed_inputs = getattr(
+            forward_batch, "welm_mtp_query_oe_hashed_inputs", None
+        )
+        if (
+            query_hashed_inputs is not None
+            and active_indices is not None
+            and output_size is not None
+            and query_hashed_inputs.shape[1] == output_size
+            and active_indices.numel() != output_size
+        ):
+            query_hashed_inputs = query_hashed_inputs[:, active_indices]
+        if query_hashed_inputs is not None and query_hashed_inputs.shape[1] != int(
+            query_input_ids.numel()
+        ):
+            raise RuntimeError(
+                "Merged WeLMV4 MTP query OE hash shape mismatch: "
+                f"{query_hashed_inputs.shape[1]} vs {query_input_ids.numel()}."
+            )
+        return self._apply_oe_embedding(
+            query_input_ids,
+            query_hidden,
+            forward_batch,
+            hashed_inputs=query_hashed_inputs,
+        )
+
+    def _maybe_override_merged_query_embedding(
+        self,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> torch.Tensor:
+        if not getattr(forward_batch, "welm_mtp_merge_kv_fill_draft", False):
+            return hidden_states
+        if _welm_should_contract_kv_mirror(forward_batch):
+            return hidden_states
+
+        query_input_ids = getattr(forward_batch, "welm_mtp_query_input_ids", None)
+        if query_input_ids is None:
+            raise RuntimeError("Missing merged WeLMV4 MTP query input ids.")
+        query_input_ids = query_input_ids.to(
+            device=hidden_states.device, dtype=torch.int64
+        )
+        expected_rows = forward_batch.custom_last_index.numel()
+        if query_input_ids.shape[0] != expected_rows:
+            raise RuntimeError(
+                "Merged WeLMV4 MTP query input shape does not match active "
+                f"last-query rows: {query_input_ids.shape[0]} vs {expected_rows}."
+            )
+
+        query_hidden = self.embed_tokens(query_input_ids)
+        query_hidden = self._apply_oe_embedding(
+            query_input_ids,
+            query_hidden,
+            forward_batch,
+            hashed_inputs=getattr(forward_batch, "welm_mtp_query_oe_hashed_inputs", None),
+        )
+        hidden_states = hidden_states.clone()
+        hidden_states[forward_batch.custom_last_index] = query_hidden.to(
+            hidden_states.dtype
+        )
+        return hidden_states
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        input_embeds: torch.Tensor = None,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        mtp_step_idx = int(getattr(forward_batch, "mtp_step_idx", 0))
+        if not getattr(forward_batch, "kv_fill_only", False) and mtp_step_idx == 0:
+            _start_mtp_dump_pass()
+
+        _dump_tensor(f"model.mtp.{mtp_step_idx}.input_ids", input_ids)
+        _dump_tensor(f"model.mtp.{mtp_step_idx}.positions", positions)
+        _dump_tensor(
+            f"model.mtp.{mtp_step_idx}.main_hidden_in",
+            forward_batch.spec_info.hidden_states,
+        )
+
+        hidden_states = self._build_merged_query_embedding_only(
+            forward_batch, input_ids.device
+        )
+        if hidden_states is None:
+            if input_embeds is None:
+                hidden_states = self.embed_tokens(input_ids)
+            else:
+                hidden_states = input_embeds
+            hidden_states = self._apply_oe_embedding(
+                input_ids, hidden_states, forward_batch
+            )
+            hidden_states = self._maybe_override_merged_query_embedding(
+                hidden_states, forward_batch
+            )
+        _dump_tensor(f"model.mtp.{mtp_step_idx}.embedding", hidden_states)
+
+        main_hidden_states = forward_batch.spec_info.hidden_states
         if (
             _welm_should_contract_kv_mirror(forward_batch)
             and main_hidden_states is not None
@@ -431,81 +595,82 @@ class WeLMV4ModelNextN(nn.Module):
             and getattr(forward_batch, "global_num_tokens_gpu", None) is not None
         )
         if hidden_states.shape[0] == 0 and not needs_empty_dp_collectives:
-            # KV-mirror contraction can select no active rows for this draft
-            # extend chunk. Avoid running zero-token decoder kernels; the caller
-            # scatters this empty result back to the logical batch shape.
             return hidden_states, hidden_states
 
+        proj = self._get_projector(mtp_step_idx)
         if hidden_states.shape[0] > 0:
-            enorm_output = self.enorm(hidden_states)
-            hnorm_output = self.hnorm(main_hidden_states)
-            hidden_states = self.eh_proj(
+            enorm_output = proj.enorm(hidden_states)
+            hnorm_output = proj.hnorm(main_hidden_states)
+            _dump_tensor(f"model.mtp.{mtp_step_idx}.enorm", enorm_output)
+            _dump_tensor(f"model.mtp.{mtp_step_idx}.hnorm", hnorm_output)
+            hidden_states = proj.eh_proj(
                 torch.cat((enorm_output, hnorm_output), dim=-1)
             )
-            if dump_enabled:
-                _dump_tensor("model.mtp.0.projector_out", hidden_states)
+            _dump_tensor(f"model.mtp.{mtp_step_idx}.projector_out", hidden_states)
 
         residual = None
         kv_mirror_states = _get_welm_kv_mirror_states(forward_batch)
         final_experts_output = None
         final_shared_output = None
+        physical_step_idx = self._get_physical_step_idx(mtp_step_idx)
+        layer = self.decoder_layers[physical_step_idx]
         with get_global_expert_distribution_recorder().disable_this_region():
-            for layer_idx, layer in enumerate(self.decoder_layers):
-                hidden_states, residual, kv_mirror_states = layer(
-                    positions,
-                    hidden_states,
-                    forward_batch,
-                    residual,
-                    kv_mirror_states,
-                )
-                final_experts_output = getattr(layer, "final_mlp_experts_output", None)
-                final_shared_output = getattr(layer, "final_mlp_shared_output", None)
+            hidden_states, residual, kv_mirror_states = layer(
+                positions,
+                hidden_states,
+                forward_batch,
+                residual,
+                kv_mirror_states,
+            )
+            final_experts_output = getattr(layer, "final_mlp_experts_output", None)
+            final_shared_output = getattr(layer, "final_mlp_shared_output", None)
 
         if hidden_states.shape[0] == 0:
             return hidden_states, hidden_states
 
+        ln_f = proj.ln_f
         hidden_states_for_next_mtp = None
         if not forward_batch.forward_mode.is_idle():
             if residual is not None:
                 if welm_use_previous_precision():
                     hidden_states_for_next_mtp = (
                         hidden_states.float() + residual.float()
-                    ).to(self.shared_head.norm.weight.dtype)
-                    hidden_states, _ = self.shared_head.norm(hidden_states, residual)
+                    ).to(ln_f.weight.dtype)
+                    hidden_states, _ = ln_f(hidden_states, residual)
                 else:
-                    final_layer = self.decoder_layers[-1]
+                    # Component outputs are captured before the MLP all-reduce.
+                    # Rebuilding from them is only equivalent when there is no
+                    # tensor-parallel reduction to apply.
                     can_rebuild_final_mlp = (
                         final_experts_output is not None
-                        and getattr(final_layer.mlp, "tp_size", 1) == 1
+                        and getattr(layer.mlp, "tp_size", 1) == 1
                         and not is_dp_attention_enabled()
                     )
                     if can_rebuild_final_mlp:
                         hidden_states = final_experts_output.float() + residual.float()
                         if final_shared_output is not None:
                             hidden_states = hidden_states + final_shared_output.float()
+                        hidden_states_for_next_mtp = hidden_states.to(ln_f.weight.dtype)
+                        hidden_states, _ = ln_f(hidden_states_for_next_mtp)
                     else:
-                        hidden_states = hidden_states.float() + residual.float()
-                if hidden_states_for_next_mtp is None:
-                    # MMQ feeds the MTP layer output before apply_ln_f into the next
-                    # recursive MTP step; shared_head.norm is only for logits.
-                    hidden_states_for_next_mtp = hidden_states.to(
-                        self.shared_head.norm.weight.dtype
-                    )
-                    hidden_states, _ = self.shared_head.norm(hidden_states_for_next_mtp)
+                        hidden_states, hidden_states_for_next_mtp = ln_f(
+                            hidden_states, residual, output_dtype=ln_f.weight.dtype
+                        )
+                        if hidden_states_for_next_mtp.dtype != ln_f.weight.dtype:
+                            hidden_states_for_next_mtp = hidden_states_for_next_mtp.to(
+                                ln_f.weight.dtype
+                            )
             else:
-                hidden_states_for_next_mtp = hidden_states.to(
-                    self.shared_head.norm.weight.dtype
-                )
-                norm_output = self.shared_head.norm(hidden_states_for_next_mtp)
+                hidden_states_for_next_mtp = hidden_states.to(ln_f.weight.dtype)
+                norm_output = ln_f(hidden_states_for_next_mtp)
                 hidden_states = (
                     norm_output[0] if isinstance(norm_output, tuple) else norm_output
                 )
-            if dump_enabled:
-                _dump_tensor(
-                    "model.mtp.0.decoder.0.output", hidden_states_for_next_mtp
-                )
-        if dump_enabled:
-            _dump_tensor("model.mtp.0.ln_f", hidden_states)
+            _dump_tensor(
+                f"model.mtp.{mtp_step_idx}.decoder.output",
+                hidden_states_for_next_mtp,
+            )
+        _dump_tensor(f"model.mtp.{mtp_step_idx}.ln_f", hidden_states)
         return hidden_states, hidden_states_for_next_mtp
 
 
@@ -522,6 +687,7 @@ class WeLMV4MoeForCausalLMNextN(WeLMV4MoeForCausalLM):
         self.quant_config = quant_config
         # if not set, model load will be broken in DeepseekV3ForCausalLM load_weights()
         self.pp_group = get_pp_group()
+        self.welm_mtp_version = get_welm_mtp_version(config)
 
         self.model = WeLMV4ModelNextN(
             config, quant_config, prefix=add_prefix("model", prefix)
@@ -536,8 +702,12 @@ class WeLMV4MoeForCausalLMNextN(WeLMV4MoeForCausalLM):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        if _MTP_DUMP_ENABLED:
-            _start_mtp_dump_pass()
+        mtp_step_idx = getattr(forward_batch, "mtp_step_idx", 0)
+        started_dump = (
+            _MTP_DUMP_ENABLED
+            and not getattr(forward_batch, "kv_fill_only", False)
+            and mtp_step_idx == 0
+        )
         try:
             hidden_states, hidden_states_for_next_mtp = self.model(
                 input_ids, positions, forward_batch
@@ -559,10 +729,13 @@ class WeLMV4MoeForCausalLMNextN(WeLMV4MoeForCausalLM):
                 aux_hidden_states,
             )
             if _MTP_DUMP_ENABLED:
-                _dump_tensor("model.mtp.0.logits", logits_output.next_token_logits)
+                _dump_tensor(
+                    f"model.mtp.{mtp_step_idx}.logits",
+                    logits_output.next_token_logits,
+            )
             return logits_output
         finally:
-            if _MTP_DUMP_ENABLED:
+            if started_dump:
                 _finish_mtp_dump_pass()
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):

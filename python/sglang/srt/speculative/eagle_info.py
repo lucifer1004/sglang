@@ -72,6 +72,9 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
     seq_lens_sum: int
     seq_lens_cpu: torch.Tensor
     grammar: BaseGrammarObject = None
+    draft_probs: Optional[torch.Tensor] = None
+    draft_topk_indices: Optional[torch.Tensor] = None
+    draft_topk_values: Optional[torch.Tensor] = None
 
     # Shape info for padding
     num_tokens_per_req: int = -1  # -1 auto-fills from draft_token_num.
@@ -106,6 +109,9 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             capture_hidden_mode=CaptureHiddenMode.FULL,
             seq_lens_sum=0,
             seq_lens_cpu=torch.empty((0,), dtype=torch.int32),
+            draft_probs=None,
+            draft_topk_indices=None,
+            draft_topk_values=None,
         )
 
     def prepare_for_verify(self, batch: ScheduleBatch, page_size: int):
@@ -661,6 +667,9 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
     # shape: (b, topk)
     topk_p: torch.Tensor = None
     topk_index: torch.Tensor = None
+    # Optional proposal distribution for topk=1 stochastic WeLM MTP.
+    # shape: (b, <=spec_steps, vocab_size) or None when unsupported.
+    draft_probs: torch.Tensor = None
     # shape: (b, hidden_size)
     hidden_states: torch.Tensor = None
     capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.FULL
@@ -694,6 +703,15 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
     # WeLMV4 MTP recursive draft-decode state. Later draft steps reuse the same
     # base KV cache row/position instead of appending speculative MTP KV.
     welm_mtp_base_positions: torch.Tensor = None
+    # Draft proposal produced by the merged extend+draft stage. It uses the
+    # existing V1 tree input contract consumed by build_tree_kernel_efficient().
+    draft_proposal_parent_list: torch.Tensor = None
+    draft_proposal_top_scores_index: torch.Tensor = None
+    draft_proposal_tokens: torch.Tensor = None
+    welm_mtp_has_draft_proposal: bool = False
+    welm_mtp_deferred_prefill_draft: bool = False
+    welm_mtp_draft_topk_indices: torch.Tensor = None
+    welm_mtp_draft_topk_values: torch.Tensor = None
 
     # Inputs for V2 overlap worker
     future_indices: Optional[FutureIndices] = None
@@ -737,6 +755,7 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
             hidden_states=torch.empty((0, hidden_size), device=device, dtype=dtype),
             topk_p=torch.empty((0, topk), device=device, dtype=torch.float32),
             topk_index=torch.empty((0, topk), device=device, dtype=torch.int64),
+            draft_probs=None,
             capture_hidden_mode=capture_hidden_mode,
             new_seq_lens=torch.empty((0,), device=device, dtype=torch.int32),
             num_accepted_drafts=torch.empty((0,), device=device, dtype=torch.int32),
@@ -829,6 +848,7 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
     def filter_batch(self, new_indices: torch.Tensor, has_been_filtered: bool = True):
         if self.future_indices is not None:
             self.future_indices.indices = self.future_indices.indices[new_indices]
+            self._filter_welm_mtp_local_future_state(new_indices)
             return
 
         strict_check = envs.SGLANG_SPEC_ENABLE_STRICT_FILTER_CHECK.get()
@@ -850,6 +870,7 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
                 self.welm_mtp_base_positions = self.welm_mtp_base_positions[
                     : len(new_indices)
                 ]
+            self._filter_welm_mtp_draft_proposal(len(new_indices), None)
         else:
             # in some cases(e.g draft_extend), we have not filtered the batch by `unfinished_index`
             self.topk_p = self.topk_p[new_indices]
@@ -860,6 +881,49 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
                 self.welm_mtp_base_positions = self.welm_mtp_base_positions[
                     new_indices
                 ]
+            self._filter_welm_mtp_draft_proposal(None, new_indices)
+
+    def _filter_welm_mtp_draft_proposal(
+        self, keep_len: Optional[int], new_indices: Optional[torch.Tensor]
+    ) -> None:
+        fields = (
+            "draft_proposal_parent_list",
+            "draft_proposal_top_scores_index",
+            "draft_proposal_tokens",
+            "draft_probs",
+            "welm_mtp_draft_topk_indices",
+            "welm_mtp_draft_topk_values",
+        )
+        for field in fields:
+            value = getattr(self, field, None)
+            if value is None:
+                continue
+            setattr(
+                self,
+                field,
+                value[:keep_len] if new_indices is None else value[new_indices],
+            )
+
+    def _filter_welm_mtp_local_future_state(self, new_indices: torch.Tensor) -> None:
+        # FutureMap resolves the core next-draft tensors. These derived/local
+        # fields are carried on EagleDraftInput itself, so they must follow the
+        # same filtering while future_indices only narrows the future map rows.
+        fields = (
+            "draft_proposal_parent_list",
+            "draft_proposal_top_scores_index",
+            "draft_proposal_tokens",
+            "draft_probs",
+            "welm_mtp_draft_topk_indices",
+            "welm_mtp_draft_topk_values",
+            "welm_mtp_base_positions",
+            "welm_mtp_oe_history_state",
+            "welm_mtp_oe_prefix_rows",
+        )
+        for field in fields:
+            value = getattr(self, field, None)
+            if value is None:
+                continue
+            setattr(self, field, value[new_indices])
 
     def merge_batch(self, spec_info: "EagleDraftInput"):
         if self.future_indices is not None:
@@ -869,6 +933,26 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
                     [self.future_indices.indices, spec_info.future_indices.indices]
                 )
             )
+            if (
+                self.welm_mtp_base_positions is not None
+                and spec_info.welm_mtp_base_positions is not None
+            ):
+                self.welm_mtp_base_positions = torch.cat(
+                    [self.welm_mtp_base_positions, spec_info.welm_mtp_base_positions],
+                    axis=0,
+                )
+            else:
+                self.welm_mtp_base_positions = None
+            self.welm_mtp_deferred_prefill_draft = (
+                self.welm_mtp_deferred_prefill_draft
+                or spec_info.welm_mtp_deferred_prefill_draft
+            ) and not (
+                self.welm_mtp_has_draft_proposal
+                or spec_info.welm_mtp_has_draft_proposal
+            )
+            self._merge_welm_mtp_draft_proposal(spec_info)
+            self._merge_optional_tensor_attr(spec_info, "welm_mtp_oe_history_state")
+            self._merge_optional_tensor_attr(spec_info, "welm_mtp_oe_prefix_rows")
             return
 
         if self.hidden_states is None:
@@ -877,6 +961,11 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
             self.topk_p = spec_info.topk_p
             self.topk_index = spec_info.topk_index
             self.welm_mtp_base_positions = spec_info.welm_mtp_base_positions
+            self.welm_mtp_deferred_prefill_draft = (
+                spec_info.welm_mtp_deferred_prefill_draft
+                and not spec_info.welm_mtp_has_draft_proposal
+            )
+            self._copy_welm_mtp_draft_proposal_from(spec_info)
             return
         if spec_info.hidden_states is None:
             return
@@ -896,6 +985,66 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
             )
         else:
             self.welm_mtp_base_positions = None
+        self.welm_mtp_deferred_prefill_draft = (
+            self.welm_mtp_deferred_prefill_draft
+            or spec_info.welm_mtp_deferred_prefill_draft
+        ) and not (
+            self.welm_mtp_has_draft_proposal
+            or spec_info.welm_mtp_has_draft_proposal
+        )
+        self._merge_welm_mtp_draft_proposal(spec_info)
+
+    def _copy_welm_mtp_draft_proposal_from(self, spec_info: "EagleDraftInput") -> None:
+        self.welm_mtp_has_draft_proposal = spec_info.welm_mtp_has_draft_proposal
+        self.draft_proposal_parent_list = spec_info.draft_proposal_parent_list
+        self.draft_proposal_top_scores_index = spec_info.draft_proposal_top_scores_index
+        self.draft_proposal_tokens = spec_info.draft_proposal_tokens
+        self.draft_probs = spec_info.draft_probs
+        self.welm_mtp_draft_topk_indices = spec_info.welm_mtp_draft_topk_indices
+        self.welm_mtp_draft_topk_values = spec_info.welm_mtp_draft_topk_values
+
+    def _merge_optional_first_dim(
+        self, lhs: Optional[torch.Tensor], rhs: Optional[torch.Tensor]
+    ) -> Optional[torch.Tensor]:
+        if lhs is None or rhs is None:
+            return None
+        return torch.cat([lhs, rhs], axis=0)
+
+    def _merge_optional_tensor_attr(
+        self, spec_info: "EagleDraftInput", field: str
+    ) -> None:
+        setattr(
+            self,
+            field,
+            self._merge_optional_first_dim(
+                getattr(self, field, None), getattr(spec_info, field, None)
+            ),
+        )
+
+    def _merge_welm_mtp_draft_proposal(self, spec_info: "EagleDraftInput") -> None:
+        if not self.welm_mtp_has_draft_proposal and not spec_info.welm_mtp_has_draft_proposal:
+            return
+        self.welm_mtp_has_draft_proposal = (
+            self.welm_mtp_has_draft_proposal and spec_info.welm_mtp_has_draft_proposal
+        )
+        self.draft_proposal_parent_list = self._merge_optional_first_dim(
+            self.draft_proposal_parent_list, spec_info.draft_proposal_parent_list
+        )
+        self.draft_proposal_top_scores_index = self._merge_optional_first_dim(
+            self.draft_proposal_top_scores_index, spec_info.draft_proposal_top_scores_index
+        )
+        self.draft_proposal_tokens = self._merge_optional_first_dim(
+            self.draft_proposal_tokens, spec_info.draft_proposal_tokens
+        )
+        self.draft_probs = self._merge_optional_first_dim(
+            self.draft_probs, spec_info.draft_probs
+        )
+        self.welm_mtp_draft_topk_indices = self._merge_optional_first_dim(
+            self.welm_mtp_draft_topk_indices, spec_info.welm_mtp_draft_topk_indices
+        )
+        self.welm_mtp_draft_topk_values = self._merge_optional_first_dim(
+            self.welm_mtp_draft_topk_values, spec_info.welm_mtp_draft_topk_values
+        )
 
 
 @dataclass
