@@ -70,6 +70,10 @@ def _welm_oe_lookup_concat_prehashed_4x512_kernel(
     shard_end_1,
     shard_end_2,
     shard_end_3,
+    hash0_stride,
+    hash1_stride,
+    hash2_stride,
+    hash3_stride,
     weight0_row_stride,
     weight1_row_stride,
     weight2_row_stride,
@@ -84,10 +88,18 @@ def _welm_oe_lookup_concat_prehashed_4x512_kernel(
     token_mask = token_idx < num_tokens
     dim_mask = offs_d < EMBED_DIM
 
-    bucket0 = tl.load(hash0_ptr + token_idx, mask=token_mask, other=0).to(tl.uint32)
-    bucket1 = tl.load(hash1_ptr + token_idx, mask=token_mask, other=0).to(tl.uint32)
-    bucket2 = tl.load(hash2_ptr + token_idx, mask=token_mask, other=0).to(tl.uint32)
-    bucket3 = tl.load(hash3_ptr + token_idx, mask=token_mask, other=0).to(tl.uint32)
+    bucket0 = tl.load(hash0_ptr + token_idx * hash0_stride, mask=token_mask, other=0).to(
+        tl.uint32
+    )
+    bucket1 = tl.load(hash1_ptr + token_idx * hash1_stride, mask=token_mask, other=0).to(
+        tl.uint32
+    )
+    bucket2 = tl.load(hash2_ptr + token_idx * hash2_stride, mask=token_mask, other=0).to(
+        tl.uint32
+    )
+    bucket3 = tl.load(hash3_ptr + token_idx * hash3_stride, mask=token_mask, other=0).to(
+        tl.uint32
+    )
 
     valid0 = token_mask & (bucket0 >= shard_start_0.to(tl.uint32)) & (
         bucket0 < shard_end_0.to(tl.uint32)
@@ -414,6 +426,10 @@ def _compute_welm_oe_concat_local_partials_prehashed_specialized_4x512(
         oe_embed_modules[1].shard_indices.org_vocab_end_index,
         oe_embed_modules[2].shard_indices.org_vocab_end_index,
         oe_embed_modules[3].shard_indices.org_vocab_end_index,
+        hashed_inputs[0].stride(0),
+        hashed_inputs[1].stride(0),
+        hashed_inputs[2].stride(0),
+        hashed_inputs[3].stride(0),
         oe_embed_modules[0].weight.stride(0),
         oe_embed_modules[1].weight.stride(0),
         oe_embed_modules[2].weight.stride(0),

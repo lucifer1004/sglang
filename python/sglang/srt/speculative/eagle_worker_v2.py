@@ -3,7 +3,7 @@ import logging
 import os
 import time
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -91,6 +91,11 @@ from sglang.srt.speculative.welmv4_mtp_draft_proposal_cuda_graph_runner import (
     WelmMTPDraftProposalCudaGraphRunner,
 )
 from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
+
+if TYPE_CHECKING:
+    from sglang.srt.speculative.welm_mtp_draft_ngram_hash import (
+        WelmMTPDraftNGramHistoryState,
+    )
 
 _is_npu = is_npu()
 _is_cuda = is_cuda()
@@ -772,20 +777,46 @@ class EagleDraftWorker(BaseDraftWorker):
         forward_batch: ForwardBatch,
         first_input_ids: torch.Tensor,
         entry_history_state: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        first_query_hashed_inputs, first_query_history_state = (
+    ) -> Tuple[torch.Tensor, "WelmMTPDraftNGramHistoryState", torch.Tensor]:
+        from sglang.srt.speculative.welm_mtp_draft_ngram_hash import (
+            WelmMTPDraftNGramEntryHistory,
+            materialize_welm_mtp_draft_ngram_history,
+            should_use_mk_welm_mtp_draft_ngram_hash,
+        )
+
+        entry_hash_history: "WelmMTPDraftNGramHistoryState" = entry_history_state
+        if (
+            should_use_mk_welm_mtp_draft_ngram_hash()
+            and entry_history_state.shape[1] >= 2
+        ):
+            entry_hash_history = WelmMTPDraftNGramEntryHistory(
+                prev_input_ids=entry_history_state[:, -1],
+                prev_prev_input_ids=[
+                    int(x) for x in entry_history_state[:, -2].detach().cpu().tolist()
+                ],
+            )
+        first_query_hashed_inputs, first_query_draft_history_state = (
             self._compute_welmv4_mtp_draft_decode_hash_inputs(
                 forward_batch,
                 first_input_ids.to(dtype=torch.int64),
-                entry_history_state,
+                entry_hash_history,
                 draft_history_state=None,
                 selected_parent_indices=None,
-                base_query_count=int(entry_history_state.shape[0]),
+                base_query_count=int(entry_hash_history.shape[0]),
                 step_idx=0,
                 use_forward_hash_buffer=False,
             )
         )
-        return first_query_hashed_inputs, first_query_history_state
+        _, _, history_width = self._welmv4_mtp_oe_hash_config()
+        first_query_verify_history_state = materialize_welm_mtp_draft_ngram_history(
+            first_query_draft_history_state,
+            history_width=history_width,
+        )
+        return (
+            first_query_hashed_inputs,
+            first_query_draft_history_state,
+            first_query_verify_history_state,
+        )
 
     def _get_welmv4_mtp_hash_out(
         self,
@@ -1079,12 +1110,12 @@ class EagleDraftWorker(BaseDraftWorker):
         self,
         forward_batch: ForwardBatch,
         input_ids: torch.Tensor,
-        entry_history_state: torch.Tensor,
-        draft_history_state: Optional[torch.Tensor],
+        entry_history_state: "WelmMTPDraftNGramHistoryState",
+        draft_history_state: Optional["WelmMTPDraftNGramHistoryState"],
         selected_parent_indices: Optional[torch.Tensor],
         base_query_count: int,
         step_idx: int,
-    ) -> torch.Tensor:
+    ) -> "WelmMTPDraftNGramHistoryState":
         hashed_out, next_history = self._compute_welmv4_mtp_draft_decode_hash_inputs(
             forward_batch,
             input_ids,
@@ -1102,16 +1133,20 @@ class EagleDraftWorker(BaseDraftWorker):
         self,
         forward_batch: ForwardBatch,
         input_ids: torch.Tensor,
-        entry_history_state: torch.Tensor,
-        draft_history_state: Optional[torch.Tensor],
+        entry_history_state: "WelmMTPDraftNGramHistoryState",
+        draft_history_state: Optional["WelmMTPDraftNGramHistoryState"],
         selected_parent_indices: Optional[torch.Tensor],
         base_query_count: int,
         step_idx: int,
         *,
         use_forward_hash_buffer: bool = False,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, "WelmMTPDraftNGramHistoryState"]:
         from sglang.jit_kernel.welm_oe import (
             welm_oe_hash_mtp_draft_decode_from_history_cuda,
+        )
+        from sglang.srt.speculative.welm_mtp_draft_ngram_hash import (
+            should_use_mk_welm_mtp_draft_ngram_hash,
+            welm_mtp_draft_ngram_hash_from_history,
         )
 
         oe_grams, oe_vocab_sizes, history_width = self._welmv4_mtp_oe_hash_config()
@@ -1132,11 +1167,58 @@ class EagleDraftWorker(BaseDraftWorker):
                 forward_batch, input_ids, len(oe_vocab_sizes)
             )
         else:
-            hashed_out = torch.empty(
-                (len(oe_vocab_sizes), int(input_ids.numel())),
-                device=input_ids.device,
-                dtype=torch.int64,
+            batch_major_hash_out = getattr(
+                forward_batch, "welm_mtp_oe_hash_out_batch_major", None
             )
+            if (
+                batch_major_hash_out is not None
+                and getattr(forward_batch, "welm_mtp_skip_draft_proposal_build", False)
+                and batch_major_hash_out.shape[0] >= int(input_ids.numel())
+                and batch_major_hash_out.shape[1] == len(oe_vocab_sizes)
+            ):
+                hashed_out = batch_major_hash_out[: int(input_ids.numel())].t()
+            else:
+                hashed_out = torch.empty(
+                    (len(oe_vocab_sizes), int(input_ids.numel())),
+                    device=input_ids.device,
+                    dtype=torch.int64,
+                )
+        mk_history_state = welm_mtp_draft_ngram_hash_from_history(
+            forward_batch=forward_batch,
+            input_ids=input_ids,
+            history_state=source_history,
+            parent_indices=parent_indices,
+            oe_grams=oe_grams,
+            oe_vocab_sizes=oe_vocab_sizes,
+            hashed_out=hashed_out,
+            next_history_state=None,
+            vocab_size=self.draft_runner.model_config.vocab_size,
+            base_query_count=base_query_count,
+            use_parent=use_parent,
+            prev_input_ids_scratch=getattr(
+                forward_batch, "welm_mtp_oe_prev_input_ids", None
+            ),
+            prev_prev_input_ids_scratch=getattr(
+                forward_batch, "welm_mtp_oe_prev_prev_input_ids", None
+            ),
+            output_ids_scratch=getattr(
+                forward_batch, "welm_mtp_oe_hash_out_batch_major", None
+            ),
+            output_prev_input_ids_scratch=getattr(
+                forward_batch, "welm_mtp_oe_output_prev_input_ids", None
+            ),
+            source_indices_scratch=getattr(
+                forward_batch, "welm_mtp_oe_parent_scratch", None
+            ),
+        )
+        if mk_history_state is not None:
+            return hashed_out, mk_history_state
+        if should_use_mk_welm_mtp_draft_ngram_hash():
+            raise RuntimeError(
+                "SGLANG_WELM_MTP_DRAFT_NGRAM_HASH is enabled, but draft decode "
+                "ngram hash did not run through mk."
+            )
+
         next_history = self._get_welmv4_mtp_next_history_out(
             forward_batch,
             int(input_ids.numel()),
@@ -1831,7 +1913,7 @@ class EagleDraftWorker(BaseDraftWorker):
         *,
         skip_attn_backend_init: bool,
         first_query_hashed_inputs: Optional[torch.Tensor] = None,
-        first_query_history_state: Optional[torch.Tensor] = None,
+        first_query_history_state: Optional["WelmMTPDraftNGramHistoryState"] = None,
         draft_path: str = "merged_extend_draft",
     ) -> None:
         if self.topk != 1:
@@ -1935,7 +2017,15 @@ class EagleDraftWorker(BaseDraftWorker):
                 draft_topk_values_list.append(draft_topk_values.unsqueeze(1))
 
             main_hidden_states = logits_output.hidden_states
-            input_ids = mapped_topk_index.flatten().to(dtype=torch.int64)
+            next_input_ids = mapped_topk_index.flatten().to(dtype=torch.int64)
+            draft_input_id_buffers = getattr(
+                forward_batch, "welm_mtp_draft_input_ids", None
+            )
+            if draft_input_id_buffers is not None:
+                input_ids = draft_input_id_buffers[step, : next_input_ids.numel()]
+                input_ids.copy_(next_input_ids)
+            else:
+                input_ids = next_input_ids
             last_logits_output = logits_output
 
         spec_info.topk_p = torch.cat(topk_p_list, dim=1)
@@ -2241,6 +2331,11 @@ class EagleDraftWorker(BaseDraftWorker):
             "welm_mtp_oe_entry_history_state",
             "welm_mtp_oe_work_history",
             "welm_mtp_oe_parent_scratch",
+            "welm_mtp_oe_prev_input_ids",
+            "welm_mtp_oe_prev_prev_input_ids",
+            "welm_mtp_oe_output_prev_input_ids",
+            "welm_mtp_oe_hash_out_batch_major",
+            "welm_mtp_oe_draft_ngram_prepared_cache",
         ):
             if hasattr(forward_batch, attr):
                 setattr(recursive_batch, attr, getattr(forward_batch, attr))
@@ -3283,12 +3378,15 @@ class EagleDraftWorker(BaseDraftWorker):
                 (
                     first_query_hashed_inputs,
                     first_query_history_state,
+                    first_query_verify_history_state,
                 ) = self._compute_welmv4_mtp_first_query_hash_from_entry_history(
                     forward_batch,
                     next_token_ids,
                     entry_history_state,
                 )
-                next_draft_input.welm_mtp_oe_history_state = first_query_history_state
+                next_draft_input.welm_mtp_oe_history_state = (
+                    first_query_verify_history_state
+                )
             if mm_input_embeds is not None:
                 forward_batch.mm_input_embeds = mm_input_embeds
             if _WELM_MTP_DUMP_ENABLED:

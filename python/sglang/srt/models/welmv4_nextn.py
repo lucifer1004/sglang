@@ -416,6 +416,11 @@ class WeLMV4ModelNextN(nn.Module):
                 oe_proj_module=self.oe_gate_up_proj,
             )
 
+        from sglang.srt.speculative.welm_mtp_draft_ngram_hash import (
+            launch_deferred_welm_mtp_draft_ngram_hash,
+        )
+
+        launch_deferred_welm_mtp_draft_ngram_hash(forward_batch)
         had_attr = hasattr(forward_batch, "welm_oe_decode_hashed_inputs")
         previous = getattr(forward_batch, "welm_oe_decode_hashed_inputs", None)
         forward_batch.welm_oe_decode_hashed_inputs = hashed_inputs

@@ -113,6 +113,11 @@ class WelmMTPDraftProposalInputBuffers(ForwardInputBuffers):
     welm_mtp_oe_work_history_a: Optional[torch.Tensor]
     welm_mtp_oe_work_history_b: Optional[torch.Tensor]
     welm_mtp_oe_parent_indices: Optional[torch.Tensor]
+    welm_mtp_oe_prev_input_ids: Optional[torch.Tensor]
+    welm_mtp_oe_prev_prev_input_ids: Optional[torch.Tensor]
+    welm_mtp_oe_output_prev_input_ids: Optional[torch.Tensor]
+    welm_mtp_oe_hash_out_batch_major: Optional[torch.Tensor]
+    welm_mtp_draft_input_ids: Optional[torch.Tensor]
     global_num_tokens_gpu: Optional[torch.Tensor]
     global_num_tokens_for_logprob_gpu: Optional[torch.Tensor]
 
@@ -291,6 +296,22 @@ class WelmMTPDraftProposalCudaGraphRunner:
                 welm_mtp_oe_parent_indices = torch.zeros(
                     (self.max_num_token,), dtype=torch.int64
                 )
+                welm_mtp_oe_prev_input_ids = torch.zeros(
+                    (self.max_num_token,), dtype=torch.int64
+                )
+                welm_mtp_oe_prev_prev_input_ids = torch.zeros(
+                    (self.max_num_token,), dtype=torch.int64
+                )
+                welm_mtp_oe_output_prev_input_ids = torch.zeros(
+                    (self.max_num_token,), dtype=torch.int64
+                )
+                welm_mtp_oe_hash_out_batch_major = torch.zeros(
+                    (self.max_num_token, len(oe_vocab_sizes)), dtype=torch.int64
+                )
+                welm_mtp_draft_input_ids = torch.zeros(
+                    (self.speculative_num_steps, self.max_num_token),
+                    dtype=torch.int64,
+                )
             else:
                 welm_mtp_oe_hash_out = None
                 welm_mtp_query_hash_inputs = None
@@ -298,6 +319,11 @@ class WelmMTPDraftProposalCudaGraphRunner:
                 welm_mtp_oe_work_history_a = None
                 welm_mtp_oe_work_history_b = None
                 welm_mtp_oe_parent_indices = None
+                welm_mtp_oe_prev_input_ids = None
+                welm_mtp_oe_prev_prev_input_ids = None
+                welm_mtp_oe_output_prev_input_ids = None
+                welm_mtp_oe_hash_out_batch_major = None
+                welm_mtp_draft_input_ids = None
 
             if self.require_gathered_buffer:
                 if self.require_mlp_tp_gather:
@@ -368,6 +394,11 @@ class WelmMTPDraftProposalCudaGraphRunner:
             welm_mtp_oe_work_history_a=welm_mtp_oe_work_history_a,
             welm_mtp_oe_work_history_b=welm_mtp_oe_work_history_b,
             welm_mtp_oe_parent_indices=welm_mtp_oe_parent_indices,
+            welm_mtp_oe_prev_input_ids=welm_mtp_oe_prev_input_ids,
+            welm_mtp_oe_prev_prev_input_ids=welm_mtp_oe_prev_prev_input_ids,
+            welm_mtp_oe_output_prev_input_ids=welm_mtp_oe_output_prev_input_ids,
+            welm_mtp_oe_hash_out_batch_major=welm_mtp_oe_hash_out_batch_major,
+            welm_mtp_draft_input_ids=welm_mtp_draft_input_ids,
             global_num_tokens_gpu=global_num_tokens_gpu,
             global_num_tokens_for_logprob_gpu=global_num_tokens_for_logprob_gpu,
         )
@@ -1236,6 +1267,21 @@ class WelmMTPDraftProposalCudaGraphRunner:
                 forward_batch.welm_mtp_oe_parent_scratch = (
                     buffers.welm_mtp_oe_parent_indices[:num_tokens]
                 )
+            forward_batch.welm_mtp_oe_prev_input_ids = (
+                buffers.welm_mtp_oe_prev_input_ids[:num_tokens]
+            )
+            forward_batch.welm_mtp_oe_prev_prev_input_ids = (
+                buffers.welm_mtp_oe_prev_prev_input_ids[:num_tokens]
+            )
+            forward_batch.welm_mtp_oe_output_prev_input_ids = (
+                buffers.welm_mtp_oe_output_prev_input_ids[:num_tokens]
+            )
+            forward_batch.welm_mtp_oe_hash_out_batch_major = (
+                buffers.welm_mtp_oe_hash_out_batch_major[:num_tokens]
+            )
+            forward_batch.welm_mtp_draft_input_ids = (
+                buffers.welm_mtp_draft_input_ids[:, :num_tokens]
+            )
 
         self.draft_extend_attn_backend.init_forward_metadata_capture_cuda_graph(
             bs=bs,
@@ -1369,6 +1415,10 @@ class WelmMTPDraftProposalCudaGraphRunner:
             buffers.welm_mtp_oe_work_history_a[:graph_num_tokens].zero_()
             buffers.welm_mtp_oe_work_history_b[:graph_num_tokens].zero_()
             buffers.welm_mtp_oe_parent_indices[:graph_num_tokens].zero_()
+            buffers.welm_mtp_oe_prev_input_ids[:graph_num_tokens].zero_()
+            buffers.welm_mtp_oe_prev_prev_input_ids[:graph_num_tokens].zero_()
+            buffers.welm_mtp_oe_output_prev_input_ids[:graph_num_tokens].zero_()
+            buffers.welm_mtp_oe_hash_out_batch_major[:graph_num_tokens].zero_()
 
         if self._is_welmv4_mtp_v1_draft_model():
             self._copy_v1_runtime_flat_layout(
