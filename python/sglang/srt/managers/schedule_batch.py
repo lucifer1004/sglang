@@ -80,6 +80,10 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
 )
+from sglang.srt.models.welm_perf_opt import (
+    get_welm_oe_hash_config,
+    should_use_welm_oe_hash_kernel,
+)
 from sglang.srt.observability.metrics_collector import (
     DPCooperationInfo,
     SchedulerMetricsCollector,
@@ -94,11 +98,6 @@ from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs, get_global_server_args
 from sglang.srt.utils import flatten_nested_list
 from sglang.srt.utils.cuda_ipc_transport_utils import CudaIpcTensorTransportProxy
-from sglang.srt.utils.over_encoding_utils import (
-    assign_ngram_input_ids_draft_extend,
-    filter_buffer,
-    update_ngram_buffer_from_segments,
-)
 
 if TYPE_CHECKING:
     from typing import Any, Dict
@@ -264,8 +263,24 @@ def build_router_replay_extend_batch(
     else:
         topk_ids = torch.cat(slices, dim=0)
     topk_ids = topk_ids.to(device=device, non_blocking=True)
-    mask = torch.ones((topk_ids.shape[0],), dtype=torch.bool, device=device)
-    return topk_ids, mask
+    # PERF: hoist per-layer cleanup (originally done num_layers times per step in
+    # `_apply_router_replay_from_forward_batch`) to per-step. Concretely:
+    #   - replace -1 sentinels (input region after push_traces_to_redis.py) with 0,
+    #     so `scores.gather(1, forced_ids)` in `_gather_router_replay_weights` is
+    #     always safe regardless of `mask` value.
+    #   - tighten mask: a row is only valid if EVERY (layer, top_k) entry is >= 0.
+    # This eliminates 5 per-layer kernel launches (ge×2, all, where, zeros_like,
+    # mask &) per decode step in topk.py, ~240 fewer kernels per step at 48-layer
+    # 80B / ~465 fewer at 93-layer 600B.
+    if topk_ids.numel() > 0:
+        valid_per_row = (topk_ids >= 0).all(dim=tuple(range(1, topk_ids.ndim)))
+        # Use clamp_min_ over torch.where(...zeros_like...): single in-place op.
+        topk_ids = topk_ids.clamp_min_(0)
+    else:
+        valid_per_row = torch.ones(
+            (topk_ids.shape[0],), dtype=torch.bool, device=device
+        )
+    return topk_ids, valid_per_row
 
 
 def build_router_replay_decode_batch(
@@ -281,7 +296,9 @@ def build_router_replay_decode_batch(
         )
 
     slices = []
-    masks = []
+    all_valid = True
+    has_overrun = False
+    overrun_indices: List[int] = []
     for i, req in enumerate(reqs):
         trace = req.router_replay_experts
         trace_pos = (
@@ -290,18 +307,38 @@ def build_router_replay_decode_batch(
         if trace_pos >= trace.shape[0]:
             if _is_router_replay_decode_overrun(req, trace_pos):
                 slices.append(torch.zeros_like(trace[:1]))
-                masks.append(False)
+                all_valid = False
+                has_overrun = True
+                overrun_indices.append(i)
                 continue
             raise _router_replay_short_trace_error(
                 req, trace_pos, trace_pos + 1, trace.shape[0]
             )
         slices.append(trace[trace_pos : trace_pos + 1])
-        masks.append(True)
 
     if len(slices) == 0:
         return None, None
     topk_ids = torch.cat(slices, dim=0).to(device=device, non_blocking=True)
-    mask = torch.tensor(masks, dtype=torch.bool, device=device)
+    # PERF: avoid `torch.tensor([True]*N, dtype=bool, device=cuda)` which forces
+    # a sync H->D copy on the hot path (~6-14 ms per decode step on TP=8 DP=4
+    # 80B with c=32). The common case is "all-valid" (every req still has trace
+    # data left), so allocate the mask directly on the GPU. Only fall back to
+    # an H->D copy when at least one request has overrun.
+    if not has_overrun:
+        mask = torch.ones((len(slices),), dtype=torch.bool, device=device)
+    else:
+        # Build the bool mask on CPU (cheap), then async-copy to GPU.
+        cpu_mask = torch.ones((len(slices),), dtype=torch.bool)
+        if overrun_indices:
+            cpu_mask[overrun_indices] = False
+        mask = cpu_mask.to(device=device, non_blocking=True)
+    # PERF: hoist per-layer cleanup to per-step (see extend variant above for
+    # rationale). For decode the per-row count equals batch size, so this loop
+    # body runs once per decode step regardless of num_layers.
+    if topk_ids.numel() > 0:
+        valid_per_row = (topk_ids >= 0).all(dim=tuple(range(1, topk_ids.ndim)))
+        mask = mask & valid_per_row
+        topk_ids = topk_ids.clamp_min_(0)
     return topk_ids, mask
 
 
@@ -752,204 +789,100 @@ class MultimodalInputs:
 
 
 @dataclasses.dataclass
+class HashInputIdsBuffer:
+    """CPU boundary tokens used by the WeLM OE hash kernel.
+
+    ``prefixes[lag - 1][segment_idx]`` is the token before a decode/prefill
+    segment starts. The current segment tokens still come from forward input_ids.
+    """
+
+    prefixes: List[List[int]]
+
+
+@dataclasses.dataclass
 class OverEncodingContext:
-    """Context data for over-encoding shifted input IDs."""
+    """Context data for WeLM OE CUDA hash-kernel inputs."""
 
     NUM_GRAMS: ClassVar[int] = 3
 
-    input_ids_grams: List[torch.Tensor] = dataclasses.field(default_factory=list)
-    input_ids_buffer: Optional[torch.Tensor] = None
-    buffer_size: int = 4
-    filtered: bool = False
+    input_ids_buffer: Optional[HashInputIdsBuffer] = None
 
     @classmethod
-    def from_extend(cls, reqs, logical_prefix_lens, device) -> "OverEncodingContext":
-        gram_lists = [[] for _ in range(cls.NUM_GRAMS)]
-        for req, logical_prefix_len in zip(reqs, logical_prefix_lens):
-            for gram_idx in range(cls.NUM_GRAMS):
-                gram_lists[gram_idx].append(
-                    cls._shift_ids(req.fill_ids, gram_idx + 1)[logical_prefix_len:]
-                )
+    def from_extend_hash_kernel(
+        cls, reqs, logical_prefix_lens, history_width: int
+    ) -> "OverEncodingContext":
+        """Build an extend context whose OE hashes are produced on GPU.
 
-        flat_per_gram = [sum(gram_lists[gram_idx], []) for gram_idx in range(cls.NUM_GRAMS)]
-        num_tokens = len(flat_per_gram[0])
-        all_flat = []
-        for flat in flat_per_gram:
-            all_flat.extend(flat)
-
-        gram_tensor = torch.tensor(all_flat, dtype=torch.int64).to(
-            device, non_blocking=True
-        )
-        buffer_builder = cls()
-        input_ids_buffer = torch.tensor(
-            sum([buffer_builder.get_token_ids_buffer(req.fill_ids) for req in reqs], []),
-            dtype=torch.int64,
-        ).to(device, non_blocking=True)
-        return cls(
-            input_ids_grams=[
-                gram_tensor[i * num_tokens : (i + 1) * num_tokens]
-                for i in range(cls.NUM_GRAMS)
-            ],
-            input_ids_buffer=input_ids_buffer,
-        )
+        The normal forward ``input_ids`` tensor contains the current segment.
+        ``prefixes`` only carries the few tokens before each segment boundary
+        that the hash kernel cannot read from that tensor.
+        """
+        prefixes = []
+        for lag in range(1, history_width + 1):
+            row = []
+            for r, lpl in zip(reqs, logical_prefix_lens):
+                pos = lpl - lag
+                row.append(r.fill_ids[pos] if pos >= 0 else 0)
+            prefixes.append(row)
+        return cls(input_ids_buffer=HashInputIdsBuffer(prefixes))
 
     @classmethod
-    def from_decode(cls, reqs, enable_overlap, device) -> "OverEncodingContext":
-        batch_size = len(reqs)
-        gram_lists = [[] for _ in range(cls.NUM_GRAMS)]
-        for req in reqs:
-            ids = req.origin_input_ids + req.output_ids
-            if enable_overlap:
-                decode_count = getattr(req, "_overlap_decode_count", 0)
-                offset = 1 if len(req.output_ids) > decode_count else 0
-                req._overlap_decode_count = decode_count + 1
-            else:
-                offset = 1
-            for gram_idx in range(cls.NUM_GRAMS):
-                shift = gram_idx + 1 + offset
-                gram_lists[gram_idx].append(ids[-shift] if len(ids) >= shift else 0)
+    def from_decode_hash_kernel(
+        cls, reqs, enable_overlap, history_width: int
+    ) -> "OverEncodingContext":
+        """Build a decode context whose OE hashes are produced on GPU."""
+        offsets = []
+        if enable_overlap:
+            for r in reqs:
+                dc = r._overlap_decode_count
+                offsets.append(1 if len(r.output_ids) > dc else 0)
+                r._overlap_decode_count = dc + 1
+        else:
+            offsets = [1] * len(reqs)
 
-        all_grams = []
-        for gram_list in gram_lists:
-            all_grams.extend(gram_list)
-
-        gram_tensor = torch.tensor(all_grams, dtype=torch.int64).to(
-            device, non_blocking=True
-        )
-        buffer_builder = cls()
-        input_ids_buffer = torch.tensor(
-            sum(
-                [
-                    buffer_builder.get_token_ids_buffer(
-                        req.origin_input_ids + req.output_ids
-                    )
-                    for req in reqs
-                ],
-                [],
-            ),
-            dtype=torch.int64,
-        ).to(device, non_blocking=True)
-        return cls(
-            input_ids_grams=[
-                gram_tensor[i * batch_size : (i + 1) * batch_size]
-                for i in range(cls.NUM_GRAMS)
-            ],
-            input_ids_buffer=input_ids_buffer,
-        )
-
-    def merge_buffer(self, other: "OverEncodingContext"):
-        if self.input_ids_buffer is not None and other.input_ids_buffer is not None:
-            self.input_ids_buffer = torch.cat(
-                [self.input_ids_buffer, other.input_ids_buffer]
-            )
-        if len(self.input_ids_grams) != len(other.input_ids_grams):
-            raise ValueError(
-                "Cannot merge OverEncodingContext with different n-gram levels: "
-                f"{len(self.input_ids_grams)} vs {len(other.input_ids_grams)}."
-            )
-
-        merged_grams = []
-        for idx, (lhs, rhs) in enumerate(
-            zip(self.input_ids_grams, other.input_ids_grams)
-        ):
-            if lhs is None or rhs is None:
-                raise ValueError(
-                    "Cannot merge OverEncodingContext with missing n-gram "
-                    f"state at level {idx}: {lhs is None} vs {rhs is None}."
-                )
-            merged_grams.append(torch.cat([lhs, rhs]))
-        self.input_ids_grams = merged_grams
-
-    def filter_buffer(self, unfinished_index_device: torch.Tensor):
-        if self.input_ids_buffer is not None and not self.filtered:
-            self.input_ids_buffer = filter_buffer(
-                self.input_ids_buffer, unfinished_index_device, self.buffer_size
-            )
-            self.filtered = True
-
-    def start_new_step(self):
-        self.filtered = False
-
-    def refresh_for_draft_extend(
-        self,
-        input_ids: torch.Tensor,
-        extend_lens: List[int],
-    ):
-        for idx, gram_tensor in enumerate(self.input_ids_grams):
-            if gram_tensor is None:
-                continue
-            assign_ngram_input_ids_draft_extend(
-                input_ids,
-                gram_tensor,
-                extend_lens,
-                idx + 2,
-            )
-
-        if self.input_ids_buffer is None:
-            return
-
-        expected_buffer_size = len(extend_lens) * self.buffer_size
-        if self.input_ids_buffer.numel() != expected_buffer_size:
-            raise ValueError(
-                "OverEncodingContext input_ids_buffer size does not match "
-                "draft-extend batch size: "
-                f"{self.input_ids_buffer.numel()} vs {expected_buffer_size}."
-            )
-        update_ngram_buffer_from_segments(
-            input_ids,
-            self.input_ids_buffer,
-            extend_lens,
-            self.buffer_size,
-        )
-
-    def get_gram(self, n: int) -> Optional[torch.Tensor]:
-        idx = n - 2
-        if 0 <= idx < len(self.input_ids_grams):
-            return self.input_ids_grams[idx]
-        return None
-
-    def set_gram(self, n: int, value: torch.Tensor):
-        idx = n - 2
-        while len(self.input_ids_grams) <= idx:
-            self.input_ids_grams.append(None)
-        self.input_ids_grams[idx] = value
-
-    def __getitem__(self, n: int) -> Optional[torch.Tensor]:
-        return self.get_gram(n)
-
-    def __len__(self) -> int:
-        return len(self.input_ids_grams)
+        prefixes = []
+        for lag in range(1, history_width + 1):
+            row = []
+            for r, offset in zip(reqs, offsets):
+                row.append(cls._decode_history_token(r, lag + offset))
+            prefixes.append(row)
+        return cls(input_ids_buffer=HashInputIdsBuffer(prefixes))
 
     @staticmethod
-    def _shift_ids(req_input_ids: List[int], n: int):
-        seq_len = len(req_input_ids)
-        result_id = [0] * seq_len
-        if seq_len <= n:
-            return result_id
-        result_id[n:] = req_input_ids[:-n]
-        return result_id
+    def _decode_history_token(req, shift: int) -> int:
+        total_len = len(req.origin_input_ids) + len(req.output_ids)
+        pos = total_len - shift
+        if pos < 0:
+            return 0
+        if pos < len(req.origin_input_ids):
+            return req.origin_input_ids[pos]
+        return req.output_ids[pos - len(req.origin_input_ids)]
 
-    def get_token_ids_buffer(self, req_input_ids: List[int]):
-        seq_len = len(req_input_ids)
-        result_id = [0] * self.buffer_size
-        start_idx = min(seq_len, self.buffer_size)
-        result_id[-start_idx:] = req_input_ids[-start_idx:]
-        return result_id
+    def merge_buffer(self, other: "OverEncodingContext"):
+        """Merge over-encoding state from *other* into this instance."""
+        self_prefixes = self.hash_prefixes
+        other_prefixes = other.hash_prefixes
+        if self_prefixes is None or other_prefixes is None:
+            raise ValueError(
+                "WeLM OE contexts must contain CUDA hash prefixes."
+            )
+        if len(self_prefixes) != len(other_prefixes):
+            raise ValueError(
+                "Cannot merge WeLM OE hash prefixes with different history "
+                f"widths: {len(self_prefixes)} vs {len(other_prefixes)}."
+            )
+        self.input_ids_buffer = HashInputIdsBuffer(
+            [lhs + rhs for lhs, rhs in zip(self_prefixes, other_prefixes)]
+        )
 
-    def __getattr__(self, name: str):
-        if name.startswith("input_ids_gram"):
-            suffix = name[len("input_ids_gram") :]
-            if suffix.isdigit():
-                return self.get_gram(int(suffix))
-        raise AttributeError(f"'{type(self).__name__}' has no attribute '{name}'")
+    def __bool__(self) -> bool:
+        return self.input_ids_buffer is not None
 
-    def __setattr__(self, name: str, value):
-        if name.startswith("input_ids_gram"):
-            suffix = name[len("input_ids_gram") :]
-            if suffix.isdigit():
-                self.set_gram(int(suffix), value)
-                return
-        object.__setattr__(self, name, value)
+    @property
+    def hash_prefixes(self) -> Optional[List[List[int]]]:
+        if isinstance(self.input_ids_buffer, HashInputIdsBuffer):
+            return self.input_ids_buffer.prefixes
+        return None
 
 
 class Req(ReqDllmMixin):
@@ -978,6 +911,7 @@ class Req(ReqDllmMixin):
         return_routed_experts: bool = False,
         routed_experts_start_len: int = 0,
         router_replay_experts: Optional[torch.Tensor] = None,
+        forced_decode_token_ids: Optional[List[int]] = None,
         return_indexer_topk: bool = False,
         eos_token_ids: Optional[Set[int]] = None,
         bootstrap_host: Optional[str] = None,
@@ -1203,6 +1137,7 @@ class Req(ReqDllmMixin):
         self.return_routed_experts = return_routed_experts
         self.routed_experts_start_len = routed_experts_start_len
         self.router_replay_experts = router_replay_experts
+        self.forced_decode_token_ids = forced_decode_token_ids
         self.routed_experts: Optional[torch.Tensor] = (
             None  # cpu tensor: shape (seqlen, topk)
         )
@@ -2146,8 +2081,18 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         input_ids_tensor = torch.tensor(
             list(chain.from_iterable(input_ids)), dtype=torch.int64, pin_memory=_pin
         ).to(self.device, non_blocking=True)
-        self.oe_context = OverEncodingContext.from_extend(
-            reqs, logical_prefix_lens, self.device
+
+        oe_grams, _ = get_welm_oe_hash_config(self.model_config)
+        if not oe_grams:
+            raise RuntimeError("WeLM OE requires oe_grams for the CUDA hash kernel.")
+        if torch.device(self.device).type != "cuda":
+            raise RuntimeError("WeLM OE requires the CUDA hash kernel.")
+        if not should_use_welm_oe_hash_kernel(self.model_config):
+            raise RuntimeError(
+                "WeLM OE CUDA hash kernel is not supported by this model config."
+            )
+        self.oe_context = OverEncodingContext.from_extend_hash_kernel(
+            reqs, logical_prefix_lens, max(oe_grams) - 1
         )
         seq_lens_tensor = torch.tensor(
             expanded_seq_lens, dtype=torch.int64, pin_memory=_pin
@@ -2774,14 +2719,30 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # but downstream kernels enforce int64 (e.g. DeepSeek-V4 hash_topk).
         self.input_ids = self.output_ids.to(torch.int64)
         self.output_ids = None
+        # Router replay trace_pos must equal the position whose MoE forward
+        # is being executed in THIS decode step. Capture writes routing for
+        # the token at sequence position `in_len + k` (slot req_to_token[p]).
+        # `seq_lens_cpu` is incremented by `scale` LATER in this function
+        # (see `self.seq_lens_cpu.add_(scale)` below), so its current value
+        # is exactly the position about to be processed.
         trace_positions = (self.seq_lens_cpu // scale).tolist()
         self.router_replay_topk_ids, self.router_replay_mask = (
             build_router_replay_decode_batch(
                 self.reqs, device=self.device, trace_positions=trace_positions
             )
         )
-        self.oe_context = OverEncodingContext.from_decode(
-            self.reqs, self.enable_overlap, self.device
+
+        oe_grams, _ = get_welm_oe_hash_config(self.model_config)
+        if not oe_grams:
+            raise RuntimeError("WeLM OE requires oe_grams for the CUDA hash kernel.")
+        if torch.device(self.device).type != "cuda":
+            raise RuntimeError("WeLM OE requires the CUDA hash kernel.")
+        if not should_use_welm_oe_hash_kernel(self.model_config):
+            raise RuntimeError(
+                "WeLM OE CUDA hash kernel is not supported by this model config."
+            )
+        self.oe_context = OverEncodingContext.from_decode_hash_kernel(
+            self.reqs, self.enable_overlap, max(oe_grams) - 1
         )
 
         if self.model_config.is_encoder_decoder:
@@ -2887,6 +2848,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if keep_indices is None or len(keep_indices) == 0:
             # Filter out all requests
             self.reqs = []
+            self.spec_info = None
             return
 
         if len(keep_indices) == len(self.reqs):
@@ -2943,9 +2905,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 new_indices=keep_indices_device,
                 has_been_filtered=has_been_filtered,
             )
-        if self.oe_context:
-            self.oe_context.filter_buffer(keep_indices_device)
-
     def merge_batch(self, other: "ScheduleBatch"):
         # In the regular scheduler path:
         # 1) self is always prefill, whose seq_lens is not a future
@@ -3066,6 +3025,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             encoder_lens=self.encoder_lens,
             encoder_lens_cpu=self.encoder_lens_cpu,
             encoder_out_cache_loc=self.encoder_out_cache_loc,
+            chunked_req=self.chunked_req,
             lora_ids=[req.lora_id for req in self.reqs],
             sampling_info=self.sampling_info,
             input_embeds=self.input_embeds,
@@ -3363,6 +3323,7 @@ class ModelWorkerBatch:
     # For constrained decoding
     # FIXME(lsyin): remove this after fully overlap grammar
     reqs: Optional[List[Req]] = None
+    chunked_req: Optional[Req] = None
     has_grammar: bool = False
 
     # Over Encoding

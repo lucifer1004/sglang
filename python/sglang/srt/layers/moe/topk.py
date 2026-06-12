@@ -1331,6 +1331,119 @@ def _post_process_topk_ids(
     return topk_ids, topk_weights
 
 
+def _gather_router_replay_weights(
+    *,
+    router_logits: torch.Tensor,
+    forced_ids: torch.Tensor,
+    topk_config: TopKConfig,
+) -> torch.Tensor:
+    forced_ids = forced_ids.to(dtype=torch.long)
+    if (
+        get_moe_runner_backend().is_flashinfer_trtllm_routed()
+        and topk_config.scoring_func == "softmax"
+        and topk_config.correction_bias is None
+    ):
+        forced_weights = router_logits.float().gather(1, forced_ids)
+        if topk_config.renormalize:
+            forced_weights = F.softmax(forced_weights, dim=-1, dtype=torch.float32)
+    else:
+        if topk_config.scoring_func == "softmax":
+            scores = torch.softmax(router_logits.float(), dim=-1)
+        elif topk_config.scoring_func == "sigmoid":
+            scores = torch.sigmoid(router_logits.float())
+        else:
+            raise ValueError(f"Invalid scoring function: {topk_config.scoring_func}")
+
+        forced_weights = scores.gather(1, forced_ids)
+        if topk_config.renormalize:
+            forced_weights = forced_weights / forced_weights.sum(
+                dim=-1, keepdim=True
+            )
+
+    if (
+        topk_config.renormalize
+        and topk_config.apply_routed_scaling_factor_on_output
+        and topk_config.routed_scaling_factor is not None
+    ):
+        forced_weights = forced_weights * topk_config.routed_scaling_factor
+
+    return forced_weights.to(torch.float32)
+
+
+def apply_router_replay_topk_override(
+    *,
+    router_logits: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    forced_ids: torch.Tensor,
+    mask: torch.Tensor,
+    topk_config: TopKConfig,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if forced_ids.shape != topk_ids.shape:
+        raise ValueError(
+            "router replay forced ids shape must match selected topk ids shape; "
+            f"got forced_ids={tuple(forced_ids.shape)}, topk_ids={tuple(topk_ids.shape)}."
+        )
+
+    mask = mask.to(device=topk_ids.device, dtype=torch.bool)
+    forced_ids = forced_ids.to(device=topk_ids.device, dtype=topk_ids.dtype)
+    forced_weights = _gather_router_replay_weights(
+        router_logits=router_logits,
+        forced_ids=forced_ids,
+        topk_config=topk_config,
+    ).to(device=topk_weights.device, dtype=topk_weights.dtype)
+
+    topk_ids = torch.where(mask[:, None], forced_ids, topk_ids)
+    topk_weights = torch.where(mask[:, None], forced_weights, topk_weights)
+    return topk_weights, topk_ids
+
+
+def _apply_router_replay_from_forward_batch(
+    *,
+    router_logits: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    topk_config: TopKConfig,
+    layer_id: Optional[int],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    forward_batch = get_current_forward_batch()
+    if forward_batch is None or forward_batch.router_replay_topk_ids is None:
+        return topk_weights, topk_ids
+    if layer_id is None:
+        raise ValueError("MoE router replay requires TopK.layer_id to be set.")
+
+    forced_ids = forward_batch.router_replay_topk_ids[:, layer_id, :]
+    mask = forward_batch.router_replay_mask
+    if forced_ids.shape[0] != topk_ids.shape[0]:
+        last_q_indices = getattr(forward_batch, "custom_last_index", None)
+        if last_q_indices is None:
+            last_q_indices = getattr(
+                forward_batch, "welm_kv_mirror_last_q_indices", None
+            )
+        if (
+            last_q_indices is None
+            or last_q_indices.shape[0] != topk_ids.shape[0]
+        ):
+            # CUDA graph capture can attach zero-masked replay placeholders before
+            # WeLM's last-token indices are populated; those placeholders are inert.
+            return topk_weights, topk_ids
+        forced_ids = forced_ids[last_q_indices]
+        mask = mask[last_q_indices]
+    # PERF: per-layer cleanup (`mask & forced_ids.ge(0).all(dim=1)` and
+    # `torch.where(forced_ids.ge(0), forced_ids, zeros_like)`) used to live here
+    # but was hoisted to `build_router_replay_{extend,decode}_batch` so it runs
+    # once per step instead of num_layers times. forced_ids is guaranteed
+    # non-negative and `mask` already reflects per-row all-layer validity.
+    return apply_router_replay_topk_override(
+        router_logits=router_logits,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+        forced_ids=forced_ids,
+        mask=mask,
+        topk_config=topk_config,
+    )
+
+
 def select_experts(
     hidden_states: torch.Tensor,
     router_logits: torch.Tensor,

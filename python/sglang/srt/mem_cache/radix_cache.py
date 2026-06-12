@@ -276,6 +276,9 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
         self.is_eagle = params.is_eagle
         self.disable_finished_insert = params.disable_finished_insert
         self.eviction_policy = params.eviction_policy.lower()
+        # Each logical token maps to scale_seq_factor physical KV slots.
+        # Overridden by scheduler after init via tree_cache.scale_seq_factor = N.
+        self.scale_seq_factor = 1
 
         self.kv_event_queue = []
 
@@ -443,7 +446,15 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
         if self.disable_finished_insert:
             is_insert = False
 
-        kv_committed_len = req.pop_committed_kv_cache()
+        scale = self.scale_seq_factor
+        logical_committed_len = req.pop_committed_kv_cache()
+        kv_committed_len = logical_committed_len * scale
+
+        # For scale_seq, the radix tree doesn't support 1:N key-to-value
+        # mapping yet. Disable insertion to avoid accounting mismatch.
+        if scale > 1:
+            is_insert = False
+
         if self.disable:
             kv_indices = self.req_to_token_pool.req_to_token[
                 req.req_pool_idx, :kv_committed_len
@@ -451,16 +462,18 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
             self.token_to_kv_pool_allocator.free(kv_indices)
             return
 
-        token_ids = (req.origin_input_ids + req.output_ids)[:kv_committed_len]
+        token_ids = (req.origin_input_ids + req.output_ids)[:logical_committed_len]
         kv_indices = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, : len(token_ids)
+            req.req_pool_idx, :kv_committed_len
         ]
 
         radix_key = RadixKey(
             token_ids, req.extra_key, is_bigram=self.is_eagle
         ).page_aligned(self.page_size)
         key_len = len(radix_key)
-        values = kv_indices[:key_len].to(dtype=torch.int64, copy=True)
+        # For scale_seq, key_len logical tokens map to key_len*scale physical slots
+        values_len = key_len * scale
+        values = kv_indices[:values_len].to(dtype=torch.int64, copy=True)
 
         # Radix Cache takes one ref in memory pool
         if is_insert:
@@ -470,15 +483,15 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
             )
             # Free the duplicates that were already in the tree
             self.token_to_kv_pool_allocator.free(
-                kv_indices[req.cache_protected_len : result.prefix_len]
+                kv_indices[req.cache_protected_len : result.prefix_len * scale]
             )
         else:
             self.token_to_kv_pool_allocator.free(
-                kv_indices[req.cache_protected_len : key_len]
+                kv_indices[req.cache_protected_len : values_len]
             )
 
         # free the unaligned tail
-        self.token_to_kv_pool_allocator.free(kv_indices[key_len:])
+        self.token_to_kv_pool_allocator.free(kv_indices[values_len:])
 
         # Remove req slot release the cache lock
         if req.last_node is not None:

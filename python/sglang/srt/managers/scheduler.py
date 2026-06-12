@@ -29,6 +29,7 @@ from sglang.srt.utils.common import suppress_noisy_warnings
 
 suppress_noisy_warnings()
 
+import numpy as np
 import psutil
 import setproctitle
 import torch
@@ -163,6 +164,12 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalInputs,
     Req,
     ScheduleBatch,
+    validate_router_replay_experts,
+)
+from sglang.srt.managers.routed_experts_store import (
+    create_routed_experts_store,
+    decode_remote_routed_experts_tensor,
+    is_remote_routed_experts_ref,
 )
 from sglang.srt.managers.schedule_policy import (
     AddReqResult,
@@ -389,6 +396,35 @@ class Scheduler(
         self.spec_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
         )
+        # PERF: scheduler-side RoutedExpertsStore lets us defer the trace
+        # fetch from tokenizer_manager (which would have to pickle the full
+        # ~64 MB tensor over ZMQ) to here. The actual fetch is async-pooled
+        # below and runs ONLY on the leader scheduler — the resolved tensor
+        # is then handed off to followers via POSIX shared memory (named
+        # /dev/shm) so the broadcast carries only a ~100 B handle dict
+        # instead of pickling 64 MB through gloo. This eliminates both:
+        #  (1) 8x Redis contention (each TP rank used to fetch the same key)
+        #  (2) ~270 ms of pickle + gloo-broadcast per req
+        self.routed_experts_store = create_routed_experts_store(
+            server_args.routed_experts_store_dsn
+        )
+        self._routed_replay_fetch_pool = None  # lazy-init below; leader-only
+        self._routed_replay_pending: List[Tuple[Any, Any]] = []  # leader-only
+        # leader-only registry of {rid: (mmap, /dev/shm path)} so we can
+        # unlink the file once the req has fully finished (all rank-side
+        # tensors released). Empty on non-leader ranks.
+        self._routed_replay_shm: Dict[str, Any] = {}
+        # Robust cleanup uses an absence counter rather than enumerating
+        # queues — disagg-decode and PD modes route reqs through several
+        # private queues (prealloc/transfer/inflight…) which would all
+        # need to be tracked separately. A simple "absent for K cleanup
+        # passes ⇒ retire" rule works regardless of which queue holds the
+        # req at any moment. K is sized so any in-flight req that the
+        # leader knows about (running_batch / waiting_queue / pending)
+        # resets the counter to 0, and even slow disagg admission paths
+        # finish within a few iterations.
+        self._routed_replay_shm_absent: Dict[str, int] = {}
+        self._routed_replay_shm_absent_threshold = 200
         self.gpu_id = gpu_id
         self.page_size = server_args.page_size
         self.enable_hierarchical_cache = server_args.enable_hierarchical_cache
@@ -980,6 +1016,16 @@ class Scheduler(
             )
         else:
             self.decode_offload_manager = None
+
+        # Propagate scale_seq_factor to tree_cache for correct KV cache sizing
+        scale_seq_times = getattr(self.model_config.hf_config, "scale_seq_times", 0)
+        if scale_seq_times > 0:
+            self.tree_cache.scale_seq_factor = scale_seq_times + 1
+            # The radix tree doesn't fully support 1:N key-value mapping for
+            # scale_seq yet. Downgrade the idle memory check to warning level
+            # to avoid false-positive crash on the small one-time init leak.
+            if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE.get():
+                envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE.set(False)
 
         embedding_cache_size = envs.SGLANG_VLM_CACHE_SIZE_MB.get()
         init_mm_embedding_cache(embedding_cache_size * 1024 * 1024)
@@ -1653,6 +1699,183 @@ class Scheduler(
             return False
         return num_recv_reqs >= self.max_recv_per_poll
 
+    def _drain_routed_replay_fetches(
+        self,
+    ) -> List["TokenizedGenerateReqInput"]:
+        """Move any completed background trace fetches to the head of the
+        ready queue. Returns a list of recv_reqs that were waiting on a
+        remote-ref fetch and are now ready to be broadcast/admitted.
+        Leader-only.
+
+        After fetch we publish the int32 trace bytes into a /dev/shm file
+        (raw POSIX mmap, no `multiprocessing.shared_memory` because its
+        `resource_tracker` aggressively unlinks attached blocks on
+        non-creator process GC and races with our own cleanup). The
+        recv_req field is replaced with a tiny handle dict {format=shm,
+        path, shape, dtype}; the follower-side validate path opens the
+        file and wraps a zero-copy torch tensor over the mmap, so the
+        gloo broadcast that follows never has to ship 64 MB through
+        pickle.
+        """
+        if not self._routed_replay_pending:
+            return []
+        import os as _os
+        import mmap as _mmap
+        import uuid as _uuid
+
+        ready: List["TokenizedGenerateReqInput"] = []
+        still_pending = []
+        for recv_req, future in self._routed_replay_pending:
+            if not future.done():
+                still_pending.append((recv_req, future))
+                continue
+            try:
+                tensor = future.result().to(dtype=torch.int32).contiguous()
+                arr = tensor.numpy()
+                shm_path = (
+                    f"/dev/shm/sglang_replay_{_uuid.uuid4().hex[:24]}"
+                )
+                # O_EXCL guards against accidental reuse / collisions.
+                fd = _os.open(
+                    shm_path,
+                    _os.O_CREAT | _os.O_EXCL | _os.O_RDWR,
+                    0o600,
+                )
+                try:
+                    _os.ftruncate(fd, arr.nbytes)
+                    mm = _mmap.mmap(
+                        fd,
+                        arr.nbytes,
+                        prot=_mmap.PROT_READ | _mmap.PROT_WRITE,
+                    )
+                    # One CPU memcpy. The followers' mmap is read-only
+                    # and points at the same kernel-managed pages.
+                    mm[:] = bytes(arr.data)
+                finally:
+                    # Closing the fd is safe once mmap is established —
+                    # the mapping holds its own reference to the inode.
+                    _os.close(fd)
+                # Hold the leader-side mmap + path on the scheduler so we
+                # can unlink the file once the req is fully retired.
+                self._routed_replay_shm[recv_req.rid] = (mm, shm_path)
+                recv_req.router_replay_experts = {
+                    "format": "shm",
+                    "path": shm_path,
+                    "shape": list(arr.shape),
+                    "dtype": str(arr.dtype),
+                    "trusted": True,
+                }
+            except BaseException as exc:  # noqa: BLE001
+                # Surface the error through the existing validate path:
+                # leave router_replay_experts as-is + attach a sentinel
+                # the scheduler will detect when it tries to validate.
+                recv_req._routed_replay_fetch_error = str(exc)
+            ready.append(recv_req)
+        self._routed_replay_pending = still_pending
+        return ready
+
+    def _cleanup_routed_replay_shm(self) -> None:
+        """Leader-only. Unlink the /dev/shm files created by
+        `_drain_routed_replay_fetches` once the req has been absent from
+        every leader-tracked queue for `_routed_replay_shm_absent_threshold`
+        consecutive cleanup passes.
+
+        We count absences instead of enumerating every disagg/PD/spec
+        queue because: (1) reqs transit through queues we don't know about
+        (prealloc/transfer/inflight in disagg-decode); (2) leader-only
+        admission means partner ranks may still be inside `validate` and
+        opening the shm path concurrently with leader's cleanup. Linux
+        mmap semantics keep follower views alive past unlink (the file
+        is removed but content lives until every mapping is dropped), so
+        it is safe to unlink once the req is genuinely gone — but we must
+        not unlink in the same iteration the followers might still be
+        opening the path.
+        """
+        if not self._routed_replay_shm:
+            return
+        if self.attn_tp_rank != 0 or self.attn_cp_rank != 0:
+            return
+        import os as _os
+
+        active_rids = set()
+        if self.running_batch is not None and self.running_batch.reqs is not None:
+            active_rids.update(r.rid for r in self.running_batch.reqs)
+        for r in self.waiting_queue:
+            active_rids.add(r.rid)
+        for recv_req, _ in self._routed_replay_pending:
+            active_rids.add(recv_req.rid)
+
+        threshold = self._routed_replay_shm_absent_threshold
+        for rid in list(self._routed_replay_shm.keys()):
+            if rid in active_rids:
+                # Reset the counter while the req is anywhere we can see.
+                self._routed_replay_shm_absent.pop(rid, None)
+                continue
+            absent = self._routed_replay_shm_absent.get(rid, 0) + 1
+            if absent < threshold:
+                self._routed_replay_shm_absent[rid] = absent
+                continue
+            # Truly retired — safe to unlink.
+            self._routed_replay_shm_absent.pop(rid, None)
+            mm, shm_path = self._routed_replay_shm.pop(rid)
+            try:
+                mm.close()
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                _os.unlink(shm_path)
+            except FileNotFoundError:
+                pass
+            except Exception as exc:  # noqa: BLE001
+                logger.debug(
+                    "shm unlink for rid=%s (%s) failed: %s",
+                    rid,
+                    shm_path,
+                    exc,
+                )
+
+    def _enqueue_routed_replay_fetches(
+        self,
+        recv_reqs: List["TokenizedGenerateReqInput"],
+    ) -> List["TokenizedGenerateReqInput"]:
+        """Split `recv_reqs` into (immediate, deferred): items with a remote
+        routed_experts ref are submitted to a background thread pool and
+        held back until the fetch completes; items without are returned
+        unchanged for the normal broadcast/admission flow. Leader-only."""
+        if self.routed_experts_store is None:
+            return recv_reqs
+        immediate: List["TokenizedGenerateReqInput"] = []
+        from sglang.srt.managers.io_struct import (
+            TokenizedGenerateReqInput as _TGen,
+        )
+
+        for recv_req in recv_reqs:
+            payload = (
+                getattr(recv_req, "router_replay_experts", None)
+                if isinstance(recv_req, _TGen)
+                else None
+            )
+            if not is_remote_routed_experts_ref(payload):
+                immediate.append(recv_req)
+                continue
+            if self._routed_replay_fetch_pool is None:
+                from concurrent.futures import ThreadPoolExecutor
+
+                # 4 workers is enough — Redis is single-threaded, so more
+                # concurrent fetches would only increase contention while
+                # producing the same wall-clock throughput.
+                self._routed_replay_fetch_pool = ThreadPoolExecutor(
+                    max_workers=4,
+                    thread_name_prefix="routed_replay_fetch",
+                )
+            future = self._routed_replay_fetch_pool.submit(
+                decode_remote_routed_experts_tensor,
+                self.routed_experts_store,
+                payload,
+            )
+            self._routed_replay_pending.append((recv_req, future))
+        return immediate
+
     def recv_requests(
         self,
     ) -> List[Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput, Any]]:
@@ -1668,6 +1891,12 @@ class Scheduler(
         if self.pp_rank == 0:
             if self.attn_tp_rank == 0 and self.attn_cp_rank == 0:
                 recv_reqs = []
+
+                # Drain any router-replay fetches that completed since the
+                # last iteration. These reqs are now resolved (have a CPU
+                # int32 tensor on .router_replay_experts) and are ready to
+                # be broadcast to the other TP ranks.
+                recv_reqs.extend(self._drain_routed_replay_fetches())
 
                 while True:
                     try:
@@ -1686,6 +1915,13 @@ class Scheduler(
                     except zmq.ZMQError:
                         break
                     recv_reqs.append(recv_rpc)
+
+                # Defer any reqs with a remote routed_experts ref to the
+                # background thread pool; they'll surface again via
+                # `_drain_routed_replay_fetches` once the Redis GET
+                # completes. This keeps the leader's main loop unblocked
+                # on what would otherwise be ~150-200 ms blocking GETs.
+                recv_reqs = self._enqueue_routed_replay_fetches(recv_reqs)
             else:
                 recv_reqs = None
         else:
@@ -1863,6 +2099,9 @@ class Scheduler(
         self._check_pending_flush()
         if self.external_corpus_manager is not None:
             self.external_corpus_manager.check_pending_load()
+        # Reclaim shared-memory blocks for finished replay reqs (leader-only,
+        # no-op when empty so cost is negligible per call).
+        self._cleanup_routed_replay_shm()
 
     def init_req_max_new_tokens(self, req):
         input_len = len(req.origin_input_ids)
@@ -1987,6 +2226,176 @@ class Scheduler(
             mm_inputs.release_features()
             req.multimodal_inputs = None
 
+    def _get_router_replay_model_dims(self) -> Tuple[int, int, int]:
+        cfg = self.model_config.hf_text_config
+        num_layers = getattr(cfg, "num_hidden_layers")
+        num_experts_per_tok = getattr(cfg, "num_experts_per_tok")
+        num_logical_routed_experts = None
+        for attr in ("n_routed_experts", "num_experts", "num_local_experts"):
+            num_logical_routed_experts = getattr(cfg, attr, None)
+            if num_logical_routed_experts is not None:
+                break
+        if num_logical_routed_experts is None:
+            raise ValueError(
+                "router replay requires model config to expose the number of routed experts"
+            )
+        return num_layers, num_experts_per_tok, num_logical_routed_experts
+
+    def _validate_router_replay_request(
+        self, req: Req, recv_req: TokenizedGenerateReqInput
+    ) -> bool:
+        if recv_req.router_replay_experts is None:
+            return True
+
+        if not self.server_args.enable_moe_router_replay:
+            req.set_finish_with_abort(
+                "MoE router replay is not enabled. Please set "
+                "`--enable-moe-router-replay` to use routed_experts replay."
+            )
+            self.init_req_max_new_tokens(req)
+            self._add_request_to_queue(req)
+            return False
+
+        if not self.spec_algorithm.is_none():
+            req.set_finish_with_abort(
+                "router replay does not support speculative decode"
+            )
+            self.init_req_max_new_tokens(req)
+            self._add_request_to_queue(req)
+            return False
+
+        if self.server_args.enable_two_batch_overlap:
+            req.set_finish_with_abort("router replay does not support TBO")
+            self.init_req_max_new_tokens(req)
+            self._add_request_to_queue(req)
+            return False
+
+        moe_backend = get_moe_runner_backend()
+        if (
+            moe_backend.is_triton_kernels()
+            or moe_backend.is_flashinfer_trtllm()
+            or moe_backend.is_flashinfer_mxfp4()
+        ):
+            req.set_finish_with_abort(
+                f"MoE backend {moe_backend.value} does not support router replay"
+            )
+            self.init_req_max_new_tokens(req)
+            self._add_request_to_queue(req)
+            return False
+
+        try:
+            num_layers, num_experts_per_tok, num_logical_routed_experts = (
+                self._get_router_replay_model_dims()
+            )
+            # If the leader's background fetch failed earlier, abort now
+            # with the saved error string (sentinel attached on the
+            # leader side; non-leader ranks won't see it but they also
+            # won't see the dict — they always get the broadcast tensor).
+            fetch_error = getattr(
+                recv_req, "_routed_replay_fetch_error", None
+            )
+            if fetch_error is not None:
+                raise ValueError(fetch_error)
+            # PERF: leader scheduler resolves remote refs in a background
+            # thread pool (see `_enqueue_routed_replay_fetches`) and
+            # publishes the trace into POSIX shared memory; the gloo
+            # broadcast that follows carries only a tiny handle dict. Each
+            # rank attaches the shm by name and wraps a zero-copy tensor.
+            # By the time we get here, recv_req.router_replay_experts may
+            # be one of:
+            #   * Dict {format=shm, name, shape, dtype, trusted} — common
+            #     path on every rank (leader, follower, single-TP, etc.)
+            #   * Dict {format=remote, ...} — direct caller bypassing the
+            #     async path (kept as a safe fallback)
+            #   * Tensor — legacy: inline payload tokenizer_manager already
+            #     converted
+            #   * List[List[List[int]]] — legacy inline list payload
+            replay_payload = recv_req.router_replay_experts
+            if isinstance(replay_payload, dict) and replay_payload.get("format") == "shm":
+                # Open the leader-created /dev/shm file read-only and wrap
+                # a zero-copy tensor over the mmap. We close the fd right
+                # after mmap (Linux semantics: the mapping keeps its own
+                # reference) and tie the mmap's lifetime to the resulting
+                # tensor via an attribute. When the req finishes and its
+                # tensor is garbage-collected, the mmap is closed; the
+                # file may be unlinked any time before that — Linux keeps
+                # the content alive until every mapping is dropped.
+                import os as _os
+                import mmap as _mmap
+
+                shape = tuple(replay_payload["shape"])
+                dtype_np = np.dtype(replay_payload["dtype"])
+                nbytes = int(np.prod(shape)) * dtype_np.itemsize
+                fd = _os.open(replay_payload["path"], _os.O_RDONLY)
+                try:
+                    mm = _mmap.mmap(fd, nbytes, prot=_mmap.PROT_READ)
+                finally:
+                    _os.close(fd)
+                arr = np.ndarray(shape=shape, dtype=dtype_np, buffer=mm)
+                replay_payload = torch.from_numpy(arr)
+                # Keep mmap alive as long as the tensor is referenced.
+                replay_payload._sglang_routed_replay_mm_ref = mm
+                if recv_req.router_replay_experts.get("trusted", False):
+                    replay_payload._sglang_router_replay_trusted = True
+            elif is_remote_routed_experts_ref(replay_payload):
+                replay_payload = decode_remote_routed_experts_tensor(
+                    self.routed_experts_store, replay_payload
+                ).to(dtype=torch.int32)
+                replay_payload._sglang_router_replay_trusted = True
+            req.router_replay_experts = validate_router_replay_experts(
+                replay_payload,
+                num_layers=num_layers,
+                num_experts_per_tok=num_experts_per_tok,
+                num_logical_routed_experts=num_logical_routed_experts,
+                min_router_seq_len=len(req.origin_input_ids),
+                rid=req.rid,
+            )
+        except ValueError as exc:
+            req.set_finish_with_abort(str(exc))
+            self.init_req_max_new_tokens(req)
+            self._add_request_to_queue(req)
+            return False
+
+        return True
+
+    @staticmethod
+    def _is_router_replay_error(exc: ValueError) -> bool:
+        message = str(exc)
+        return "router replay" in message or "routed_experts" in message
+
+    def _abort_router_replay_running_batch(
+        self, batch: ScheduleBatch, exc: ValueError
+    ) -> ScheduleBatch:
+        error_msg = str(exc)
+        logger.error("Abort router replay batch: %s", error_msg)
+
+        keep_indices = []
+        for i, req in enumerate(batch.reqs):
+            if req.router_replay_experts is None:
+                keep_indices.append(i)
+                continue
+            req.set_finish_with_abort(error_msg)
+            abort_reason: FINISH_ABORT = req.to_finish
+            if self.enable_hisparse:
+                self.hisparse_coordinator.request_finished(req)
+            release_kv_cache(req, self.tree_cache)
+            self.send_to_tokenizer.send_output(
+                AbortReq(
+                    finished_reason=abort_reason.to_json(),
+                    rid=req.rid,
+                ),
+                req,
+            )
+
+        batch.router_replay_topk_ids = None
+        batch.router_replay_mask = None
+        if keep_indices:
+            batch.filter_batch(keep_indices=keep_indices)
+        else:
+            batch.reqs = []
+            batch.batch_is_full = False
+        return batch
+
     def handle_generate_request(
         self,
         recv_req: TokenizedGenerateReqInput,
@@ -2026,6 +2435,8 @@ class Scheduler(
                 return_hidden_states=recv_req.return_hidden_states,
                 return_routed_experts=recv_req.return_routed_experts,
                 routed_experts_start_len=recv_req.routed_experts_start_len,
+                router_replay_experts=recv_req.router_replay_experts,
+                forced_decode_token_ids=recv_req.forced_decode_token_ids,
                 return_indexer_topk=recv_req.return_indexer_topk,
                 eos_token_ids=self.model_config.hf_eos_token_id,
                 bootstrap_host=recv_req.bootstrap_host,
@@ -2155,6 +2566,9 @@ class Scheduler(
         if error_msg:
             req.set_finish_with_abort(error_msg)
             self._add_request_to_queue(req)
+            return
+
+        if not self._validate_router_replay_request(req, recv_req):
             return
 
         if not recv_req.return_logprob and recv_req.logprob_start_len != -1:
@@ -2852,6 +3266,9 @@ class Scheduler(
             and not (new_batch.return_logprob or self.running_batch.return_logprob)
             # mix_with_running cats input_ids but not input_embeds — shapes would mismatch
             and new_batch.input_embeds is None
+            and not (
+                new_batch.has_router_replay() or self.running_batch.has_router_replay()
+            )
         ):
             # TODO (lianmin): support return_logprob + mixed chunked prefill
             self.running_batch.filter_batch(v1_spec_info_filtered=True)

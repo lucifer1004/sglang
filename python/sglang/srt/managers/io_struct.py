@@ -737,6 +737,17 @@ class TokenizedGenerateReqInput(BaseReq):
     routed_experts_start_len: int = 0
 
     return_indexer_topk: bool = False
+    # Replay-specific routed experts. May be one of:
+    #   - List[List[List[int]]] (inline payload from /generate body)
+    #   - torch.Tensor (already resolved by tokenizer_manager)
+    #   - Dict[str, Any] (remote-fetch ref dict, format=="remote";
+    #     scheduler resolves to tensor via its local RoutedExpertsStore so
+    #     tokenizer_manager doesn't have to pickle 64+ MB across ZMQ + gloo)
+    router_replay_experts: Optional[
+        Union[List[List[List[int]]], torch.Tensor, Dict[str, Any]]
+    ] = None
+    # Request-provided decode token ids to use after each forward has executed.
+    forced_decode_token_ids: Optional[List[int]] = None
 
     # The input embeds
     input_embeds: Optional[Union[List[List[List[float]]], List[List[float]]]] = None

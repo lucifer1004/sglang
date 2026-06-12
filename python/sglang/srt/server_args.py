@@ -960,6 +960,7 @@ class ServerArgs:
 
         # Apply model-specific adjustments.
         self._handle_model_specific_adjustments()
+        self._handle_welm_oe_hash_kernel_args()
 
         # Set kernel backends.
         self._handle_sampling_backend()
@@ -3589,6 +3590,16 @@ class ServerArgs:
             )
         return False
 
+    def _handle_welm_oe_hash_kernel_args(self):
+        if not self.prepare_n_gram_inputs:
+            return
+
+        from sglang.srt.models.welm_perf_opt import (
+            validate_welm_oe_hash_kernel_compatibility,
+        )
+
+        validate_welm_oe_hash_kernel_compatibility()
+
     def _handle_speculative_decoding(self):
         if (
             self.speculative_draft_model_path is not None
@@ -3855,6 +3866,59 @@ class ServerArgs:
                     self.speculative_eagle_topk,
                     self.speculative_num_draft_tokens,
                 ) = auto_choose_speculative_params(self)
+
+            if (
+                model_arch == "WeLMV4MoeForCausalLM"
+                and self.speculative_draft_model_path is not None
+            ):
+                from sglang.srt.utils.hf_transformers_utils import get_config
+
+                draft_hf_config = get_config(
+                    self.speculative_draft_model_path,
+                    trust_remote_code=self.trust_remote_code,
+                    revision=self.speculative_draft_model_revision,
+                    model_override_args=json.loads(self.json_model_override_args),
+                )
+                draft_arch = (getattr(draft_hf_config, "architectures", []) or [None])[
+                    0
+                ]
+                is_welm_mtp_draft = (
+                    draft_arch in ("WeLMV4MoeForCausalLM", "WeLMV4MoeForCausalLMNextN")
+                    and int(getattr(draft_hf_config, "num_nextn_predict_layers", 0))
+                    > 0
+                )
+                if is_welm_mtp_draft:
+                    num_nextn_layers = int(
+                        getattr(draft_hf_config, "num_nextn_predict_layers", 0)
+                    )
+                    if self.disable_overlap_schedule:
+                        raise ValueError(
+                            "WeLM MTP requires overlap scheduling/spec v2. "
+                            "Set SGLANG_ENABLE_SPEC_V2=1 and do not pass "
+                            "--disable-overlap-schedule."
+                        )
+                    if self.speculative_eagle_topk != 1:
+                        raise ValueError(
+                            "WeLM MTP requires speculative_eagle_topk=1, "
+                            f"got {self.speculative_eagle_topk}."
+                        )
+                    if (
+                        self.speculative_num_draft_tokens
+                        != self.speculative_num_steps + 1
+                    ):
+                        raise ValueError(
+                            "WeLM MTP requires speculative_num_draft_tokens to equal "
+                            "speculative_num_steps + 1, got "
+                            f"steps={self.speculative_num_steps}, "
+                            f"draft_tokens={self.speculative_num_draft_tokens}."
+                        )
+                    if num_nextn_layers not in (1, self.speculative_num_steps):
+                        raise ValueError(
+                            "WeLM MTP requires num_nextn_predict_layers to be either "
+                            "1 or speculative_num_steps, got "
+                            f"layers={num_nextn_layers}, "
+                            f"steps={self.speculative_num_steps}."
+                        )
 
             if (
                 self.attention_backend == "trtllm_mha"

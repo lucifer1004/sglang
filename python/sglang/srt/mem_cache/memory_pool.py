@@ -100,11 +100,29 @@ def _set_kv_buffer_impl(
     alt_stream: Optional[torch.cuda.Stream] = None,
     same_kv_dim: bool = True,
 ) -> None:
+    k_rows = k.view(-1, row_dim)
+    v_rows = v.view(-1, row_dim)
+    index_count = indices.numel()
+    if k_rows.shape[0] != index_count:
+        if k_rows.shape[0] == 1:
+            k_rows = k_rows.expand(index_count, -1)
+            v_rows = v_rows.expand(index_count, -1)
+        elif k_rows.shape[0] > index_count:
+            k_rows = k_rows[:index_count]
+            v_rows = v_rows[:index_count]
+        else:
+            raise RuntimeError(
+                "KV cache store row/index mismatch: "
+                f"k_rows={k_rows.shape[0]}, v_rows={v_rows.shape[0]}, "
+                f"indices={index_count}, row_dim={row_dim}. "
+                "This would read past the source KV tensor in the JIT store_cache kernel."
+            )
+
     row_bytes = row_dim * store_dtype.itemsize
     if (_is_cuda or _is_hip) and same_kv_dim and can_use_store_cache(row_bytes):
         return store_cache(
-            k.view(-1, row_dim),
-            v.view(-1, row_dim),
+            k_rows,
+            v_rows,
             k_cache.view(-1, row_dim),
             v_cache.view(-1, row_dim),
             indices,
@@ -116,13 +134,13 @@ def _set_kv_buffer_impl(
     if get_is_capture_mode() and alt_stream is not None:
         current_stream = device_module.current_stream()
         alt_stream.wait_stream(current_stream)
-        k_cache[indices] = k
+        k_cache[indices] = k_rows.view_as(k_cache[indices])
         with device_module.stream(alt_stream):
-            v_cache[indices] = v
+            v_cache[indices] = v_rows.view_as(v_cache[indices])
         current_stream.wait_stream(alt_stream)
     else:  # fallback to naive implementation
-        k_cache[indices] = k
-        v_cache[indices] = v
+        k_cache[indices] = k_rows.view_as(k_cache[indices])
+        v_cache[indices] = v_rows.view_as(v_cache[indices])
 
 
 class ReqToTokenPool:

@@ -479,3 +479,43 @@ def create_routed_experts_store(dsn: Optional[str]) -> Optional[RoutedExpertsSto
         f"Unsupported routed experts store DSN scheme: {scheme!r}. "
         "Supported schemes are dummy://, redis://, rediss:// and mooncake://."
     )
+
+
+def is_remote_routed_experts_ref(value) -> bool:
+    """Return True if `value` is a remote-fetch ref dict (rather than a tensor
+    or a Python list of expert ids)."""
+    return isinstance(value, dict) and value.get("format") == "remote"
+
+
+def _dtype_from_routed_experts_ref_dict(ref: Dict[str, Any]):
+    import numpy as np
+    dtype = str(ref.get("dtype", "int32")).removeprefix("torch.")
+    if dtype == "bool":
+        return np.dtype(np.bool_)
+    return np.dtype(dtype)
+
+
+def decode_remote_routed_experts_tensor(
+    store: Optional[RoutedExpertsStore], ref: Dict[str, Any]
+):
+    """Fetch and reshape a `remote` routed-experts ref into a CPU torch.Tensor.
+    Used by tokenizer_manager (when fetching at HTTP-admission time) AND by
+    scheduler (when the tokenizer_manager opts to defer the fetch — passes the
+    ref through ZMQ instead of the full 64 MB tensor — to avoid pickling the
+    raw bytes across the IPC boundary)."""
+    import numpy as np
+    import torch
+
+    if store is None:
+        raise ValueError(
+            "Remote routed_experts replay requires --routed-experts-store-dsn."
+        )
+    if ref.get("format") != "remote":
+        raise ValueError(f"Unsupported routed_experts remote reference: {ref}")
+    payload = store.get(ref)
+    dtype = _dtype_from_routed_experts_ref_dict(ref)
+    tensor = np.frombuffer(payload, dtype=dtype).copy()
+    shape = ref.get("shape")
+    if shape is not None:
+        tensor = tensor.reshape(shape)
+    return torch.from_numpy(tensor)

@@ -27,6 +27,7 @@ from sglang.srt.managers.mm_utils import (
     get_embedding_and_mask,
 )
 from sglang.srt.managers.schedule_batch import (
+    HashInputIdsBuffer,
     MultimodalDataItem,
     MultimodalInputs,
 )
@@ -755,25 +756,8 @@ class WeLMV4VLMForConditionalGeneration(WeLMV4MoeForCausalLM):
     def _logical_forward_batch(
         self, forward_batch: ForwardBatch, image_items: List[MultimodalDataItem]
     ) -> ForwardBatch:
-        # On the perf branch, OE embedding is computed on `logical_input_ids`
-        # (where image-pad placeholders have been mapped back to
-        # `image_token_id`). The OE inline path also reads
-        # `forward_batch.oe_context.input_ids_grams` for the n-gram lookup
-        # tensors -- those grams are derived from `r.fill_ids`, which still
-        # contain the *hashed* multimodal pad values (a hash of the image
-        # bytes -- effectively random ints).
-        #
-        # If we leave the gram tensors unmodified, OE indexes its vocab
-        # embeddings at random hash positions for image rows, while the
-        # token-level path indexes at `image_token_id`. The two paths produce
-        # incoherent OE outputs and the difference propagates through every
-        # downstream layer. main_v056 had a real `_logical_forward_batch`
-        # that rewrote the n_gram_input_ids in lock-step with input_ids;
-        # without this rewrite on the perf branch, even `WELM_USE_PREVIOUS_PRECISION=True`
-        # cannot reproduce main_v056's output bit-for-bit.
-        #
-        # Mirror main_v056 here: rewrite oe_context grams (and the buffer
-        # used by the decode path) so pad values become `image_token_id`.
+        # OE reads hash-kernel boundary prefixes from the context. Keep those
+        # prefixes aligned with logical multimodal token IDs.
         if forward_batch.oe_context is None:
             return forward_batch
         pad_values = [
@@ -783,25 +767,20 @@ class WeLMV4VLMForConditionalGeneration(WeLMV4MoeForCausalLM):
             return forward_batch
         image_token_id = self._image_token_id()
 
-        logical_grams: List[Optional[torch.Tensor]] = []
-        for gram in forward_batch.oe_context.input_ids_grams:
-            if gram is None:
-                logical_grams.append(None)
-                continue
-            logical_gram = gram.clone()
-            for pad_value in pad_values:
-                logical_gram[logical_gram == pad_value] = image_token_id
-            logical_grams.append(logical_gram)
-
         logical_buffer = forward_batch.oe_context.input_ids_buffer
         if logical_buffer is not None:
-            logical_buffer = logical_buffer.clone()
-            for pad_value in pad_values:
-                logical_buffer[logical_buffer == pad_value] = image_token_id
+            logical_buffer = HashInputIdsBuffer(
+                [
+                    [
+                        image_token_id if token in pad_values else token
+                        for token in prefix_row
+                    ]
+                    for prefix_row in logical_buffer.prefixes
+                ]
+            )
 
         logical_oe_context = dataclasses.replace(
             forward_batch.oe_context,
-            input_ids_grams=logical_grams,
             input_ids_buffer=logical_buffer,
         )
         logical_batch = copy.copy(forward_batch)

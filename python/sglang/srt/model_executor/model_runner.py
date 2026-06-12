@@ -152,6 +152,10 @@ from sglang.srt.model_executor.hook_manager import register_forward_hooks
 from sglang.srt.model_executor.model_runner_kv_cache_mixin import (
     ModelRunnerKVCacheMixin,
 )
+from sglang.srt.models.welm_perf_opt import (
+    get_welm_oe_hash_config,
+    should_use_welm_oe_hash_kernel,
+)
 from sglang.srt.model_executor.piecewise_cuda_graph_runner import (
     PiecewiseCudaGraphRunner,
 )
@@ -751,6 +755,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         # Init ngram embedding token table
         self.maybe_init_ngram_embedding()
+        self.maybe_warmup_welm_oe_hash_kernel()
 
         # Init routed experts capturer
         self.init_routed_experts_capturer()
@@ -2650,6 +2655,31 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if require_gathered_buffer(self.server_args):
             assert require_mlp_tp_gather_ or require_attn_tp_gather(self.server_args)
 
+        hf_config = self.model_config.hf_config
+        kv_mirror_layers = []
+        kv_mirror_tensor_size = None
+        if (
+            self.server_args.pp_size > 1
+            and self.server_args.enable_welm_kv_mirror_opt
+        ):
+            num_hidden_layers = getattr(hf_config, "num_hidden_layers", 0)
+            kv_mirror_layers = [
+                int(layer_idx)
+                for layer_idx in getattr(hf_config, "kv_mirror_layers", [])
+                if 0 <= int(layer_idx) < num_hidden_layers
+            ]
+            if kv_mirror_layers:
+                num_attention_heads = getattr(hf_config, "num_attention_heads")
+                num_key_value_heads = getattr(hf_config, "num_key_value_heads")
+                head_dim = getattr(
+                    hf_config,
+                    "head_dim",
+                    self.model_config.hidden_size // num_attention_heads,
+                )
+                kv_mirror_tensor_size = (
+                    max(1, num_key_value_heads // get_attention_tp_size()) * head_dim
+                )
+
         buffers: DecodeInputBuffers = DecodeInputBuffers.create(
             device=self.device,
             max_bs=batch_size,
@@ -2679,6 +2709,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             router_replay_top_k=getattr(
                 self.model_config.hf_text_config, "num_experts_per_tok", 0
             ),
+            kv_mirror_layers=kv_mirror_layers,
+            kv_mirror_tensor_size=kv_mirror_tensor_size,
         )
         buffers.num_token_non_padded[...] = num_tokens
 
@@ -2906,6 +2938,27 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     module.init_buffers(
                         self.max_running_requests, chunked_prefill_size, self.device
                     )
+
+    def maybe_warmup_welm_oe_hash_kernel(self):
+        if not self.server_args.prepare_n_gram_inputs:
+            return
+        if not should_use_welm_oe_hash_kernel(self.model_config):
+            return
+        if torch.device(self.device).type != "cuda":
+            return
+
+        oe_grams, oe_vocab_sizes = get_welm_oe_hash_config(self.model_config)
+        if not oe_grams:
+            return
+
+        from sglang.jit_kernel.welm_oe import warmup_welm_oe_hash_kernel
+
+        warmup_welm_oe_hash_kernel(
+            self.device,
+            history_width=max(oe_grams) - 1,
+            oe_grams=oe_grams,
+            oe_vocab_sizes=oe_vocab_sizes,
+        )
 
     def maybe_update_ngram_token_table(
         self,

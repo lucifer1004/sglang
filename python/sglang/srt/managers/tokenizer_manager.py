@@ -14,6 +14,7 @@
 """TokenizerManager is a process that tokenizes the text."""
 
 import asyncio
+import base64
 import copy
 import dataclasses
 import json
@@ -32,6 +33,7 @@ from http import HTTPStatus
 from typing import Any, Awaitable, Dict, List, Optional, Tuple, Union
 
 import fastapi
+import numpy as np
 import pybase64
 import torch
 import uvloop
@@ -998,6 +1000,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             session_params = (
                 SessionParams(**obj.session_params) if obj.session_params else None
             )
+            router_replay_experts = self._resolve_router_replay_experts(
+                obj.routed_experts
+            )
 
             bootstrap_room = obj.bootstrap_room
             if (
@@ -1032,6 +1037,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 return_routed_experts=obj.return_routed_experts,
                 routed_experts_start_len=obj.routed_experts_start_len,
                 return_indexer_topk=obj.return_indexer_topk,
+                router_replay_experts=router_replay_experts,
+                forced_decode_token_ids=obj.forced_decode_token_ids,
                 routed_dp_rank=obj.routed_dp_rank,
                 disagg_prefill_dp_rank=obj.disagg_prefill_dp_rank,
                 priority=obj.priority,
@@ -1074,6 +1081,90 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.rid_to_state[obj.rid].time_stats.set_tokenize_finish_time()
 
         return tokenized_obj
+
+    @staticmethod
+    def _dtype_from_routed_experts_ref(ref: Dict[str, Any]) -> np.dtype:
+        dtype = str(ref.get("dtype", "int32")).removeprefix("torch.")
+        if dtype == "bool":
+            return np.dtype(np.bool_)
+        return np.dtype(dtype)
+
+    def _decode_remote_routed_experts_tensor(self, ref: Dict[str, Any]) -> torch.Tensor:
+        if self.routed_experts_store is None:
+            raise ValueError(
+                "Remote routed_experts replay requires --routed-experts-store-dsn."
+            )
+        if ref.get("format") != "remote":
+            raise ValueError(f"Unsupported routed_experts remote reference: {ref}")
+        payload = self.routed_experts_store.get(ref)
+        dtype = self._dtype_from_routed_experts_ref(ref)
+        tensor = np.frombuffer(payload, dtype=dtype).copy()
+        shape = ref.get("shape")
+        if shape is not None:
+            tensor = tensor.reshape(shape)
+        return torch.from_numpy(tensor)
+
+    def _decode_routed_experts_valid_mask(self, payload: Dict[str, Any]) -> torch.Tensor:
+        valid_mask = payload.get("valid_mask")
+        if valid_mask is None:
+            shape = payload.get("valid_mask_shape")
+            if shape is None:
+                shape = payload.get("shape", [])[:2]
+            return torch.ones(shape, dtype=torch.bool)
+
+        if isinstance(valid_mask, dict):
+            mask = self._decode_remote_routed_experts_tensor(valid_mask)
+        elif isinstance(valid_mask, str):
+            raw = base64.b64decode(valid_mask.encode("utf-8"))
+            mask = torch.from_numpy(np.frombuffer(raw, dtype=np.uint8).copy())
+            if payload.get("valid_mask_shape") is not None:
+                mask = mask.reshape(payload["valid_mask_shape"])
+        else:
+            mask = torch.as_tensor(valid_mask)
+        return mask.to(dtype=torch.bool)
+
+    def _resolve_router_replay_experts(self, routed_experts):
+        if not isinstance(routed_experts, dict):
+            return routed_experts
+
+        fmt = routed_experts.get("format")
+        if fmt == "shm":
+            # Client pre-staged the trace file on every server node (see
+            # 3b_prefetch_to_shm.py). Pass through unchanged; scheduler's
+            # _validate_router_replay_request will mmap the file zero-copy.
+            # No Redis is touched on the inference hot path at all.
+            return routed_experts
+        if fmt == "remote":
+            # PERF: defer the actual Redis fetch + np.frombuffer copy to the
+            # scheduler. tokenizer_manager just passes the small ref dict
+            # (~250 bytes) across the ZMQ boundary instead of pickling the
+            # full ~64 MB tensor (which is also broadcast via gloo to every
+            # TP rank). The scheduler will detect the dict in
+            # `_validate_router_replay_request` and resolve it via its own
+            # RoutedExpertsStore handle. The trusted flag is inherent to
+            # remote refs (they were produced by a prior capture run we
+            # control, so range/shape are already known).
+            return routed_experts
+        if fmt != "remote_masked_dense":
+            raise ValueError(f"Unsupported routed_experts payload format: {fmt!r}")
+
+        values_ref = routed_experts.get("values")
+        if not isinstance(values_ref, dict):
+            raise ValueError(
+                "remote_masked_dense routed_experts requires a remote values reference."
+            )
+        values = self._decode_remote_routed_experts_tensor(values_ref).to(
+            dtype=torch.int32
+        )
+        valid_mask = self._decode_routed_experts_valid_mask(routed_experts)
+        if values.shape[:2] != valid_mask.shape:
+            raise ValueError(
+                "Invalid remote_masked_dense routed_experts shapes: "
+                f"values={tuple(values.shape)}, valid_mask={tuple(valid_mask.shape)}."
+            )
+        values[~valid_mask] = -1
+        values._sglang_router_replay_trusted = True
+        return values
 
     @staticmethod
     def _resolve_embed_overrides(

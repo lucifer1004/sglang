@@ -576,8 +576,16 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         ):
             ret.positions = ret.spec_info.positions
 
+        # For scale_seq decode, override forward_mode so that the extend
+        # metadata branch below is taken (the attention backend needs
+        # extend_start_loc / extend_seq_lens to write multiple KV entries).
+        if ret.forward_mode.is_decode() and ret.scale_seq_factor > 1:
+            ret.forward_mode = ForwardMode.TARGET_VERIFY
+
         # Init position information
-        if ret.forward_mode.is_decode() or ret.forward_mode.is_target_verify():
+        if ret.forward_mode.is_decode() or (
+            ret.forward_mode.is_target_verify() and ret.spec_info is not None
+        ):
             if ret.positions is None:
                 ret.positions = clamp_position(batch.seq_lens)
         else:
@@ -958,17 +966,28 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         self.global_num_tokens_gpu.copy_(global_num_tokens_pinned, non_blocking=True)
 
         if self.router_replay_topk_ids is not None:
-            from sglang.srt.layers.dp_attention import dp_gather_partial
+            # NOTE(replay+dp-attn): router_replay_topk_ids is REPLICATED across
+            # attention-TP ranks within the same DP rank (every TP rank in a DP
+            # rank holds the same per-request expert ids). The DP gather is
+            # implemented as `inplace_all_reduce` (sum) across the full TP
+            # group, so calling `dp_gather_partial` here would DOUBLE the
+            # values for each DP rank (sum of two identical TP copies),
+            # producing out-of-range expert ids that crash the downstream
+            # `scores.gather(1, forced_ids)` in _gather_router_replay_weights.
+            # Use `dp_gather_replicate` instead, which only contributes from
+            # attn_tp_rank==0 — matching the replication semantics — so the
+            # sum yields exactly one copy of each DP rank's data.
+            from sglang.srt.layers.dp_attention import dp_gather_replicate
 
-            gathered_topk_ids = self.router_replay_topk_ids.new_empty(
+            gathered_topk_ids = self.router_replay_topk_ids.new_zeros(
                 (self.global_dp_buffer_len, *self.router_replay_topk_ids.shape[1:])
             )
-            dp_gather_partial(gathered_topk_ids, self.router_replay_topk_ids, self)
+            dp_gather_replicate(gathered_topk_ids, self.router_replay_topk_ids, self)
             self.router_replay_topk_ids = gathered_topk_ids
 
             replay_mask_i32 = self.router_replay_mask.to(torch.int32)
-            gathered_mask_i32 = replay_mask_i32.new_empty((self.global_dp_buffer_len,))
-            dp_gather_partial(gathered_mask_i32, replay_mask_i32, self)
+            gathered_mask_i32 = replay_mask_i32.new_zeros((self.global_dp_buffer_len,))
+            dp_gather_replicate(gathered_mask_i32, replay_mask_i32, self)
             self.router_replay_mask = gathered_mask_i32.to(torch.bool)
 
         TboForwardBatchPreparer.prepare(
@@ -1030,12 +1049,17 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 self.router_replay_mask, num_tokens, value=0
             )
 
-        oe_context = getattr(self, "oe_context", None)
-        if oe_context is not None and oe_context.input_ids_grams is not None:
-            oe_context.input_ids_grams = [
-                self._pad_tensor_to_size(gram, num_tokens)
-                for gram in oe_context.input_ids_grams
-            ]
+        welm_oe_hash = getattr(self, "welm_oe_decode_hashed_inputs", None)
+        if welm_oe_hash is not None and welm_oe_hash.shape[1] < num_tokens:
+            self.welm_oe_decode_hashed_inputs = torch.cat(
+                [
+                    welm_oe_hash,
+                    welm_oe_hash.new_zeros(
+                        welm_oe_hash.shape[0], num_tokens - welm_oe_hash.shape[1]
+                    ),
+                ],
+                dim=1,
+            )
 
         if self.mrope_positions is not None:
             self.mrope_positions = torch.cat(
