@@ -1212,9 +1212,10 @@ class CudaGraphRunner:
         graph = self._create_device_graph()
         stream = self.stream
         num_tokens = bs * self.num_tokens_per_bs
+        model_input_len = bs if self.scale_seq_factor > 1 else num_tokens
 
         # Graph inputs
-        input_ids = buffers.input_ids[:num_tokens]
+        input_ids = buffers.input_ids[:model_input_len]
         req_pool_indices = buffers.req_pool_indices[:bs]
         seq_lens = buffers.seq_lens[:bs]
         seq_lens_cpu = buffers.seq_lens_cpu[:bs]
@@ -1225,7 +1226,7 @@ class CudaGraphRunner:
         else:
             encoder_lens = None
         mrope_positions = buffers.mrope_positions[:, :num_tokens]
-        next_token_logits_buffer = buffers.next_token_logits_buffer[:num_tokens]
+        next_token_logits_buffer = buffers.next_token_logits_buffer[:model_input_len]
 
         # Adjust for attention TP if needed (matching replay path in
         # populate_from_forward_batch).
@@ -1351,6 +1352,7 @@ class CudaGraphRunner:
             router_replay_mask=buffers.router_replay_mask[:router_replay_num_tokens],
             global_forward_mode=self.capture_forward_mode,
             lora_ids=lora_ids,
+            scale_seq_factor=self.scale_seq_factor,
         )
         if self.model_runner.server_args.prepare_n_gram_inputs:
             model_input_len = bs if self.scale_seq_factor > 1 else num_tokens

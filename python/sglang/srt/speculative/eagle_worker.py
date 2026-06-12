@@ -65,7 +65,9 @@ from sglang.srt.speculative.spec_utils import (
     load_token_map,
     maybe_detect_nan,
     maybe_detect_oob,
+    mark_welmv4_mtp_draft_decode,
     select_top_k_tokens,
+    slice_welmv4_mtp_kv_mirror_states,
 )
 from sglang.srt.utils import (
     MultiprocessingSerializer,
@@ -471,6 +473,7 @@ class EAGLEWorker(TpModelWorker):
                     logits_output.hidden_states,
                     next_token_ids,
                     seq_lens_cpu,
+                    getattr(logits_output, "model_specific_states", None),
                     logits_output.mm_input_embeds,
                 )
             return GenerationBatchResult(
@@ -781,6 +784,7 @@ class EAGLEWorker(TpModelWorker):
         forward_batch = ForwardBatch.init_new(
             model_worker_batch, self.draft_model_runner
         )
+        mark_welmv4_mtp_draft_decode(forward_batch, self.draft_model_runner)
         can_cuda_graph = self.cuda_graph_runner and self.cuda_graph_runner.can_run(
             forward_batch
         )
@@ -1113,6 +1117,7 @@ class EAGLEWorker(TpModelWorker):
         hidden_states: torch.Tensor,
         next_token_ids: torch.Tensor,
         seq_lens_cpu: Optional[torch.Tensor],
+        target_model_specific_states: Optional[dict] = None,
         mm_input_embeds: Optional[torch.Tensor] = None,
     ):
         """Run draft model extend. This API modifies the states of the batch.
@@ -1124,6 +1129,9 @@ class EAGLEWorker(TpModelWorker):
         """
         batch.spec_info = EagleDraftInput(
             hidden_states=hidden_states,
+            model_specific_states=slice_welmv4_mtp_kv_mirror_states(
+                target_model_specific_states
+            ),
             bonus_tokens=next_token_ids,
             num_tokens_per_req=1,
             num_tokens_for_logprob_per_req=1,

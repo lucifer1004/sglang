@@ -4,7 +4,7 @@ import logging
 import os
 import time
 from contextlib import contextmanager
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 import torch
 import triton
@@ -62,6 +62,218 @@ def spec_need_hidden_states(server_args: Optional[ServerArgs] = None) -> bool:
     if server_args.speculative_algorithm == "STANDALONE":
         return False
     return not server_args.enable_multi_layer_eagle
+
+
+def uses_welmv4_nextn_draft(model_runner) -> bool:
+    hf_config = getattr(getattr(model_runner, "model_config", None), "hf_config", None)
+    archs = getattr(hf_config, "architectures", None) or []
+    return archs[:1] == ["WeLMV4MoeForCausalLMNextN"]
+
+
+def mark_welmv4_mtp_draft_decode(forward_batch, model_runner) -> None:
+    if uses_welmv4_nextn_draft(model_runner) and forward_batch.forward_mode.is_decode():
+        forward_batch.welm_mtp_use_base_kv_cache = True
+
+
+WELMV4_KV_MIRROR_STATES_KEY = "welm_kv_mirror_states"
+
+
+def _get_welmv4_mtp_mirror_imitated_layers(model_runner) -> List[int]:
+    hf_config = getattr(getattr(model_runner, "model_config", None), "hf_config", None)
+    num_hidden_layers = getattr(hf_config, "num_hidden_layers", 0)
+    num_nextn_predict_layers = getattr(hf_config, "num_nextn_predict_layers", 0)
+    mirror_layers = getattr(hf_config, "kv_mirror_layers", []) or []
+    imitated_layers = getattr(hf_config, "kv_mirror_imitated_layers", []) or []
+    layers = []
+    for mirror, imitated in zip(mirror_layers, imitated_layers):
+        mirror = int(mirror)
+        imitated = int(imitated)
+        if (
+            num_hidden_layers <= mirror < num_hidden_layers + num_nextn_predict_layers
+            and 0 <= imitated < num_hidden_layers
+        ):
+            layers.append(imitated)
+    return layers
+
+
+def get_welmv4_mtp_kv_mirror_tensor_size(model_runner) -> int:
+    hf_config = getattr(getattr(model_runner, "model_config", None), "hf_config", None)
+    if hf_config is None:
+        return 0
+
+    num_attention_heads = getattr(hf_config, "num_attention_heads")
+    num_key_value_heads = getattr(hf_config, "num_key_value_heads")
+    head_dim = getattr(
+        hf_config,
+        "head_dim",
+        model_runner.model_config.hidden_size // num_attention_heads,
+    )
+    return max(1, num_key_value_heads // model_runner.tp_size) * head_dim
+
+
+def make_welmv4_mtp_kv_mirror_state_buffers(
+    model_runner,
+    max_rows: int,
+) -> Dict[str, torch.Tensor]:
+    if not uses_welmv4_nextn_draft(model_runner):
+        return {}
+
+    tensor_size = get_welmv4_mtp_kv_mirror_tensor_size(model_runner)
+    if tensor_size <= 0:
+        return {}
+
+    buffers = {}
+    dtype = model_runner.model_config.dtype
+    device = model_runner.device
+    for layer_idx in _get_welmv4_mtp_mirror_imitated_layers(model_runner):
+        buffers[f"{layer_idx}.k"] = torch.zeros(
+            (max_rows, tensor_size), dtype=dtype, device=device
+        )
+        buffers[f"{layer_idx}.v"] = torch.zeros(
+            (max_rows, tensor_size), dtype=dtype, device=device
+        )
+    return buffers
+
+
+def build_welmv4_mtp_model_specific_states(
+    buffers: Optional[Dict[str, torch.Tensor]],
+    rows: int,
+) -> Optional[Dict[str, Dict[int, Tuple[torch.Tensor, torch.Tensor]]]]:
+    if not buffers:
+        return None
+
+    kv_mirror_states = {}
+    for key, tensor in buffers.items():
+        layer_idx, suffix = key.split(".", 1)
+        pair = kv_mirror_states.setdefault(int(layer_idx), [None, None])
+        pair[0 if suffix == "k" else 1] = tensor[:rows]
+
+    kv_mirror_states = {
+        layer_idx: (k, v)
+        for layer_idx, (k, v) in kv_mirror_states.items()
+        if k is not None and v is not None
+    }
+    if not kv_mirror_states:
+        return None
+    return {WELMV4_KV_MIRROR_STATES_KEY: kv_mirror_states}
+
+
+def copy_welmv4_mtp_kv_mirror_states_to_buffers(
+    dst_buffers: Optional[Dict[str, torch.Tensor]],
+    model_specific_states,
+    rows: int,
+) -> None:
+    if not dst_buffers:
+        return
+
+    for buffer in dst_buffers.values():
+        if buffer.shape[0] > rows:
+            buffer[rows:].zero_()
+
+    kv_mirror_states = (model_specific_states or {}).get(WELMV4_KV_MIRROR_STATES_KEY)
+    if not isinstance(kv_mirror_states, dict):
+        for buffer in dst_buffers.values():
+            buffer[:rows].zero_()
+        return
+
+    for key, dst in dst_buffers.items():
+        layer_idx, suffix = key.split(".", 1)
+        tensors = kv_mirror_states.get(int(layer_idx))
+        if not tensors:
+            dst[:rows].zero_()
+            continue
+        src = tensors[0 if suffix == "k" else 1]
+        if not isinstance(src, torch.Tensor):
+            dst[:rows].zero_()
+            continue
+        dst[:rows].copy_(src[:rows])
+
+
+def slice_welmv4_mtp_kv_mirror_states(model_specific_states, indices=None):
+    if not model_specific_states:
+        return None
+
+    kv_mirror_states = model_specific_states.get(WELMV4_KV_MIRROR_STATES_KEY)
+    if not isinstance(kv_mirror_states, dict):
+        return None
+
+    sliced_states = {}
+    for layer_idx, tensors in kv_mirror_states.items():
+        if not isinstance(tensors, (tuple, list)) or len(tensors) != 2:
+            continue
+        k, v = tensors
+        if not isinstance(k, torch.Tensor) or not isinstance(v, torch.Tensor):
+            continue
+        if indices is None:
+            sliced_states[int(layer_idx)] = (k, v)
+        else:
+            sliced_states[int(layer_idx)] = (k[indices], v[indices])
+
+    if not sliced_states:
+        return None
+
+    ret = dict(model_specific_states)
+    ret[WELMV4_KV_MIRROR_STATES_KEY] = sliced_states
+    return ret
+
+
+def concat_welmv4_mtp_kv_mirror_states(lhs, rhs):
+    lhs_kv = (lhs or {}).get(WELMV4_KV_MIRROR_STATES_KEY)
+    rhs_kv = (rhs or {}).get(WELMV4_KV_MIRROR_STATES_KEY)
+    if not isinstance(lhs_kv, dict):
+        return rhs
+    if not isinstance(rhs_kv, dict):
+        return lhs
+
+    merged = {}
+    for layer_idx, lhs_tensors in lhs_kv.items():
+        rhs_tensors = rhs_kv.get(layer_idx)
+        if not rhs_tensors:
+            continue
+        lhs_k, lhs_v = lhs_tensors
+        rhs_k, rhs_v = rhs_tensors
+        if not all(isinstance(t, torch.Tensor) for t in (lhs_k, lhs_v, rhs_k, rhs_v)):
+            continue
+        merged[int(layer_idx)] = (
+            torch.cat([lhs_k, rhs_k], dim=0),
+            torch.cat([lhs_v, rhs_v], dim=0),
+        )
+    if not merged:
+        return lhs
+
+    ret = dict(lhs)
+    ret[WELMV4_KV_MIRROR_STATES_KEY] = merged
+    return ret
+
+
+def refresh_welmv4_mtp_oe_context_for_draft_extend(
+    batch,
+    input_ids: torch.Tensor,
+    extend_lens: List[int],
+    extend_num_tokens: Optional[int] = None,
+) -> None:
+    oe_context = getattr(batch, "oe_context", None)
+    if oe_context is None or not getattr(oe_context, "input_ids_grams", None):
+        return
+
+    if extend_num_tokens is None:
+        extend_num_tokens = sum(extend_lens)
+
+    resized_grams = []
+    for gram in oe_context.input_ids_grams:
+        if gram is None:
+            resized_grams.append(None)
+            continue
+        if gram.shape[0] < extend_num_tokens:
+            gram = torch.cat(
+                [gram, gram.new_zeros(extend_num_tokens - gram.shape[0])],
+                dim=0,
+            )
+        else:
+            gram = gram[:extend_num_tokens]
+        resized_grams.append(gram)
+    oe_context.input_ids_grams = resized_grams
+    oe_context.refresh_for_draft_extend(input_ids, extend_lens)
 
 
 @triton.jit

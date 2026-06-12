@@ -1537,17 +1537,26 @@ class FlashAttentionBackend(AttentionBackend):
                 ),
             }
 
-        if (
-            self.speculative_num_draft_tokens is not None
+        target_verify_num_tokens = (
+            self.speculative_num_draft_tokens
+            if self.speculative_num_draft_tokens is not None
             and self.speculative_num_draft_tokens > 0
-        ):
+            else max(1, max_num_tokens // max_bs)
+        )
+        if target_verify_num_tokens > 0:
             # "page_table_draft_decode" will be set only when spec decoding enabled to save memory
-            self.decode_cuda_graph_metadata["page_table_draft_decode"] = torch.zeros(
-                max_bs,
-                max_num_pages,
-                dtype=torch.int32,
-                device=self.device,
-            )
+            if (
+                self.speculative_num_draft_tokens is not None
+                and self.speculative_num_draft_tokens > 0
+            ):
+                self.decode_cuda_graph_metadata["page_table_draft_decode"] = (
+                    torch.zeros(
+                        max_bs,
+                        max_num_pages,
+                        dtype=torch.int32,
+                        device=self.device,
+                    )
+                )
 
             self.target_verify_metadata = {
                 "cache_seqlens": torch.zeros(
@@ -1555,31 +1564,8 @@ class FlashAttentionBackend(AttentionBackend):
                 ),
                 "cu_seqlens_q": torch.arange(
                     0,
-                    max_bs * self.speculative_num_draft_tokens + 1,
-                    step=self.speculative_num_draft_tokens,
-                    dtype=torch.int32,
-                    device=self.device,
-                ),
-                "cu_seqlens_k": torch.zeros(
-                    max_bs + 1, dtype=torch.int32, device=self.device
-                ),
-                "page_table": torch.zeros(
-                    max_bs,
-                    max_num_pages,
-                    dtype=torch.int32,
-                    device=self.device,
-                ),
-                "strided_indices": torch.arange(
-                    0, self.max_context_len, self.page_size, device=self.device
-                ),
-            }
-
-            self.draft_extend_metadata = {
-                "cache_seqlens": torch.zeros(
-                    max_bs, dtype=torch.int32, device=self.device
-                ),
-                "cu_seqlens_q": torch.zeros(
-                    max_bs + 1,
+                    max_bs * target_verify_num_tokens + 1,
+                    step=target_verify_num_tokens,
                     dtype=torch.int32,
                     device=self.device,
                 ),
@@ -1604,6 +1590,35 @@ class FlashAttentionBackend(AttentionBackend):
                     dtype=torch.int32,
                     device=self.device,
                 )
+
+        if (
+            self.speculative_num_draft_tokens is not None
+            and self.speculative_num_draft_tokens > 0
+        ):
+            self.draft_extend_metadata = {
+                "cache_seqlens": torch.zeros(
+                    max_bs, dtype=torch.int32, device=self.device
+                ),
+                "cu_seqlens_q": torch.zeros(
+                    max_bs + 1,
+                    dtype=torch.int32,
+                    device=self.device,
+                ),
+                "cu_seqlens_k": torch.zeros(
+                    max_bs + 1, dtype=torch.int32, device=self.device
+                ),
+                "page_table": torch.zeros(
+                    max_bs,
+                    max_num_pages,
+                    dtype=torch.int32,
+                    device=self.device,
+                ),
+                "strided_indices": torch.arange(
+                    0, self.max_context_len, self.page_size, device=self.device
+                ),
+            }
+
+            if self.use_sliding_window_kv_pool:
                 self.draft_extend_metadata["swa_page_table"] = torch.zeros(
                     max_bs,
                     max_num_pages,
@@ -1704,6 +1719,29 @@ class FlashAttentionBackend(AttentionBackend):
         else:
             # For decoder-only models, skip encoder_metadata allocation
             self.encoder_metadata = {}
+
+    def _get_target_verify_num_tokens(self, num_tokens: int, bs: int) -> int:
+        if self.speculative_num_draft_tokens is not None:
+            return self.speculative_num_draft_tokens
+        return max(1, num_tokens // bs)
+
+    def _get_target_verify_num_tokens_for_replay(
+        self, bs: int, spec_info: Optional[SpecInput]
+    ) -> int:
+        if self.speculative_num_draft_tokens is not None:
+            return self.speculative_num_draft_tokens
+        replay_forward_batch = getattr(self, "_replay_forward_batch", None)
+        return max(1, getattr(replay_forward_batch, "scale_seq_factor", 1))
+
+    @staticmethod
+    def _target_verify_kv_lens(
+        seq_lens: torch.Tensor,
+        num_verify_tokens: int,
+        spec_info: Optional[SpecInput],
+    ) -> torch.Tensor:
+        if spec_info is None:
+            return seq_lens
+        return seq_lens + num_verify_tokens
 
     def init_forward_metadata_capture_cuda_graph(
         self,
@@ -1836,19 +1874,19 @@ class FlashAttentionBackend(AttentionBackend):
                 metadata.cache_seqlens_int32 = self.target_verify_metadata[
                     "cache_seqlens"
                 ][:bs]
-                metadata.cache_seqlens_int32.copy_(
-                    (seq_lens + self.speculative_num_draft_tokens)
+                num_verify_tokens = self._get_target_verify_num_tokens(num_tokens, bs)
+                kv_lens = self._target_verify_kv_lens(
+                    seq_lens, num_verify_tokens, spec_info
                 )
+                metadata.cache_seqlens_int32.copy_(kv_lens)
 
-                metadata.max_seq_len_q = self.speculative_num_draft_tokens
-                metadata.max_seq_len_k = (
-                    seq_lens.max().item() + self.speculative_num_draft_tokens
-                )
+                metadata.max_seq_len_q = num_verify_tokens
+                metadata.max_seq_len_k = kv_lens.max().item()
 
                 metadata.cu_seqlens_q = torch.arange(
                     0,
-                    bs * self.speculative_num_draft_tokens + 1,
-                    self.speculative_num_draft_tokens,
+                    bs * num_verify_tokens + 1,
+                    num_verify_tokens,
                     dtype=torch.int32,
                     device=device,
                 )
@@ -2117,13 +2155,15 @@ class FlashAttentionBackend(AttentionBackend):
         elif forward_mode.is_target_verify():
             if self.topk <= 1:
                 metadata = self.target_verify_metadata[bs]
-                metadata.cache_seqlens_int32.copy_(
-                    (seq_lens + self.speculative_num_draft_tokens)
+                num_verify_tokens = self._get_target_verify_num_tokens_for_replay(
+                    bs, spec_info
                 )
+                kv_lens = self._target_verify_kv_lens(
+                    seq_lens, num_verify_tokens, spec_info
+                )
+                metadata.cache_seqlens_int32.copy_(kv_lens)
 
-                metadata.max_seq_len_k = (
-                    seq_lens_cpu.max().item() + self.speculative_num_draft_tokens
-                )
+                metadata.max_seq_len_k = kv_lens.max().item()
                 metadata.cu_seqlens_k[1:].copy_(
                     torch.cumsum(metadata.cache_seqlens_int32, dim=0, dtype=torch.int32)
                 )

@@ -37,12 +37,15 @@ from sglang.srt.speculative.spec_utils import (
     TREE_SPEC_KERNEL_AVAILABLE,
     align_evict_mask_to_page_size,
     assign_req_to_token_pool_func,
+    concat_welmv4_mtp_kv_mirror_states,
     create_extend_after_decode_spec_info,
     create_num_accept_tokens_filter,
     filter_finished_cache_loc_kernel,
     generate_simulated_accept_index,
     get_src_tgt_cache_loc,
     get_target_cache_loc,
+    refresh_welmv4_mtp_oe_context_for_draft_extend,
+    slice_welmv4_mtp_kv_mirror_states,
 )
 from sglang.srt.utils import is_cuda, is_musa, next_power_of_2
 
@@ -567,6 +570,10 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                     if batch.spec_info.hidden_states is not None
                     else None
                 ),
+                model_specific_states=slice_welmv4_mtp_kv_mirror_states(
+                    getattr(logits_output, "model_specific_states", None),
+                    accept_index,
+                ),
                 num_correct_drafts=num_correct_drafts,
                 num_accept_tokens=num_correct_drafts + 1,
                 num_accept_tokens_cpu=num_accept_tokens_list,
@@ -639,6 +646,10 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                         if batch.spec_info.hidden_states is not None
                         else None
                     ),
+                    model_specific_states=slice_welmv4_mtp_kv_mirror_states(
+                        getattr(logits_output, "model_specific_states", None),
+                        unfinished_accept_index,
+                    ),
                     num_accept_tokens_cpu=draft_input_num_accept_tokens_cpu,
                     num_correct_drafts=unfinished_num_correct_drafts,
                     num_accept_tokens=unfinished_num_correct_drafts + 1,
@@ -679,6 +690,7 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
     # None when the spec algorithm's draft doesn't read hidden_states
     # (e.g., STANDALONE — vanilla LLM draft).
     hidden_states: Optional[torch.Tensor] = None
+    model_specific_states: Optional[dict] = None
     capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.FULL
 
     # Per-req bonus token (the "+1" target prediction at end of each accept
@@ -723,6 +735,9 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
                 (input_ids[1:], self.bonus_tokens[i].reshape(1))
             )
             pt += extend_len
+        refresh_welmv4_mtp_oe_context_for_draft_extend(
+            batch, batch.input_ids, batch.extend_lens
+        )
 
     @classmethod
     def hidden_size_for(cls, worker) -> Optional[int]:
@@ -782,6 +797,10 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
             self.topk_index = self.topk_index[: len(new_indices)]
             if self.hidden_states is not None:
                 self.hidden_states = self.hidden_states[: len(new_indices)]
+            self.model_specific_states = slice_welmv4_mtp_kv_mirror_states(
+                self.model_specific_states,
+                slice(None, len(new_indices)),
+            )
             self.bonus_tokens = self.bonus_tokens[: len(new_indices)]
         else:
             # in some cases(e.g draft_extend), we have not filtered the batch by `unfinished_index`
@@ -789,6 +808,10 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
             self.topk_index = self.topk_index[new_indices]
             if self.hidden_states is not None:
                 self.hidden_states = self.hidden_states[new_indices]
+            self.model_specific_states = slice_welmv4_mtp_kv_mirror_states(
+                self.model_specific_states,
+                new_indices,
+            )
             self.bonus_tokens = self.bonus_tokens[new_indices]
 
     def merge_batch(self, spec_info: "EagleDraftInput"):
@@ -806,6 +829,7 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
         # for STANDALONE all non-idle inputs also have None hidden_states.
         if len(self.topk_index) == 0:
             self.hidden_states = spec_info.hidden_states
+            self.model_specific_states = spec_info.model_specific_states
             self.bonus_tokens = spec_info.bonus_tokens
             self.topk_p = spec_info.topk_p
             self.topk_index = spec_info.topk_index
@@ -816,6 +840,10 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
             self.hidden_states = torch.cat(
                 [self.hidden_states, spec_info.hidden_states], axis=0
             )
+        self.model_specific_states = concat_welmv4_mtp_kv_mirror_states(
+            self.model_specific_states,
+            spec_info.model_specific_states,
+        )
         self.bonus_tokens = torch.cat(
             [self.bonus_tokens, spec_info.bonus_tokens], axis=0
         )
@@ -836,6 +864,10 @@ class EagleDraftExtendInput(SpecInput):
     # by accept_index; consumed by the draft-extend forward. None when the spec
     # algorithm's draft doesn't read hidden_states (e.g., STANDALONE).
     hidden_states: Optional[torch.Tensor] = None
+
+    # Optional model-private tensors that must follow the same accepted-token
+    # slicing as hidden_states. WeLMv4 NextN uses this for mirrored target K/V.
+    model_specific_states: Optional[dict] = None
 
     # Per-req accept counts. `num_accept_tokens = num_correct_drafts + 1`.
     # Both kept for cuda-graph buffer indexing and the
@@ -951,6 +983,12 @@ class EagleDraftExtendInput(SpecInput):
         batch.req_pool_indices = self.req_pool_indices
         batch.return_logprob = False
         batch.return_hidden_states = False
+        refresh_welmv4_mtp_oe_context_for_draft_extend(
+            batch,
+            batch.input_ids,
+            batch.extend_lens,
+            batch.extend_num_tokens,
+        )
 
         self.capture_hidden_mode = CaptureHiddenMode.LAST
         self.positions = torch.empty_like(batch.input_ids, dtype=torch.long)

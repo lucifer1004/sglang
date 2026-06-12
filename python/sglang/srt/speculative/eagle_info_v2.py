@@ -34,6 +34,8 @@ from sglang.srt.speculative.eagle_utils import verify_tree_greedy_func
 from sglang.srt.speculative.spec_utils import (
     SIMULATE_ACC_LEN,
     generate_simulated_accept_index,
+    mark_welmv4_mtp_draft_decode,
+    refresh_welmv4_mtp_oe_context_for_draft_extend,
 )
 from sglang.srt.utils.common import is_cuda, is_hip, is_musa, is_npu, next_power_of_2
 
@@ -214,6 +216,7 @@ class EagleDraftInputV2Mixin:
         batch.capture_hidden_mode = capture_mode
         self.positions = batch.seq_lens.repeat_interleave(topk, dim=0)
         forward_batch = ForwardBatch.init_new(batch, draft_model_runner)
+        mark_welmv4_mtp_draft_decode(forward_batch, draft_model_runner)
         can_cuda_graph = cuda_graph_runner and cuda_graph_runner.can_run(forward_batch)
         return forward_batch, can_cuda_graph
 
@@ -236,6 +239,12 @@ class EagleDraftInputV2Mixin:
         batch.extend_seq_lens = [num_draft_tokens for _ in range(len(batch.seq_lens))]
         batch.extend_prefix_lens = seq_lens_cpu_.tolist()
         batch.extend_num_tokens = extend_num_tokens
+        refresh_welmv4_mtp_oe_context_for_draft_extend(
+            batch,
+            batch.input_ids,
+            batch.extend_seq_lens,
+            extend_num_tokens,
+        )
         capture_mode = (
             CaptureHiddenMode.NULL
             if draft_model_runner.spec_algorithm.is_standalone()

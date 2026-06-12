@@ -47,6 +47,12 @@ _FAST_LLAMA_TOKENIZER = "hf-internal-testing/llama-tokenizer"
 
 # Class name used by transformers v5 when no tokenizer mapping exists for a model_type.
 _TOKENIZERS_BACKEND = "TokenizersBackend"
+_RESTORE_RAW_BACKEND_COMPONENT_TOKENIZER_CLASSES = {
+    "Qwen2Tokenizer",
+    "Qwen2TokenizerFast",
+    "WeLMV3Tokenizer",
+    "WeLMV3TokenizerFast",
+}
 
 
 def _load_tokenizer_by_declared_class(tokenizer_name, *args, **kwargs):
@@ -304,7 +310,7 @@ def _fix_v5_tokenizer_components(tokenizer, model_name_or_path, revision=None):
             return loaded is not expected
         return repr(loaded) != repr(expected)
 
-    if tokenizer_class == "Qwen2Tokenizer":
+    if tokenizer_class in _RESTORE_RAW_BACKEND_COMPONENT_TOKENIZER_CLASSES:
         restored = []
         for attr in (
             "model",
@@ -330,8 +336,9 @@ def _fix_v5_tokenizer_components(tokenizer, model_name_or_path, revision=None):
 
         if restored:
             logger.info(
-                "Restored v5 Qwen2 tokenizer backend components for %s "
+                "Restored v5 %s tokenizer backend components for %s "
                 "from tokenizer.json: %s",
+                tokenizer_class,
                 model_name_or_path,
                 ", ".join(restored),
             )

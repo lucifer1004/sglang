@@ -59,7 +59,9 @@ from sglang.srt.speculative.spec_utils import (
     load_token_map,
     maybe_detect_nan,
     maybe_detect_oob,
+    refresh_welmv4_mtp_oe_context_for_draft_extend,
     select_top_k_tokens,
+    slice_welmv4_mtp_kv_mirror_states,
 )
 from sglang.srt.utils.common import (
     MultiprocessingSerializer,
@@ -516,6 +518,7 @@ class EagleDraftWorker(BaseDraftWorker):
         batch: ModelWorkerBatch,
         target_hidden_states: torch.Tensor,
         next_token_ids: torch.Tensor,
+        target_model_specific_states: Optional[dict] = None,
         mm_input_embeds: Optional[torch.Tensor] = None,
     ):
         """
@@ -535,10 +538,19 @@ class EagleDraftWorker(BaseDraftWorker):
                     (input_ids[1:], next_token_ids[i].reshape(1))
                 )
                 pt += extend_len
+            refresh_welmv4_mtp_oe_context_for_draft_extend(
+                batch,
+                batch.input_ids,
+                batch.extend_seq_lens,
+                batch.extend_num_tokens,
+            )
 
         # Construct spec_info
         next_draft_input = EagleDraftInput(
             hidden_states=target_hidden_states,
+            model_specific_states=slice_welmv4_mtp_kv_mirror_states(
+                target_model_specific_states
+            ),
             bonus_tokens=next_token_ids,
             new_seq_lens=batch.seq_lens,
             # draft mode is same with decode mode, only 1 token per req
@@ -568,16 +580,19 @@ class EagleDraftWorker(BaseDraftWorker):
         self, batch: ModelWorkerBatch, batch_result: GenerationBatchResult
     ):
         # Batch 2: Draft extend
-        draft_input = EagleDraftInput(
-            hidden_states=batch_result.logits_output.hidden_states,
-            num_tokens_per_req=self.speculative_num_steps + 1,
-            num_tokens_for_logprob_per_req=self.speculative_num_steps + 1,
-        )
         select_index = (
             torch.arange(len(batch.seq_lens), device=self.device)
             * self.speculative_num_draft_tokens
             + batch_result.accept_lens
             - 1
+        )
+        draft_input = EagleDraftInput(
+            hidden_states=batch_result.logits_output.hidden_states,
+            model_specific_states=slice_welmv4_mtp_kv_mirror_states(
+                getattr(batch_result.logits_output, "model_specific_states", None)
+            ),
+            num_tokens_per_req=self.speculative_num_steps + 1,
+            num_tokens_for_logprob_per_req=self.speculative_num_steps + 1,
         )
 
         # Prepare for draft extend in a separate stream
@@ -776,6 +791,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                         model_worker_batch,
                         batch_output.logits_output.hidden_states,
                         batch_output.next_token_ids,
+                        getattr(batch_output.logits_output, "model_specific_states", None),
                         batch_output.logits_output.mm_input_embeds,
                     )
                 )

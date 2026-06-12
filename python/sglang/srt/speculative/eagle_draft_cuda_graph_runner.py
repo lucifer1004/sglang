@@ -27,6 +27,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 from sglang.srt.model_executor.input_buffers import ForwardInputBuffers
 from sglang.srt.speculative.eagle_info import EagleDraftInput
 from sglang.srt.speculative.spec_utils import (
+    mark_welmv4_mtp_draft_decode,
     maybe_detect_nan,
     maybe_detect_oob,
 )
@@ -349,6 +350,7 @@ class EAGLEDraftCudaGraphRunner:
                 spec_info.capture_hidden_mode if spec_info else CaptureHiddenMode.NULL
             ),
         )
+        mark_welmv4_mtp_draft_decode(forward_batch, self.model_runner)
 
         # Attention backend
         self.draft_attn_backend.init_forward_metadata_capture_cuda_graph(forward_batch)
