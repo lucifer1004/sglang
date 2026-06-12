@@ -109,12 +109,17 @@ class FutureMap:
             dtype=new_seq_lens0.dtype,
             device=self.device,
         )
-        self.welm_mtp_has_draft_proposal_buf = torch.empty(
+        self.welm_mtp_deferred_prefill_draft_buf = torch.empty(
             (self.future_buffer_len,),
             dtype=torch.bool,
             device=self.device,
         )
-        self.welm_mtp_deferred_prefill_draft_buf = torch.empty(
+        self.welm_mtp_has_draft_probs_buf = torch.empty(
+            (self.future_buffer_len,),
+            dtype=torch.bool,
+            device=self.device,
+        )
+        self.welm_mtp_has_draft_topk_buf = torch.empty(
             (self.future_buffer_len,),
             dtype=torch.bool,
             device=self.device,
@@ -133,44 +138,28 @@ class FutureMap:
                 device=self.device,
             )
 
-        self.has_welm_mtp_draft_proposal_tensor_buf = False
+        self.has_welm_mtp_draft_probs_buf = False
         self.has_welm_mtp_draft_topk_buf = False
         self.has_welm_mtp_oe_history_buf = False
-        self._ensure_welm_mtp_draft_proposal_buf(draft_input)
+        self._ensure_welm_mtp_draft_probs_buf(draft_input)
         self._ensure_welm_mtp_draft_topk_buf(draft_input)
         self._ensure_welm_mtp_oe_history_buf(draft_input)
 
-    def _ensure_welm_mtp_draft_proposal_buf(self, draft_input: EagleDraftInput):
-        if getattr(self, "has_welm_mtp_draft_proposal_tensor_buf", False):
+    def _ensure_welm_mtp_draft_probs_buf(self, draft_input: EagleDraftInput):
+        if getattr(self, "has_welm_mtp_draft_probs_buf", False):
             return
 
-        parent_list = getattr(draft_input, "draft_proposal_parent_list", None)
-        top_scores_index = getattr(
-            draft_input, "draft_proposal_top_scores_index", None
-        )
-        draft_tokens = getattr(draft_input, "draft_proposal_tokens", None)
-        if parent_list is None or top_scores_index is None or draft_tokens is None:
+        draft_probs = getattr(draft_input, "draft_probs", None)
+        if draft_probs is None:
             return
 
-        parent_list0 = parent_list[0]
-        top_scores_index0 = top_scores_index[0]
-        draft_tokens0 = draft_tokens[0]
-        self.welm_mtp_draft_proposal_parent_list_buf = torch.empty(
-            (self.future_buffer_len, *parent_list0.shape),
-            dtype=parent_list0.dtype,
+        draft_probs0 = draft_probs[0]
+        self.welm_mtp_draft_probs_buf = torch.empty(
+            (self.future_buffer_len, *draft_probs0.shape),
+            dtype=draft_probs0.dtype,
             device=self.device,
         )
-        self.welm_mtp_draft_proposal_top_scores_index_buf = torch.empty(
-            (self.future_buffer_len, *top_scores_index0.shape),
-            dtype=top_scores_index0.dtype,
-            device=self.device,
-        )
-        self.welm_mtp_draft_proposal_tokens_buf = torch.empty(
-            (self.future_buffer_len, *draft_tokens0.shape),
-            dtype=draft_tokens0.dtype,
-            device=self.device,
-        )
-        self.has_welm_mtp_draft_proposal_tensor_buf = True
+        self.has_welm_mtp_draft_probs_buf = True
 
     def _ensure_welm_mtp_draft_topk_buf(self, draft_input: EagleDraftInput):
         if getattr(self, "has_welm_mtp_draft_topk_buf", False):
@@ -241,47 +230,45 @@ class FutureMap:
             draft_input.topk_index = self.topk_index_buf[indices]
             draft_input.verified_id = self.verified_id_buf[indices]
             draft_input.new_seq_lens = self.new_seq_lens_buf[indices]
-            has_draft_proposal = False
-            if hasattr(self, "welm_mtp_has_draft_proposal_buf"):
-                draft_proposal_flags = self.welm_mtp_has_draft_proposal_buf[indices]
-                has_draft_proposal = (
-                    bool(draft_proposal_flags.any().item())
-                    if draft_proposal_flags.numel() > 0
-                    else False
-                )
-                draft_input.welm_mtp_has_draft_proposal = has_draft_proposal
             if hasattr(self, "welm_mtp_deferred_prefill_draft_buf"):
+                draft_input.welm_mtp_deferred_prefill_draft_mask = (
+                    self.welm_mtp_deferred_prefill_draft_buf[indices]
+                )
                 draft_input.welm_mtp_deferred_prefill_draft = (
-                    bool(
-                        self.welm_mtp_deferred_prefill_draft_buf[
-                            indices
-                        ].any().item()
-                    )
-                    and not has_draft_proposal
+                    bool(draft_input.welm_mtp_deferred_prefill_draft_mask.any().item())
+                    if draft_input.welm_mtp_deferred_prefill_draft_mask.numel() > 0
+                    else False
                 )
             if spec_need_hidden_states():
                 draft_input.hidden_states = self.hidden_states_buf[indices]
+            has_draft_probs = False
             if (
-                getattr(self, "has_welm_mtp_draft_proposal_tensor_buf", False)
-                and has_draft_proposal
+                getattr(self, "has_welm_mtp_draft_probs_buf", False)
+                and hasattr(self, "welm_mtp_has_draft_probs_buf")
             ):
-                draft_input.draft_proposal_parent_list = (
-                    self.welm_mtp_draft_proposal_parent_list_buf[indices]
+                draft_probs_flags = self.welm_mtp_has_draft_probs_buf[indices]
+                has_draft_probs = (
+                    bool(draft_probs_flags.all().item())
+                    if draft_probs_flags.numel() > 0
+                    else False
                 )
-                draft_input.draft_proposal_top_scores_index = (
-                    self.welm_mtp_draft_proposal_top_scores_index_buf[indices]
-                )
-                draft_input.draft_proposal_tokens = (
-                    self.welm_mtp_draft_proposal_tokens_buf[indices]
-                )
-            else:
-                draft_input.draft_proposal_parent_list = None
-                draft_input.draft_proposal_top_scores_index = None
-                draft_input.draft_proposal_tokens = None
+            draft_input.draft_probs = (
+                self.welm_mtp_draft_probs_buf[indices]
+                if has_draft_probs
+                else None
+            )
+            has_draft_topk = False
             if (
                 getattr(self, "has_welm_mtp_draft_topk_buf", False)
-                and has_draft_proposal
+                and hasattr(self, "welm_mtp_has_draft_topk_buf")
             ):
+                draft_topk_flags = self.welm_mtp_has_draft_topk_buf[indices]
+                has_draft_topk = (
+                    bool(draft_topk_flags.all().item())
+                    if draft_topk_flags.numel() > 0
+                    else False
+                )
+            if has_draft_topk:
                 draft_input.welm_mtp_draft_topk_indices = (
                     self.welm_mtp_draft_topk_indices_buf[indices]
                 )
@@ -341,41 +328,44 @@ class FutureMap:
         self.topk_index_buf[intv] = draft_input.topk_index
         self.verified_id_buf[intv] = draft_input.verified_id
         self.new_seq_lens_buf[intv] = draft_input.new_seq_lens
-        if hasattr(self, "welm_mtp_has_draft_proposal_buf"):
-            self.welm_mtp_has_draft_proposal_buf[intv] = bool(
-                getattr(draft_input, "welm_mtp_has_draft_proposal", False)
-            )
+        deferred_mask = getattr(
+            draft_input, "welm_mtp_deferred_prefill_draft_mask", None
+        )
         if hasattr(self, "welm_mtp_deferred_prefill_draft_buf"):
-            self.welm_mtp_deferred_prefill_draft_buf[intv] = bool(
-                getattr(draft_input, "welm_mtp_deferred_prefill_draft", False)
+            if deferred_mask is None:
+                self.welm_mtp_deferred_prefill_draft_buf[intv] = bool(
+                    getattr(draft_input, "welm_mtp_deferred_prefill_draft", False)
+                )
+            else:
+                self.welm_mtp_deferred_prefill_draft_buf[intv] = deferred_mask
+        if hasattr(self, "welm_mtp_has_draft_probs_buf"):
+            has_draft_probs = getattr(draft_input, "draft_probs", None) is not None
+            if has_draft_probs and deferred_mask is not None:
+                self.welm_mtp_has_draft_probs_buf[intv] = ~deferred_mask
+            else:
+                self.welm_mtp_has_draft_probs_buf[intv] = has_draft_probs
+        if hasattr(self, "welm_mtp_has_draft_topk_buf"):
+            has_draft_topk = (
+                getattr(draft_input, "welm_mtp_draft_topk_indices", None) is not None
+                and getattr(draft_input, "welm_mtp_draft_topk_values", None)
+                is not None
             )
+            if has_draft_topk and deferred_mask is not None:
+                self.welm_mtp_has_draft_topk_buf[intv] = ~deferred_mask
+            else:
+                self.welm_mtp_has_draft_topk_buf[intv] = has_draft_topk
         if hasattr(self, "welm_mtp_has_oe_history_buf"):
             self.welm_mtp_has_oe_history_buf[intv] = (
                 getattr(draft_input, "welm_mtp_oe_history_state", None) is not None
             )
         if spec_need_hidden_states():
             self.hidden_states_buf[intv] = draft_input.hidden_states
-        self._ensure_welm_mtp_draft_proposal_buf(draft_input)
-        if getattr(self, "has_welm_mtp_draft_proposal_tensor_buf", False):
-            has_draft_proposal_tensors = (
-                draft_input.draft_proposal_parent_list is not None
-                and draft_input.draft_proposal_top_scores_index is not None
-                and draft_input.draft_proposal_tokens is not None
-            )
-            if not has_draft_proposal_tensors:
-                self.welm_mtp_draft_proposal_parent_list_buf[intv].zero_()
-                self.welm_mtp_draft_proposal_top_scores_index_buf[intv].zero_()
-                self.welm_mtp_draft_proposal_tokens_buf[intv].zero_()
+        self._ensure_welm_mtp_draft_probs_buf(draft_input)
+        if getattr(self, "has_welm_mtp_draft_probs_buf", False):
+            if getattr(draft_input, "draft_probs", None) is None:
+                self.welm_mtp_draft_probs_buf[intv].zero_()
             else:
-                self.welm_mtp_draft_proposal_parent_list_buf[intv] = (
-                    draft_input.draft_proposal_parent_list
-                )
-                self.welm_mtp_draft_proposal_top_scores_index_buf[intv] = (
-                    draft_input.draft_proposal_top_scores_index
-                )
-                self.welm_mtp_draft_proposal_tokens_buf[intv] = (
-                    draft_input.draft_proposal_tokens
-                )
+                self.welm_mtp_draft_probs_buf[intv] = draft_input.draft_probs
         self._ensure_welm_mtp_draft_topk_buf(draft_input)
         if getattr(self, "has_welm_mtp_draft_topk_buf", False):
             has_draft_topk = (

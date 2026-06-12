@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import bisect
 import contextlib
-import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable, Optional
 
@@ -26,7 +25,6 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
 )
 from sglang.srt.model_executor.input_buffers import ForwardInputBuffers
-from sglang.srt.models.welm_perf_opt import get_welm_oe_hash_config
 from sglang.srt.speculative.eagle_info import EagleDraftInput
 from sglang.srt.speculative.spec_utils import maybe_detect_nan, maybe_detect_oob
 from sglang.srt.utils import (
@@ -38,11 +36,6 @@ from sglang.srt.utils import (
 
 if TYPE_CHECKING:
     from sglang.srt.speculative.eagle_worker import EAGLEWorker
-
-
-_WELM_MTP_DUMP_ENABLED = os.environ.get(
-    "SGLANG_DUMP_MTP_ACTIVATIONS", "0"
-).strip().lower() in {"1", "true", "yes", "on"}
 
 
 @dataclass
@@ -58,11 +51,6 @@ class EagleDraftInputBuffers(ForwardInputBuffers):
     topk_p: torch.Tensor
     topk_index: torch.Tensor
     hidden_states: torch.Tensor
-    welm_mtp_oe_hash_out: Optional[torch.Tensor]
-    welm_mtp_oe_entry_history: Optional[torch.Tensor]
-    welm_mtp_oe_work_history_a: Optional[torch.Tensor]
-    welm_mtp_oe_work_history_b: Optional[torch.Tensor]
-    welm_mtp_oe_parent_indices: Optional[torch.Tensor]
     global_num_tokens_gpu: Optional[torch.Tensor]
     global_num_tokens_for_logprob_gpu: Optional[torch.Tensor]
 
@@ -78,7 +66,7 @@ class EAGLEDraftCudaGraphRunner:
         # Parse args
         self.eagle_worker = eagle_worker
         if not hasattr(eagle_worker, "model_runner"):
-            # V2: EagleDraftWorker
+            # Overlap worker: EagleDraftWorker
             self.model_runner = model_runner = eagle_worker.draft_runner
         else:
             self.model_runner = model_runner = eagle_worker.model_runner
@@ -114,11 +102,6 @@ class EAGLEDraftCudaGraphRunner:
         self.max_num_token = self.max_bs * self.num_tokens_per_bs
 
         self.draft_attn_backend.init_cuda_graph_state(self.max_bs, self.max_num_token)
-        welmv4_mtp_base_kv_attn_backend = self._get_welmv4_mtp_base_kv_attn_backend()
-        if welmv4_mtp_base_kv_attn_backend is not None:
-            welmv4_mtp_base_kv_attn_backend.init_cuda_graph_state(
-                self.max_bs, self.max_num_token
-            )
         self.seq_len_fill_value = self.draft_attn_backend.attn_backends[
             0
         ].get_cuda_graph_seq_len_fill_value()
@@ -150,42 +133,6 @@ class EAGLEDraftCudaGraphRunner:
                 (self.max_bs, self.model_runner.model_config.spec_hidden_size),
                 dtype=self.model_runner.dtype,
             )
-            use_welm_mtp_oe_hash = getattr(
-                self.eagle_worker,
-                "_should_use_welmv4_mtp_oe_hash_kernel",
-                lambda: False,
-            )()
-            if use_welm_mtp_oe_hash:
-                oe_grams, oe_vocab_sizes = get_welm_oe_hash_config(
-                    self.model_runner.model_config
-                )
-                history_width = max(int(g) for g in oe_grams)
-                welm_mtp_oe_hash_out = torch.zeros(
-                    (len(oe_vocab_sizes), self.max_num_token), dtype=torch.int64
-                )
-                welm_mtp_oe_entry_history = torch.zeros(
-                    (self.max_bs, history_width), dtype=torch.int64
-                )
-                welm_mtp_oe_work_history_a = torch.zeros(
-                    (self.max_num_token, history_width), dtype=torch.int64
-                )
-                welm_mtp_oe_work_history_b = torch.zeros(
-                    (self.max_num_token, history_width), dtype=torch.int64
-                )
-                welm_mtp_oe_parent_indices = torch.zeros(
-                    (self.max_num_token,), dtype=torch.int64
-                )
-            else:
-                if self.model_runner.server_args.prepare_n_gram_inputs:
-                    raise RuntimeError(
-                        "WeLM MTP OE CUDA graph requires the hash kernel. "
-                        "Materialized n-gram fallback is no longer supported."
-                    )
-                welm_mtp_oe_hash_out = None
-                welm_mtp_oe_entry_history = None
-                welm_mtp_oe_work_history_a = None
-                welm_mtp_oe_work_history_b = None
-                welm_mtp_oe_parent_indices = None
 
             if self.require_gathered_buffer:
                 if self.require_mlp_tp_gather:
@@ -217,11 +164,6 @@ class EAGLEDraftCudaGraphRunner:
             topk_p=topk_p,
             topk_index=topk_index,
             hidden_states=hidden_states,
-            welm_mtp_oe_hash_out=welm_mtp_oe_hash_out,
-            welm_mtp_oe_entry_history=welm_mtp_oe_entry_history,
-            welm_mtp_oe_work_history_a=welm_mtp_oe_work_history_a,
-            welm_mtp_oe_work_history_b=welm_mtp_oe_work_history_b,
-            welm_mtp_oe_parent_indices=welm_mtp_oe_parent_indices,
             global_num_tokens_gpu=global_num_tokens_gpu,
             global_num_tokens_for_logprob_gpu=global_num_tokens_for_logprob_gpu,
         )
@@ -274,100 +216,6 @@ class EAGLEDraftCudaGraphRunner:
         with torch.cuda.graph(graph, pool=pool, stream=stream):
             out = run_once_fn()
         return out
-
-    def _get_welmv4_mtp_base_kv_attn_backend(self):
-        is_welmv4_mtp = getattr(
-            self.eagle_worker, "_is_welmv4_mtp_draft_model", lambda: False
-        )()
-        if not is_welmv4_mtp:
-            return None
-        return (
-            self.model_runner.decode_attn_backend
-            if self.model_runner.server_args.enable_pdmux
-            else self.model_runner.attn_backend
-        )
-
-    def _prepare_welmv4_mtp_base_kv_capture_metadata(
-        self,
-        forward_batch: ForwardBatch,
-        bs: int,
-        num_tokens: int,
-    ) -> None:
-        attn_backend = self._get_welmv4_mtp_base_kv_attn_backend()
-        if attn_backend is None:
-            return
-
-        spec_info_backup = forward_batch.spec_info
-        forward_batch.spec_info = None
-        try:
-            if not (
-                self.topk > 1
-                and hasattr(
-                    attn_backend,
-                    "init_welm_mtp_base_kv_metadata_capture_cuda_graph",
-                )
-                and attn_backend.init_welm_mtp_base_kv_metadata_capture_cuda_graph(
-                    bs,
-                    num_tokens,
-                    forward_batch.req_pool_indices,
-                    forward_batch.seq_lens,
-                )
-            ):
-                attn_backend.init_forward_metadata_capture_cuda_graph(
-                    bs,
-                    num_tokens,
-                    forward_batch.req_pool_indices,
-                    forward_batch.seq_lens,
-                    None,
-                    ForwardMode.DECODE,
-                    None,
-                )
-        finally:
-            forward_batch.spec_info = spec_info_backup
-        forward_batch.attn_backend = attn_backend
-        forward_batch.welm_mtp_base_kv_metadata_prepared = True
-
-    def _prepare_welmv4_mtp_base_kv_replay_metadata(
-        self,
-        forward_batch: ForwardBatch,
-        bs: int,
-        seq_lens_sum: int,
-    ) -> None:
-        attn_backend = self._get_welmv4_mtp_base_kv_attn_backend()
-        if attn_backend is None:
-            return
-
-        spec_info_backup = forward_batch.spec_info
-        forward_batch.spec_info = None
-        try:
-            if not (
-                self.topk > 1
-                and hasattr(
-                    attn_backend,
-                    "init_welm_mtp_base_kv_metadata_replay_cuda_graph",
-                )
-                and attn_backend.init_welm_mtp_base_kv_metadata_replay_cuda_graph(
-                    bs,
-                    self.num_tokens_per_bs,
-                    forward_batch.req_pool_indices,
-                    forward_batch.seq_lens,
-                    forward_batch.seq_lens_cpu,
-                )
-            ):
-                attn_backend.init_forward_metadata_replay_cuda_graph(
-                    bs,
-                    forward_batch.req_pool_indices,
-                    forward_batch.seq_lens,
-                    seq_lens_sum,
-                    None,
-                    ForwardMode.DECODE,
-                    None,
-                    seq_lens_cpu=forward_batch.seq_lens_cpu,
-                )
-        finally:
-            forward_batch.spec_info = spec_info_backup
-        forward_batch.attn_backend = attn_backend
-        forward_batch.welm_mtp_base_kv_metadata_prepared = True
 
     def _replay(self, forward_batch: ForwardBatch):
         ctx = (
@@ -477,32 +325,9 @@ class EAGLEDraftCudaGraphRunner:
             ),
             oe_context=None,
         )
-        if getattr(
-            self.eagle_worker, "_is_welmv4_mtp_draft_model", lambda: False
-        )():
-            forward_batch.welm_mtp_graph_oe_context_prepared = True
-            if buffers.welm_mtp_oe_hash_out is not None:
-                forward_batch.welm_mtp_oe_hash_out = (
-                    buffers.welm_mtp_oe_hash_out[:, :num_tokens]
-                )
-                forward_batch.welm_mtp_oe_entry_history_state = (
-                    buffers.welm_mtp_oe_entry_history[:num_seqs]
-                )
-                forward_batch.welm_mtp_oe_work_history = [
-                    buffers.welm_mtp_oe_work_history_a[:num_tokens],
-                    buffers.welm_mtp_oe_work_history_b[:num_tokens],
-                ]
-                forward_batch.welm_mtp_oe_parent_scratch = (
-                    buffers.welm_mtp_oe_parent_indices[:num_tokens]
-                )
 
         # Attention backend
         self.draft_attn_backend.init_forward_metadata_capture_cuda_graph(forward_batch)
-        self._prepare_welmv4_mtp_base_kv_capture_metadata(
-            forward_batch,
-            num_seqs,
-            num_tokens,
-        )
 
         # Run and capture
         def run_once():
@@ -519,18 +344,7 @@ class EAGLEDraftCudaGraphRunner:
             output_cache_loc_backup = forward_batch.out_cache_loc
             hidden_states_backup = forward_batch.spec_info.hidden_states
 
-            if _WELM_MTP_DUMP_ENABLED:
-                from sglang.srt.models import welmv4 as welmv4_module
-                from sglang.srt.models import welmv4_nextn as welmv4_nextn_module
-
-                welmv4_nextn_module._reset_mtp_graph_dump_call_index()
-                old_dump_context = welmv4_module._welm_set_graph_dump_context("draft")
-                try:
-                    ret = self.eagle_worker.draft_forward(forward_batch)
-                finally:
-                    welmv4_module._welm_set_graph_dump_context(old_dump_context)
-            else:
-                ret = self.eagle_worker.draft_forward(forward_batch)
+            ret = self.eagle_worker.draft_forward(forward_batch)
 
             forward_batch.out_cache_loc = output_cache_loc_backup
             forward_batch.spec_info.hidden_states = hidden_states_backup
@@ -582,12 +396,6 @@ class EAGLEDraftCudaGraphRunner:
             buffers.topk_index.zero_()
             buffers.hidden_states.zero_()
             buffers.req_pool_indices.zero_()
-            if buffers.welm_mtp_oe_hash_out is not None:
-                buffers.welm_mtp_oe_hash_out.zero_()
-                buffers.welm_mtp_oe_entry_history.zero_()
-                buffers.welm_mtp_oe_work_history_a.zero_()
-                buffers.welm_mtp_oe_work_history_b.zero_()
-                buffers.welm_mtp_oe_parent_indices.zero_()
 
         num_tokens = bs * self.num_tokens_per_bs
 
@@ -612,25 +420,6 @@ class EAGLEDraftCudaGraphRunner:
         buffers.topk_index[:raw_bs].copy_(forward_batch.spec_info.topk_index)
         buffers.hidden_states[:raw_bs].copy_(forward_batch.spec_info.hidden_states)
         buffers.req_pool_indices[:raw_bs].copy_(forward_batch.req_pool_indices)
-        if buffers.welm_mtp_oe_entry_history is not None and raw_bs > 0:
-            history_state = getattr(
-                forward_batch.spec_info, "welm_mtp_oe_history_state", None
-            )
-            if history_state is None:
-                raise RuntimeError(
-                    "WeLMV4 MTP fused OE hash draft graph replay is missing "
-                    "entry history state."
-                )
-            if history_state.shape[0] != raw_bs:
-                raise RuntimeError(
-                    "WeLMV4 MTP fused OE hash draft graph replay history row "
-                    f"count mismatch: {history_state.shape[0]} vs {raw_bs}."
-                )
-            buffers.welm_mtp_oe_entry_history[:raw_bs].copy_(
-                history_state[:raw_bs]
-            )
-            if bs > raw_bs:
-                buffers.welm_mtp_oe_entry_history[raw_bs:bs].zero_()
         # TODO(ch-wan): support num_token_non_padded
         if self.require_gathered_buffer:
             buffers.global_num_tokens_gpu.fill_(bs * self.num_tokens_per_bs)
@@ -651,11 +440,6 @@ class EAGLEDraftCudaGraphRunner:
 
         self.draft_attn_backend.init_forward_metadata_replay_cuda_graph(
             forward_batch, bs
-        )
-        self._prepare_welmv4_mtp_base_kv_replay_metadata(
-            forward_batch,
-            bs,
-            forward_batch.seq_lens_sum + (bs - raw_bs) * self.seq_len_fill_value,
         )
         self.raw_bs = raw_bs
         self.bs = bs

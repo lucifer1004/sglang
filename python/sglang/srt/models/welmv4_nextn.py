@@ -22,7 +22,6 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.models.welm_perf_opt import compute_welm_oe_embedding
-from sglang.srt.models.welm_mtp_version import WelmMTPVersion, get_welm_mtp_version
 import sglang.srt.models.welmv4 as welmv4_module
 from sglang.srt.models.welmv4 import (
     Qwen2MoeDecoderLayer,
@@ -33,12 +32,19 @@ from sglang.srt.models.welmv4 import (
     _welm_prepare_kv_mirror_logits_states,
     _welm_select_kv_mirror_rows,
     _welm_should_contract_kv_mirror,
+    _welm_update_contracted_dp_metadata,
     welm_use_previous_precision,
 )
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix, is_cuda, is_npu
 
 logger = logging.getLogger(__name__)
+
+
+def _welm_mtp_trace(message: str) -> None:
+    if os.environ.get("SGLANG_WELM_MTP_TRACE", "0") == "1":
+        print(f"[WELM_MTP_TRACE pid={os.getpid()}] {message}", flush=True)
+
 
 _is_cuda = is_cuda()
 _is_npu = is_npu()
@@ -86,53 +92,6 @@ def _cuda_graph_capture_active() -> bool:
 
 def _mtp_dump_enabled() -> bool:
     return _MTP_DUMP_ENABLED
-
-
-def _update_mtp_kv_mirror_dp_metadata(
-    forward_batch: ForwardBatch, new_local_num_tokens: int
-) -> None:
-    if (
-        not is_dp_attention_enabled()
-        or welm_use_previous_precision()
-        or getattr(forward_batch, "global_num_tokens_gpu", None) is None
-    ):
-        return
-
-    from sglang.srt.layers.dp_attention import (
-        get_attention_dp_rank,
-        set_dp_buffer_len,
-    )
-
-    dp_rank = get_attention_dp_rank()
-    scale = max(getattr(forward_batch, "scale_seq_factor", 1), 1)
-    if scale > 1:
-        new_global_num_tokens_gpu = forward_batch.global_num_tokens_gpu // scale
-        forward_batch.global_num_tokens_gpu.copy_(new_global_num_tokens_gpu)
-        new_global_num_tokens = [int(x) for x in new_global_num_tokens_gpu.tolist()]
-        if forward_batch.global_num_tokens_cpu is not None:
-            forward_batch.global_num_tokens_cpu = new_global_num_tokens
-    else:
-        forward_batch.global_num_tokens_gpu[dp_rank] = new_local_num_tokens
-        new_global_num_tokens = None
-
-    forward_batch.dp_local_start_pos = None
-    forward_batch.dp_local_num_tokens = None
-    if new_global_num_tokens is not None:
-        if forward_batch.dp_padding_mode.is_max_len():
-            global_dp_buffer_len = max(new_global_num_tokens) * len(
-                new_global_num_tokens
-            )
-        else:
-            global_dp_buffer_len = sum(new_global_num_tokens)
-        forward_batch.global_dp_buffer_len = global_dp_buffer_len
-    else:
-        global_dp_buffer_len = forward_batch.global_dp_buffer_len
-    set_dp_buffer_len(
-        global_dp_buffer_len,
-        new_local_num_tokens,
-        forward_batch.dp_padding_mode.is_max_len(),
-        new_global_num_tokens,
-    )
 
 
 def _mtp_dump_dir() -> Path:
@@ -319,7 +278,6 @@ class WeLMV4ModelNextN(nn.Module):
         super().__init__()
         self.config = config
         self.vocab_size = config.vocab_size
-        self.welm_mtp_version = get_welm_mtp_version(config)
         self.num_physical_mtp_layers = int(config.num_nextn_predict_layers)
         self.num_nextn_predict_layers = self.num_physical_mtp_layers
 
@@ -379,14 +337,17 @@ class WeLMV4ModelNextN(nn.Module):
             raise RuntimeError(
                 f"WeLM MTP logical step index must be non-negative, got {step_idx}."
             )
-        if self.welm_mtp_version == WelmMTPVersion.V1:
-            return 0
-        if step_idx >= self.num_physical_mtp_layers:
+        if self.num_physical_mtp_layers <= 0:
+            raise RuntimeError(
+                "WeLM MTP requires at least one physical MTP layer, got "
+                f"{self.num_physical_mtp_layers}."
+            )
+        if self.num_physical_mtp_layers != 1 and step_idx >= self.num_physical_mtp_layers:
             raise RuntimeError(
                 "WeLM MTP logical step index is out of physical layer range: "
                 f"{step_idx} vs {self.num_physical_mtp_layers}."
             )
-        return step_idx
+        return step_idx % self.num_physical_mtp_layers
 
     def _get_projector(self, step_idx: int) -> MTPProjector:
         return self.projectors[self._get_physical_step_idx(step_idx)]
@@ -399,7 +360,11 @@ class WeLMV4ModelNextN(nn.Module):
         *,
         hashed_inputs: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        if len(self.oe_grams) == 0 or input_ids.numel() == 0:
+        if (
+            len(self.oe_grams) == 0
+            or input_ids.numel() == 0
+            or forward_batch.forward_mode.is_idle()
+        ):
             return hidden_states
 
         if hashed_inputs is None:
@@ -516,7 +481,35 @@ class WeLMV4ModelNextN(nn.Module):
         query_input_ids = query_input_ids.to(
             device=hidden_states.device, dtype=torch.int64
         )
-        expected_rows = forward_batch.custom_last_index.numel()
+        custom_last_index = getattr(forward_batch, "custom_last_index", None)
+        if custom_last_index is None:
+            if forward_batch.extend_seq_lens is None:
+                if (
+                    forward_batch.forward_mode.is_idle()
+                    and hidden_states.shape[0] == 0
+                    and query_input_ids.numel() == 0
+                ):
+                    custom_last_index = torch.empty(
+                        (0,), dtype=torch.long, device=hidden_states.device
+                    )
+                    forward_batch.custom_last_index = custom_last_index
+                else:
+                    raise RuntimeError(
+                        "Merged WeLMV4 MTP query embedding override requires "
+                        "custom_last_index or extend_seq_lens."
+                    )
+            else:
+                custom_last_index = (
+                    torch.cumsum(forward_batch.extend_seq_lens, dim=0) - 1
+                )
+                forward_batch.custom_last_index = custom_last_index
+                out_cache_loc = getattr(forward_batch, "out_cache_loc", None)
+                if out_cache_loc is not None:
+                    forward_batch.custom_last_cache_loc = out_cache_loc[
+                        custom_last_index
+                    ]
+
+        expected_rows = custom_last_index.numel()
         if query_input_ids.shape[0] != expected_rows:
             raise RuntimeError(
                 "Merged WeLMV4 MTP query input shape does not match active "
@@ -531,9 +524,7 @@ class WeLMV4ModelNextN(nn.Module):
             hashed_inputs=getattr(forward_batch, "welm_mtp_query_oe_hashed_inputs", None),
         )
         hidden_states = hidden_states.clone()
-        hidden_states[forward_batch.custom_last_index] = query_hidden.to(
-            hidden_states.dtype
-        )
+        hidden_states[custom_last_index] = query_hidden.to(hidden_states.dtype)
         return hidden_states
 
     def forward(
@@ -590,10 +581,23 @@ class WeLMV4ModelNextN(nn.Module):
                 forward_batch,
                 first_contract=main_first_contract,
             )
-            if first_contract:
-                _update_mtp_kv_mirror_dp_metadata(
-                    forward_batch, hidden_states.shape[0]
-                )
+            _welm_update_contracted_dp_metadata(
+                forward_batch,
+                hidden_states.shape[0],
+                marker_attr="_welm_mtp_contracted_dp_metadata_rows",
+                contract_to_request_counts=True,
+            )
+        elif (
+            forward_batch.forward_mode.is_idle()
+            and forward_batch.is_extend_in_batch
+            and main_hidden_states is not None
+        ):
+            _welm_update_contracted_dp_metadata(
+                forward_batch,
+                hidden_states.shape[0],
+                marker_attr="_welm_mtp_contracted_dp_metadata_rows",
+                contract_to_request_counts=True,
+            )
 
         needs_empty_dp_collectives = (
             is_dp_attention_enabled()
@@ -619,6 +623,13 @@ class WeLMV4ModelNextN(nn.Module):
         final_shared_output = None
         physical_step_idx = self._get_physical_step_idx(mtp_step_idx)
         layer = self.decoder_layers[physical_step_idx]
+        _welm_mtp_trace(
+            "nextn_before_layer "
+            f"step={mtp_step_idx} mode={forward_batch.forward_mode} "
+            f"hidden_shape={tuple(hidden_states.shape)} "
+            f"main_hidden_shape={None if main_hidden_states is None else tuple(main_hidden_states.shape)} "
+            f"global_tokens={getattr(forward_batch, 'global_num_tokens_cpu', None)}"
+        )
         with get_global_expert_distribution_recorder().disable_this_region():
             hidden_states, residual, kv_mirror_states = layer(
                 positions,
@@ -629,13 +640,26 @@ class WeLMV4ModelNextN(nn.Module):
             )
             final_experts_output = getattr(layer, "final_mlp_experts_output", None)
             final_shared_output = getattr(layer, "final_mlp_shared_output", None)
+        _welm_mtp_trace(
+            "nextn_after_layer "
+            f"step={mtp_step_idx} mode={forward_batch.forward_mode} "
+            f"hidden_shape={tuple(hidden_states.shape)} "
+            f"residual_shape={None if residual is None else tuple(residual.shape)} "
+            f"global_tokens={getattr(forward_batch, 'global_num_tokens_cpu', None)}"
+        )
 
-        if hidden_states.shape[0] == 0:
+        if hidden_states.shape[0] == 0 and not needs_empty_dp_collectives:
             return hidden_states, hidden_states
 
         ln_f = proj.ln_f
         hidden_states_for_next_mtp = None
-        if not forward_batch.forward_mode.is_idle():
+        if not forward_batch.forward_mode.is_idle() or needs_empty_dp_collectives:
+            _welm_mtp_trace(
+                "nextn_before_ln_f "
+                f"step={mtp_step_idx} mode={forward_batch.forward_mode} "
+                f"hidden_shape={tuple(hidden_states.shape)} "
+                f"residual_shape={None if residual is None else tuple(residual.shape)}"
+            )
             if residual is not None:
                 if welm_use_previous_precision():
                     hidden_states_for_next_mtp = (
@@ -675,6 +699,12 @@ class WeLMV4ModelNextN(nn.Module):
                 f"model.mtp.{mtp_step_idx}.decoder.output",
                 hidden_states_for_next_mtp,
             )
+            _welm_mtp_trace(
+                "nextn_after_ln_f "
+                f"step={mtp_step_idx} mode={forward_batch.forward_mode} "
+                f"hidden_shape={tuple(hidden_states.shape)} "
+                f"next_hidden_shape={None if hidden_states_for_next_mtp is None else tuple(hidden_states_for_next_mtp.shape)}"
+            )
         _dump_tensor(f"model.mtp.{mtp_step_idx}.ln_f", hidden_states)
         return hidden_states, hidden_states_for_next_mtp
 
@@ -692,7 +722,6 @@ class WeLMV4MoeForCausalLMNextN(WeLMV4MoeForCausalLM):
         self.quant_config = quant_config
         # if not set, model load will be broken in DeepseekV3ForCausalLM load_weights()
         self.pp_group = get_pp_group()
-        self.welm_mtp_version = get_welm_mtp_version(config)
 
         self.model = WeLMV4ModelNextN(
             config, quant_config, prefix=add_prefix("model", prefix)
@@ -722,17 +751,50 @@ class WeLMV4MoeForCausalLMNextN(WeLMV4MoeForCausalLM):
                 if hidden_states_for_next_mtp is not None
                 else None
             )
+            previous_pruned = None
             if _welm_should_contract_kv_mirror(forward_batch):
                 hidden_states, aux_hidden_states = _welm_prepare_kv_mirror_logits_states(
                     hidden_states, aux_hidden_states, forward_batch
                 )
-            logits_output = self.logits_processor(
-                input_ids,
-                hidden_states,
-                self.lm_head,
-                forward_batch,
-                aux_hidden_states,
-            )
+                _welm_update_contracted_dp_metadata(
+                    forward_batch,
+                    hidden_states.shape[0],
+                    marker_attr="_welm_mtp_contracted_dp_metadata_rows",
+                    contract_to_request_counts=True,
+                )
+            elif getattr(forward_batch, "welm_mtp_merge_kv_fill_draft", False):
+                custom_last_index = getattr(forward_batch, "custom_last_index", None)
+                if (
+                    custom_last_index is not None
+                    and hidden_states.shape[0] != custom_last_index.numel()
+                ):
+                    if aux_hidden_states is None:
+                        raise RuntimeError(
+                            "Merged WeLM MTP full-layout logits pruning requires "
+                            "the full hidden state for the next MTP step."
+                        )
+                    hidden_states = hidden_states[custom_last_index]
+                    previous_pruned = getattr(
+                        forward_batch, "welm_kv_mirror_contracted", False
+                    )
+                    forward_batch.welm_kv_mirror_contracted = True
+                    _welm_update_contracted_dp_metadata(
+                        forward_batch,
+                        hidden_states.shape[0],
+                        marker_attr="_welm_mtp_contracted_dp_metadata_rows",
+                        contract_to_request_counts=True,
+                    )
+            try:
+                logits_output = self.logits_processor(
+                    input_ids,
+                    hidden_states,
+                    self.lm_head,
+                    forward_batch,
+                    aux_hidden_states,
+                )
+            finally:
+                if previous_pruned is not None:
+                    forward_batch.welm_kv_mirror_contracted = previous_pruned
             if _MTP_DUMP_ENABLED:
                 _dump_tensor(
                     f"model.mtp.{mtp_step_idx}.logits",

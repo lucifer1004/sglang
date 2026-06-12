@@ -47,6 +47,7 @@ from sglang.srt.layers.communicator import (
     ScatterMode,
 )
 from sglang.srt.layers.dp_attention import (
+    DpPaddingMode,
     get_attention_dp_size,
     get_attention_tp_rank,
     get_attention_tp_size,
@@ -480,12 +481,6 @@ def _welm_should_contract_kv_mirror(forward_batch: ForwardBatch) -> bool:
     )
 
 
-def _welm_mtp_uses_base_kv_cache(forward_batch: ForwardBatch) -> bool:
-    return forward_batch.forward_mode.is_decode() and getattr(
-        forward_batch, "welm_mtp_use_base_kv_cache", False
-    )
-
-
 def _welm_init_kv_mirror_last_q_indices(forward_batch: ForwardBatch) -> bool:
     forward_batch.welm_kv_mirror_contracted = True
     if getattr(forward_batch, "kv_mirror_output_size", None) is not None:
@@ -580,6 +575,8 @@ def _welm_write_kv_cache_only(
         return
     if forward_batch.out_cache_loc is None:
         return
+    if k.numel() == 0 or v.numel() == 0 or forward_batch.out_cache_loc.numel() == 0:
+        return
     forward_batch.token_to_kv_pool.set_kv_buffer(
         attn,
         forward_batch.out_cache_loc,
@@ -614,6 +611,144 @@ def _welm_prepare_kv_mirror_logits_states(
             for hidden in aux_hidden_states
         ]
     return hidden_states, aux_hidden_states
+
+
+def _welm_update_contracted_dp_metadata(
+    forward_batch: ForwardBatch,
+    new_local_num_tokens: int,
+    *,
+    marker_attr: Optional[str] = None,
+    contract_to_request_counts: bool = False,
+) -> None:
+    if (
+        not is_dp_attention_enabled()
+        or welm_use_previous_precision()
+        or getattr(forward_batch, "global_num_tokens_gpu", None) is None
+    ):
+        return
+
+    new_local_num_tokens = int(new_local_num_tokens)
+    if marker_attr is not None and (
+        getattr(forward_batch, marker_attr, None) == new_local_num_tokens
+    ):
+        return
+
+    from sglang.srt.layers.dp_attention import (
+        get_attention_dp_rank,
+        set_dp_buffer_len,
+        set_is_extend_in_batch,
+    )
+
+    dp_rank = get_attention_dp_rank()
+    scale = max(getattr(forward_batch, "scale_seq_factor", 1), 1)
+    local_dp_buffer_len = new_local_num_tokens
+    if contract_to_request_counts:
+        num_dp_slots = int(forward_batch.global_num_tokens_gpu.numel())
+        source_counts = getattr(
+            forward_batch, "global_num_tokens_for_logprob_cpu", None
+        )
+        if source_counts is None or len(source_counts) != num_dp_slots:
+            source_counts = getattr(
+                forward_batch, "original_global_num_tokens_cpu", None
+            )
+        if source_counts is not None and len(source_counts) == num_dp_slots:
+            raw_global_num_tokens = [int(x) for x in source_counts]
+        else:
+            raw_global_num_tokens = [new_local_num_tokens] * num_dp_slots
+        expected_local_num_tokens = raw_global_num_tokens[dp_rank]
+        if expected_local_num_tokens != new_local_num_tokens:
+            raise RuntimeError(
+                "WeLM MTP DP metadata contraction mismatch: "
+                f"dp_rank={dp_rank}, local_rows={new_local_num_tokens}, "
+                f"global_request_counts={raw_global_num_tokens}."
+            )
+
+        force_extend_sum_len = (
+            num_dp_slots > 1
+            and (
+                forward_batch.is_extend_in_batch
+                or forward_batch.forward_mode.is_draft_extend(include_v2=True)
+                or getattr(forward_batch, "welm_mtp_merge_kv_fill_draft", False)
+            )
+        )
+        if force_extend_sum_len:
+            forward_batch.is_extend_in_batch = True
+            forward_batch.dp_padding_mode = DpPaddingMode.SUM_LEN
+        else:
+            forward_batch.dp_padding_mode = (
+                forward_batch.dp_padding_mode.get_dp_padding_mode(
+                    forward_batch.is_extend_in_batch, raw_global_num_tokens
+                )
+            )
+
+        if forward_batch.dp_padding_mode.is_max_len():
+            max_num_tokens = max(raw_global_num_tokens)
+            new_global_num_tokens = [max_num_tokens] * num_dp_slots
+        else:
+            new_global_num_tokens = raw_global_num_tokens
+        local_dp_buffer_len = new_global_num_tokens[dp_rank]
+        is_uniform_count = all(x == new_global_num_tokens[0] for x in new_global_num_tokens)
+        if is_uniform_count:
+            forward_batch.global_num_tokens_gpu.fill_(new_global_num_tokens[0])
+            new_global_num_tokens_gpu = forward_batch.global_num_tokens_gpu
+        else:
+            # ForwardBatch.init_new has already copied the synchronized per-DP
+            # token counts to the GPU. Avoid allocating/copying a fresh CUDA
+            # tensor here; this path can run while prior MTP collectives are
+            # still pending.
+            new_global_num_tokens_gpu = forward_batch.global_num_tokens_gpu
+            for i, count in enumerate(new_global_num_tokens):
+                new_global_num_tokens_gpu[i] = count
+            forward_batch.global_num_tokens_gpu = new_global_num_tokens_gpu
+        if forward_batch.global_num_tokens_cpu is not None:
+            forward_batch.global_num_tokens_cpu = new_global_num_tokens
+        if forward_batch.global_num_tokens_for_logprob_gpu is not None:
+            if (
+                int(forward_batch.global_num_tokens_for_logprob_gpu.numel())
+                == num_dp_slots
+            ):
+                if is_uniform_count:
+                    forward_batch.global_num_tokens_for_logprob_gpu.fill_(
+                        new_global_num_tokens[0]
+                    )
+                else:
+                    for i, count in enumerate(new_global_num_tokens):
+                        forward_batch.global_num_tokens_for_logprob_gpu[i] = count
+                forward_batch.global_num_tokens_for_logprob_cpu = (
+                    new_global_num_tokens
+                )
+    elif scale > 1:
+        new_global_num_tokens_gpu = forward_batch.global_num_tokens_gpu // scale
+        forward_batch.global_num_tokens_gpu.copy_(new_global_num_tokens_gpu)
+        new_global_num_tokens = [int(x) for x in new_global_num_tokens_gpu.tolist()]
+        if forward_batch.global_num_tokens_cpu is not None:
+            forward_batch.global_num_tokens_cpu = new_global_num_tokens
+    else:
+        forward_batch.global_num_tokens_gpu[dp_rank] = new_local_num_tokens
+        new_global_num_tokens = None
+
+    forward_batch.dp_local_start_pos = None
+    forward_batch.dp_local_num_tokens = None
+    if new_global_num_tokens is not None:
+        if forward_batch.dp_padding_mode.is_max_len():
+            global_dp_buffer_len = max(new_global_num_tokens) * len(
+                new_global_num_tokens
+            )
+        else:
+            global_dp_buffer_len = sum(new_global_num_tokens)
+        forward_batch.global_dp_buffer_len = global_dp_buffer_len
+    else:
+        global_dp_buffer_len = forward_batch.global_dp_buffer_len
+
+    set_dp_buffer_len(
+        global_dp_buffer_len,
+        local_dp_buffer_len,
+        forward_batch.dp_padding_mode.is_max_len(),
+        new_global_num_tokens,
+    )
+    set_is_extend_in_batch(forward_batch.is_extend_in_batch)
+    if marker_attr is not None:
+        setattr(forward_batch, marker_attr, new_local_num_tokens)
 
 
 def _get_kv_mirror_pair_maps(
@@ -830,36 +965,6 @@ class StandardQkvProjection(BaseWelmQkvProjection):
         return q, k, v, hidden_states
 
 
-class ImitateQkvKvProjection(BaseWelmQkvProjection):
-    def __init__(self, mirror_layer_idx: int, **kwargs) -> None:
-        super().__init__(shard_layout=("q", "k1", "v1", "k2", "v2"), **kwargs)
-        self.mirror_layer_idx = mirror_layer_idx
-
-    def forward(
-        self,
-        attn: "Qwen2MoeAttention",
-        hidden_states: torch.Tensor,
-        forward_batch: ForwardBatch,
-        kv_mirror_states: Dict[int, Tuple[torch.Tensor, torch.Tensor]],
-    ) -> WelmQkvProjectionOutput:
-        qkv = self._apply_qkv(hidden_states)
-        q, k, v, mirror_k, mirror_v = qkv.split(
-            [attn.q_size, attn.kv_size, attn.kv_size, attn.kv_size, attn.kv_size],
-            dim=-1,
-        )
-        if _WELM_DUMP_ENABLED:
-            _welm_dump_tensor(
-                f"model.layers.{attn.layer_idx}.self_attn.mirror_k_pre_rope",
-                mirror_k,
-            )
-            _welm_dump_tensor(
-                f"model.layers.{attn.layer_idx}.self_attn.mirror_v",
-                mirror_v,
-            )
-        kv_mirror_states[attn.kv_mirror_layer_idx] = (mirror_k, mirror_v)
-        return q, k, v, hidden_states
-
-
 class ImitateQkvMultiBankKvProjection(BaseWelmQkvProjection):
     def __init__(self, mirror_layer_indices: List[int], **kwargs) -> None:
         self.mirror_layer_indices = mirror_layer_indices
@@ -892,9 +997,12 @@ class ImitateQkvMultiBankKvProjection(BaseWelmQkvProjection):
 
 
 class MirrorQProjection(BaseWelmQkvProjection):
-    def __init__(self, imitated_layer_idx: int, **kwargs) -> None:
+    def __init__(
+        self, imitated_layer_idx: int, mirror_layer_idx: int = None, **kwargs
+    ) -> None:
         super().__init__(shard_layout=("q",), **kwargs)
         self.imitated_layer_idx = imitated_layer_idx
+        self.mirror_layer_idx = mirror_layer_idx
 
     def forward(
         self,
@@ -921,10 +1029,16 @@ class MirrorQProjection(BaseWelmQkvProjection):
                         hidden_states, forward_batch, first_contract=False
                     )
 
-        kv_activation = kv_mirror_states.pop(self.imitated_layer_idx, None)
+        pop_key = (
+            self.mirror_layer_idx
+            if self.mirror_layer_idx is not None
+            else self.imitated_layer_idx
+        )
+        kv_activation = kv_mirror_states.pop(pop_key, None)
         if kv_activation is None:
             raise RuntimeError(
-                f"Missing mirrored KV activation for imitated_layer_idx={self.imitated_layer_idx}"
+                f"Missing mirrored KV activation for pop_key={pop_key} "
+                f"(imitated={self.imitated_layer_idx}, mirror={self.mirror_layer_idx})"
             )
 
         k, v = kv_activation
@@ -957,15 +1071,11 @@ class NextnMirrorQProjection(BaseWelmQkvProjection):
 
         q_weight = self.weight[: attn.q_size, :]
         q_bias = None if self.bias is None else self.bias[: attn.q_size]
-        if _welm_mtp_uses_base_kv_cache(forward_batch):
-            # Recursive MTP draft steps reuse the committed/base KV cache that was
-            # populated from mirrored main-model KV, so this layer only computes Q.
-            q = F.linear(hidden_states, q_weight, q_bias)
-            return q, None, None, hidden_states
 
         if forward_batch.forward_mode.is_decode():
             raise RuntimeError(
-                "WeLMV4 MTP draft decode must reuse the base mirrored-KV cache."
+                "WeLM MTP draft decode is not supported; use the merged "
+                "draft-extend path."
             )
 
         project_hidden_states = hidden_states
@@ -988,7 +1098,7 @@ class NextnMirrorQProjection(BaseWelmQkvProjection):
             if self.mirror_layer_idx is not None
             else self.imitated_layer_idx
         )
-        kv_activation = kv_mirror_states.pop(pop_key, None)
+        kv_activation = kv_mirror_states.get(pop_key)
         if kv_activation is None:
             raise RuntimeError(
                 f"Missing mirrored KV activation for nextn pop_key={pop_key} "
@@ -1010,8 +1120,6 @@ class NextnMirrorQProjection(BaseWelmQkvProjection):
                 )
             k = k[mirrored_kv_indices]
             v = v[mirrored_kv_indices]
-        if attn.need_clear_kv_cache:
-            kv_mirror_states.clear()
         q = F.linear(project_hidden_states, q_weight, q_bias)
         return q, k, v, project_hidden_states
 
@@ -1785,28 +1893,16 @@ class Qwen2MoeAttention(nn.Module):
             projection_cls = NextnMirrorQProjection if is_nextn else MirrorQProjection
             proj_kwargs = dict(
                 imitated_layer_idx=mirror_to_imitated[self.kv_mirror_layer_idx],
+                mirror_layer_idx=self.kv_mirror_layer_idx,
                 **qkv_proj_kwargs,
             )
-            if is_nextn:
-                source_idx = mirror_to_imitated[self.kv_mirror_layer_idx]
-                if (
-                    source_idx in imitated_to_mirrors
-                    and len(imitated_to_mirrors[source_idx]) > 1
-                ):
-                    proj_kwargs["mirror_layer_idx"] = self.kv_mirror_layer_idx
             self.qkv_proj = projection_cls(**proj_kwargs)
         elif self.kv_mirror_layer_idx in imitated_to_mirrors:
             mirror_list = imitated_to_mirrors[self.kv_mirror_layer_idx]
-            if len(mirror_list) == 1:
-                self.qkv_proj = ImitateQkvKvProjection(
-                    mirror_layer_idx=mirror_list[0],
-                    **qkv_proj_kwargs,
-                )
-            else:
-                self.qkv_proj = ImitateQkvMultiBankKvProjection(
-                    mirror_layer_indices=mirror_list,
-                    **qkv_proj_kwargs,
-                )
+            self.qkv_proj = ImitateQkvMultiBankKvProjection(
+                mirror_layer_indices=mirror_list,
+                **qkv_proj_kwargs,
+            )
         else:
             self.qkv_proj = StandardQkvProjection(**qkv_proj_kwargs)
         if is_nextn:
@@ -1863,20 +1959,14 @@ class Qwen2MoeAttention(nn.Module):
         q, k, v, hidden_states = self.qkv_proj.forward(
             self, hidden_states, forward_batch, kv_mirror_states
         )
-        use_mtp_base_kv_cache = _welm_mtp_uses_base_kv_cache(forward_batch)
         if (k is None) != (v is None):
             raise RuntimeError(
                 "WeLMV4 attention expects K/V to be both present or both absent."
             )
         has_kv = k is not None
         if not has_kv:
-            if not (use_mtp_base_kv_cache and self.is_nextn):
-                raise RuntimeError(
-                    "WeLMV4 q-only attention is only valid for MTP base-KV draft decode."
-                )
-        elif use_mtp_base_kv_cache and self.is_nextn:
             raise RuntimeError(
-                "WeLMV4 MTP base-KV draft decode expects q-only mirror layers."
+                "WeLMV4 attention requires K/V in the merged WeLM MTP path."
             )
         if dump_this_layer:
             _welm_dump_tensor(f"{dump_prefix}.positions", positions)
@@ -1916,10 +2006,6 @@ class Qwen2MoeAttention(nn.Module):
 
         qk_nope_head_dim = self.head_dim - self.qk_rope_head_dim
         k_for_rope = k
-        if not has_kv:
-            # RotaryEmbedding rotates Q/K together. In the base-KV MTP path K/V
-            # already live in the cache, so this temporary K only lets us rotate Q.
-            k_for_rope = q.new_empty((q.shape[0], self.kv_size))
         if qk_nope_head_dim > 0:
             if (
                 _welm_should_contract_kv_mirror(forward_batch)
@@ -2004,7 +2090,12 @@ class Qwen2MoeAttention(nn.Module):
             if dump_this_layer:
                 _welm_dump_tensor(f"{dump_prefix}.gated_attn_output", attn_output)
 
-        if attn_output.shape[0] == 0:
+        needs_empty_dp_collectives = (
+            self.is_nextn
+            and is_dp_attention_enabled()
+            and getattr(forward_batch, "global_num_tokens_gpu", None) is not None
+        )
+        if attn_output.shape[0] == 0 and not needs_empty_dp_collectives:
             output = hidden_states.new_empty((0, self.hidden_size))
         else:
             output, _ = self.o_proj(attn_output)
@@ -2026,7 +2117,8 @@ class Qwen2MoeAttention(nn.Module):
             )
         if self.use_o_norm and not skip_o_norm:
             need_attn_tp_reduce_for_o_norm = (
-                self.o_norm_needs_attn_tp_reduce and output.shape[0] != 0
+                self.o_norm_needs_attn_tp_reduce
+                and (output.shape[0] != 0 or needs_empty_dp_collectives)
             )
             if need_attn_tp_reduce_for_o_norm:
                 output = attention_tensor_model_parallel_all_reduce(output)
@@ -2287,7 +2379,12 @@ class Qwen2MoeDecoderLayer(nn.Module):
             # The fused path would run o_norm on attn-TP partial sums.
             and not self.self_attn.o_norm_needs_attn_tp_reduce
         )
-        if hidden_states.shape[0] != 0:
+        needs_empty_dp_collectives = (
+            self.is_nextn
+            and is_dp_attention_enabled()
+            and getattr(forward_batch, "global_num_tokens_gpu", None) is not None
+        )
+        if hidden_states.shape[0] != 0 or needs_empty_dp_collectives:
             hidden_states = self.self_attn(
                 positions=positions,
                 hidden_states=hidden_states,
@@ -2303,44 +2400,10 @@ class Qwen2MoeDecoderLayer(nn.Module):
         ):
             residual = _welm_align_kv_mirror_residual_rows(residual, forward_batch)
             if is_dp_attention_enabled() and not use_previous_precision:
-                from sglang.srt.layers.dp_attention import (
-                    get_attention_dp_rank,
-                    set_dp_buffer_len,
-                )
-
-                dp_rank = get_attention_dp_rank()
-                new_local_num_tokens = hidden_states.shape[0]
-                scale = max(getattr(forward_batch, "scale_seq_factor", 1), 1)
-                if scale > 1:
-                    new_global_num_tokens_gpu = (
-                        forward_batch.global_num_tokens_gpu // scale
-                    )
-                    forward_batch.global_num_tokens_gpu.copy_(new_global_num_tokens_gpu)
-                    new_global_num_tokens = [
-                        int(x) for x in new_global_num_tokens_gpu.tolist()
-                    ]
-                    if forward_batch.global_num_tokens_cpu is not None:
-                        forward_batch.global_num_tokens_cpu = new_global_num_tokens
-                else:
-                    forward_batch.global_num_tokens_gpu[dp_rank] = new_local_num_tokens
-                    new_global_num_tokens = None
-                forward_batch.dp_local_start_pos = None
-                forward_batch.dp_local_num_tokens = None
-                if new_global_num_tokens is not None:
-                    if forward_batch.dp_padding_mode.is_max_len():
-                        global_dp_buffer_len = max(new_global_num_tokens) * len(
-                            new_global_num_tokens
-                        )
-                    else:
-                        global_dp_buffer_len = sum(new_global_num_tokens)
-                    forward_batch.global_dp_buffer_len = global_dp_buffer_len
-                else:
-                    global_dp_buffer_len = forward_batch.global_dp_buffer_len
-                set_dp_buffer_len(
-                    global_dp_buffer_len,
-                    new_local_num_tokens,
-                    forward_batch.dp_padding_mode.is_max_len(),
-                    new_global_num_tokens,
+                _welm_update_contracted_dp_metadata(
+                    forward_batch,
+                    hidden_states.shape[0],
+                    marker_attr="_welm_kv_mirror_contracted_dp_metadata_rows",
                 )
 
         if use_mmq_norm_after_attn:
@@ -3104,16 +3167,13 @@ class WeLMV4MoeForCausalLM(nn.Module):
             pair_attn = attn_by_kv_mirror_layer_idx.get(imitated_layer_idx)
             if pair_attn is None:
                 return False
-            if isinstance(pair_attn.qkv_proj, ImitateQkvMultiBankKvProjection):
-                try:
-                    bank_idx = pair_attn.qkv_proj.mirror_layer_indices.index(layer_id)
-                except ValueError:
-                    return False
-                pair_shard_id = f"{base_shard}_{bank_idx}"
-            elif isinstance(pair_attn.qkv_proj, ImitateQkvKvProjection):
-                pair_shard_id = base_shard
-            else:
+            if not isinstance(pair_attn.qkv_proj, ImitateQkvMultiBankKvProjection):
                 return False
+            try:
+                bank_idx = pair_attn.qkv_proj.mirror_layer_indices.index(layer_id)
+            except ValueError:
+                return False
+            pair_shard_id = f"{base_shard}_{bank_idx}"
             pair_param = (
                 pair_attn.qkv_proj.bias
                 if name.endswith(".bias")
@@ -3262,7 +3322,7 @@ class WeLMV4MoeForCausalLM(nn.Module):
                     and isinstance(current_attn, Qwen2MoeAttention)
                     and isinstance(
                         current_attn.qkv_proj,
-                        (ImitateQkvKvProjection, ImitateQkvMultiBankKvProjection),
+                        ImitateQkvMultiBankKvProjection,
                     )
                     and shard_id in ("k", "v")
                 ):
@@ -3299,10 +3359,6 @@ class WeLMV4MoeForCausalLM(nn.Module):
                                 if shard_id == "k"
                                 else f"v2_{bank_idx}"
                             )
-                    elif pair_attn is not None and isinstance(
-                        pair_attn.qkv_proj, ImitateQkvKvProjection
-                    ):
-                        pair_shard_id = "k2" if shard_id == "k" else "v2"
                     if pair_shard_id is not None:
                         pair_param = (
                             pair_attn.qkv_proj.bias
@@ -3357,36 +3413,21 @@ class WeLMV4MoeForCausalLM(nn.Module):
         if is_nextn and is_welm_mtp_nextn:
             missing_projector_steps = expected_nextn_steps - seen_nextn_projector_steps
             missing_decoder_steps = expected_nextn_steps - seen_nextn_decoder_steps
-            if num_nextn_layers == 1:
-                if missing_projector_steps or missing_decoder_steps:
-                    raise ValueError(
-                        "WeLM MTP V1 checkpoint layout does not match the "
-                        "single physical MTP layer. "
-                        f"missing_projector_steps={sorted(missing_projector_steps)}, "
-                        f"missing_decoder_steps={sorted(missing_decoder_steps)}."
-                    )
-                if extra_nextn_steps:
-                    raise ValueError(
-                        "WeLM MTP V1 config expects exactly one physical MTP "
-                        "layer, but checkpoint contains extra nextn steps: "
-                        f"{sorted(extra_nextn_steps)}."
-                    )
-            else:
-                if missing_projector_steps or missing_decoder_steps:
-                    raise ValueError(
-                        "WeLM MTP V2 checkpoint layout does not match "
-                        "num_nextn_predict_layers. "
-                        f"missing_projector_steps={sorted(missing_projector_steps)}, "
-                        f"missing_decoder_steps={sorted(missing_decoder_steps)}, "
-                        f"num_nextn_predict_layers={num_nextn_layers}."
-                    )
-                if extra_nextn_steps:
-                    raise ValueError(
-                        "WeLM MTP V2 checkpoint contains more nextn steps than "
-                        "num_nextn_predict_layers: "
-                        f"extra_steps={sorted(extra_nextn_steps)}, "
-                        f"num_nextn_predict_layers={num_nextn_layers}."
-                    )
+            if missing_projector_steps or missing_decoder_steps:
+                raise ValueError(
+                    "WeLM MTP checkpoint layout does not match "
+                    "num_nextn_predict_layers. "
+                    f"missing_projector_steps={sorted(missing_projector_steps)}, "
+                    f"missing_decoder_steps={sorted(missing_decoder_steps)}, "
+                    f"num_nextn_predict_layers={num_nextn_layers}."
+                )
+            if extra_nextn_steps:
+                raise ValueError(
+                    "WeLM MTP checkpoint contains more nextn steps than "
+                    "num_nextn_predict_layers: "
+                    f"extra_steps={sorted(extra_nextn_steps)}, "
+                    f"num_nextn_predict_layers={num_nextn_layers}."
+                )
 
     def get_embed_and_head(self):
         return [

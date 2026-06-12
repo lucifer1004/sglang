@@ -108,7 +108,7 @@ class _DpGatheredBufferWrapper:
 
     @classmethod
     def set_metadata(cls, hidden_size: int, dtype: torch.dtype, device: torch.device):
-        cls._hidden_size = hidden_size
+        cls._hidden_size = int(hidden_size)
         cls._dtype = dtype
         cls._device = device
 
@@ -126,23 +126,62 @@ class _DpGatheredBufferWrapper:
         cls._global_num_tokens = global_num_tokens
 
     @classmethod
+    def _concrete_dim(cls, value, name: str) -> int:
+        try:
+            return int(value)
+        except Exception as exc:
+            raise RuntimeError(
+                "DP gathered buffer dimension must be a concrete integer: "
+                f"{name}={value!r}, type={type(value)}, "
+                f"global_len={getattr(cls, '_global_dp_buffer_len', None)!r}, "
+                f"local_len={getattr(cls, '_local_dp_buffer_len', None)!r}, "
+                f"hidden_size={getattr(cls, '_hidden_size', None)!r}, "
+                f"dp_max_padding={getattr(cls, '_dp_max_padding', None)!r}, "
+                f"global_num_tokens={getattr(cls, '_global_num_tokens', None)!r}."
+            ) from exc
+
+    @classmethod
     def get_global_dp_buffer(cls) -> torch.Tensor:
+        global_len = cls._concrete_dim(cls._global_dp_buffer_len, "global_len")
+        hidden_size = cls._concrete_dim(cls._hidden_size, "hidden_size")
         with use_symmetric_memory(get_tp_group(), disabled=not cls._dp_max_padding):
-            buffer = torch.empty(
-                (cls._global_dp_buffer_len, cls._hidden_size),
-                dtype=cls._dtype,
-                device=cls._device,
-            )
+            try:
+                buffer = torch.empty(
+                    (global_len, hidden_size),
+                    dtype=cls._dtype,
+                    device=cls._device,
+                )
+            except RuntimeError as exc:
+                raise RuntimeError(
+                    "Failed to allocate global DP gathered buffer: "
+                    f"shape=({global_len}, {hidden_size}), "
+                    f"global_len_type={type(cls._global_dp_buffer_len)}, "
+                    f"hidden_size_type={type(cls._hidden_size)}, "
+                    f"dp_max_padding={cls._dp_max_padding}, "
+                    f"global_num_tokens={cls._global_num_tokens}."
+                ) from exc
         return buffer
 
     @classmethod
     def get_local_dp_buffer(cls) -> torch.Tensor:
+        local_len = cls._concrete_dim(cls._local_dp_buffer_len, "local_len")
+        hidden_size = cls._concrete_dim(cls._hidden_size, "hidden_size")
         with use_symmetric_memory(get_tp_group(), disabled=not cls._dp_max_padding):
-            buffer = torch.empty(
-                (cls._local_dp_buffer_len, cls._hidden_size),
-                dtype=cls._dtype,
-                device=cls._device,
-            )
+            try:
+                buffer = torch.empty(
+                    (local_len, hidden_size),
+                    dtype=cls._dtype,
+                    device=cls._device,
+                )
+            except RuntimeError as exc:
+                raise RuntimeError(
+                    "Failed to allocate local DP gathered buffer: "
+                    f"shape=({local_len}, {hidden_size}), "
+                    f"local_len_type={type(cls._local_dp_buffer_len)}, "
+                    f"hidden_size_type={type(cls._hidden_size)}, "
+                    f"dp_max_padding={cls._dp_max_padding}, "
+                    f"global_num_tokens={cls._global_num_tokens}."
+                ) from exc
         return buffer
 
     @classmethod
@@ -188,6 +227,12 @@ def set_dp_buffer_len(
     dp_max_padding: bool,
     global_num_tokens: Optional[List[int]] = None,
 ):
+    if global_dp_buffer_len is not None:
+        global_dp_buffer_len = int(global_dp_buffer_len)
+    if local_dp_buffer_len is not None:
+        local_dp_buffer_len = int(local_dp_buffer_len)
+    if global_num_tokens is not None:
+        global_num_tokens = [int(x) for x in global_num_tokens]
     _DpGatheredBufferWrapper.set_dp_buffer_len(
         global_dp_buffer_len, local_dp_buffer_len, dp_max_padding, global_num_tokens
     )

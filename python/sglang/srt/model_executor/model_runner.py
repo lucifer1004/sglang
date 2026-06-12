@@ -2483,6 +2483,31 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if require_gathered_buffer(self.server_args):
             assert require_mlp_tp_gather_ or require_attn_tp_gather(self.server_args)
 
+        hf_config = self.model_config.hf_config
+        kv_mirror_layers = []
+        kv_mirror_tensor_size = None
+        if (
+            self.server_args.pp_size > 1
+            and self.server_args.enable_welm_kv_mirror_opt
+        ):
+            num_hidden_layers = getattr(hf_config, "num_hidden_layers", 0)
+            kv_mirror_layers = [
+                int(layer_idx)
+                for layer_idx in getattr(hf_config, "kv_mirror_layers", [])
+                if 0 <= int(layer_idx) < num_hidden_layers
+            ]
+            if kv_mirror_layers:
+                num_attention_heads = getattr(hf_config, "num_attention_heads")
+                num_key_value_heads = getattr(hf_config, "num_key_value_heads")
+                head_dim = getattr(
+                    hf_config,
+                    "head_dim",
+                    self.model_config.hidden_size // num_attention_heads,
+                )
+                kv_mirror_tensor_size = (
+                    max(1, num_key_value_heads // get_attention_tp_size()) * head_dim
+                )
+
         buffers: DecodeInputBuffers = DecodeInputBuffers.create(
             device=self.device,
             max_bs=batch_size,
@@ -2512,6 +2537,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             router_replay_top_k=getattr(
                 self.model_config.hf_text_config, "num_experts_per_tok", 0
             ),
+            kv_mirror_layers=kv_mirror_layers,
+            kv_mirror_tensor_size=kv_mirror_tensor_size,
         )
         buffers.num_token_non_padded[...] = num_tokens
 

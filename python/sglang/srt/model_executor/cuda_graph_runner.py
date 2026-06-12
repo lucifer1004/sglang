@@ -216,7 +216,7 @@ class DecodeInputBuffers(ForwardInputBuffers):
         scale_seq_factor: int,
         router_replay_num_layers: int = 0,
         router_replay_top_k: int = 0,
-        kv_mirror_imitated_layers: Optional[List[int]] = None,
+        kv_mirror_layers: Optional[List[int]] = None,
         kv_mirror_tensor_size: Optional[int] = None,
         ne_token_table: Optional[torch.Tensor] = None,
         is_hybrid_swa: bool = False,
@@ -302,8 +302,8 @@ class DecodeInputBuffers(ForwardInputBuffers):
                     "hidden_states": torch.zeros((max_bs, hidden_size), dtype=dtype),
                     "residual": torch.zeros((max_bs, hidden_size), dtype=torch.float32),
                 }
-                if kv_mirror_imitated_layers and kv_mirror_tensor_size:
-                    for layer_idx in kv_mirror_imitated_layers:
+                if kv_mirror_layers and kv_mirror_tensor_size:
+                    for layer_idx in kv_mirror_layers:
                         pp_proxy_tensors[
                             f"{WELM_KV_MIRROR_PP_KEY_PREFIX}.{layer_idx}.k"
                         ] = torch.zeros((max_bs, kv_mirror_tensor_size), dtype=dtype)
@@ -904,16 +904,16 @@ class CudaGraphRunner:
             assert self.require_mlp_tp_gather or self.require_attn_tp_gather
 
         hf_config = self.model_runner.model_config.hf_config
-        kv_mirror_imitated_layers = []
+        kv_mirror_layers = []
         kv_mirror_tensor_size = None
         if self.pp_size > 1 and self.model_runner.server_args.enable_welm_kv_mirror_opt:
             num_hidden_layers = getattr(hf_config, "num_hidden_layers", 0)
-            kv_mirror_imitated_layers = [
+            kv_mirror_layers = [
                 int(layer_idx)
-                for layer_idx in getattr(hf_config, "kv_mirror_imitated_layers", [])
+                for layer_idx in getattr(hf_config, "kv_mirror_layers", [])
                 if 0 <= int(layer_idx) < num_hidden_layers
             ]
-            if kv_mirror_imitated_layers:
+            if kv_mirror_layers:
                 num_attention_heads = getattr(hf_config, "num_attention_heads")
                 num_key_value_heads = getattr(hf_config, "num_key_value_heads")
                 head_dim = getattr(
@@ -1059,7 +1059,7 @@ class CudaGraphRunner:
                 "num_experts_per_tok",
                 0,
             ),
-            kv_mirror_imitated_layers=kv_mirror_imitated_layers,
+            kv_mirror_layers=kv_mirror_layers,
             kv_mirror_tensor_size=kv_mirror_tensor_size,
             ne_token_table=(
                 model_runner.token_table if self.use_ngram_embedding else None
