@@ -120,8 +120,12 @@ class _DpGatheredBufferWrapper:
         dp_max_padding: bool,
         global_num_tokens: Optional[List[int]] = None,
     ):
-        cls._global_dp_buffer_len = int(global_dp_buffer_len)
-        cls._local_dp_buffer_len = int(local_dp_buffer_len)
+        cls._global_dp_buffer_len = (
+            int(global_dp_buffer_len) if global_dp_buffer_len is not None else None
+        )
+        cls._local_dp_buffer_len = (
+            int(local_dp_buffer_len) if local_dp_buffer_len is not None else None
+        )
         cls._dp_max_padding = dp_max_padding
         cls._global_num_tokens = (
             [int(x) for x in global_num_tokens]

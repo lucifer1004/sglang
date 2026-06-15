@@ -178,6 +178,21 @@ class GenerateReqInput(BaseReq):
     # `[routed_experts_start_len, seqlen - 1)`. Must be in [0, prompt_tokens].
     # 0 = full sequence.
     routed_experts_start_len: int = 0
+    # Force MoE router replay with structured expert ids.
+    # Single request: [router_seq_len, num_layers, top_k]
+    # Batch request: [batch, router_seq_len, num_layers, top_k]
+    routed_experts: Optional[
+        Union[
+            Dict[str, Any],
+            List[Union[Dict[str, Any], List[List[List[int]]]]],
+            List[List[List[int]]],
+            List[List[List[List[int]]]],
+        ]
+    ] = None
+    # Force the generated decode token sequence after each forward has run.
+    # Single request: [max_new_tokens]
+    # Batch request: [batch, max_new_tokens]
+    forced_decode_token_ids: Optional[Union[List[int], List[List[int]]]] = None
 
     # The modalities of the image data [image, multi-images, video]
     modalities: Optional[List[str]] = None

@@ -944,6 +944,8 @@ class Req(ReqDllmMixin):
         self.origin_input_ids = origin_input_ids
         # Each decode stage's output ids
         self.output_ids = []
+        # Tracks how many decode steps this request has been through (overlap mode)
+        self._overlap_decode_count = 0
         # fill_ids = origin_input_ids + output_ids. Updated if chunked.
         self.fill_ids = []
         self.session = session
