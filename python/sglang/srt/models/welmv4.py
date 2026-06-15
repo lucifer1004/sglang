@@ -1334,12 +1334,6 @@ class NextnMirrorQProjection(BaseWelmQkvProjection):
             q, k, v = self._split_qkv(attn, qkv)
             return q, k, v, hidden_states
 
-        if _welm_mtp_uses_base_kv_cache(forward_batch):
-            # Recursive MTP draft steps reuse the committed/base KV cache that was
-            # populated from mirrored main-model KV, so this layer only computes Q.
-            q = self._apply_q_only(hidden_states, attn.q_size)
-            return q, None, None, hidden_states
-
         if forward_batch.forward_mode.is_decode() and not getattr(
             forward_batch, "welm_mtp_merge_kv_fill_draft", False
         ):
