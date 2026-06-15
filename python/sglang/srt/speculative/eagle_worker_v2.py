@@ -461,6 +461,27 @@ class EagleDraftWorker(BaseDraftWorker):
 
         return (forward_batch.seq_lens - 1).to(forward_batch.positions.dtype)
 
+    def _get_welmv4_mtp_topk_cs_indices(
+        self,
+        i: int,
+        tree_info: Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+        forward_batch: Optional[ForwardBatch] = None,
+    ) -> Optional[torch.Tensor]:
+        if i == 0:
+            return None
+        offset = self.topk**2 * (i - 1) + self.topk
+        topk_cs_idx = tree_info[2]
+        scratch = (
+            None
+            if forward_batch is None
+            else getattr(forward_batch, "welm_mtp_oe_parent_scratch", None)
+        )
+        if scratch is not None and scratch.numel() >= topk_cs_idx.numel():
+            out = scratch[: topk_cs_idx.numel()].view_as(topk_cs_idx)
+            torch.sub(topk_cs_idx, offset, out=out)
+            return out
+        return topk_cs_idx - offset
+
     def _should_use_welmv4_mtp_oe_hash_kernel(self) -> bool:
         return self._is_welmv4_mtp_draft_model() and should_use_welm_oe_hash_kernel(
             self.draft_runner.model_config
@@ -1001,6 +1022,7 @@ class EagleDraftWorker(BaseDraftWorker):
         base_query_count: int,
         step_idx: int,
         selected_parent_indices: Optional[torch.Tensor] = None,
+        topk_cs_idx: Optional[torch.Tensor] = None,
     ) -> "WelmMTPDraftNGramHistoryState":
         hashed_out, next_history = self._compute_welmv4_mtp_draft_decode_hash_inputs(
             forward_batch,
@@ -1010,6 +1032,7 @@ class EagleDraftWorker(BaseDraftWorker):
             base_query_count,
             step_idx,
             selected_parent_indices=selected_parent_indices,
+            topk_cs_idx=topk_cs_idx,
             use_forward_hash_buffer=True,
         )
         forward_batch.welm_oe_decode_hashed_inputs = hashed_out
@@ -1025,6 +1048,7 @@ class EagleDraftWorker(BaseDraftWorker):
         step_idx: int,
         *,
         selected_parent_indices: Optional[torch.Tensor] = None,
+        topk_cs_idx: Optional[torch.Tensor] = None,
         use_forward_hash_buffer: bool = False,
     ) -> Tuple[torch.Tensor, "WelmMTPDraftNGramHistoryState"]:
         from sglang.jit_kernel.welm_oe import (
@@ -1036,20 +1060,20 @@ class EagleDraftWorker(BaseDraftWorker):
         )
 
         oe_grams, oe_vocab_sizes, history_width = self._welmv4_mtp_oe_hash_config()
+        use_mk_draft_ngram_hash = should_use_mk_welm_mtp_draft_ngram_hash()
         source_history = (
             entry_history_state if draft_history_state is None else draft_history_state
         )
-        parent_indices = getattr(forward_batch, "welm_mtp_oe_parent_scratch", None)
-        if parent_indices is None or parent_indices.numel() < input_ids.numel():
-            parent_indices = torch.empty(
-                (input_ids.numel(),), device=input_ids.device, dtype=torch.int64
-            )
         use_parent = selected_parent_indices is not None
-        if use_parent:
-            parent_indices[: input_ids.numel()].copy_(
-                selected_parent_indices.reshape(-1)[: input_ids.numel()].to(
-                    device=input_ids.device, dtype=torch.int64
+        if selected_parent_indices is None:
+            parent_indices = getattr(forward_batch, "welm_mtp_oe_parent_scratch", None)
+            if parent_indices is None or parent_indices.numel() < input_ids.numel():
+                parent_indices = torch.empty(
+                    (input_ids.numel(),), device=input_ids.device, dtype=torch.int64
                 )
+        else:
+            parent_indices = selected_parent_indices.to(
+                device=input_ids.device, dtype=torch.int64
             )
         if use_forward_hash_buffer:
             hashed_out = self._get_welmv4_mtp_hash_out(
@@ -1060,7 +1084,8 @@ class EagleDraftWorker(BaseDraftWorker):
                 forward_batch, "welm_mtp_oe_hash_out_batch_major", None
             )
             if (
-                batch_major_hash_out is not None
+                use_mk_draft_ngram_hash
+                and batch_major_hash_out is not None
                 and getattr(forward_batch, "welm_mtp_skip_draft_proposal_build", False)
                 and batch_major_hash_out.shape[0] >= int(input_ids.numel())
                 and batch_major_hash_out.shape[1] == len(oe_vocab_sizes)
@@ -1084,6 +1109,8 @@ class EagleDraftWorker(BaseDraftWorker):
             vocab_size=self.draft_runner.model_config.vocab_size,
             base_query_count=base_query_count,
             use_parent=use_parent,
+            topk=self.topk,
+            topk_cs_idx=topk_cs_idx,
             prev_input_ids_scratch=getattr(
                 forward_batch, "welm_mtp_oe_prev_input_ids", None
             ),
@@ -1102,7 +1129,7 @@ class EagleDraftWorker(BaseDraftWorker):
         )
         if mk_history_state is not None:
             return hashed_out, mk_history_state
-        if should_use_mk_welm_mtp_draft_ngram_hash():
+        if use_mk_draft_ngram_hash:
             raise RuntimeError(
                 "SGLANG_WELM_MTP_DRAFT_NGRAM_HASH is enabled, but draft decode "
                 "ngram hash did not run through mk."
@@ -2001,6 +2028,7 @@ class EagleDraftWorker(BaseDraftWorker):
         parents_list: List[torch.Tensor] = []
         scores = None
         selected_parent_indices = None
+        topk_cs_idx = None
         current_mirrored_kv_indices = getattr(spec_info, "mirrored_kv_indices", None)
         branch_step_cache_locs = None
         branch_flat_cache_locs = None
@@ -2089,6 +2117,7 @@ class EagleDraftWorker(BaseDraftWorker):
                             base_query_count=int(first_query_history_state.shape[0]),
                             step_idx=step,
                             selected_parent_indices=selected_parent_indices,
+                            topk_cs_idx=topk_cs_idx,
                             use_forward_hash_buffer=False,
                         )
                     )
@@ -2263,6 +2292,20 @@ class EagleDraftWorker(BaseDraftWorker):
                         mapped_topk_index,
                         step_hidden_states,
                         scores,
+                    )
+                    draft_input_id_buffers = getattr(
+                        forward_batch, "welm_mtp_draft_input_ids", None
+                    )
+                    if draft_input_id_buffers is not None:
+                        stable_input_ids = draft_input_id_buffers[
+                            step, : input_ids.numel()
+                        ]
+                        stable_input_ids.copy_(input_ids)
+                        input_ids = stable_input_ids
+                    topk_cs_idx = self._get_welmv4_mtp_topk_cs_indices(
+                        step,
+                        tree_info,
+                        forward_batch,
                     )
                     score_list.append(tree_info[0])
                     token_list.append(tree_info[1])

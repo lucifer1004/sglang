@@ -1219,6 +1219,7 @@ class WelmMTPDraftProposalCudaGraphRunner:
             forward_batch.welm_mtp_draft_graph_select_fn = (
                 lambda logits, step: self._select_topk(logits, step, bs)
             )
+            forward_batch.welm_mtp_skip_draft_proposal_build = True
             try:
                 self.eagle_worker._run_welmv4_mtp_merged_extend_draft(
                     forward_batch,
@@ -1238,6 +1239,7 @@ class WelmMTPDraftProposalCudaGraphRunner:
                 )
             finally:
                 forward_batch.welm_mtp_draft_graph_select_fn = None
+                forward_batch.welm_mtp_skip_draft_proposal_build = False
             out = (
                 forward_batch.spec_info.topk_p,
                 forward_batch.spec_info.topk_index,

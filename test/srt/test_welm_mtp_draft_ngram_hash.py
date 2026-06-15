@@ -266,3 +266,182 @@ def test_welm_mtp_draft_ngram_hash_v2_chained_history_matches_reference(monkeypa
         forward_batch.welm_mtp_oe_output_prev_input_ids[: step1_input.numel()].cpu(),
         expected_history1[:, -2],
     )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.skipif(
+    not _has_mk_draft_ngram_hash(), reason="mk draft ngram hash is unavailable"
+)
+def test_welm_mtp_draft_ngram_hash_topk4_topk_cs_idx_matches_reference(monkeypatch):
+    monkeypatch.setenv("SGLANG_WELM_MTP_DRAFT_NGRAM_HASH", "true")
+    device = "cuda"
+    topk = 4
+    vocab_size = 32017
+    oe_grams = (2, 2, 3, 3)
+    oe_vocab_sizes = (257, 263, 269, 271)
+
+    entry_history_cpu = torch.tensor(
+        [
+            [101, 102, 103],
+            [201, 202, 203],
+            [301, 302, 303],
+        ],
+        dtype=torch.int64,
+    )
+    step0_input_cpu = torch.tensor(
+        [11, 12, 13, 14, 21, 22, 23, 24, 31, 32, 33, 34],
+        dtype=torch.int64,
+    )
+    base_query_count = entry_history_cpu.shape[0]
+    parent_step0_cpu = torch.empty((step0_input_cpu.numel(),), dtype=torch.int64)
+    expected_hash0, expected_history0 = _reference_draft_decode_hash_from_history(
+        step0_input_cpu,
+        entry_history_cpu,
+        parent_step0_cpu,
+        oe_grams,
+        oe_vocab_sizes,
+        vocab_size,
+        base_query_count,
+        use_parent=False,
+    )
+
+    entry_history = entry_history_cpu.to(device=device)
+    entry_ngram_history = WelmMTPDraftNGramEntryHistory(
+        prev_input_ids=entry_history[:, -1],
+        prev_prev_input_ids=[int(x) for x in entry_history_cpu[:, -2].tolist()],
+    )
+    step0_input = step0_input_cpu.to(device=device)
+    parent_step0 = torch.empty_like(step0_input)
+    scratch_len = step0_input.numel()
+    forward_batch = SimpleNamespace(
+        welm_mtp_skip_draft_proposal_build=True,
+        welm_mtp_oe_prev_input_ids=torch.empty(
+            (scratch_len,), dtype=torch.int64, device=device
+        ),
+        welm_mtp_oe_prev_prev_input_ids=torch.empty(
+            (scratch_len,), dtype=torch.int64, device=device
+        ),
+        welm_mtp_oe_output_prev_input_ids=torch.empty(
+            (scratch_len,), dtype=torch.int64, device=device
+        ),
+        welm_mtp_oe_parent_scratch=torch.empty(
+            (scratch_len,), dtype=torch.int64, device=device
+        ),
+        welm_mtp_oe_hash_out_batch_major=torch.empty(
+            (scratch_len, len(oe_grams)), dtype=torch.int64, device=device
+        ),
+    )
+
+    hash0 = forward_batch.welm_mtp_oe_hash_out_batch_major[:scratch_len].t()
+    state0 = welm_mtp_draft_ngram_hash_from_history(
+        forward_batch=forward_batch,
+        input_ids=step0_input,
+        history_state=entry_ngram_history,
+        parent_indices=parent_step0,
+        oe_grams=oe_grams,
+        oe_vocab_sizes=oe_vocab_sizes,
+        hashed_out=hash0,
+        next_history_state=None,
+        vocab_size=vocab_size,
+        base_query_count=base_query_count,
+        use_parent=False,
+        topk=topk,
+        prev_input_ids_scratch=forward_batch.welm_mtp_oe_prev_input_ids,
+        prev_prev_input_ids_scratch=forward_batch.welm_mtp_oe_prev_prev_input_ids,
+        output_ids_scratch=forward_batch.welm_mtp_oe_hash_out_batch_major,
+        output_prev_input_ids_scratch=(
+            forward_batch.welm_mtp_oe_output_prev_input_ids
+        ),
+        source_indices_scratch=forward_batch.welm_mtp_oe_parent_scratch,
+    )
+    prepared0 = forward_batch.welm_mtp_draft_ngram_prepared_launch
+    assert prepared0 is not None
+    assert prepared0.topk == topk
+    assert not prepared0.has_topk_cs_idx
+    assert launch_deferred_welm_mtp_draft_ngram_hash(forward_batch)
+    assert forward_batch.welm_mtp_draft_ngram_prepared_launch is None
+    torch.cuda.synchronize()
+
+    assert isinstance(state0, WelmMTPDraftNGramHistory)
+    assert torch.equal(hash0.cpu(), expected_hash0)
+    assert torch.equal(state0.prev_prev_input_ids.cpu(), expected_history0[:, -2])
+
+    candidate_tokens_cpu = (
+        torch.arange(
+            base_query_count * topk * topk, dtype=torch.int64
+        ).reshape(base_query_count, topk * topk)
+        * 7
+        + 5
+    ) % vocab_size
+    topk_cs_idx_cpu = torch.tensor(
+        [
+            [0, 6, 11, 15],
+            [12, 9, 2, 3],
+            [4, 5, 10, 14],
+        ],
+        dtype=torch.int64,
+    )
+    step1_input_cpu = torch.gather(candidate_tokens_cpu, 1, topk_cs_idx_cpu).flatten()
+    parent_step1_cpu = (
+        torch.arange(0, base_query_count * topk, step=topk, dtype=torch.int64)
+        .repeat_interleave(topk)
+        .add(topk_cs_idx_cpu.flatten() // topk)
+    )
+    expected_hash1, expected_history1 = _reference_draft_decode_hash_from_history(
+        step1_input_cpu,
+        expected_history0,
+        parent_step1_cpu,
+        oe_grams,
+        oe_vocab_sizes,
+        vocab_size,
+        base_query_count,
+        use_parent=True,
+    )
+
+    step1_input = step1_input_cpu.to(device=device)
+    parent_step1 = parent_step1_cpu.to(device=device)
+    topk_cs_idx = topk_cs_idx_cpu.to(device=device)
+    hash1 = forward_batch.welm_mtp_oe_hash_out_batch_major[
+        : step1_input.numel()
+    ].t()
+    state1 = welm_mtp_draft_ngram_hash_from_history(
+        forward_batch=forward_batch,
+        input_ids=step1_input,
+        history_state=state0,
+        parent_indices=parent_step1,
+        oe_grams=oe_grams,
+        oe_vocab_sizes=oe_vocab_sizes,
+        hashed_out=hash1,
+        next_history_state=None,
+        vocab_size=vocab_size,
+        base_query_count=base_query_count,
+        use_parent=True,
+        topk=topk,
+        topk_cs_idx=topk_cs_idx,
+        prev_input_ids_scratch=forward_batch.welm_mtp_oe_prev_input_ids[
+            : step1_input.numel()
+        ],
+        prev_prev_input_ids_scratch=forward_batch.welm_mtp_oe_prev_prev_input_ids[
+            : step1_input.numel()
+        ],
+        output_ids_scratch=forward_batch.welm_mtp_oe_hash_out_batch_major[
+            : step1_input.numel()
+        ],
+        output_prev_input_ids_scratch=(
+            forward_batch.welm_mtp_oe_output_prev_input_ids[: step1_input.numel()]
+        ),
+        source_indices_scratch=forward_batch.welm_mtp_oe_parent_scratch[
+            : step1_input.numel()
+        ],
+    )
+    prepared1 = forward_batch.welm_mtp_draft_ngram_prepared_launch
+    assert prepared1 is not None
+    assert prepared1.topk == topk
+    assert prepared1.has_topk_cs_idx
+    assert launch_deferred_welm_mtp_draft_ngram_hash(forward_batch)
+    assert forward_batch.welm_mtp_draft_ngram_prepared_launch is None
+    torch.cuda.synchronize()
+
+    assert isinstance(state1, WelmMTPDraftNGramHistory)
+    assert torch.equal(hash1.cpu(), expected_hash1)
+    assert torch.equal(state1.prev_prev_input_ids.cpu(), expected_history1[:, -2])
