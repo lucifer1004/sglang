@@ -339,7 +339,10 @@ def _set_welm_custom_last_prefill_cache_loc(forward_batch: ForwardBatch) -> None
 
     out_cache_loc = getattr(forward_batch, "out_cache_loc", None)
     if out_cache_loc is not None:
-        forward_batch.custom_last_cache_loc = out_cache_loc[custom_last_index]
+        if out_cache_loc.numel() == custom_last_index.numel():
+            forward_batch.custom_last_cache_loc = out_cache_loc
+        else:
+            forward_batch.custom_last_cache_loc = out_cache_loc[custom_last_index]
     else:
         req_to_token_pool = getattr(forward_batch, "req_to_token_pool", None)
         req_pool_indices = getattr(forward_batch, "req_pool_indices", None)
@@ -478,6 +481,7 @@ def _welm_should_contract_kv_mirror(forward_batch: ForwardBatch) -> bool:
     return forward_batch.enable_welm_kv_mirror_opt and (
         forward_batch.forward_mode.is_extend_without_speculative()
         or forward_batch.forward_mode.is_draft_extend(include_v2=True)
+        or getattr(forward_batch, "welm_mtp_merge_kv_fill_draft", False)
     )
 
 
@@ -1072,7 +1076,9 @@ class NextnMirrorQProjection(BaseWelmQkvProjection):
         q_weight = self.weight[: attn.q_size, :]
         q_bias = None if self.bias is None else self.bias[: attn.q_size]
 
-        if forward_batch.forward_mode.is_decode():
+        if forward_batch.forward_mode.is_decode() and not getattr(
+            forward_batch, "welm_mtp_merge_kv_fill_draft", False
+        ):
             raise RuntimeError(
                 "WeLM MTP draft decode is not supported; use the merged "
                 "draft-extend path."
@@ -1110,7 +1116,10 @@ class NextnMirrorQProjection(BaseWelmQkvProjection):
             forward_batch.spec_info, "mirrored_kv_indices", None
         )
         if (
-            forward_batch.forward_mode.is_draft_extend(include_v2=True)
+            (
+                forward_batch.forward_mode.is_draft_extend(include_v2=True)
+                or getattr(forward_batch, "welm_mtp_merge_kv_fill_draft", False)
+            )
             and mirrored_kv_indices is not None
         ):
             if _WELM_MTP_DUMP_ENABLED:
@@ -1120,6 +1129,35 @@ class NextnMirrorQProjection(BaseWelmQkvProjection):
                 )
             k = k[mirrored_kv_indices]
             v = v[mirrored_kv_indices]
+        if (
+            getattr(forward_batch, "welm_mtp_merge_kv_fill_draft", False)
+            and _welm_should_contract_kv_mirror(forward_batch)
+            and project_hidden_states.shape[0] > 0
+            and k.shape[0] != project_hidden_states.shape[0]
+        ):
+            kv_fill_positions = getattr(
+                forward_batch, "welm_mtp_kv_fill_positions", None
+            )
+            has_full_kv_positions = (
+                kv_fill_positions is not None
+                and kv_fill_positions.shape[0] == k.shape[0]
+            )
+            if not has_full_kv_positions:
+                if k.shape[0] < project_hidden_states.shape[0]:
+                    raise RuntimeError(
+                        "WeLMV4 MTP merged mirror-KV rows are already more "
+                        "contracted than query rows: "
+                        f"k_rows={k.shape[0]} q_rows={project_hidden_states.shape[0]} "
+                        f"custom_last_rows={forward_batch.custom_last_index.numel()} "
+                        f"kv_mirror_output_size={forward_batch.kv_mirror_output_size}."
+                    )
+                first_contract = k.shape[0] != forward_batch.kv_mirror_output_size
+                k = _welm_select_kv_mirror_rows(
+                    k, forward_batch, first_contract=first_contract
+                )
+                v = _welm_select_kv_mirror_rows(
+                    v, forward_batch, first_contract=first_contract
+                )
         q = F.linear(project_hidden_states, q_weight, q_bias)
         return q, k, v, project_hidden_states
 
@@ -2039,8 +2077,25 @@ class Qwen2MoeAttention(nn.Module):
                             f"{last_query_positions.shape[0]} vs "
                             f"{forward_batch.custom_last_index.numel()}."
                         )
+                rotary_positions = positions
+                kv_fill_positions = getattr(
+                    forward_batch, "welm_mtp_kv_fill_positions", None
+                )
+                if (
+                    getattr(forward_batch, "welm_mtp_merge_kv_fill_draft", False)
+                    and kv_fill_positions is not None
+                    and k_for_rope.shape[0] != positions.shape[0]
+                ):
+                    if kv_fill_positions.shape[0] != k_for_rope.shape[0]:
+                        raise RuntimeError(
+                            "WeLMV4 MTP merged KV-fill positions shape mismatch: "
+                            f"{kv_fill_positions.shape[0]} vs {k_for_rope.shape[0]}."
+                        )
+                    rotary_positions = kv_fill_positions.to(
+                        device=positions.device, dtype=positions.dtype
+                    )
                 self.rotary_emb.forward_cuda(
-                    positions,
+                    rotary_positions,
                     q,
                     k_for_rope,
                     last_index=forward_batch.custom_last_index,

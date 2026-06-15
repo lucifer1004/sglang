@@ -3586,12 +3586,15 @@ class ServerArgs:
                             "Set SGLANG_ENABLE_SPEC_V2=1 and do not pass "
                             "--disable-overlap-schedule."
                         )
-                    if self.speculative_eagle_topk != 1:
+                    if self.speculative_eagle_topk > 1 and os.environ.get(
+                        "SGLANG_WELM_MTP_SAMPLE_DRAFT", "0"
+                    ).strip().lower() in {"1", "true", "yes", "on"}:
                         raise ValueError(
-                            "WeLM MTP requires speculative_eagle_topk=1, "
-                            f"got {self.speculative_eagle_topk}."
+                            "WeLM MTP topk>1 does not support draft sampling yet. "
+                            "Unset SGLANG_WELM_MTP_SAMPLE_DRAFT or use "
+                            "speculative_eagle_topk=1."
                         )
-                    if (
+                    if self.speculative_eagle_topk == 1 and (
                         self.speculative_num_draft_tokens
                         != self.speculative_num_steps + 1
                     ):
@@ -3601,6 +3604,23 @@ class ServerArgs:
                             f"steps={self.speculative_num_steps}, "
                             f"draft_tokens={self.speculative_num_draft_tokens}."
                         )
+                    if self.speculative_eagle_topk > 1:
+                        max_tree_tokens = (
+                            1
+                            + self.speculative_eagle_topk
+                            + (self.speculative_num_steps - 1)
+                            * self.speculative_eagle_topk
+                            * self.speculative_eagle_topk
+                        )
+                        if self.speculative_num_draft_tokens > max_tree_tokens:
+                            raise ValueError(
+                                "WeLM MTP topk>1 requires "
+                                "speculative_num_draft_tokens to fit the draft tree, "
+                                f"got draft_tokens={self.speculative_num_draft_tokens}, "
+                                f"max_tree_tokens={max_tree_tokens}, "
+                                f"topk={self.speculative_eagle_topk}, "
+                                f"steps={self.speculative_num_steps}."
+                            )
                     if num_nextn_layers not in (1, self.speculative_num_steps):
                         raise ValueError(
                             "WeLM MTP requires num_nextn_predict_layers to be either "

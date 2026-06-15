@@ -392,7 +392,10 @@ class EagleDraftInputV2Mixin:
         alloc_len_per_decode = get_alloc_len_per_decode()
         for r in batch.reqs:
             # Over-allocation happens here
-            x = r.kv_committed_len + 2 * alloc_len_per_decode - r.kv_allocated_len
+            x = max(
+                0,
+                r.kv_committed_len + 2 * alloc_len_per_decode - r.kv_allocated_len,
+            )
             cur_kv_lens_cpu.append(r.kv_allocated_len)
             nxt_kv_lens_cpu.append(r.kv_allocated_len + x)
             num_needed_tokens += x
@@ -406,6 +409,8 @@ class EagleDraftInputV2Mixin:
 
         if page_size == 1:
             out_cache_loc = alloc_token_slots(batch.tree_cache, num_needed_tokens)
+            if (get_global_server_args().speculative_eagle_topk or 1) > 1:
+                out_cache_loc = out_cache_loc.clone()
         else:
             cur_kv_lens = cur_kv_lens_cpu.to(device=batch.device)
             nxt_kv_lens = nxt_kv_lens_cpu.to(device=batch.device)

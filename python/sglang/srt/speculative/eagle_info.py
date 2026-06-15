@@ -706,6 +706,10 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
     welm_mtp_deferred_prefill_draft_mask: torch.Tensor = None
     welm_mtp_draft_topk_indices: torch.Tensor = None
     welm_mtp_draft_topk_values: torch.Tensor = None
+    draft_proposal_parent_list: torch.Tensor = None
+    draft_proposal_top_scores_index: torch.Tensor = None
+    draft_proposal_tokens: torch.Tensor = None
+    welm_mtp_prefill_branch_cache_locs: Optional[torch.Tensor] = None
 
     # Inputs for overlap worker
     future_indices: Optional[FutureIndices] = None
@@ -887,6 +891,9 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
             "welm_mtp_deferred_prefill_draft_mask",
             "welm_mtp_draft_topk_indices",
             "welm_mtp_draft_topk_values",
+            "draft_proposal_parent_list",
+            "draft_proposal_top_scores_index",
+            "draft_proposal_tokens",
         )
         for field in fields:
             value = getattr(self, field, None)
@@ -906,6 +913,9 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
             "draft_probs",
             "welm_mtp_draft_topk_indices",
             "welm_mtp_draft_topk_values",
+            "draft_proposal_parent_list",
+            "draft_proposal_top_scores_index",
+            "draft_proposal_tokens",
             "welm_mtp_deferred_prefill_draft_mask",
             "welm_mtp_base_positions",
             "welm_mtp_oe_history_state",
@@ -1038,6 +1048,11 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
         self._sync_welm_mtp_deferred_prefill_draft_from_mask()
         self.welm_mtp_draft_topk_indices = spec_info.welm_mtp_draft_topk_indices
         self.welm_mtp_draft_topk_values = spec_info.welm_mtp_draft_topk_values
+        self.draft_proposal_parent_list = spec_info.draft_proposal_parent_list
+        self.draft_proposal_top_scores_index = (
+            spec_info.draft_proposal_top_scores_index
+        )
+        self.draft_proposal_tokens = spec_info.draft_proposal_tokens
 
     def _merge_optional_first_dim(
         self, lhs: Optional[torch.Tensor], rhs: Optional[torch.Tensor]
@@ -1066,6 +1081,18 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
         )
         self.welm_mtp_draft_topk_values = self._merge_optional_first_dim(
             self.welm_mtp_draft_topk_values, spec_info.welm_mtp_draft_topk_values
+        )
+        self.draft_proposal_parent_list = self._merge_optional_first_dim(
+            self.draft_proposal_parent_list,
+            spec_info.draft_proposal_parent_list,
+        )
+        self.draft_proposal_top_scores_index = self._merge_optional_first_dim(
+            self.draft_proposal_top_scores_index,
+            spec_info.draft_proposal_top_scores_index,
+        )
+        self.draft_proposal_tokens = self._merge_optional_first_dim(
+            self.draft_proposal_tokens,
+            spec_info.draft_proposal_tokens,
         )
 
 
