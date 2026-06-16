@@ -585,6 +585,11 @@ def multinomial_with_seed(
     """
     n, m = logprobs.shape
     seed = seed.to(torch.uint64)
+    # AttnDP/MLP sync may make `positions` longer than `seed` (padding tokens
+    # for communication alignment). The murmur kernel requires equal shapes
+    # and only uses the first `n` positions, so trim here.
+    if positions.shape[0] != n:
+        positions = positions[:n]
     col_indices = torch.arange(m, device=logprobs.device)
     hashed = murmur_hash32(seed, positions, col_indices)
 
