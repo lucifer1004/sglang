@@ -1704,6 +1704,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     inner_idle_batch: Optional[ScheduleBatch] = None
     global_num_tokens: Optional[List[int]] = None
     global_num_tokens_for_logprob: Optional[List[int]] = None
+    global_num_reqs: Optional[List[int]] = None
+    global_forward_modes: Optional[List[int]] = None
+    welm_mtp_global_prefill_num_tokens: Optional[List[int]] = None
     is_extend_in_batch: bool = False
     all_extend_in_batch: bool = False
     can_run_dp_cuda_graph: bool = False
@@ -2287,6 +2290,41 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.model_config.vocab_size,
         )
 
+    def prepare_extend_metadata_for_dp_sync(self):
+        # DP-attention spec scheduling needs extend sizes before the global MLP
+        # sync, but must not launch local CUDA prefill prep before every DP rank
+        # has reached that sync point.
+        self.forward_mode = ForwardMode.EXTEND
+        self.scale_seq_factor = self._get_scale_seq_factor()
+
+        reqs = self.reqs
+        scale = self.scale_seq_factor
+        logical_prefix_lens = [len(r.prefix_indices) // scale for r in reqs]
+        extend_num_tokens = sum(
+            len(r.fill_ids) - lpl for r, lpl in zip(reqs, logical_prefix_lens)
+        )
+        extend_lens = [r.extend_input_len for r in reqs]
+
+        for req, pre_len in zip(reqs, logical_prefix_lens):
+            if req.logprob_start_len >= pre_len:
+                if self.is_prefill_only and req.logprob_start_len == len(
+                    req.origin_input_ids
+                ):
+                    req.extend_logprob_start_len = req.extend_input_len
+                else:
+                    req.extend_logprob_start_len = min(
+                        req.logprob_start_len - pre_len,
+                        req.extend_input_len,
+                        req.seqlen - 1,
+                    )
+            else:
+                req.extend_logprob_start_len = 0
+
+        self.prefix_lens = [p * scale for p in logical_prefix_lens]
+        self.extend_lens = [e * scale for e in extend_lens]
+        self.extend_num_tokens = extend_num_tokens * scale
+        self.extend_logprob_start_lens = [r.extend_logprob_start_len for r in reqs]
+
     def prepare_for_split_prefill(self):
         self.prepare_for_extend()
         # For split prefill, we need to set the forward mode to SPLIT_PREFILL
@@ -2837,6 +2875,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             token_ids_logprobs=self.token_ids_logprobs,
             global_num_tokens=self.global_num_tokens,
             global_num_tokens_for_logprob=self.global_num_tokens_for_logprob,
+            global_num_reqs=self.global_num_reqs,
+            global_forward_modes=self.global_forward_modes,
+            welm_mtp_global_prefill_num_tokens=(
+                self.welm_mtp_global_prefill_num_tokens
+            ),
             is_extend_in_batch=self.is_extend_in_batch,
             all_extend_in_batch=getattr(self, "all_extend_in_batch", False),
             can_run_dp_cuda_graph=self.can_run_dp_cuda_graph,
@@ -3059,6 +3102,9 @@ class ModelWorkerBatch:
     # For DP attention
     global_num_tokens: Optional[List[int]]
     global_num_tokens_for_logprob: Optional[List[int]]
+    global_num_reqs: Optional[List[int]]
+    global_forward_modes: Optional[List[int]]
+    welm_mtp_global_prefill_num_tokens: Optional[List[int]]
     is_extend_in_batch: bool
     can_run_dp_cuda_graph: bool
     tbo_split_seq_index: Optional[int]

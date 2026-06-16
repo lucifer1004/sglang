@@ -22,6 +22,7 @@ from sglang.srt.layers.attention.trtllm_mla_backend import (
     TRTLLMMLABackend,
 )
 from sglang.srt.layers.dp_attention import (
+    get_attention_dp_rank,
     get_attention_tp_group,
     is_dp_attention_enabled,
 )
@@ -1308,7 +1309,9 @@ class EagleDraftWorker(BaseDraftWorker):
         topk_index = torch.multinomial(probs, num_samples=1)
         topk_p = torch.gather(probs, dim=1, index=topk_index)
 
-        tp_group = get_tp_group()
+        tp_group = (
+            get_attention_tp_group() if is_dp_attention_enabled() else get_tp_group()
+        )
         if tp_group.world_size > 1:
             tp_group.broadcast(topk_index, src=0)
             topk_p = torch.gather(probs, dim=1, index=topk_index)
@@ -1356,7 +1359,11 @@ class EagleDraftWorker(BaseDraftWorker):
 
             topk_p, topk_pos = self._sample_welmv4_mtp_probs_top1(probs)
             topk_index = torch.gather(top_indices, dim=-1, index=topk_pos)
-            tp_group = get_tp_group()
+            tp_group = (
+                get_attention_tp_group()
+                if is_dp_attention_enabled()
+                else get_tp_group()
+            )
             if tp_group.world_size > 1:
                 tp_group.broadcast(topk_index, src=0)
                 topk_p = torch.gather(probs, dim=1, index=topk_pos)
@@ -1485,6 +1492,7 @@ class EagleDraftWorker(BaseDraftWorker):
     ) -> None:
         forward_batch.welm_mtp_merge_kv_fill_draft = True
         forward_batch.welm_mtp_kv_fill_positions = forward_batch.positions
+        forward_batch.welm_mtp_kv_fill_cache_loc = forward_batch.out_cache_loc
         forward_batch.welm_mtp_query_input_ids = input_ids.to(torch.int64)
         forward_batch.welm_mtp_query_oe_hashed_inputs = query_hashed_inputs
         forward_batch.welm_mtp_query_positions = query_positions
@@ -1492,6 +1500,7 @@ class EagleDraftWorker(BaseDraftWorker):
     def _clear_welmv4_mtp_merged_query(self, forward_batch: ForwardBatch) -> None:
         forward_batch.welm_mtp_merge_kv_fill_draft = False
         forward_batch.welm_mtp_kv_fill_positions = None
+        forward_batch.welm_mtp_kv_fill_cache_loc = None
         forward_batch.welm_mtp_query_input_ids = None
         forward_batch.welm_mtp_query_oe_hashed_inputs = None
         forward_batch.welm_mtp_query_positions = None
@@ -1805,7 +1814,33 @@ class EagleDraftWorker(BaseDraftWorker):
             f"extend_seq_lens={extend_seq_lens}."
         )
 
-    def _get_welmv4_mtp_step_dp_counts(
+    @staticmethod
+    def _get_welmv4_mtp_int_list_attr(
+        obj,
+        name: str,
+        num_dp_slots: int,
+    ) -> Optional[List[int]]:
+        values = getattr(obj, name, None)
+        if values is None:
+            return None
+        values = [int(x) for x in values]
+        if len(values) != num_dp_slots:
+            raise RuntimeError(
+                f"WeLM MTP DP metadata got mismatched {name}: "
+                f"values={values}, dp_slots={num_dp_slots}."
+            )
+        return values
+
+    @staticmethod
+    def _is_welmv4_mtp_prefill_forward_mode(mode_value: Optional[int]) -> bool:
+        if mode_value is None:
+            return False
+        try:
+            return ForwardMode(int(mode_value)).is_extend_without_speculative()
+        except ValueError:
+            return False
+
+    def _get_welmv4_mtp_base_request_dp_counts(
         self,
         forward_batch: ForwardBatch,
         local_rows: int,
@@ -1813,7 +1848,6 @@ class EagleDraftWorker(BaseDraftWorker):
         if (
             not is_dp_attention_enabled()
             or getattr(forward_batch, "global_num_tokens_gpu", None) is None
-            or get_is_capture_mode()
         ):
             return None
 
@@ -1821,10 +1855,68 @@ class EagleDraftWorker(BaseDraftWorker):
         if num_dp_slots <= 1:
             return [int(local_rows)]
 
+        counts = self._get_welmv4_mtp_int_list_attr(
+            forward_batch, "global_num_reqs_cpu", num_dp_slots
+        )
+        if counts is None and self.topk == 1:
+            counts = self._get_welmv4_mtp_int_list_attr(
+                forward_batch, "global_num_tokens_for_logprob_cpu", num_dp_slots
+            )
+        if counts is None:
+            if get_is_capture_mode():
+                return [int(local_rows)] * num_dp_slots
+            return None
+
+        prefill_counts = self._get_welmv4_mtp_int_list_attr(
+            forward_batch, "welm_mtp_global_prefill_num_tokens", num_dp_slots
+        )
+        forward_modes = self._get_welmv4_mtp_int_list_attr(
+            forward_batch, "global_forward_modes", num_dp_slots
+        )
+        if prefill_counts is not None and forward_modes is not None:
+            for i, (prefill_count, mode) in enumerate(
+                zip(prefill_counts, forward_modes)
+            ):
+                if prefill_count == 0 and (
+                    self._is_welmv4_mtp_prefill_forward_mode(mode)
+                    or mode == ForwardMode.IDLE.value
+                ):
+                    counts[i] = 0
+
+        dp_rank = int(get_attention_dp_rank())
+        if not 0 <= dp_rank < num_dp_slots:
+            raise RuntimeError(
+                "WeLM MTP DP request-count inference got an invalid attention DP "
+                f"rank: dp_rank={dp_rank}, dp_slots={num_dp_slots}."
+            )
+        if counts[dp_rank] != int(local_rows):
+            raise RuntimeError(
+                "WeLM MTP DP request-count inference mismatch: "
+                f"dp_rank={dp_rank}, local_rows={local_rows}, counts={counts}."
+            )
+        return counts
+
+    def _get_welmv4_mtp_local_row_dp_counts(
+        self,
+        forward_batch: ForwardBatch,
+        local_rows: int,
+    ) -> Optional[List[int]]:
+        if (
+            not is_dp_attention_enabled()
+            or getattr(forward_batch, "global_num_tokens_gpu", None) is None
+        ):
+            return None
+
+        num_dp_slots = int(forward_batch.global_num_tokens_gpu.numel())
+        if num_dp_slots <= 1:
+            return [int(local_rows)]
+        if get_is_capture_mode():
+            return None
+
         tp_group = get_tp_group()
         if tp_group.world_size % num_dp_slots != 0:
             raise RuntimeError(
-                "WeLM MTP DP step-count gather expected the TP group size to be "
+                "WeLM MTP DP row-count gather expected the TP group size to be "
                 f"divisible by DP slots: tp_group={tp_group.world_size}, "
                 f"dp_slots={num_dp_slots}."
             )
@@ -1841,7 +1933,7 @@ class EagleDraftWorker(BaseDraftWorker):
         )
         tp_group.all_gather_into_tensor(gathered_counts, local_count)
         ranks_per_dp = tp_group.world_size // num_dp_slots
-        return (
+        counts = (
             gathered_counts.view(num_dp_slots, ranks_per_dp)
             .max(dim=1)
             .values.detach()
@@ -1849,20 +1941,138 @@ class EagleDraftWorker(BaseDraftWorker):
             .tolist()
         )
 
+        dp_rank = int(get_attention_dp_rank())
+        if not 0 <= dp_rank < num_dp_slots:
+            raise RuntimeError(
+                "WeLM MTP DP row-count gather got an invalid attention DP rank: "
+                f"dp_rank={dp_rank}, dp_slots={num_dp_slots}."
+            )
+        if counts[dp_rank] != int(local_rows):
+            raise RuntimeError(
+                "WeLM MTP DP row-count gather mismatch: "
+                f"dp_rank={dp_rank}, local_rows={local_rows}, counts={counts}."
+            )
+        return counts
+
+    def _get_welmv4_mtp_step0_dp_token_counts(
+        self,
+        forward_batch: ForwardBatch,
+        token_counts: Optional[List[int]],
+        base_request_counts: Optional[List[int]],
+    ) -> Optional[List[int]]:
+        if (
+            not is_dp_attention_enabled()
+            or getattr(forward_batch, "global_num_tokens_gpu", None) is None
+            or token_counts is None
+        ):
+            return token_counts
+
+        num_dp_slots = int(forward_batch.global_num_tokens_gpu.numel())
+        counts = [int(x) for x in token_counts]
+        if len(counts) != num_dp_slots:
+            raise RuntimeError(
+                "WeLM MTP DP token-count inference got mismatched counts: "
+                f"counts={counts}, dp_slots={num_dp_slots}."
+            )
+
+        prefill_counts = self._get_welmv4_mtp_int_list_attr(
+            forward_batch, "welm_mtp_global_prefill_num_tokens", num_dp_slots
+        )
+        forward_modes = self._get_welmv4_mtp_int_list_attr(
+            forward_batch, "global_forward_modes", num_dp_slots
+        )
+        if prefill_counts is None or forward_modes is None:
+            return counts
+
+        for i, (prefill_count, mode) in enumerate(zip(prefill_counts, forward_modes)):
+            if prefill_count > 0:
+                counts[i] = prefill_count
+            elif (
+                self._is_welmv4_mtp_prefill_forward_mode(mode)
+                or mode == ForwardMode.IDLE.value
+            ):
+                counts[i] = 0
+            elif (
+                base_request_counts is not None
+                and ForwardMode(int(mode)).is_decode()
+            ):
+                counts[i] = (
+                    int(base_request_counts[i]) * self.speculative_num_draft_tokens
+                )
+        return counts
+
+    def _get_welmv4_mtp_step_dp_counts_from_base_requests(
+        self,
+        forward_batch: ForwardBatch,
+        base_request_counts: Optional[List[int]],
+        *,
+        step: int,
+        local_rows: int,
+        use_tree_proposal: bool,
+    ) -> Optional[List[int]]:
+        if (
+            not is_dp_attention_enabled()
+            or getattr(forward_batch, "global_num_tokens_gpu", None) is None
+        ):
+            return None
+
+        num_dp_slots = int(forward_batch.global_num_tokens_gpu.numel())
+        if base_request_counts is None:
+            raise RuntimeError(
+                "WeLM MTP DP step-count inference requires synchronized request "
+                "counts."
+            )
+        if len(base_request_counts) != num_dp_slots:
+            raise RuntimeError(
+                "WeLM MTP DP step-count inference got mismatched row counts: "
+                f"counts={base_request_counts}, dp_slots={num_dp_slots}."
+            )
+        if num_dp_slots <= 1:
+            return [int(local_rows)]
+
+        dp_rank = int(get_attention_dp_rank())
+        if not 0 <= dp_rank < num_dp_slots:
+            raise RuntimeError(
+                "WeLM MTP DP step-count inference got an invalid attention DP rank: "
+                f"dp_rank={dp_rank}, dp_slots={num_dp_slots}."
+            )
+
+        # The step 0 forward consumes one input row per request. Its tree
+        # selection expands the *next* step to topk rows per request.
+        rows_per_request = self.topk if use_tree_proposal and step > 0 else 1
+        counts = [int(count) * rows_per_request for count in base_request_counts]
+        expected_local_rows = counts[dp_rank]
+        if expected_local_rows != local_rows:
+            raise RuntimeError(
+                "WeLM MTP DP step-count inference mismatch: "
+                f"step={step}, local_rows={local_rows}, "
+                f"expected_local_rows={expected_local_rows}, "
+                f"rows_per_request={rows_per_request}, "
+                f"base_request_counts={base_request_counts}."
+            )
+
+        return counts
+
     def _set_welmv4_mtp_step_dp_counts(
         self,
         forward_batch: ForwardBatch,
         token_counts: Optional[List[int]],
         logprob_counts: Optional[List[int]] = None,
     ) -> None:
-        if token_counts is None:
+        if token_counts is None and logprob_counts is None:
             return
-        forward_batch.global_num_tokens_cpu = [int(x) for x in token_counts]
+        if token_counts is not None:
+            token_counts = [int(x) for x in token_counts]
+            forward_batch.global_num_tokens_cpu = token_counts
         if logprob_counts is None:
             logprob_counts = token_counts
-        forward_batch.global_num_tokens_for_logprob_cpu = [
-            int(x) for x in logprob_counts
-        ]
+        else:
+            logprob_counts = [int(x) for x in logprob_counts]
+        if logprob_counts is not None:
+            forward_batch.global_num_tokens_for_logprob_cpu = logprob_counts
+        forward_batch._welm_mtp_contract_global_num_tokens_cpu = logprob_counts
+        forward_batch.dp_local_start_pos = None
+        forward_batch.dp_local_num_tokens = None
 
     @staticmethod
     def _is_welmv4_mtp_intermediate_prefill_chunk(req) -> bool:
@@ -1905,6 +2115,48 @@ class EagleDraftWorker(BaseDraftWorker):
             dtype=torch.bool,
             device=device,
         )
+
+    @staticmethod
+    def _get_welmv4_mtp_global_prefill_num_tokens(
+        batch: ModelWorkerBatch,
+    ) -> Optional[List[int]]:
+        counts = getattr(batch, "welm_mtp_global_prefill_num_tokens", None)
+        if counts is None:
+            return None
+        return [int(x) for x in counts]
+
+    def _prepare_welmv4_mtp_empty_prefill_collective_batch(
+        self,
+        batch: ModelWorkerBatch,
+    ) -> None:
+        device = self.device
+        empty_i64 = torch.empty((0,), dtype=torch.int64, device=device)
+        empty_i32 = torch.empty((0,), dtype=torch.int32, device=device)
+        empty_i64_cpu = torch.empty((0,), dtype=torch.int64)
+
+        batch.forward_mode = ForwardMode.IDLE
+        batch.input_ids = empty_i64
+        batch.req_pool_indices = empty_i64
+        batch.seq_lens = empty_i32
+        batch.seq_lens_cpu = empty_i64_cpu
+        batch.orig_seq_lens = empty_i32
+        batch.out_cache_loc = empty_i64
+        batch.seq_lens_sum = 0
+        batch.extend_seq_lens = []
+        batch.extend_prefix_lens = []
+        batch.extend_logprob_start_lens = []
+        batch.extend_num_tokens = 0
+        batch.extend_input_logprob_token_ids = None
+        batch.welm_kv_mirror_last_q_indices = None
+        batch.welm_kv_mirror_active_batch_indices = None
+        batch.welm_kv_mirror_output_size = None
+        batch.return_logprob = False
+        batch.return_hidden_states = False
+        batch.input_embeds = None
+        batch.multimodal_inputs = None
+        batch.reqs = []
+        batch.lora_ids = []
+        batch.oe_context = None
 
     @staticmethod
     def _has_welmv4_mtp_deferred_prefill_rows(
@@ -2053,6 +2305,7 @@ class EagleDraftWorker(BaseDraftWorker):
                 "extend_prefix_lens_cpu",
                 "global_num_tokens_cpu",
                 "global_num_tokens_for_logprob_cpu",
+                "_welm_mtp_contract_global_num_tokens_cpu",
                 "lora_ids",
                 "attn_backend",
                 "forward_mode",
@@ -2073,15 +2326,46 @@ class EagleDraftWorker(BaseDraftWorker):
             if forward_batch.global_num_tokens_cpu is None
             else [int(x) for x in forward_batch.global_num_tokens_cpu]
         )
+        base_request_counts = self._get_welmv4_mtp_base_request_dp_counts(
+            forward_batch,
+            int(input_ids.numel()),
+        )
+        variable_decode_token_counts = None
+        if getattr(forward_batch, "welm_mtp_variable_decode_extend", False):
+            variable_decode_token_counts = self._get_welmv4_mtp_local_row_dp_counts(
+                forward_batch,
+                int(forward_batch.extend_num_tokens),
+            )
+        step0_token_counts = (
+            variable_decode_token_counts
+            if variable_decode_token_counts is not None
+            else self._get_welmv4_mtp_step0_dp_token_counts(
+                forward_batch,
+                prefill_token_counts,
+                base_request_counts,
+            )
+        )
 
         try:
             for step in range(self.speculative_num_steps):
-                request_token_counts = self._get_welmv4_mtp_step_dp_counts(
-                    forward_batch, int(input_ids.numel())
+                request_token_counts = (
+                    self._get_welmv4_mtp_step_dp_counts_from_base_requests(
+                        forward_batch,
+                        base_request_counts,
+                        step=step,
+                        local_rows=int(input_ids.numel()),
+                        use_tree_proposal=use_tree_proposal,
+                    )
                 )
                 self._set_welmv4_mtp_step_dp_counts(
                     forward_batch,
-                    prefill_token_counts,
+                    (
+                        request_token_counts
+                        if use_tree_proposal
+                        and step > 0
+                        and not get_is_capture_mode()
+                        else step0_token_counts
+                    ),
                     logprob_counts=request_token_counts,
                 )
 
@@ -2148,13 +2432,16 @@ class EagleDraftWorker(BaseDraftWorker):
                         ).to(dtype=forward_batch.positions.dtype)
                         spec_info.num_tokens_per_req = self.topk
                         spec_info.num_tokens_for_logprob_per_req = self.topk
-                        if not getattr(
-                            forward_batch,
-                            "welm_mtp_draft_tree_graph_metadata_ready",
-                            False,
+                        if (
+                            not is_idle_batch
+                            and not getattr(
+                                forward_batch,
+                                "welm_mtp_draft_tree_graph_metadata_ready",
+                                False,
+                            )
                         ):
                             forward_batch.forward_mode = ForwardMode.DECODE
-                            forward_batch.is_extend_in_batch = False
+                            forward_batch.is_extend_in_batch = True
                             self.draft_attn_backend.init_forward_metadata(
                                 forward_batch
                             )
@@ -2207,8 +2494,10 @@ class EagleDraftWorker(BaseDraftWorker):
                     forward_batch.attn_backend = self.draft_attn_backend.attn_backends[
                         step - 1
                     ]
-                    forward_batch.forward_mode = ForwardMode.DECODE
-                    forward_batch.is_extend_in_batch = False
+                    forward_batch.forward_mode = (
+                        ForwardMode.IDLE if is_idle_batch else ForwardMode.DECODE
+                    )
+                    forward_batch.is_extend_in_batch = True
                     forward_batch.next_token_logits_buffer = getattr(
                         forward_batch,
                         "welm_mtp_branch_next_token_logits_buffer",
@@ -2240,7 +2529,20 @@ class EagleDraftWorker(BaseDraftWorker):
                 graph_select_fn = getattr(
                     forward_batch, "welm_mtp_draft_graph_select_fn", None
                 )
-                if graph_select_fn is None:
+                if is_idle_batch:
+                    proposal_width = self.topk
+                    topk_p = logits_output.next_token_logits.new_zeros(
+                        (int(logits_output.next_token_logits.shape[0]), proposal_width)
+                    )
+                    topk_index = torch.zeros(
+                        topk_p.shape,
+                        dtype=torch.long,
+                        device=logits_output.next_token_logits.device,
+                    )
+                    draft_probs = None
+                    draft_topk_indices = None
+                    draft_topk_values = None
+                elif graph_select_fn is None:
                     (
                         topk_p,
                         topk_index,
@@ -2361,7 +2663,7 @@ class EagleDraftWorker(BaseDraftWorker):
         )
         if use_tree_proposal and main_hidden_states is not None:
             final_hidden_states = main_hidden_states.reshape(
-                int(base_positions.numel()), self.topk, -1
+                int(base_positions.numel()), self.topk, main_hidden_states.shape[-1]
             )[:, 0, :]
         else:
             final_hidden_states = self._select_welmv4_mtp_request_hidden_states(
@@ -2980,23 +3282,55 @@ class EagleDraftWorker(BaseDraftWorker):
             target_hidden_states: Hidden states from the target model forward
             next_token_ids: Next token ids generated from the target forward.
         """
+        global_prefill_counts = self._get_welmv4_mtp_global_prefill_num_tokens(batch)
+        global_has_welmv4_mtp_prefill_work = (
+            global_prefill_counts is None
+            or any(count > 0 for count in global_prefill_counts)
+        )
+        needs_welmv4_mtp_empty_prefill_collective = (
+            global_prefill_counts is not None
+            and global_has_welmv4_mtp_prefill_work
+        )
+        is_welmv4_mtp_draft_model = self._is_welmv4_mtp_draft_model()
         use_welmv4_mtp_idle_prefill = (
-            batch.forward_mode.is_idle() and batch.is_extend_in_batch
+            batch.forward_mode.is_idle()
+            and batch.is_extend_in_batch
+            and needs_welmv4_mtp_empty_prefill_collective
         )
         use_welmv4_mtp_prefill_proposal = (
-            self._is_welmv4_mtp_draft_model()
+            is_welmv4_mtp_draft_model
             and self.speculative_num_steps > 1
             and (not batch.forward_mode.is_idle() or use_welmv4_mtp_idle_prefill)
         )
+        deferred_return_draft_input = None
+        use_welmv4_mtp_empty_prefill_collective = False
         _welm_mtp_trace(
             "draft_extend_for_prefill "
             f"mode={batch.forward_mode} is_extend_in_batch={batch.is_extend_in_batch} "
             f"use_idle_prefill={use_welmv4_mtp_idle_prefill} "
             f"use_prefill_proposal={use_welmv4_mtp_prefill_proposal} "
+            f"needs_empty_collective={needs_welmv4_mtp_empty_prefill_collective} "
+            f"global_mtp_prefill_tokens={getattr(batch, 'welm_mtp_global_prefill_num_tokens', None)} "
             f"global_tokens={getattr(batch, 'global_num_tokens', None)} "
             f"target_hidden_shape={tuple(target_hidden_states.shape)} "
             f"next_token_shape={tuple(next_token_ids.shape)}"
         )
+        if (
+            is_welmv4_mtp_draft_model
+            and batch.forward_mode.is_idle()
+            and batch.is_extend_in_batch
+            and not global_has_welmv4_mtp_prefill_work
+        ):
+            empty_i32 = torch.empty((0,), dtype=torch.int32, device=self.device)
+            return EagleDraftInput(
+                hidden_states=target_hidden_states[:0],
+                verified_id=next_token_ids[:0],
+                new_seq_lens=empty_i32,
+                num_tokens_per_req=1,
+                num_tokens_for_logprob_per_req=1,
+                model_specific_states=model_specific_states,
+            )
+
         if use_welmv4_mtp_prefill_proposal:
             batch.capture_hidden_mode = CaptureHiddenMode.LAST
             deferred_prefill_mask = self._get_welmv4_mtp_deferred_prefill_mask(
@@ -3022,8 +3356,18 @@ class EagleDraftWorker(BaseDraftWorker):
                     target_hidden_states,
                     next_token_ids,
                 )
-                batch.spec_info = next_draft_input
-                return next_draft_input
+                deferred_return_draft_input = next_draft_input
+                if not needs_welmv4_mtp_empty_prefill_collective:
+                    batch.spec_info = next_draft_input
+                    return next_draft_input
+                use_welmv4_mtp_empty_prefill_collective = True
+
+        if (
+            use_welmv4_mtp_idle_prefill
+            or use_welmv4_mtp_empty_prefill_collective
+        ):
+            target_hidden_states = target_hidden_states[:0]
+            next_token_ids = next_token_ids[:0]
 
         # Construct input_ids. The WeLM MTP merged path fills the draft KV cache
         # from the original extend tokens and injects the target next token as
@@ -3062,6 +3406,12 @@ class EagleDraftWorker(BaseDraftWorker):
                     deferred_prefill_mask.any().item()
                 )
 
+        if (
+            use_welmv4_mtp_idle_prefill
+            or use_welmv4_mtp_empty_prefill_collective
+        ):
+            self._prepare_welmv4_mtp_empty_prefill_collective_batch(batch)
+
         # Run forward
         forward_batch = ForwardBatch.init_new(batch, self.draft_runner)
         forward_batch.return_logprob = False
@@ -3075,6 +3425,12 @@ class EagleDraftWorker(BaseDraftWorker):
             first_query_history_state = None
             if batch.forward_mode.is_idle():
                 forward_batch.can_run_dp_cuda_graph = False
+                forward_batch.custom_last_index = torch.empty(
+                    (0,), dtype=torch.long, device=self.device
+                )
+                forward_batch.custom_last_cache_loc = torch.empty(
+                    (0,), dtype=torch.long, device=self.device
+                )
             if (
                 self._should_use_welmv4_mtp_oe_hash_kernel()
                 and not batch.forward_mode.is_idle()
@@ -3100,7 +3456,7 @@ class EagleDraftWorker(BaseDraftWorker):
                 next_draft_input.welm_mtp_oe_history_state = (
                     first_query_verify_history_state
                 )
-            if mm_input_embeds is not None:
+            if mm_input_embeds is not None and not batch.forward_mode.is_idle():
                 forward_batch.mm_input_embeds = mm_input_embeds
             prefill_branch_cache_locs = None
             if self.topk > 1:
@@ -3129,6 +3485,8 @@ class EagleDraftWorker(BaseDraftWorker):
                     first_query_history_state=first_query_history_state,
                     draft_path="prefill",
                 )
+            if deferred_return_draft_input is not None:
+                return deferred_return_draft_input
             return next_draft_input
         if mm_input_embeds is not None:
             forward_batch.mm_input_embeds = mm_input_embeds
@@ -3458,7 +3816,37 @@ class EagleDraftWorker(BaseDraftWorker):
                         forward_batch
                     )
                 )
-                if not can_cuda_graph:
+                use_variable_decode_extend = (
+                    self.topk == 1
+                    and self.welmv4_mtp_sample_draft
+                    and self._get_welmv4_mtp_draft_sampling_topk() == 0
+                    and not can_cuda_graph
+                )
+                if use_variable_decode_extend and not is_idle_decode:
+                    batch.forward_mode = ForwardMode.EXTEND
+                    draft_input.num_tokens_per_req = 1
+                    draft_input.num_tokens_for_logprob_per_req = 1
+                    forward_batch = ForwardBatch.init_new(batch, self.draft_runner)
+                    forward_batch.return_logprob = False
+                    forward_batch.welm_mtp_variable_decode_extend = True
+                    real_last_index = (
+                        torch.cumsum(forward_batch.extend_seq_lens, dim=0) - 1
+                    )
+                    forward_batch.custom_last_index = real_last_index
+                    if forward_batch.out_cache_loc is not None:
+                        forward_batch.custom_last_cache_loc = forward_batch.out_cache_loc[
+                            real_last_index
+                        ]
+                    attn_backend = (
+                        self.draft_extend_attn_backend
+                        or self.draft_runner.attn_backend
+                    )
+                    forward_batch.attn_backend = attn_backend
+                elif use_variable_decode_extend:
+                    forward_batch.welm_mtp_variable_decode_extend = True
+                if is_idle_decode and not can_cuda_graph:
+                    forward_batch.forward_mode = ForwardMode.IDLE
+                if not can_cuda_graph and not is_idle_decode:
                     attn_backend.init_forward_metadata(forward_batch)
             if self.plan_stream:
                 torch.get_device_module(self.device).current_stream().wait_stream(

@@ -486,6 +486,34 @@ def _welm_should_contract_kv_mirror(forward_batch: ForwardBatch) -> bool:
     )
 
 
+def _welm_should_contract_idle_extend_dp_metadata(
+    forward_batch: ForwardBatch,
+) -> bool:
+    return (
+        forward_batch.enable_welm_kv_mirror_opt
+        and forward_batch.forward_mode.is_idle()
+        and forward_batch.is_extend_in_batch
+        and is_dp_attention_enabled()
+        and getattr(forward_batch, "global_num_tokens_gpu", None) is not None
+        and getattr(forward_batch, "global_num_reqs_cpu", None) is not None
+    )
+
+
+def _welm_needs_empty_dp_collectives(
+    forward_batch: ForwardBatch,
+    *,
+    is_nextn: bool,
+) -> bool:
+    if (
+        not is_dp_attention_enabled()
+        or getattr(forward_batch, "global_num_tokens_gpu", None) is None
+    ):
+        return False
+    return is_nextn or (
+        forward_batch.forward_mode.is_idle() and forward_batch.is_extend_in_batch
+    )
+
+
 def _welm_init_kv_mirror_last_q_indices(forward_batch: ForwardBatch) -> bool:
     forward_batch.welm_kv_mirror_contracted = True
     if getattr(forward_batch, "kv_mirror_output_size", None) is not None:
@@ -644,28 +672,59 @@ def _welm_update_contracted_dp_metadata(
         set_is_extend_in_batch,
     )
 
+    def copy_dp_counts_to_gpu(dst: Optional[torch.Tensor], counts: List[int]) -> bool:
+        if dst is None:
+            return False
+        if int(dst.numel()) != len(counts):
+            return False
+        if _welm_cuda_graph_capture_active():
+            if all(count == counts[0] for count in counts):
+                dst.fill_(counts[0])
+            else:
+                for i, count in enumerate(counts):
+                    dst[i] = count
+            return True
+        count_tensor = torch.tensor(counts, dtype=dst.dtype, pin_memory=True)
+        dst.copy_(count_tensor, non_blocking=True)
+        return True
+
     dp_rank = get_attention_dp_rank()
     scale = max(getattr(forward_batch, "scale_seq_factor", 1), 1)
     local_dp_buffer_len = new_local_num_tokens
     if contract_to_request_counts:
         num_dp_slots = int(forward_batch.global_num_tokens_gpu.numel())
-        source_counts = getattr(
-            forward_batch, "global_num_tokens_for_logprob_cpu", None
+        raw_global_num_tokens = None
+        candidate_count_names = (
+            "_welm_mtp_contract_global_num_tokens_cpu",
+            "global_num_reqs_cpu",
+            "global_num_tokens_for_logprob_cpu",
+            "global_num_tokens_cpu",
+            "original_global_num_tokens_cpu",
         )
-        if source_counts is None or len(source_counts) != num_dp_slots:
-            source_counts = getattr(
-                forward_batch, "original_global_num_tokens_cpu", None
-            )
-        if source_counts is not None and len(source_counts) == num_dp_slots:
-            raw_global_num_tokens = [int(x) for x in source_counts]
-        else:
+        candidate_count_values = {}
+        for name in candidate_count_names:
+            counts = getattr(forward_batch, name, None)
+            if counts is None or len(counts) != num_dp_slots:
+                continue
+            counts = [int(x) for x in counts]
+            candidate_count_values[name] = counts
+            if counts[dp_rank] == new_local_num_tokens:
+                raw_global_num_tokens = counts
+                break
+        if raw_global_num_tokens is None:
+            if candidate_count_values:
+                raise RuntimeError(
+                    "WeLM DP metadata contraction mismatch: "
+                    f"dp_rank={dp_rank}, local_rows={new_local_num_tokens}, "
+                    f"candidate_counts={candidate_count_values}."
+                )
             raw_global_num_tokens = [new_local_num_tokens] * num_dp_slots
         expected_local_num_tokens = raw_global_num_tokens[dp_rank]
         if expected_local_num_tokens != new_local_num_tokens:
             raise RuntimeError(
-                "WeLM MTP DP metadata contraction mismatch: "
+                "WeLM DP metadata contraction mismatch: "
                 f"dp_rank={dp_rank}, local_rows={new_local_num_tokens}, "
-                f"global_request_counts={raw_global_num_tokens}."
+                f"candidate_counts={candidate_count_values}."
             )
 
         force_extend_sum_len = (
@@ -692,33 +751,16 @@ def _welm_update_contracted_dp_metadata(
         else:
             new_global_num_tokens = raw_global_num_tokens
         local_dp_buffer_len = new_global_num_tokens[dp_rank]
-        is_uniform_count = all(x == new_global_num_tokens[0] for x in new_global_num_tokens)
-        if is_uniform_count:
-            forward_batch.global_num_tokens_gpu.fill_(new_global_num_tokens[0])
-            new_global_num_tokens_gpu = forward_batch.global_num_tokens_gpu
-        else:
-            # ForwardBatch.init_new has already copied the synchronized per-DP
-            # token counts to the GPU. Avoid allocating/copying a fresh CUDA
-            # tensor here; this path can run while prior MTP collectives are
-            # still pending.
-            new_global_num_tokens_gpu = forward_batch.global_num_tokens_gpu
-            for i, count in enumerate(new_global_num_tokens):
-                new_global_num_tokens_gpu[i] = count
-            forward_batch.global_num_tokens_gpu = new_global_num_tokens_gpu
+        copy_dp_counts_to_gpu(
+            forward_batch.global_num_tokens_gpu, new_global_num_tokens
+        )
         if forward_batch.global_num_tokens_cpu is not None:
             forward_batch.global_num_tokens_cpu = new_global_num_tokens
         if forward_batch.global_num_tokens_for_logprob_gpu is not None:
-            if (
-                int(forward_batch.global_num_tokens_for_logprob_gpu.numel())
-                == num_dp_slots
+            if copy_dp_counts_to_gpu(
+                forward_batch.global_num_tokens_for_logprob_gpu,
+                new_global_num_tokens,
             ):
-                if is_uniform_count:
-                    forward_batch.global_num_tokens_for_logprob_gpu.fill_(
-                        new_global_num_tokens[0]
-                    )
-                else:
-                    for i, count in enumerate(new_global_num_tokens):
-                        forward_batch.global_num_tokens_for_logprob_gpu[i] = count
                 forward_batch.global_num_tokens_for_logprob_cpu = (
                     new_global_num_tokens
                 )
@@ -729,7 +771,29 @@ def _welm_update_contracted_dp_metadata(
         if forward_batch.global_num_tokens_cpu is not None:
             forward_batch.global_num_tokens_cpu = new_global_num_tokens
     else:
-        forward_batch.global_num_tokens_gpu[dp_rank] = new_local_num_tokens
+        if forward_batch.global_num_tokens_cpu is not None:
+            new_global_num_tokens = [
+                int(x) for x in forward_batch.global_num_tokens_cpu
+            ]
+            if 0 <= dp_rank < len(new_global_num_tokens):
+                new_global_num_tokens[dp_rank] = new_local_num_tokens
+                copy_dp_counts_to_gpu(
+                    forward_batch.global_num_tokens_gpu, new_global_num_tokens
+                )
+                forward_batch.global_num_tokens_cpu = new_global_num_tokens
+            else:
+                raise RuntimeError(
+                    "WeLM DP metadata contraction got an invalid attention DP "
+                    f"rank: dp_rank={dp_rank}, "
+                    f"global_num_tokens={new_global_num_tokens}."
+                )
+        elif _welm_cuda_graph_capture_active():
+            forward_batch.global_num_tokens_gpu[dp_rank] = new_local_num_tokens
+        else:
+            raise RuntimeError(
+                "WeLM DP metadata contraction requires CPU DP token metadata "
+                "outside CUDA graph capture."
+            )
         new_global_num_tokens = None
 
     forward_batch.dp_local_start_pos = None
@@ -1328,8 +1392,10 @@ class NextnMirrorQProjection(BaseWelmQkvProjection):
         forward_batch: ForwardBatch,
         kv_mirror_states: Dict[int, Tuple[torch.Tensor, torch.Tensor]],
     ) -> WelmQkvProjectionOutput:
-        if forward_batch.forward_mode.is_idle():
-            # Idle batches carry no mirrored activations and do not write cache.
+        if forward_batch.forward_mode.is_idle() and not getattr(
+            forward_batch, "welm_mtp_merge_kv_fill_draft", False
+        ):
+            # Non-MTP idle batches carry no mirrored activations and do not write cache.
             qkv = self._apply_qkv(hidden_states)
             q, k, v = self._split_qkv(attn, qkv)
             return q, k, v, hidden_states
@@ -1364,12 +1430,29 @@ class NextnMirrorQProjection(BaseWelmQkvProjection):
         )
         kv_activation = kv_mirror_states.get(pop_key)
         if kv_activation is None:
-            raise RuntimeError(
-                f"Missing mirrored KV activation for nextn pop_key={pop_key} "
-                f"(imitated={self.imitated_layer_idx}, mirror={self.mirror_layer_idx})"
-            )
+            if (
+                getattr(forward_batch, "welm_mtp_merge_kv_fill_draft", False)
+                and _welm_should_contract_kv_mirror(forward_batch)
+                and _welm_kv_mirror_has_no_active_q(forward_batch)
+            ):
+                kv_activation = (
+                    hidden_states.new_empty((0, attn.kv_size)),
+                    hidden_states.new_empty((0, attn.kv_size)),
+                )
+            else:
+                raise RuntimeError(
+                    f"Missing mirrored KV activation for nextn pop_key={pop_key} "
+                    f"(imitated={self.imitated_layer_idx}, mirror={self.mirror_layer_idx})"
+                )
 
         k, v = kv_activation
+        if (
+            getattr(forward_batch, "welm_mtp_merge_kv_fill_draft", False)
+            and _welm_should_contract_kv_mirror(forward_batch)
+            and _welm_kv_mirror_has_no_active_q(forward_batch)
+        ):
+            k = k[:0]
+            v = v[:0]
         mirrored_kv_indices = getattr(
             forward_batch.spec_info, "mirrored_kv_indices", None
         )
@@ -2350,14 +2433,22 @@ class Qwen2MoeAttention(nn.Module):
                     and kv_fill_positions is not None
                     and k_for_rope.shape[0] != positions.shape[0]
                 ):
-                    if kv_fill_positions.shape[0] != k_for_rope.shape[0]:
+                    if kv_fill_positions.shape[0] == k_for_rope.shape[0]:
+                        rotary_positions = kv_fill_positions.to(
+                            device=positions.device, dtype=positions.dtype
+                        )
+                    elif (
+                        last_query_positions is not None
+                        and last_query_positions.shape[0] == k_for_rope.shape[0]
+                    ):
+                        rotary_positions = last_query_positions.to(
+                            device=positions.device, dtype=positions.dtype
+                        )
+                    else:
                         raise RuntimeError(
                             "WeLMV4 MTP merged KV-fill positions shape mismatch: "
                             f"{kv_fill_positions.shape[0]} vs {k_for_rope.shape[0]}."
                         )
-                    rotary_positions = kv_fill_positions.to(
-                        device=positions.device, dtype=positions.dtype
-                    )
                 self.rotary_emb.forward_cuda(
                     rotary_positions,
                     q,
@@ -2409,10 +2500,9 @@ class Qwen2MoeAttention(nn.Module):
             if dump_this_layer:
                 _welm_dump_tensor(f"{dump_prefix}.gated_attn_output", attn_output)
 
-        needs_empty_dp_collectives = (
-            self.is_nextn
-            and is_dp_attention_enabled()
-            and getattr(forward_batch, "global_num_tokens_gpu", None) is not None
+        needs_empty_dp_collectives = _welm_needs_empty_dp_collectives(
+            forward_batch,
+            is_nextn=self.is_nextn,
         )
         if attn_output.shape[0] == 0 and not needs_empty_dp_collectives:
             output = hidden_states.new_empty((0, self.hidden_size))
@@ -2698,10 +2788,9 @@ class Qwen2MoeDecoderLayer(nn.Module):
             # The fused path would run o_norm on attn-TP partial sums.
             and not self.self_attn.o_norm_needs_attn_tp_reduce
         )
-        needs_empty_dp_collectives = (
-            self.is_nextn
-            and is_dp_attention_enabled()
-            and getattr(forward_batch, "global_num_tokens_gpu", None) is not None
+        needs_empty_dp_collectives = _welm_needs_empty_dp_collectives(
+            forward_batch,
+            is_nextn=self.is_nextn,
         )
         if hidden_states.shape[0] != 0 or needs_empty_dp_collectives:
             hidden_states = self.self_attn(
@@ -2711,9 +2800,24 @@ class Qwen2MoeDecoderLayer(nn.Module):
                 kv_mirror_states=kv_mirror_states,
                 skip_o_norm=use_mmq_norm_after_attn,
             )
+        is_kv_mirror_layer = (
+            self.self_attn.kv_mirror_layer_idx in self.kv_mirror_layers
+        )
+        if (
+            _welm_should_contract_idle_extend_dp_metadata(forward_batch)
+            and is_kv_mirror_layer
+            and not self.is_nextn
+            and not use_previous_precision
+        ):
+            _welm_update_contracted_dp_metadata(
+                forward_batch,
+                0,
+                marker_attr="_welm_kv_mirror_contracted_dp_metadata_rows",
+                contract_to_request_counts=True,
+            )
         if (
             _welm_should_contract_kv_mirror(forward_batch)
-            and self.self_attn.kv_mirror_layer_idx in self.kv_mirror_layers
+            and is_kv_mirror_layer
             and residual is not None
             and residual.shape[0] != hidden_states.shape[0]
         ):
@@ -2723,6 +2827,7 @@ class Qwen2MoeDecoderLayer(nn.Module):
                     forward_batch,
                     hidden_states.shape[0],
                     marker_attr="_welm_kv_mirror_contracted_dp_metadata_rows",
+                    contract_to_request_counts=True,
                 )
 
         if use_mmq_norm_after_attn:

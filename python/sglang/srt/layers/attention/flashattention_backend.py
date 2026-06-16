@@ -871,10 +871,21 @@ class FlashAttentionBackend(AttentionBackend):
                     if not layer.is_cross_attention
                     else forward_batch.encoder_out_cache_loc
                 )
+                kv_fill_cache_loc = getattr(
+                    forward_batch, "welm_mtp_kv_fill_cache_loc", None
+                )
                 custom_last_cache_loc = getattr(
                     forward_batch, "custom_last_cache_loc", None
                 )
                 if (
+                    not layer.is_cross_attention
+                    and getattr(forward_batch, "welm_mtp_merge_kv_fill_draft", False)
+                    and kv_fill_cache_loc is not None
+                    and k.shape[0] != cache_loc.numel()
+                    and k.shape[0] == kv_fill_cache_loc.numel()
+                ):
+                    cache_loc = kv_fill_cache_loc
+                elif (
                     not layer.is_cross_attention
                     and getattr(forward_batch, "welm_kv_mirror_contracted", False)
                     and custom_last_cache_loc is not None

@@ -1589,12 +1589,47 @@ class Scheduler(
             tmp_batch, tmp_result = self.result_queue.popleft()
             self.process_batch_result(tmp_batch, tmp_result)
 
+        dp_spec_prefill_flag = torch.empty((1,), dtype=torch.int32)
+
+        def should_process_last_before_dp_spec_prefill():
+            if not (
+                self.last_batch is not None
+                and len(self.result_queue) > 0
+                and self.require_mlp_sync
+                and not self.spec_algorithm.is_none()
+                and not self.server_args.speculative_skip_dp_mlp_sync
+            ):
+                return False
+
+            has_local_prefill = int(
+                self.chunked_req is not None or len(self.waiting_queue) > 0
+            )
+            if self.tp_size == 1:
+                return bool(has_local_prefill)
+
+            dp_spec_prefill_flag.fill_(has_local_prefill)
+            torch.distributed.all_reduce(
+                dp_spec_prefill_flag,
+                op=torch.distributed.ReduceOp.MAX,
+                group=self.tp_cpu_group,
+            )
+            return bool(dp_spec_prefill_flag.item())
+
         while True:
             # Receive requests
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
             if self._engine_paused:
                 continue
+
+            processed_last_before_schedule = False
+            if should_process_last_before_dp_spec_prefill():
+                # A DP prefill may be local to only one attention-DP rank, but
+                # its MLP-sync collective is global. Finish the previous
+                # speculative decode result on every rank before any rank can
+                # enter the next MLP-sync scheduling collective.
+                pop_and_process()
+                processed_last_before_schedule = True
 
             # Get the next batch to run
             batch = self.get_next_batch_to_run()
@@ -1615,7 +1650,10 @@ class Scheduler(
 
             # Process the last batch
             if self.last_batch:
-                if not disable_overlap_for_batch:
+                if (
+                    not processed_last_before_schedule
+                    and not disable_overlap_for_batch
+                ):
                     pop_and_process()
             elif batch is None:
                 # When the server is idle, do self-check and re-init some states
@@ -2907,10 +2945,19 @@ class Scheduler(
             if self.running_batch.is_empty():
                 self.running_batch.batch_is_full = False
 
+        defer_prefill_prepare_for_dp_sync = (
+            self.require_mlp_sync
+            and not self.spec_algorithm.is_none()
+            and not self.server_args.speculative_skip_dp_mlp_sync
+            and not self.is_mixed_chunk
+        )
+
         if self.dllm_config is not None:
             new_batch = self.get_new_batch_dllm()
         else:
-            new_batch = self.get_new_batch_prefill()
+            new_batch = self.get_new_batch_prefill(
+                defer_prepare_for_dp_sync=defer_prefill_prepare_for_dp_sync
+            )
 
         need_mlp_sync = self.require_mlp_sync
         if (
@@ -2924,6 +2971,14 @@ class Scheduler(
             # 2. All new batches are some (prefill / idle) -> we do not need prepare mlp sync one more time.
             new_batch = self.maybe_prepare_mlp_sync_batch(new_batch)
             need_mlp_sync = new_batch is None
+
+            if (
+                defer_prefill_prepare_for_dp_sync
+                and new_batch is not None
+                and new_batch.forward_mode.is_extend()
+                and new_batch.input_ids is None
+            ):
+                new_batch.prepare_for_extend()
 
         if new_batch is not None:
             # Run prefill first if possible
@@ -2956,7 +3011,9 @@ class Scheduler(
             res = min(res, self.req_to_token_pool.available_size())
         return res
 
-    def get_new_batch_prefill(self) -> Optional[ScheduleBatch]:
+    def get_new_batch_prefill(
+        self, defer_prepare_for_dp_sync: bool = False
+    ) -> Optional[ScheduleBatch]:
         prefill_delayer_single_pass = None
         if self.prefill_delayer:
             # Get max usage across all pools for prefill delay decision
@@ -2966,7 +3023,8 @@ class Scheduler(
             )
 
         ret = self._get_new_batch_prefill_raw(
-            prefill_delayer_single_pass=prefill_delayer_single_pass
+            prefill_delayer_single_pass=prefill_delayer_single_pass,
+            defer_prepare_for_dp_sync=defer_prepare_for_dp_sync,
         )
 
         if self.prefill_delayer:
@@ -2975,7 +3033,9 @@ class Scheduler(
         return ret
 
     def _get_new_batch_prefill_raw(
-        self, prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor]
+        self,
+        prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor],
+        defer_prepare_for_dp_sync: bool = False,
     ) -> Optional[ScheduleBatch]:
         # Check if the grammar is ready in the grammar queue
         if self.grammar_manager.has_waiting_grammars():
@@ -3181,7 +3241,10 @@ class Scheduler(
                 self.tree_cache.ready_to_load_host_cache()
             )
 
-        new_batch.prepare_for_extend()
+        if defer_prepare_for_dp_sync:
+            new_batch.prepare_extend_metadata_for_dp_sync()
+        else:
+            new_batch.prepare_for_extend()
 
         # Record prefill stats for logging after forward.
         new_batch.prefill_stats = PrefillStats.from_adder(
