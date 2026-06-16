@@ -3797,17 +3797,52 @@ class ServerArgs:
                     "Max running requests is reset to 48 for speculative decoding. You can override this by explicitly setting --max-running-requests."
                 )
 
+            # Detect WeLM MTP draft early so the topk>1 spec-v1 fallback below
+            # can exempt it (WeLM MTP topk>1 has its own spec-v2 path).
+            _is_welm_mtp_draft_early = False
+            try:
+                _early_arch = (
+                    self.get_model_config().hf_config.architectures[0]
+                )
+            except Exception:
+                _early_arch = None
+            if (
+                _early_arch == "WeLMV4MoeForCausalLM"
+                and self.speculative_draft_model_path is not None
+            ):
+                try:
+                    from sglang.srt.utils.hf_transformers_utils import get_config as _early_get_config
+
+                    _draft_cfg = _early_get_config(
+                        self.speculative_draft_model_path,
+                        trust_remote_code=self.trust_remote_code,
+                        revision=self.speculative_draft_model_revision,
+                        model_override_args=json.loads(self.json_model_override_args),
+                    )
+                    _draft_arch = (
+                        getattr(_draft_cfg, "architectures", []) or [None]
+                    )[0]
+                    _is_welm_mtp_draft_early = (
+                        _draft_arch
+                        in ("WeLMV4MoeForCausalLM", "WeLMV4MoeForCausalLMNextN")
+                        and int(getattr(_draft_cfg, "num_nextn_predict_layers", 0)) > 0
+                    )
+                except Exception:
+                    _is_welm_mtp_draft_early = False
+
             spec_v1_reason = None
             if (
                 self.speculative_eagle_topk is not None
                 and self.speculative_eagle_topk > 1
                 and not self.disable_overlap_schedule
+                and not _is_welm_mtp_draft_early
             ):
                 self.disable_overlap_schedule = True
                 spec_v1_reason = "spec v2 currently only supports topk = 1"
             elif (
                 not envs.SGLANG_ENABLE_SPEC_V2.get()
                 and not self.disable_overlap_schedule
+                and not _is_welm_mtp_draft_early
             ):
                 self.disable_overlap_schedule = True
                 spec_v1_reason = "SGLANG_ENABLE_SPEC_V2=False"

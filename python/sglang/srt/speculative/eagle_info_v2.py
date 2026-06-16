@@ -924,7 +924,7 @@ class EagleVerifyInputV2Mixin:
 
 
 @triton.jit
-def fill_bonus_tokens(
+def fill_new_bonus_tokens(
     bonus_tokens,
     accept_lens,
     new_bonus_tokens,

@@ -42,10 +42,9 @@ class ScheduleBatchDisaggregationDecodeMixin:
         offset = 0
         for i, req in enumerate(reqs):
             req_pool_indices.append(req.req_pool_idx)
-            pre_len = len(req.prefix_indices)
 
             chunk = self.req_to_token_pool.req_to_token[req.req_pool_idx][
-                pre_len : pre_len + req.extend_input_len
+                : req.extend_input_len
             ]
             assert (
                 offset + req.extend_input_len <= total_size
@@ -53,6 +52,7 @@ class ScheduleBatchDisaggregationDecodeMixin:
             out_cache_loc[offset : offset + req.extend_input_len] = chunk
             offset += req.extend_input_len
 
+            pre_len = len(req.prefix_indices)
             seq_len = len(req.origin_input_ids) + max(0, len(req.output_ids) - 1)
             seq_lens.append(seq_len)
             if len(req.output_ids) == 0:

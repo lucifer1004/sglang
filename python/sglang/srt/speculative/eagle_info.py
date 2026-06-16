@@ -459,8 +459,8 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                     unfinished_accept_index.append(accept_index[i])
             req.spec_verify_ct += 1
             accepted_draft_tokens = sum(1 for idx in accept_index_row if idx != -1) - 1
-            req.spec_num_correct_drafts += accepted_draft_tokens
-            req.update_spec_correct_drafts_histogram(accepted_draft_tokens)
+            req.spec_accepted_drafts += accepted_draft_tokens
+            req.update_spec_acceptance_histogram(accepted_draft_tokens)
 
         if has_finished:
             num_correct_drafts = (accept_index != -1).sum(dim=1) - 1

@@ -86,7 +86,7 @@ class FutureMap:
         # Get a reference for each tensor
         topk_p0 = draft_input.topk_p[0]
         topk_index0 = draft_input.topk_index[0]
-        bonus_token0 = draft_input.bonus_tokens[0]
+        bonus_tokens0 = draft_input.bonus_tokens[0]
         new_seq_lens0 = draft_input.new_seq_lens[0]
 
         self.topk_p_buf = torch.empty(
@@ -100,8 +100,8 @@ class FutureMap:
             device=self.device,
         )
         self.bonus_tokens_buf = torch.empty(
-            (self.future_buffer_len, *bonus_token0.shape),
-            dtype=bonus_token0.dtype,
+            (self.future_buffer_len, *bonus_tokens0.shape),
+            dtype=bonus_tokens0.dtype,
             device=self.device,
         )
         self.new_seq_lens_buf = torch.empty(

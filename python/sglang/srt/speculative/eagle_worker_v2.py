@@ -61,7 +61,7 @@ from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative.eagle_info_v2 import (
     assign_extend_cache_locs,
     fill_accepted_out_cache_loc,
-    fill_bonus_tokens,
+    fill_new_bonus_tokens,
 )
 from sglang.srt.speculative.eagle_utils import (
     TreeMaskMode,
@@ -3363,7 +3363,7 @@ class EagleDraftWorker(BaseDraftWorker):
                         draft_input.hidden_states = (
                             batch_result.logits_output.hidden_states[accepted_indices]
                         )
-                    draft_input.verified_id = next_draft_input.verified_id
+                    draft_input.bonus_tokens = next_draft_input.bonus_tokens
                     draft_input.new_seq_lens = next_draft_input.new_seq_lens
                     draft_input.verify_done = next_draft_input.verify_done
                     draft_input.num_tokens_for_logprob_per_req = 1
@@ -4176,7 +4176,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
         if not batch.forward_mode.is_idle():
             bonus_tokens = torch.empty_like(accept_lens, dtype=torch.int32)
             if self.topk > 1:
-                fill_bonus_tokens[(bs,)](
+                fill_new_bonus_tokens[(bs,)](
                     next_token_ids,
                     accept_lens,
                     bonus_tokens,
@@ -4184,7 +4184,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 )
             else:
                 all_bonus_tokens = predict[accept_index]
-                fill_bonus_tokens[(bs,)](
+                fill_new_bonus_tokens[(bs,)](
                     all_bonus_tokens,
                     accept_lens,
                     bonus_tokens,
@@ -4219,6 +4219,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
             spec_accept_index=accept_index,
             routed_experts_output=forward_batch_output.routed_experts_output,
             welm_mtp_accepted_draft_token_ids=welm_mtp_accepted_draft_token_ids,
+            speculative_num_draft_tokens=self.speculative_num_draft_tokens,
         )
 
     def _mamba_verify_update(
