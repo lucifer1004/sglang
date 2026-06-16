@@ -210,6 +210,17 @@ class SchedulerOutputProcessorMixin:
                 result.extend_input_len_per_req,
                 result.extend_logprob_start_len_per_req,
             )
+            if result.next_draft_input is not None:
+                mtp_prefill_branch_cache_locs = getattr(
+                    result.next_draft_input,
+                    "welm_mtp_prefill_branch_cache_locs",
+                    None,
+                )
+                if mtp_prefill_branch_cache_locs is not None:
+                    self.token_to_kv_pool_allocator.free(
+                        mtp_prefill_branch_cache_locs
+                    )
+                    result.next_draft_input.welm_mtp_prefill_branch_cache_locs = None
 
             # Move next_token_ids and logprobs to cpu
             next_token_ids = next_token_ids.tolist()

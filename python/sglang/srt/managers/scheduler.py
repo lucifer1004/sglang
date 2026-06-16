@@ -3861,14 +3861,14 @@ class Scheduler(
         if self.is_fully_idle():
             self.cur_batch = None
             self.last_batch = None
+            if self.draft_worker:
+                self.draft_worker.clear_cache_pool()
+
             self.tree_cache.reset()
             self.req_to_token_pool.clear()
             self.token_to_kv_pool_allocator.clear()
             self.grammar_manager.clear()
             self.reset_metrics()
-
-            if self.draft_worker:
-                self.draft_worker.clear_cache_pool()
 
             if empty_cache:
                 empty_device_cache(self.device_module)

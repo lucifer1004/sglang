@@ -40,7 +40,7 @@ from sglang.srt.utils import (
     require_mlp_sync,
     require_mlp_tp_gather,
 )
-from sglang.srt.utils.common import is_cuda, is_musa
+from sglang.srt.utils.common import fast_topk, is_cuda, is_musa
 
 _is_cuda = is_cuda()
 _is_musa = is_musa()
@@ -83,6 +83,8 @@ class WelmMTPDraftProposalInputBuffers(ForwardInputBuffers):
     welm_mtp_oe_output_prev_input_ids: Optional[torch.Tensor]
     welm_mtp_oe_hash_out_batch_major: Optional[torch.Tensor]
     welm_mtp_draft_input_ids: Optional[torch.Tensor]
+    welm_mtp_branch_step_cache_locs: Optional[torch.Tensor]
+    welm_mtp_branch_flat_cache_locs: Optional[torch.Tensor]
     global_num_tokens_gpu: Optional[torch.Tensor]
     global_num_tokens_for_logprob_gpu: Optional[torch.Tensor]
 
@@ -146,15 +148,21 @@ class WelmMTPDraftProposalCudaGraphRunner:
             and (_is_cuda or _is_musa)
         )
 
-        self.num_tokens_per_bs = int(self.speculative_num_draft_tokens)
+        self.topk = int(model_runner.server_args.speculative_eagle_topk)
+        self.branch_tokens_per_bs = int(self.topk * self.speculative_num_steps)
+        self.num_tokens_per_bs = int(
+            max(self.speculative_num_draft_tokens, self.branch_tokens_per_bs)
+            if self.topk > 1
+            else self.speculative_num_draft_tokens
+        )
         capture_bs, compile_bs = get_batch_sizes_to_capture(
             model_runner, num_tokens_per_bs=self.num_tokens_per_bs
         )
         self.capture_bs = self._filter_contracted_dp_capture_bs(capture_bs)
         self.compile_bs = [bs for bs in compile_bs if bs in self.capture_bs]
-        self.topk = int(model_runner.server_args.speculative_eagle_topk)
         self.max_bs = max(self.capture_bs)
         self.max_num_token = self.max_bs * self.num_tokens_per_bs
+        self.max_branch_num_token = self.max_bs * self.branch_tokens_per_bs
         self._welm_mtp_mirror_cu_seqlens_q = {
             bs: torch.arange(
                 0,
@@ -168,6 +176,10 @@ class WelmMTPDraftProposalCudaGraphRunner:
         self.draft_extend_attn_backend.init_cuda_graph_state(
             self.max_bs, self.max_num_token
         )
+        if self.topk > 1:
+            self.eagle_worker.draft_attn_backend.init_cuda_graph_state(
+                self.max_bs, self.max_branch_num_token
+            )
         self.seq_len_fill_value = (
             self.draft_extend_attn_backend.get_cuda_graph_seq_len_fill_value()
         )
@@ -225,6 +237,18 @@ class WelmMTPDraftProposalCudaGraphRunner:
                 0.5,
                 dtype=torch.float32,
             )
+            if self.topk > 1:
+                welm_mtp_branch_step_cache_locs = torch.zeros(
+                    (self.speculative_num_steps, self.max_bs * self.topk),
+                    dtype=torch.int64,
+                )
+                welm_mtp_branch_flat_cache_locs = torch.zeros(
+                    (self.max_branch_num_token,),
+                    dtype=torch.int64,
+                )
+            else:
+                welm_mtp_branch_step_cache_locs = None
+                welm_mtp_branch_flat_cache_locs = None
 
             if eagle_worker._should_use_welmv4_mtp_oe_hash_kernel():
                 oe_grams, oe_vocab_sizes = get_welm_oe_hash_config(
@@ -345,6 +369,8 @@ class WelmMTPDraftProposalCudaGraphRunner:
             welm_mtp_oe_output_prev_input_ids=welm_mtp_oe_output_prev_input_ids,
             welm_mtp_oe_hash_out_batch_major=welm_mtp_oe_hash_out_batch_major,
             welm_mtp_draft_input_ids=welm_mtp_draft_input_ids,
+            welm_mtp_branch_step_cache_locs=welm_mtp_branch_step_cache_locs,
+            welm_mtp_branch_flat_cache_locs=welm_mtp_branch_flat_cache_locs,
             global_num_tokens_gpu=global_num_tokens_gpu,
             global_num_tokens_for_logprob_gpu=global_num_tokens_for_logprob_gpu,
         )
@@ -747,6 +773,137 @@ class WelmMTPDraftProposalCudaGraphRunner:
             self.model_runner.tp_group.broadcast(broadcast_samples, src=0)
             uniform_samples.copy_(broadcast_samples)
 
+    def _copy_branch_cache_locs(self, raw_bs: int, bs: int) -> None:
+        if self.topk <= 1:
+            return
+        buffers = self.buffers
+        if (
+            buffers.welm_mtp_branch_step_cache_locs is None
+            or buffers.welm_mtp_branch_flat_cache_locs is None
+        ):
+            raise RuntimeError("Missing WeLM MTP branch cache loc graph buffers.")
+
+        req_to_token = self.model_runner.req_to_token_pool.req_to_token
+        req_pool_indices = buffers.req_pool_indices[:bs].to(
+            device=req_to_token.device, dtype=torch.long
+        )
+        seq_lens = buffers.seq_lens[:bs].to(device=req_to_token.device, dtype=torch.long)
+        if raw_bs < bs:
+            seq_lens = seq_lens.clone()
+            seq_lens[raw_bs:bs].zero_()
+        offsets = torch.arange(
+            self.branch_tokens_per_bs,
+            dtype=torch.long,
+            device=req_to_token.device,
+        )
+        flat_cache_locs = req_to_token[
+            req_pool_indices[:, None],
+            seq_lens[:, None] + offsets[None, :],
+        ].contiguous()
+        branch_flat = buffers.welm_mtp_branch_flat_cache_locs[
+            : bs * self.branch_tokens_per_bs
+        ]
+        branch_flat.copy_(flat_cache_locs.flatten())
+        branch_step = (
+            flat_cache_locs.reshape(bs, self.topk, self.speculative_num_steps)
+            .permute(2, 0, 1)
+            .reshape(self.speculative_num_steps, bs * self.topk)
+            .contiguous()
+        )
+        buffers.welm_mtp_branch_step_cache_locs[
+            :, : bs * self.topk
+        ].copy_(branch_step)
+
+    def _init_tree_draft_attn_graph_metadata_capture(
+        self,
+        forward_batch: ForwardBatch,
+        bs: int,
+    ) -> None:
+        if self.topk <= 1:
+            return
+        if self.eagle_worker.draft_attn_backend is None:
+            raise RuntimeError("WeLM MTP topk>1 requires a draft attention backend.")
+        buffers = self.buffers
+        assert buffers.welm_mtp_branch_flat_cache_locs is not None
+        branch_flat = buffers.welm_mtp_branch_flat_cache_locs[
+            : bs * self.branch_tokens_per_bs
+        ]
+        original_forward_mode = forward_batch.forward_mode
+        original_is_extend = forward_batch.is_extend_in_batch
+        original_out_cache_loc = forward_batch.out_cache_loc
+        original_num_tokens = forward_batch.spec_info.num_tokens_per_req
+        original_num_logprob_tokens = (
+            forward_batch.spec_info.num_tokens_for_logprob_per_req
+        )
+        try:
+            forward_batch.forward_mode = ForwardMode.DECODE
+            forward_batch.is_extend_in_batch = False
+            forward_batch.out_cache_loc = branch_flat
+            forward_batch.spec_info.num_tokens_per_req = self.topk
+            forward_batch.spec_info.num_tokens_for_logprob_per_req = self.topk
+            self.eagle_worker.draft_attn_backend.init_forward_metadata_capture_cuda_graph(
+                forward_batch
+            )
+        finally:
+            forward_batch.forward_mode = original_forward_mode
+            forward_batch.is_extend_in_batch = original_is_extend
+            forward_batch.out_cache_loc = original_out_cache_loc
+            forward_batch.spec_info.num_tokens_per_req = original_num_tokens
+            forward_batch.spec_info.num_tokens_for_logprob_per_req = (
+                original_num_logprob_tokens
+            )
+        forward_batch.welm_mtp_branch_step_cache_locs = (
+            buffers.welm_mtp_branch_step_cache_locs[:, : bs * self.topk]
+        )
+        forward_batch.welm_mtp_branch_flat_cache_locs = branch_flat
+        forward_batch.welm_mtp_draft_tree_graph_metadata_ready = True
+
+    def _init_tree_draft_attn_graph_metadata_replay(
+        self,
+        forward_batch: ForwardBatch,
+        bs: int,
+        raw_bs: int,
+    ) -> None:
+        if self.topk <= 1:
+            return
+        if self.eagle_worker.draft_attn_backend is None:
+            raise RuntimeError("WeLM MTP topk>1 requires a draft attention backend.")
+        self._copy_branch_cache_locs(raw_bs, bs)
+        buffers = self.buffers
+        assert buffers.welm_mtp_branch_flat_cache_locs is not None
+        branch_flat = buffers.welm_mtp_branch_flat_cache_locs[
+            : bs * self.branch_tokens_per_bs
+        ]
+        original_forward_mode = forward_batch.forward_mode
+        original_is_extend = forward_batch.is_extend_in_batch
+        original_out_cache_loc = forward_batch.out_cache_loc
+        original_num_tokens = forward_batch.spec_info.num_tokens_per_req
+        original_num_logprob_tokens = (
+            forward_batch.spec_info.num_tokens_for_logprob_per_req
+        )
+        try:
+            forward_batch.forward_mode = ForwardMode.DECODE
+            forward_batch.is_extend_in_batch = False
+            forward_batch.out_cache_loc = branch_flat
+            forward_batch.spec_info.num_tokens_per_req = self.topk
+            forward_batch.spec_info.num_tokens_for_logprob_per_req = self.topk
+            self.eagle_worker.draft_attn_backend.init_forward_metadata_replay_cuda_graph(
+                forward_batch, bs
+            )
+        finally:
+            forward_batch.forward_mode = original_forward_mode
+            forward_batch.is_extend_in_batch = original_is_extend
+            forward_batch.out_cache_loc = original_out_cache_loc
+            forward_batch.spec_info.num_tokens_per_req = original_num_tokens
+            forward_batch.spec_info.num_tokens_for_logprob_per_req = (
+                original_num_logprob_tokens
+            )
+        forward_batch.welm_mtp_branch_step_cache_locs = (
+            buffers.welm_mtp_branch_step_cache_locs[:, : bs * self.topk]
+        )
+        forward_batch.welm_mtp_branch_flat_cache_locs = branch_flat
+        forward_batch.welm_mtp_draft_tree_graph_metadata_ready = True
+
     def _select_topk(
         self,
         logits: torch.Tensor,
@@ -759,12 +916,16 @@ class WelmMTPDraftProposalCudaGraphRunner:
         Optional[torch.Tensor],
     ]:
         if not self.sample_draft:
-            topk_index = torch.argmax(logits, dim=-1, keepdim=True)
-            topk_p = torch.ones(
-                topk_index.shape,
-                dtype=logits.dtype,
-                device=logits.device,
-            )
+            if self.topk == 1:
+                topk_index = torch.argmax(logits, dim=-1, keepdim=True)
+                topk_p = torch.ones(
+                    topk_index.shape,
+                    dtype=logits.dtype,
+                    device=logits.device,
+                )
+            else:
+                probs = torch.softmax(logits, dim=-1)
+                topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
             return topk_p, topk_index, None, None
 
         top_logits, top_indices = torch.topk(
@@ -975,16 +1136,24 @@ class WelmMTPDraftProposalCudaGraphRunner:
         forward_batch.custom_last_index = custom_last_index
         forward_batch.custom_last_cache_loc = custom_last_cache_loc
         forward_batch.welm_mtp_draft_extend_metadata_bs = bs
+        if self.topk > 1:
+            forward_batch.welm_mtp_first_next_token_logits_buffer = (
+                buffers.next_token_logits_buffer[:bs]
+            )
+            forward_batch.welm_mtp_branch_next_token_logits_buffer = (
+                buffers.next_token_logits_buffer[: bs * self.topk]
+            )
         forward_batch.enable_welm_kv_mirror_opt = (
             self.model_runner.server_args.enable_welm_kv_mirror_opt
         )
         if buffers.welm_mtp_oe_hash_out is not None:
+            oe_work_history_size = num_tokens if self.topk == 1 else bs
             forward_batch.welm_oe_decode_hashed_inputs = (
                 buffers.welm_mtp_oe_hash_out[:, :num_tokens]
             )
             forward_batch.welm_mtp_oe_work_history = [
-                buffers.welm_mtp_oe_work_history_a[:bs],
-                buffers.welm_mtp_oe_work_history_b[:bs],
+                buffers.welm_mtp_oe_work_history_a[:oe_work_history_size],
+                buffers.welm_mtp_oe_work_history_b[:oe_work_history_size],
             ]
             forward_batch.welm_mtp_oe_entry_history_state = (
                 buffers.welm_mtp_oe_entry_history[:bs]
@@ -1007,6 +1176,15 @@ class WelmMTPDraftProposalCudaGraphRunner:
             forward_batch.welm_mtp_draft_input_ids = (
                 buffers.welm_mtp_draft_input_ids[:, :num_tokens]
             )
+        if self.topk > 1:
+            forward_batch.welm_mtp_branch_step_cache_locs = (
+                buffers.welm_mtp_branch_step_cache_locs[:, : bs * self.topk]
+            )
+            forward_batch.welm_mtp_branch_flat_cache_locs = (
+                buffers.welm_mtp_branch_flat_cache_locs[
+                    : bs * self.branch_tokens_per_bs
+                ]
+            )
 
         self.draft_extend_attn_backend.init_forward_metadata_capture_cuda_graph(
             bs=bs,
@@ -1018,6 +1196,10 @@ class WelmMTPDraftProposalCudaGraphRunner:
             spec_info=spec_info,
         )
         self._set_welmv4_mtp_mirror_metadata(bs)
+        self._init_tree_draft_attn_graph_metadata_capture(
+            forward_batch,
+            bs,
+        )
 
         def run_once():
             forward_batch.dp_local_start_pos = forward_batch.dp_local_num_tokens = None
@@ -1037,6 +1219,7 @@ class WelmMTPDraftProposalCudaGraphRunner:
             forward_batch.welm_mtp_draft_graph_select_fn = (
                 lambda logits, step: self._select_topk(logits, step, bs)
             )
+            forward_batch.welm_mtp_skip_draft_proposal_build = True
             try:
                 self.eagle_worker._run_welmv4_mtp_merged_extend_draft(
                     forward_batch,
@@ -1056,6 +1239,7 @@ class WelmMTPDraftProposalCudaGraphRunner:
                 )
             finally:
                 forward_batch.welm_mtp_draft_graph_select_fn = None
+                forward_batch.welm_mtp_skip_draft_proposal_build = False
             out = (
                 forward_batch.spec_info.topk_p,
                 forward_batch.spec_info.topk_index,
@@ -1063,6 +1247,9 @@ class WelmMTPDraftProposalCudaGraphRunner:
                 forward_batch.spec_info.draft_probs,
                 forward_batch.spec_info.welm_mtp_draft_topk_indices,
                 forward_batch.spec_info.welm_mtp_draft_topk_values,
+                forward_batch.spec_info.draft_proposal_parent_list,
+                forward_batch.spec_info.draft_proposal_top_scores_index,
+                forward_batch.spec_info.draft_proposal_tokens,
             )
             forward_batch.spec_info.hidden_states = hidden_states_backup
             return out
@@ -1204,6 +1391,11 @@ class WelmMTPDraftProposalCudaGraphRunner:
             seq_lens_cpu=buffers.seq_lens_cpu,
         )
         self._set_welmv4_mtp_mirror_metadata(bs)
+        self._init_tree_draft_attn_graph_metadata_replay(
+            replay_forward_batch,
+            bs,
+            raw_bs,
+        )
 
         self.raw_bs = raw_bs
         self.bs = bs
@@ -1215,6 +1407,9 @@ class WelmMTPDraftProposalCudaGraphRunner:
             draft_probs,
             draft_topk_indices,
             draft_topk_values,
+            proposal_parent_list,
+            proposal_top_scores_index,
+            proposal_tokens,
         ) = self.output_buffers[bs]
 
         spec_info = forward_batch.spec_info
@@ -1232,6 +1427,19 @@ class WelmMTPDraftProposalCudaGraphRunner:
         )
         spec_info.welm_mtp_draft_topk_values = (
             None if draft_topk_values is None else draft_topk_values[:raw_bs].clone()
+        )
+        spec_info.draft_proposal_parent_list = (
+            None
+            if proposal_parent_list is None
+            else proposal_parent_list[:raw_bs].clone()
+        )
+        spec_info.draft_proposal_top_scores_index = (
+            None
+            if proposal_top_scores_index is None
+            else proposal_top_scores_index[:raw_bs].clone()
+        )
+        spec_info.draft_proposal_tokens = (
+            None if proposal_tokens is None else proposal_tokens[:raw_bs].clone()
         )
         base_position_index = buffers.custom_last_index[:raw_bs]
         spec_info.welm_mtp_base_positions = buffers.positions[

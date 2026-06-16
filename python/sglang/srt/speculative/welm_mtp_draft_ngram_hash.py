@@ -209,6 +209,9 @@ def _copy_draft_ngram_history_column(
     if source_indices is None:
         out.copy_(history_column[: out.numel()])
         return
+    if out.untyped_storage().data_ptr() == history_column.untyped_storage().data_ptr():
+        out.copy_(torch.index_select(history_column, 0, source_indices))
+        return
     torch.index_select(history_column, 0, source_indices, out=out)
 
 
@@ -350,27 +353,27 @@ def _prepared_cache_key(
     *,
     input_ids: torch.Tensor,
     prev_input_ids: torch.Tensor,
-    prev_prev_input_ids: torch.Tensor | Sequence[int],
+    prev_prev_input_ids: torch.Tensor,
+    topk_cs_idx: torch.Tensor | None,
     output_ids: torch.Tensor,
-    output_prev_input_ids: torch.Tensor,
     ngram_spec: Sequence[Any],
+    topk: int,
     vocab_size: int,
 ) -> tuple[Any, ...]:
-    if isinstance(prev_prev_input_ids, torch.Tensor):
-        prev_prev_key: tuple[Any, ...] = (
-            "tensor",
-            int(prev_prev_input_ids.data_ptr()),
-        )
-    else:
-        prev_prev_key = ("list", tuple(int(x) for x in prev_prev_input_ids))
+    topk_cs_key: tuple[str, int | None] = (
+        ("tensor", int(topk_cs_idx.data_ptr()))
+        if topk_cs_idx is not None
+        else ("none", None)
+    )
     return (
         int(input_ids.data_ptr()),
         int(prev_input_ids.data_ptr()),
-        prev_prev_key,
+        int(prev_prev_input_ids.data_ptr()),
+        topk_cs_key,
         int(output_ids.data_ptr()),
-        int(output_prev_input_ids.data_ptr()),
         int(input_ids.numel()),
         int(vocab_size),
+        int(topk),
         tuple(ngram_spec),
     )
 
@@ -381,10 +384,11 @@ def _get_or_prepare_draft_ngram_hash(
     prepare_draft_ngram_hash,
     input_ids: torch.Tensor,
     prev_input_ids: torch.Tensor,
-    prev_prev_input_ids: torch.Tensor | Sequence[int],
+    prev_prev_input_ids: torch.Tensor,
+    topk_cs_idx: torch.Tensor | None,
     output_ids: torch.Tensor,
-    output_prev_input_ids: torch.Tensor,
     ngram_spec: Sequence[Any],
+    topk: int,
     vocab_size: int,
 ):
     cache = getattr(forward_batch, "welm_mtp_oe_draft_ngram_prepared_cache", None)
@@ -398,9 +402,10 @@ def _get_or_prepare_draft_ngram_hash(
         input_ids=input_ids,
         prev_input_ids=prev_input_ids,
         prev_prev_input_ids=prev_prev_input_ids,
+        topk_cs_idx=topk_cs_idx,
         output_ids=output_ids,
-        output_prev_input_ids=output_prev_input_ids,
         ngram_spec=ngram_spec,
+        topk=topk,
         vocab_size=vocab_size,
     )
     prepared = cache.get(key)
@@ -413,9 +418,10 @@ def _get_or_prepare_draft_ngram_hash(
         input_ids=input_ids,
         prev_input_ids=prev_input_ids,
         prev_prev_input_ids=prev_prev_input_ids,
+        topk_cs_idx=topk_cs_idx,
         output_ids=output_ids,
-        output_prev_input_ids=output_prev_input_ids,
         ngram_spec=ngram_spec,
+        topk=int(topk),
         vocab_size=int(vocab_size),
     )
     cache[key] = prepared
@@ -435,6 +441,8 @@ def welm_mtp_draft_ngram_hash_from_history(
     vocab_size: int,
     base_query_count: int,
     use_parent: bool,
+    topk: int = 1,
+    topk_cs_idx: torch.Tensor | None = None,
     prev_input_ids_scratch: torch.Tensor | None = None,
     prev_prev_input_ids_scratch: torch.Tensor | None = None,
     output_ids_scratch: torch.Tensor | None = None,
@@ -505,17 +513,6 @@ def welm_mtp_draft_ngram_hash_from_history(
     device = input_ids.device
     input_ids_i64 = input_ids
 
-    source_indices = _draft_ngram_source_indices(
-        input_ids=input_ids_i64,
-        parent_indices=parent_indices,
-        base_query_count=base_query_count,
-        use_parent=use_parent,
-        source_indices_scratch=source_indices_scratch,
-    )
-    _require_mk_draft_ngram(
-        (not use_parent) or source_indices is not None,
-        "mk draft ngram hash requires parent indices for parent-selected draft.",
-    )
     _require_mk_draft_ngram(
         use_parent or base_query_count > 0,
         "mk draft ngram hash requires positive base_query_count.",
@@ -526,62 +523,137 @@ def welm_mtp_draft_ngram_hash_from_history(
         f"size: {base_query_count} vs {history_batch_size}.",
     )
 
-    prev_input_ids = _valid_int64_scratch(
-        prev_input_ids_scratch,
-        device=device,
-        numel=num_tokens,
-        name="prev_input_ids",
+    requested_topk = int(topk)
+    _require_mk_draft_ngram(
+        requested_topk > 0,
+        f"mk draft ngram hash requires positive topk, got {requested_topk}.",
     )
-    if prev_input_ids is None:
-        prev_input_ids = torch.empty((num_tokens,), device=device, dtype=torch.int64)
-    output_prev_input_ids = _valid_int64_scratch(
+    if topk_cs_idx is not None:
+        _require_mk_draft_ngram(
+            use_parent,
+            "mk draft ngram hash topk_cs_idx is only valid for parent-selected draft.",
+        )
+        if topk_cs_idx.device != device or topk_cs_idx.dtype != torch.int64:
+            topk_cs_idx = topk_cs_idx.to(device=device, dtype=torch.int64)
+        if not topk_cs_idx.is_contiguous():
+            topk_cs_idx = topk_cs_idx.contiguous()
+        _require_mk_draft_ngram(
+            topk_cs_idx.ndim == 2
+            and topk_cs_idx.shape[1] == requested_topk
+            and topk_cs_idx.numel() == num_tokens,
+            "mk draft ngram hash topk_cs_idx shape must be "
+            f"({num_tokens // requested_topk}, {requested_topk}), got "
+            f"{tuple(topk_cs_idx.shape)}.",
+        )
+        _require_mk_draft_ngram(
+            history_batch_size >= num_tokens,
+            "mk draft ngram hash topk_cs_idx requires draft history rows for "
+            f"all parent candidates: {history_batch_size} vs {num_tokens}.",
+        )
+        mk_topk = requested_topk
+        source_indices = None
+    elif use_parent:
+        mk_topk = 1
+        source_indices = _draft_ngram_source_indices(
+            input_ids=input_ids_i64,
+            parent_indices=parent_indices,
+            base_query_count=base_query_count,
+            use_parent=True,
+            source_indices_scratch=source_indices_scratch,
+        )
+        _require_mk_draft_ngram(
+            source_indices is not None,
+            "mk draft ngram hash requires parent indices for parent-selected draft.",
+        )
+    else:
+        _require_mk_draft_ngram(
+            num_tokens % int(base_query_count) == 0,
+            "mk draft ngram hash cannot infer first-step topk: "
+            f"num_tokens={num_tokens}, base_query_count={base_query_count}.",
+        )
+        mk_topk = num_tokens // int(base_query_count)
+        source_indices = None
+
+    if source_indices is None:
+        prev_input_ids = base_prev_input_ids
+        if not prev_input_ids.is_contiguous():
+            prev_input_ids = _valid_int64_scratch(
+                prev_input_ids_scratch,
+                device=device,
+                numel=max(num_tokens, history_batch_size),
+                name="prev_input_ids",
+            )
+            if prev_input_ids is None:
+                prev_input_ids = torch.empty(
+                    (max(num_tokens, history_batch_size),),
+                    device=device,
+                    dtype=torch.int64,
+                )
+            prev_input_ids[:history_batch_size].copy_(base_prev_input_ids)
+    else:
+        prev_input_ids = _valid_int64_scratch(
+            prev_input_ids_scratch,
+            device=device,
+            numel=num_tokens,
+            name="prev_input_ids",
+        )
+        if prev_input_ids is None:
+            prev_input_ids = torch.empty((num_tokens,), device=device, dtype=torch.int64)
+        _copy_draft_ngram_history_column(
+            base_prev_input_ids, source_indices, prev_input_ids
+        )
+
+    prev_prev_input_ids = _valid_int64_scratch(
         output_prev_input_ids_scratch,
         device=device,
         numel=num_tokens,
-        name="output_prev_input_ids",
+        name="prev_prev_input_ids",
     )
-    if output_prev_input_ids is None:
-        output_prev_input_ids = torch.empty(
-            (num_tokens,), device=device, dtype=torch.int64
-        )
-
-    _copy_draft_ngram_history_column(
-        base_prev_input_ids, source_indices, prev_input_ids
-    )
-    if requires_prev_prev:
-        assert base_prev_prev_input_ids is not None
-        if isinstance(base_prev_prev_input_ids, torch.Tensor):
-            prev_prev_input_ids = _valid_int64_scratch(
-                prev_prev_input_ids_scratch,
-                device=device,
-                numel=num_tokens,
-                name="prev_prev_input_ids",
-            )
-            if prev_prev_input_ids is None:
-                prev_prev_input_ids = torch.empty(
-                    (num_tokens,), device=device, dtype=torch.int64
-                )
-            _copy_draft_ngram_history_column(
-                base_prev_prev_input_ids, source_indices, prev_prev_input_ids
-            )
-        else:
-            prev_prev_input_ids = _expanded_prev_prev_input_ids_list(
-                base_prev_prev_input_ids,
-                num_tokens=num_tokens,
-                base_query_count=base_query_count,
-                use_parent=use_parent,
-            )
-    else:
+    if prev_prev_input_ids is None:
         prev_prev_input_ids = _valid_int64_scratch(
             prev_prev_input_ids_scratch,
             device=device,
             numel=num_tokens,
             name="prev_prev_input_ids",
         )
-        if prev_prev_input_ids is None:
+    if prev_prev_input_ids is None:
+        if (
+            isinstance(base_prev_prev_input_ids, torch.Tensor)
+            and base_prev_prev_input_ids.is_contiguous()
+            and base_prev_prev_input_ids.numel() >= num_tokens
+        ):
+            prev_prev_input_ids = base_prev_prev_input_ids.reshape(-1)[:num_tokens]
+        else:
             prev_prev_input_ids = torch.empty(
                 (num_tokens,), device=device, dtype=torch.int64
             )
+    if requires_prev_prev:
+        assert base_prev_prev_input_ids is not None
+        if isinstance(base_prev_prev_input_ids, torch.Tensor):
+            if source_indices is None:
+                rows_to_copy = min(int(base_prev_prev_input_ids.numel()), num_tokens)
+                if not _is_same_tensor_view(
+                    prev_prev_input_ids[:rows_to_copy],
+                    base_prev_prev_input_ids.reshape(-1)[:rows_to_copy],
+                ):
+                    prev_prev_input_ids[:rows_to_copy].copy_(
+                        base_prev_prev_input_ids.reshape(-1)[:rows_to_copy]
+                    )
+            else:
+                _copy_draft_ngram_history_column(
+                    base_prev_prev_input_ids, source_indices, prev_prev_input_ids
+                )
+        else:
+            values = [int(x) for x in base_prev_prev_input_ids]
+            _require_mk_draft_ngram(
+                len(values) == int(base_query_count),
+                "mk draft ngram hash first-step prev_prev_input_ids length does not "
+                f"match base_query_count: {len(values)} vs {base_query_count}.",
+            )
+            prev_prev_input_ids[: len(values)].copy_(
+                torch.tensor(values, device=device, dtype=torch.int64)
+            )
+    elif source_indices is not None:
         prev_prev_input_ids.zero_()
 
     ngram_spec = _build_mk_draft_ngram_spec(
@@ -614,9 +686,10 @@ def welm_mtp_draft_ngram_hash_from_history(
                 input_ids=input_ids_i64,
                 prev_input_ids=prev_input_ids,
                 prev_prev_input_ids=prev_prev_input_ids,
+                topk_cs_idx=topk_cs_idx,
                 output_ids=output_ids,
-                output_prev_input_ids=output_prev_input_ids,
                 ngram_spec=ngram_spec,
+                topk=mk_topk,
                 vocab_size=int(vocab_size),
             )
         if prepared is not None:
@@ -635,9 +708,10 @@ def welm_mtp_draft_ngram_hash_from_history(
                     prev_input_ids=prev_input_ids,
                     prev_prev_input_ids=prev_prev_input_ids,
                     ngram_spec=ngram_spec,
+                    topk=mk_topk,
+                    topk_cs_idx=topk_cs_idx,
                     vocab_size=int(vocab_size),
                     output_ids=output_ids,
-                    output_prev_input_ids=output_prev_input_ids,
                 )
             )
     except Exception as exc:
@@ -661,5 +735,5 @@ def welm_mtp_draft_ngram_hash_from_history(
     )
     return WelmMTPDraftNGramHistory(
         prev_input_ids=input_ids_i64,
-        prev_prev_input_ids=output_prev_input_ids,
+        prev_prev_input_ids=prev_prev_input_ids,
     )

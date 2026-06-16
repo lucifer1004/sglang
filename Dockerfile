@@ -313,7 +313,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     --mount=type=cache,target=/root/.cargo/registry \
     --mount=type=cache,target=/root/.cargo/git \
     --mount=type=cache,target=/sgl-workspace/sgl-model-gateway/target \
-    uv pip install --python "${VENV_PATH}/bin/python" maturin && \
+    uv pip install --python "${VENV_PATH}/bin/python" "maturin<1.14" && \
     cd /sgl-workspace/sgl-model-gateway/bindings/python && \
     ulimit -n 65536 && \
     "${VENV_PATH}/bin/python" -m maturin build \

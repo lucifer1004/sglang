@@ -58,6 +58,7 @@ from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
+    QKVParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
 )
@@ -340,7 +341,10 @@ def _set_welm_custom_last_prefill_cache_loc(forward_batch: ForwardBatch) -> None
 
     out_cache_loc = getattr(forward_batch, "out_cache_loc", None)
     if out_cache_loc is not None:
-        forward_batch.custom_last_cache_loc = out_cache_loc[custom_last_index]
+        if out_cache_loc.numel() == custom_last_index.numel():
+            forward_batch.custom_last_cache_loc = out_cache_loc
+        else:
+            forward_batch.custom_last_cache_loc = out_cache_loc[custom_last_index]
     else:
         req_to_token_pool = getattr(forward_batch, "req_to_token_pool", None)
         req_pool_indices = getattr(forward_batch, "req_pool_indices", None)
@@ -490,6 +494,7 @@ def _welm_should_contract_kv_mirror(forward_batch: ForwardBatch) -> bool:
     return forward_batch.enable_welm_kv_mirror_opt and (
         forward_batch.forward_mode.is_extend_without_speculative()
         or forward_batch.forward_mode.is_draft_extend(include_v2=True)
+        or getattr(forward_batch, "welm_mtp_merge_kv_fill_draft", False)
     )
 
 
@@ -797,6 +802,167 @@ WelmQkvProjectionOutput = Tuple[
 ]
 
 
+def _get_welm_qkv_wna16_args(quant_config, layer, prefix):
+    """Detect a compressed-tensors weight-only INT4/INT8 (WNA16) scheme for a
+    custom WeLM QKV projection. Returns (num_bits, group_size, symmetric) or None.
+
+    The kv-mirror / MTP QKV variants use bespoke shard layouts that the stock
+    fused quantized linears cannot represent, so they take a "dequant-on-load"
+    path: store compressed-tensors packed weights, then unpack+dequantize to a
+    bf16 ``self.weight`` in process_weights_after_loading, keeping all of their
+    custom forward / slicing / kv-mirror logic unchanged. The dequantized weight
+    equals the training fake-quant (QDQ) weight, so train-infer stays consistent.
+    """
+    if quant_config is None or not hasattr(quant_config, "get_scheme_dict"):
+        return None
+    try:
+        scheme_dict = quant_config.get_scheme_dict(layer, prefix)
+    except Exception:  # pylint: disable=broad-except
+        return None
+    if not scheme_dict:
+        return None
+    weight_quant = scheme_dict.get("weights")
+    input_quant = scheme_dict.get("input_activations")
+    if weight_quant is None or input_quant is not None:
+        return None  # weight-only (W*A16) required
+    num_bits = getattr(weight_quant, "num_bits", None)
+    symmetric = getattr(weight_quant, "symmetric", True)
+    group_size = getattr(weight_quant, "group_size", None)
+    qtype = getattr(weight_quant, "type", "int")
+    qtype = getattr(qtype, "value", qtype)
+    if num_bits not in (4, 8) or str(qtype).lower().endswith("int") is False or not symmetric:
+        return None
+    return int(num_bits), group_size, bool(symmetric)
+
+
+class _WelmQkvDequantMethod:
+    """Minimal quant_method whose process_weights_after_loading unpacks the
+    compressed-tensors packed weight into a bf16 ``layer.weight`` (W4A16/W8A16,
+    per-group symmetric). Invoked by the model loader's post-load pass.
+
+    NOTE: This is the FALLBACK path. When Marlin kernels are available, prefer
+    ``_WelmQkvMarlinMethod`` which keeps weights in INT8/INT4 and uses the
+    Marlin GEMM kernel for true W8A16/W4A16 acceleration.
+    """
+
+    def __init__(self, num_bits: int, group_size: int):
+        self.num_bits = num_bits
+        self.group_size = group_size
+
+    def process_weights_after_loading(self, layer: nn.Module) -> None:
+        num_bits, group_size = self.num_bits, self.group_size
+        pack_factor = 32 // num_bits
+        offset = 1 << (num_bits - 1)
+        mask = (1 << num_bits) - 1
+
+        packed = layer.weight_packed.data  # [out, in // pack_factor] int32
+        out, n_packed = packed.shape
+        in_features = n_packed * pack_factor
+
+        shifts = torch.arange(pack_factor, device=packed.device, dtype=torch.int32) * num_bits
+        codes = (packed.unsqueeze(-1) >> shifts) & mask  # [out, n_packed, pf]
+        codes = codes.reshape(out, in_features).to(torch.float32) - offset
+
+        scale = layer.weight_scale.data.float()  # [out, in // group_size]
+        gs = group_size if group_size and group_size > 0 else in_features
+        deq = (codes.reshape(out, in_features // gs, gs) * scale.unsqueeze(-1)).reshape(out, in_features)
+        layer.weight.data = deq.to(layer.weight.dtype)
+
+
+class _WelmQkvMarlinMethod:
+    """Quant method that keeps QKV weights in Marlin-repacked INT8/INT4 format
+    and uses the Marlin GEMM kernel for W8A16/W4A16 inference.
+
+    This replaces the dequant-on-load fallback with true quantized inference,
+    providing actual compute savings from INT8/INT4 kernels.
+    """
+
+    def __init__(self, num_bits: int, group_size: int):
+        self.num_bits = num_bits
+        self.group_size = group_size
+        self.workspace = None
+        self.output_size_per_partition = None
+        self.input_size_per_partition = None
+
+    def process_weights_after_loading(self, layer: nn.Module) -> None:
+        from sgl_kernel.scalar_type import scalar_types
+
+        from sglang.jit_kernel.gptq_marlin_repack import gptq_marlin_repack
+        from sglang.srt.layers.quantization.marlin_utils import (
+            marlin_make_empty_g_idx,
+            marlin_make_workspace,
+            marlin_permute_scales,
+        )
+
+        num_bits = self.num_bits
+        group_size = self.group_size
+        pack_factor = 32 // num_bits
+
+        packed = layer.weight_packed.data  # [N, K // pack_factor] int32
+        scale = layer.weight_scale.data    # [N, K // group_size]
+
+        N, K_packed = packed.shape
+        K = K_packed * pack_factor
+        device = packed.device
+
+        self.output_size_per_partition = N
+        self.input_size_per_partition = K
+        self.wtype = scalar_types.uint8b128 if num_bits == 8 else scalar_types.uint4b8
+
+        # Transpose packed weight: [N, K/pack] -> [K/pack, N] for gptq_marlin_repack
+        packed_t = packed.t().contiguous()
+        repacked = gptq_marlin_repack(
+            packed_t,
+            perm=torch.empty(0, dtype=torch.int32, device=device),
+            size_k=K,
+            size_n=N,
+            num_bits=num_bits,
+        )
+        layer.weight_packed = nn.Parameter(repacked, requires_grad=False)
+
+        # Transpose and permute scales: [N, num_groups] -> permuted [num_groups, N]
+        scale_t = scale.t().contiguous()
+        scale_perm = marlin_permute_scales(
+            scale_t,
+            size_k=K,
+            size_n=N,
+            group_size=group_size,
+        )
+        layer.weight_scale = nn.Parameter(scale_perm, requires_grad=False)
+
+        # Empty g_idx (no activation reordering) and weight_zp (symmetric)
+        layer.g_idx = marlin_make_empty_g_idx(device)
+        layer.g_idx_sort_indices = marlin_make_empty_g_idx(device)
+        layer.weight_zp = marlin_make_empty_g_idx(device)
+
+        # Workspace buffer
+        self.workspace = marlin_make_workspace(device)
+
+        # Remove the BF16 weight placeholder (no longer needed)
+        if hasattr(layer, "weight"):
+            delattr(layer, "weight")
+
+    def apply(self, layer: nn.Module, x: torch.Tensor, bias=None) -> torch.Tensor:
+        from sglang.srt.layers.quantization.marlin_utils import (
+            apply_gptq_marlin_linear,
+        )
+
+        return apply_gptq_marlin_linear(
+            input=x,
+            weight=layer.weight_packed,
+            weight_scale=layer.weight_scale,
+            weight_zp=layer.weight_zp,
+            g_idx=layer.g_idx,
+            g_idx_sort_indices=layer.g_idx_sort_indices,
+            workspace=self.workspace,
+            wtype=self.wtype,
+            output_size_per_partition=self.output_size_per_partition,
+            input_size_per_partition=self.input_size_per_partition,
+            is_k_full=True,
+            bias=bias,
+        )
+
+
 class BaseWelmQkvProjection(nn.Module):
     def __init__(
         self,
@@ -813,13 +979,6 @@ class BaseWelmQkvProjection(nn.Module):
         shard_layout: Tuple[str, ...] = ("q", "k", "v"),
     ) -> None:
         super().__init__()
-        if quant_config is not None:
-            logger.warning(
-                "WeLM qkv projection uses an unquantized custom module; ignoring "
-                "quant_config=%s for %s",
-                type(quant_config).__name__,
-                prefix,
-            )
         self.hidden_size = hidden_size
         self.head_dim = head_dim
         self.total_num_heads = total_num_heads
@@ -843,14 +1002,62 @@ class BaseWelmQkvProjection(nn.Module):
         self.output_size_per_partition = sum(
             self._get_local_shard_size(shard_id) for shard_id in self.shard_layout
         )
-        self.weight = nn.Parameter(
-            torch.empty(self.output_size_per_partition, self.hidden_size),
-            requires_grad=False,
-        )
-        set_weight_attrs(
-            self.weight,
-            {"input_dim": 1, "output_dim": 0, "weight_loader": self.weight_loader},
-        )
+
+        # bf16 weight consumed by forward / slicing / kv-mirror logic. When a
+        # weight-only INT4/INT8 (WNA16) scheme is active we register
+        # compressed-tensors packed buffers + a quant_method. Two strategies:
+        #   - Marlin path (_WelmQkvMarlinMethod): keeps INT8/INT4, true W8A16 kernel
+        #   - Dequant path (_WelmQkvDequantMethod): fallback, unpacks to bf16
+        self._wna16 = _get_welm_qkv_wna16_args(quant_config, self, prefix)
+        self._use_marlin_qkv = False
+        if self._wna16 is None:
+            self.weight = nn.Parameter(
+                torch.empty(self.output_size_per_partition, self.hidden_size),
+                requires_grad=False,
+            )
+            set_weight_attrs(
+                self.weight,
+                {"input_dim": 1, "output_dim": 0, "weight_loader": self.weight_loader},
+            )
+        else:
+            num_bits, group_size, _symmetric = self._wna16
+            pack_factor = 32 // num_bits
+            gs = group_size if group_size and group_size > 0 else self.hidden_size
+            assert self.hidden_size % pack_factor == 0 and self.hidden_size % gs == 0, (
+                f"hidden_size={self.hidden_size} must be divisible by pack_factor={pack_factor} "
+                f"and group_size={gs} for WNA16 qkv"
+            )
+            self.weight_packed = nn.Parameter(
+                torch.empty(
+                    self.output_size_per_partition, self.hidden_size // pack_factor, dtype=torch.int32
+                ),
+                requires_grad=False,
+            )
+            self.weight_scale = nn.Parameter(
+                torch.empty(self.output_size_per_partition, self.hidden_size // gs),
+                requires_grad=False,
+            )
+            # output-dim(0) sharded loaders; reuse the same shard-aware loader
+            # (packing/grouping lives on dim 1 / input, untouched by output sharding).
+            set_weight_attrs(self.weight_packed, {"output_dim": 0, "weight_loader": self.weight_loader})
+            set_weight_attrs(self.weight_scale, {"output_dim": 0, "weight_loader": self.weight_loader})
+
+            # Use Marlin kernel for true W8A16/W4A16 acceleration
+            use_marlin = os.environ.get("WELM_QKV_DEQUANT_FALLBACK", "0") != "1"
+            if use_marlin:
+                self._use_marlin_qkv = True
+                self.quant_method = _WelmQkvMarlinMethod(num_bits, gs)
+                # Placeholder weight for cases that need Q-only slice (NextnMirror)
+                # Will be removed by process_weights_after_loading
+                self.weight = nn.Parameter(
+                    torch.empty(0), requires_grad=False,
+                )
+            else:
+                self.weight = nn.Parameter(
+                    torch.empty(self.output_size_per_partition, self.hidden_size),
+                    requires_grad=False,
+                )
+                self.quant_method = _WelmQkvDequantMethod(num_bits, gs)
         if qkv_bias:
             self.bias = nn.Parameter(
                 torch.empty(self.output_size_per_partition),
@@ -873,7 +1080,19 @@ class BaseWelmQkvProjection(nn.Module):
         raise NotImplementedError
 
     def _apply_qkv(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if self._use_marlin_qkv:
+            return self.quant_method.apply(self, hidden_states, self.bias)
         return F.linear(hidden_states, self.weight, self.bias)
+
+    def _apply_q_only(self, hidden_states: torch.Tensor, q_size: int) -> torch.Tensor:
+        """Compute Q-only projection. In Marlin mode, does full GEMM then slices."""
+        if self._use_marlin_qkv:
+            # Full GEMM with bias, then slice out the Q portion
+            out = self.quant_method.apply(self, hidden_states, self.bias)
+            return out[..., :q_size]
+        q_weight = self.weight[:q_size, :]
+        q_bias = None if self.bias is None else self.bias[:q_size]
+        return F.linear(hidden_states, q_weight, q_bias)
 
     def _get_primary_kv_shard_names(self) -> Tuple[str, str]:
         if "k" in self.shard_layout and "v" in self.shard_layout:
@@ -964,7 +1183,53 @@ class BaseWelmQkvProjection(nn.Module):
         param_data.copy_(loaded_weight)
 
 
-class StandardQkvProjection(BaseWelmQkvProjection):
+class StandardQkvProjection(QKVParallelLinear):
+    """Standard (non kv-mirror) fused QKV projection.
+
+    Subclasses the stock ``QKVParallelLinear`` so it natively supports
+    compressed-tensors W4A16 / W8A16 (Marlin) in addition to bf16, reusing the
+    standard fused-QKV weight loading (q/k/v shards, GQA TP) and
+    ``process_weights_after_loading`` (Marlin repack). Only the forward is
+    customized to keep the WeLM projection signature and split the fused output.
+
+    Param names stay at ``<...>.qkv_proj.{weight|weight_packed|weight_scale|...}``
+    so the model's existing ``("qkv_proj", "q_proj", "q")`` stacked-params
+    mapping loads both bf16 and packed (int4/int8) checkpoints unchanged.
+
+    NOTE: ``params_dtype`` must be bf16/fp16 for the Marlin path (float32
+    silently produces garbage). welmv4 builds layers under the model dtype
+    (bf16), which satisfies this.
+    """
+
+    def __init__(
+        self,
+        *,
+        hidden_size: int,
+        head_dim: int,
+        total_num_heads: int,
+        total_num_kv_heads: int,
+        qkv_bias: bool,
+        quant_config: Optional[QuantizationConfig],
+        prefix: str,
+        tp_rank: int,
+        tp_size: int,
+        shard_layout: Tuple[str, ...] = ("q", "k", "v"),
+    ) -> None:
+        assert tuple(shard_layout) == ("q", "k", "v"), (
+            f"StandardQkvProjection only supports (q, k, v) layout, got {shard_layout}"
+        )
+        super().__init__(
+            hidden_size=hidden_size,
+            head_size=head_dim,
+            total_num_heads=total_num_heads,
+            total_num_kv_heads=total_num_kv_heads,
+            bias=qkv_bias,
+            quant_config=quant_config,
+            prefix=prefix,
+            tp_rank=tp_rank,
+            tp_size=tp_size,
+        )
+
     def forward(
         self,
         attn: "Qwen2MoeAttention",
@@ -972,8 +1237,8 @@ class StandardQkvProjection(BaseWelmQkvProjection):
         forward_batch: ForwardBatch,
         kv_mirror_states: Dict[int, Tuple[torch.Tensor, torch.Tensor]],
     ) -> WelmQkvProjectionOutput:
-        qkv = self._apply_qkv(hidden_states)
-        q, k, v = self._split_qkv(attn, qkv)
+        qkv, _ = QKVParallelLinear.forward(self, hidden_states)
+        q, k, v = qkv.split([attn.q_size, attn.kv_size, attn.kv_size], dim=-1)
         return q, k, v, hidden_states
 
 
@@ -1056,7 +1321,7 @@ class MirrorQProjection(BaseWelmQkvProjection):
         k, v = kv_activation
         if attn.need_clear_kv_cache:
             kv_mirror_states.clear()
-        q = F.linear(project_hidden_states, self.weight, self.bias)
+        q = self._apply_qkv(project_hidden_states)
         return q, k, v, project_hidden_states
 
 
@@ -1081,10 +1346,9 @@ class NextnMirrorQProjection(BaseWelmQkvProjection):
             q, k, v = self._split_qkv(attn, qkv)
             return q, k, v, hidden_states
 
-        q_weight = self.weight[: attn.q_size, :]
-        q_bias = None if self.bias is None else self.bias[: attn.q_size]
-
-        if forward_batch.forward_mode.is_decode():
+        if forward_batch.forward_mode.is_decode() and not getattr(
+            forward_batch, "welm_mtp_merge_kv_fill_draft", False
+        ):
             raise RuntimeError(
                 "WeLM MTP draft decode is not supported; use the merged "
                 "draft-extend path."
@@ -1122,7 +1386,10 @@ class NextnMirrorQProjection(BaseWelmQkvProjection):
             forward_batch.spec_info, "mirrored_kv_indices", None
         )
         if (
-            forward_batch.forward_mode.is_draft_extend(include_v2=True)
+            (
+                forward_batch.forward_mode.is_draft_extend(include_v2=True)
+                or getattr(forward_batch, "welm_mtp_merge_kv_fill_draft", False)
+            )
             and mirrored_kv_indices is not None
         ):
             if _WELM_MTP_DUMP_ENABLED:
@@ -1132,7 +1399,38 @@ class NextnMirrorQProjection(BaseWelmQkvProjection):
                 )
             k = k[mirrored_kv_indices]
             v = v[mirrored_kv_indices]
-        q = F.linear(project_hidden_states, q_weight, q_bias)
+        if (
+            getattr(forward_batch, "welm_mtp_merge_kv_fill_draft", False)
+            and _welm_should_contract_kv_mirror(forward_batch)
+            and project_hidden_states.shape[0] > 0
+            and k.shape[0] != project_hidden_states.shape[0]
+        ):
+            kv_fill_positions = getattr(
+                forward_batch, "welm_mtp_kv_fill_positions", None
+            )
+            has_full_kv_positions = (
+                kv_fill_positions is not None
+                and kv_fill_positions.shape[0] == k.shape[0]
+            )
+            if not has_full_kv_positions:
+                if k.shape[0] < project_hidden_states.shape[0]:
+                    raise RuntimeError(
+                        "WeLMV4 MTP merged mirror-KV rows are already more "
+                        "contracted than query rows: "
+                        f"k_rows={k.shape[0]} q_rows={project_hidden_states.shape[0]} "
+                        f"custom_last_rows={forward_batch.custom_last_index.numel()} "
+                        f"kv_mirror_output_size={forward_batch.kv_mirror_output_size}."
+                    )
+                first_contract = k.shape[0] != forward_batch.kv_mirror_output_size
+                k = _welm_select_kv_mirror_rows(
+                    k, forward_batch, first_contract=first_contract
+                )
+                v = _welm_select_kv_mirror_rows(
+                    v, forward_batch, first_contract=first_contract
+                )
+        if attn.need_clear_kv_cache:
+            kv_mirror_states.clear()
+        q = self._apply_q_only(project_hidden_states, attn.q_size)
         return q, k, v, project_hidden_states
 
 
@@ -1883,6 +2181,10 @@ class Qwen2MoeAttention(nn.Module):
         )
         self.gated_self_attention_headwise = True
         if self.gated_self_attention_headwise:
+            # NOTE: attn gate_proj stays bf16. Its output dim == num_heads (e.g. 24)
+            # is not a multiple of 64 so it cannot go through Marlin W4A16; and the
+            # inference gate weight is the per-head mean of the training-side gate
+            # rows (mean is linear), so a bf16 gate is consistent with training.
             self.gate_proj = ColumnParallelLinear(
                 hidden_size,
                 self.total_num_heads,
@@ -2051,8 +2353,25 @@ class Qwen2MoeAttention(nn.Module):
                             f"{last_query_positions.shape[0]} vs "
                             f"{forward_batch.custom_last_index.numel()}."
                         )
+                rotary_positions = positions
+                kv_fill_positions = getattr(
+                    forward_batch, "welm_mtp_kv_fill_positions", None
+                )
+                if (
+                    getattr(forward_batch, "welm_mtp_merge_kv_fill_draft", False)
+                    and kv_fill_positions is not None
+                    and k_for_rope.shape[0] != positions.shape[0]
+                ):
+                    if kv_fill_positions.shape[0] != k_for_rope.shape[0]:
+                        raise RuntimeError(
+                            "WeLMV4 MTP merged KV-fill positions shape mismatch: "
+                            f"{kv_fill_positions.shape[0]} vs {k_for_rope.shape[0]}."
+                        )
+                    rotary_positions = kv_fill_positions.to(
+                        device=positions.device, dtype=positions.dtype
+                    )
                 self.rotary_emb.forward_cuda(
-                    positions,
+                    rotary_positions,
                     q,
                     k_for_rope,
                     last_index=forward_batch.custom_last_index,
@@ -3203,12 +3522,20 @@ class WeLMV4MoeForCausalLM(nn.Module):
             except ValueError:
                 return False
             pair_shard_id = f"{base_shard}_{bank_idx}"
-            pair_param = (
-                pair_attn.qkv_proj.bias
-                if name.endswith(".bias")
-                else pair_attn.qkv_proj.weight
-            )
-            if pair_param is None:
+            pair_qkv = pair_attn.qkv_proj
+            if name.endswith(".bias"):
+                pair_param = pair_qkv.bias
+            elif name.endswith(".weight_packed"):
+                pair_param = getattr(pair_qkv, "weight_packed", None)
+            elif name.endswith(".weight_scale"):
+                pair_param = getattr(pair_qkv, "weight_scale", None)
+            elif name.endswith(".weight_shape"):
+                pair_param = getattr(pair_qkv, "weight_shape", None)
+            elif name.endswith(".weight"):
+                pair_param = pair_qkv.weight
+            else:
+                pair_param = None
+            if pair_param is None or not hasattr(pair_param, "weight_loader"):
                 return True
             pair_param.weight_loader(pair_param, loaded_weight, pair_shard_id)
             return True
@@ -3389,12 +3716,20 @@ class WeLMV4MoeForCausalLM(nn.Module):
                                 else f"v2_{bank_idx}"
                             )
                     if pair_shard_id is not None:
-                        pair_param = (
-                            pair_attn.qkv_proj.bias
-                            if name.endswith(".bias")
-                            else pair_attn.qkv_proj.weight
-                        )
-                        if pair_param is not None:
+                        pair_qkv = pair_attn.qkv_proj
+                        if name.endswith(".bias"):
+                            pair_param = pair_qkv.bias
+                        elif name.endswith(".weight_packed"):
+                            pair_param = getattr(pair_qkv, "weight_packed", None)
+                        elif name.endswith(".weight_scale"):
+                            pair_param = getattr(pair_qkv, "weight_scale", None)
+                        elif name.endswith(".weight_shape"):
+                            pair_param = getattr(pair_qkv, "weight_shape", None)
+                        elif name.endswith(".weight"):
+                            pair_param = pair_qkv.weight
+                        else:
+                            pair_param = None
+                        if pair_param is not None and hasattr(pair_param, "weight_loader"):
                             pair_param.weight_loader(
                                 pair_param,
                                 loaded_weight,
