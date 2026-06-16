@@ -19,6 +19,22 @@ if TYPE_CHECKING:
 
 
 _ENABLE_METRICS_DP_ATTENTION = envs.SGLANG_ENABLE_METRICS_DP_ATTENTION.get()
+_WELM_MTP_PREFILL_INFO_SHIFT = 32
+_WELM_MTP_PREFILL_INFO_REQ_MASK = (1 << _WELM_MTP_PREFILL_INFO_SHIFT) - 1
+
+
+def _pack_welm_mtp_prefill_info(prefill_num_tokens: int, num_reqs: int) -> int:
+    return (
+        int(prefill_num_tokens) << _WELM_MTP_PREFILL_INFO_SHIFT
+    ) | int(num_reqs)
+
+
+def _unpack_welm_mtp_prefill_info(value: int) -> tuple[int, int]:
+    value = int(value)
+    return (
+        value >> _WELM_MTP_PREFILL_INFO_SHIFT,
+        value & _WELM_MTP_PREFILL_INFO_REQ_MASK,
+    )
 
 
 @dataclass
@@ -29,16 +45,21 @@ class MLPSyncBatchInfo:
 
     num_tokens: int
     num_tokens_for_logprob: int
+    num_reqs: int
     can_cuda_graph: bool
     is_extend_in_batch: bool
     local_can_run_tbo: bool
     local_forward_mode: int
     has_router_replay: bool = False
+    welm_mtp_prefill_num_tokens: int = 0
 
     # some gathered elements
     tp0_info: torch.Tensor = None
     global_num_tokens: list[int] = None
     global_num_tokens_for_logprob: list[int] = None
+    global_num_reqs: list[int] = None
+    global_forward_modes: list[int] = None
+    welm_mtp_global_prefill_num_tokens: list[int] = None
     tbo_split_seq_index: torch.Tensor = None
     global_forward_mode: int = None
     dp_cooperation_info: Optional[DPCooperationInfo] = None
@@ -53,6 +74,10 @@ class MLPSyncBatchInfo:
                 int(self.local_can_run_tbo),
                 self.local_forward_mode,
                 int(self.has_router_replay),
+                _pack_welm_mtp_prefill_info(
+                    self.welm_mtp_prefill_num_tokens,
+                    self.num_reqs,
+                ),
             ],
             device=device,
             dtype=dtype,
@@ -68,6 +93,7 @@ class MLPSyncBatchInfo:
                 1,  # local_can_run_tbo
                 ForwardMode.IDLE.value,  # local_forward_mode
                 0,  # has_router_replay
+                _pack_welm_mtp_prefill_info(0, 0),  # welm_mtp_prefill_info
             ],
             device=device,
             dtype=dtype,
@@ -76,7 +102,7 @@ class MLPSyncBatchInfo:
     def all_gather(self, device, group: torch.distributed.ProcessGroup):
         local_info_tensor = self._get_local_tensor(device=device)
         global_info_tensor = torch.empty(
-            (self.dp_size, self.tp_size * self.cp_size, 7),
+            (self.dp_size, self.tp_size * self.cp_size, 8),
             dtype=torch.int64,
             device=device,
         )
@@ -92,15 +118,23 @@ class MLPSyncBatchInfo:
             tp_active_ranks = get_tp_group().active_ranks
 
         # Set fallback values for inactive ranks
-        tp_info = global_info_tensor.view(self.dp_size * self.tp_size * self.cp_size, 7)
+        tp_info = global_info_tensor.view(self.dp_size * self.tp_size * self.cp_size, 8)
         tp_info[tp_active_ranks == 0] = self._get_fallback_tensor(device=device)
 
         tp0_info = global_info_tensor[:, 0, :]
         self.tp0_info = tp0_info
         # Perform only one Device-to-Host (D2H) memory copy
-        cpu_data = tp0_info[:, :2].cpu()
+        cpu_data = tp0_info[:, [0, 1, 5, 7]].cpu()
         self.global_num_tokens = cpu_data[:, 0].tolist()
         self.global_num_tokens_for_logprob = cpu_data[:, 1].tolist()
+        self.global_forward_modes = cpu_data[:, 2].tolist()
+        prefill_info = [
+            _unpack_welm_mtp_prefill_info(value) for value in cpu_data[:, 3].tolist()
+        ]
+        self.welm_mtp_global_prefill_num_tokens = [
+            item[0] for item in prefill_info
+        ]
+        self.global_num_reqs = [item[1] for item in prefill_info]
         self.can_cuda_graph = bool(tp0_info[:, 2].min().item())
         self.is_extend_in_batch = bool(tp0_info[:, 3].max().item())
         self.has_router_replay = bool(tp0_info[:, 6].max().item())
@@ -146,12 +180,44 @@ def _update_gather_batch(
         batch.is_extend_in_batch = mlp_sync_info.is_extend_in_batch
         batch.tbo_split_seq_index = mlp_sync_info.tbo_split_seq_index
         batch.global_forward_mode = mlp_sync_info.global_forward_mode
+        batch.global_forward_modes = mlp_sync_info.global_forward_modes
+        batch.global_num_reqs = mlp_sync_info.global_num_reqs
+        batch.welm_mtp_global_prefill_num_tokens = (
+            mlp_sync_info.welm_mtp_global_prefill_num_tokens
+        )
 
     # Check forward mode for cuda graph
     batch.can_run_dp_cuda_graph = mlp_sync_info.can_cuda_graph
 
     if require_mlp_tp_gather and mlp_sync_info.has_router_replay:
         _ensure_router_replay_gather_inputs(batch, mlp_sync_info.num_tokens)
+
+
+def _is_welm_mtp_intermediate_prefill_chunk(req) -> bool:
+    if getattr(req, "is_chunked", 0) <= 0:
+        return False
+
+    fill_ids = getattr(req, "fill_ids", None)
+    origin_input_ids = getattr(req, "origin_input_ids", None)
+    if fill_ids is None or origin_input_ids is None:
+        return True
+
+    output_ids = getattr(req, "output_ids", ())
+    return len(fill_ids) < len(origin_input_ids) + len(output_ids)
+
+
+def _get_welm_mtp_prefill_num_tokens(local_batch: Optional[ScheduleBatch]) -> int:
+    if local_batch is None or not local_batch.forward_mode.is_extend():
+        return 0
+
+    reqs = getattr(local_batch, "reqs", None)
+    if not reqs:
+        return 0
+
+    if all(_is_welm_mtp_intermediate_prefill_chunk(req) for req in reqs):
+        return 0
+
+    return int(local_batch.extend_num_tokens or 0)
 
 
 def prepare_mlp_sync_batch_raw(
@@ -170,11 +236,14 @@ def prepare_mlp_sync_batch_raw(
     if local_batch is None or local_batch.forward_mode.is_prebuilt():
         num_tokens = 0
         num_tokens_for_logprob = 0
+        num_reqs = 0
     elif local_batch.forward_mode.is_decode():
         num_tokens = local_batch.batch_size()
         num_tokens_for_logprob = num_tokens
+        num_reqs = local_batch.batch_size()
     else:
         num_tokens = local_batch.extend_num_tokens
+        num_reqs = local_batch.batch_size()
         if local_batch.return_logprob:
             scale = getattr(local_batch, "scale_seq_factor", 1) or 1
             num_tokens_for_logprob = sum(
@@ -205,6 +274,7 @@ def prepare_mlp_sync_batch_raw(
             or local_batch.has_router_replay()
         )
     )
+    welm_mtp_prefill_num_tokens = _get_welm_mtp_prefill_num_tokens(local_batch)
 
     tbo_preparer = TboDPAttentionPreparer()
     if len(offload_tags) == 0 and (
@@ -225,11 +295,13 @@ def prepare_mlp_sync_batch_raw(
         cp_size=attn_cp_size,
         num_tokens=num_tokens,
         num_tokens_for_logprob=num_tokens_for_logprob,
+        num_reqs=num_reqs,
         can_cuda_graph=can_cuda_graph,
         is_extend_in_batch=is_extend_in_batch,
         local_can_run_tbo=local_can_run_tbo,
         local_forward_mode=local_forward_mode,
         has_router_replay=has_router_replay,
+        welm_mtp_prefill_num_tokens=welm_mtp_prefill_num_tokens,
     )
 
     if not skip_all_gather:

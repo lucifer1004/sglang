@@ -946,6 +946,30 @@ class WelmMTPDraftProposalCudaGraphRunner:
         topk_index = torch.gather(top_indices, dim=-1, index=sample_pos)
         return topk_p, topk_index, top_indices, probs
 
+    def _get_dp_cuda_graph_request_bs(
+        self,
+        forward_batch: ForwardBatch,
+    ) -> Optional[int]:
+        if not self.require_mlp_tp_gather:
+            return int(forward_batch.batch_size)
+
+        global_num_reqs = getattr(forward_batch, "global_num_reqs_cpu", None)
+        if global_num_reqs is not None:
+            if len(global_num_reqs) == 0:
+                return None
+            return max(int(count) for count in global_num_reqs)
+
+        # Topk tree proposals can have a different row width from scheduler
+        # token counts, so DP graph replay must use synchronized request counts.
+        if self.topk > 1:
+            return None
+
+        global_num_tokens = getattr(forward_batch, "global_num_tokens_cpu", None)
+        if global_num_tokens is None:
+            return None
+        max_num_tokens = max(int(count) for count in global_num_tokens)
+        return (max_num_tokens + self.num_tokens_per_bs - 1) // self.num_tokens_per_bs
+
     def can_run(self, forward_batch: ForwardBatch) -> bool:
         if not forward_batch.forward_mode.is_draft_extend(include_v2=True):
             return False
@@ -967,9 +991,9 @@ class WelmMTPDraftProposalCudaGraphRunner:
         if raw_bs == 0 and not self.require_mlp_sync:
             return False
         if self.require_mlp_tp_gather:
-            cuda_graph_bs = max(forward_batch.global_num_tokens_cpu) // (
-                self.num_tokens_per_bs
-            )
+            cuda_graph_bs = self._get_dp_cuda_graph_request_bs(forward_batch)
+            if cuda_graph_bs is None or cuda_graph_bs <= 0:
+                return False
         else:
             cuda_graph_bs = raw_bs
         is_bs_supported = (
@@ -1276,10 +1300,18 @@ class WelmMTPDraftProposalCudaGraphRunner:
         raw_bs = int(forward_batch.batch_size)
 
         if self.require_mlp_tp_gather:
-            max_num_tokens = max(forward_batch.global_num_tokens_cpu)
-            index = bisect.bisect_left(
-                self.capture_bs, max_num_tokens // self.num_tokens_per_bs
-            )
+            cuda_graph_bs = self._get_dp_cuda_graph_request_bs(forward_batch)
+            if cuda_graph_bs is None:
+                raise RuntimeError(
+                    "WeLM MTP draft proposal graph replay requires synchronized "
+                    "request counts when topk tree capacity differs from draft tokens."
+                )
+            if cuda_graph_bs <= 0:
+                raise RuntimeError(
+                    "WeLM MTP draft proposal graph replay got an empty global "
+                    "request count."
+                )
+            index = bisect.bisect_left(self.capture_bs, cuda_graph_bs)
         else:
             index = bisect.bisect_left(self.capture_bs, raw_bs)
         bs = self.capture_bs[index]

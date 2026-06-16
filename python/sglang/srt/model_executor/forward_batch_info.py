@@ -388,6 +388,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # Has to be None when cuda graph is captured.
     global_num_tokens_for_logprob_cpu: Optional[List[int]] = None
     global_num_tokens_for_logprob_gpu: Optional[torch.Tensor] = None
+    global_num_reqs_cpu: Optional[List[int]] = None
+    global_forward_modes: Optional[List[int]] = None
+    welm_mtp_global_prefill_num_tokens: Optional[List[int]] = None
     # The padding mode for DP attention
     dp_padding_mode: Optional[DpPaddingMode] = None
     # for extend, local start pos and num tokens is different in logits processor
@@ -484,6 +487,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             all_extend_in_batch=batch.all_extend_in_batch,
             can_run_dp_cuda_graph=batch.can_run_dp_cuda_graph,
             global_forward_mode=batch.global_forward_mode,
+            global_num_reqs_cpu=batch.global_num_reqs,
+            global_forward_modes=batch.global_forward_modes,
+            welm_mtp_global_prefill_num_tokens=(
+                batch.welm_mtp_global_prefill_num_tokens
+            ),
             router_replay_topk_ids=batch.router_replay_topk_ids,
             router_replay_mask=batch.router_replay_mask,
             is_prefill_only=batch.is_prefill_only,
@@ -1078,6 +1086,14 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
         if self.spec_info is not None and self.spec_info.is_draft_input():
             spec_info = self.spec_info
+            if getattr(self, "welm_mtp_merge_kv_fill_draft", False):
+                self.input_ids_backup = self.input_ids
+                self.positions_backup = self.positions
+                self.mrope_positions_backup = self.mrope_positions
+                if hasattr(self, "welm_oe_decode_hashed_inputs"):
+                    self.welm_oe_decode_hashed_inputs_backup = (
+                        self.welm_oe_decode_hashed_inputs
+                    )
             self.output_cache_loc_backup = self.out_cache_loc
             self.hidden_states_backup = spec_info.hidden_states
             # spec_info is EagleDraftInput | EagleDraftExtendInput; each carries
@@ -1095,8 +1111,17 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 spec_info.num_accept_tokens = self._pad_tensor_to_size(
                     spec_info.num_accept_tokens, bs
                 )
+            hidden_states_num_tokens = num_tokens
+            if (
+                getattr(self, "welm_mtp_merge_kv_fill_draft", False)
+                and spec_info.hidden_states is not None
+                and spec_info.hidden_states.shape[0] == self.batch_size
+            ):
+                # Merged WeLM MTP uses token rows to fill KV, but step>0 main
+                # hidden states are already contracted to one row per request.
+                hidden_states_num_tokens = bs
             spec_info.hidden_states = self._pad_tensor_to_size(
-                spec_info.hidden_states, num_tokens
+                spec_info.hidden_states, hidden_states_num_tokens
             )
 
     def prepare_attn_tp_scatter_input(self, model_runner: ModelRunner):
@@ -1130,12 +1155,14 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                     :num_tokens
                 ]
                 logits_output.hidden_states = logits_output.hidden_states[:num_tokens]
+                self._slice_model_specific_states(logits_output, num_tokens)
             elif self.forward_mode.is_target_verify():  # verify
                 num_tokens = bs * self.spec_info.draft_token_num
                 logits_output.next_token_logits = logits_output.next_token_logits[
                     :num_tokens
                 ]
                 logits_output.hidden_states = logits_output.hidden_states[:num_tokens]
+                self._slice_model_specific_states(logits_output, num_tokens)
             elif self.forward_mode.is_draft_extend():  # draft extend
                 self.spec_info.num_correct_drafts = self.spec_info.num_correct_drafts[
                     :bs
@@ -1143,23 +1170,45 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 self.spec_info.num_accept_tokens = self.spec_info.num_accept_tokens[:bs]
                 logits_output.next_token_logits = logits_output.next_token_logits[:bs]
                 logits_output.hidden_states = logits_output.hidden_states[:bs]
+                self._slice_model_specific_states(logits_output, bs)
             elif self.forward_mode.is_draft_extend_v2():  # draft extend_v2
                 bs = bs * self.spec_info.num_tokens_per_req
                 logits_output.next_token_logits = logits_output.next_token_logits[:bs]
                 logits_output.hidden_states = logits_output.hidden_states[:bs]
+                self._slice_model_specific_states(logits_output, bs)
             elif self.forward_mode.is_extend() or self.forward_mode.is_idle():
                 logits_output.next_token_logits = logits_output.next_token_logits[:bs]
                 logits_output.hidden_states = logits_output.hidden_states[:bs]
+                self._slice_model_specific_states(logits_output, bs)
 
             if hasattr(self, "hidden_states_backup"):
                 self.spec_info.hidden_states = self.hidden_states_backup
             if hasattr(self, "output_cache_loc_backup"):
                 self.out_cache_loc = self.output_cache_loc_backup
+            if hasattr(self, "input_ids_backup"):
+                self.input_ids = self.input_ids_backup
+            if hasattr(self, "positions_backup"):
+                self.positions = self.positions_backup
+            if hasattr(self, "mrope_positions_backup"):
+                self.mrope_positions = self.mrope_positions_backup
+            if hasattr(self, "welm_oe_decode_hashed_inputs_backup"):
+                self.welm_oe_decode_hashed_inputs = (
+                    self.welm_oe_decode_hashed_inputs_backup
+                )
+            for attr_name in (
+                "input_ids_backup",
+                "positions_backup",
+                "mrope_positions_backup",
+                "welm_oe_decode_hashed_inputs_backup",
+            ):
+                if hasattr(self, attr_name):
+                    delattr(self, attr_name)
 
         elif self.forward_mode.is_decode() or self.forward_mode.is_idle():
             logits_output.next_token_logits = logits_output.next_token_logits[:bs]
             if logits_output.hidden_states is not None:
                 logits_output.hidden_states = logits_output.hidden_states[:bs]
+            self._slice_model_specific_states(logits_output, bs)
         elif self.forward_mode.is_extend():
             num_tokens = self.seq_lens_sum
             logits_output.next_token_logits = logits_output.next_token_logits[
@@ -1167,6 +1216,38 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             ]
             if logits_output.hidden_states is not None:
                 logits_output.hidden_states = logits_output.hidden_states[:num_tokens]
+            self._slice_model_specific_states(logits_output, num_tokens)
+
+    @staticmethod
+    def _slice_model_specific_states(
+        logits_output: LogitsProcessorOutput, num_tokens: int
+    ) -> None:
+        model_specific_states = logits_output.model_specific_states
+        if model_specific_states is None:
+            return
+
+        kv_mirror_states = model_specific_states.get("welm_kv_mirror_states")
+        if not isinstance(kv_mirror_states, dict):
+            return
+
+        num_tokens = int(num_tokens)
+        model_specific_states = dict(model_specific_states)
+        model_specific_states["welm_kv_mirror_states"] = {
+            layer_idx: tuple(
+                (
+                    tensor[:num_tokens]
+                    if (
+                        isinstance(tensor, torch.Tensor)
+                        and tensor.shape
+                        and tensor.shape[0] >= num_tokens
+                    )
+                    else tensor
+                )
+                for tensor in tensors
+            )
+            for layer_idx, tensors in kv_mirror_states.items()
+        }
+        logits_output.model_specific_states = model_specific_states
 
     @property
     def can_run_tbo(self):
