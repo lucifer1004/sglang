@@ -569,6 +569,9 @@ class Envs:
     SGLANG_PLATFORM = EnvStr("")
     SGLANG_PLUGINS = EnvStr("")
 
+    # WeLM related environment variables
+    WELM_ALLOW_PARTIAL_MTP_LOAD = EnvBool(False) # Skip mtp layer integration check. Useful for RL.
+
 
 envs = Envs()
 EnvField._allow_set_name = False

@@ -106,6 +106,7 @@ from sglang.srt.utils import (
     make_layers,
     set_weight_attrs,
 )
+from sglang.srt.environ import Envs
 
 logger = logging.getLogger(__name__)
 
@@ -3853,7 +3854,7 @@ class WeLMV4MoeForCausalLM(nn.Module):
         if is_nextn and is_welm_mtp_nextn:
             missing_projector_steps = expected_nextn_steps - seen_nextn_projector_steps
             missing_decoder_steps = expected_nextn_steps - seen_nextn_decoder_steps
-            if missing_projector_steps or missing_decoder_steps:
+            if not Envs.WELM_ALLOW_PARTIAL_MTP_LOAD.get() and (missing_projector_steps or missing_decoder_steps):
                 raise ValueError(
                     "WeLM MTP checkpoint layout does not match "
                     "num_nextn_predict_layers. "
