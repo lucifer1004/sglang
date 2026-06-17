@@ -666,7 +666,7 @@ class EagleVerifyInputV2Mixin:
         else:
             if getattr(sampling_info, "sampling_seed", None) is not None:
                 verify_base_positions = welm_mtp_batch_base_positions(
-                    getattr(batch, "positions", None),
+                    self.positions,
                     batch_size=bs,
                     draft_token_num=self.draft_token_num,
                 )

@@ -93,6 +93,7 @@ from sglang.srt.utils.common import (
 from sglang.srt.speculative.welmv4_mtp_draft_proposal_cuda_graph_runner import (
     WelmMTPDraftProposalCudaGraphRunner,
 )
+from sglang.srt.speculative.welmv4_mtp_sampling import welm_mtp_deterministic_uniforms
 from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
 
 if TYPE_CHECKING:
@@ -1302,11 +1303,56 @@ class EagleDraftWorker(BaseDraftWorker):
             device=logits.device, dtype=torch.float32
         )
 
+    def _get_welmv4_mtp_draft_uniform(
+        self,
+        forward_batch: ForwardBatch,
+        *,
+        device: torch.device,
+        batch_size: int,
+        base_positions: Optional[torch.Tensor],
+        step: int,
+    ) -> Optional[torch.Tensor]:
+        sampling_info = forward_batch.sampling_info
+        if (
+            sampling_info is None
+            or getattr(sampling_info, "sampling_seed", None) is None
+        ):
+            return None
+        if base_positions is None:
+            base_positions = self._get_welmv4_mtp_base_positions(forward_batch)
+        deterministic_uniforms = welm_mtp_deterministic_uniforms(
+            sampling_info=sampling_info,
+            positions=base_positions,
+            batch_size=batch_size,
+            width=1,
+            salt=3000 + int(step),
+        )
+        if deterministic_uniforms is None:
+            return None
+        return deterministic_uniforms[:, :1].to(device=device, dtype=torch.float32)
+
     def _sample_welmv4_mtp_probs_top1(
         self,
         probs: torch.Tensor,
+        forward_batch: ForwardBatch,
+        *,
+        base_positions: Optional[torch.Tensor] = None,
+        step: int = 0,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        topk_index = torch.multinomial(probs, num_samples=1)
+        uniform = self._get_welmv4_mtp_draft_uniform(
+            forward_batch,
+            device=probs.device,
+            batch_size=int(probs.shape[0]),
+            base_positions=base_positions,
+            step=step,
+        )
+        if uniform is None:
+            topk_index = torch.multinomial(probs, num_samples=1)
+        else:
+            cdf = torch.cumsum(probs.to(torch.float32), dim=-1)
+            threshold = uniform * cdf[:, -1:]
+            topk_index = torch.sum(cdf < threshold, dim=-1, keepdim=True).to(torch.long)
+            topk_index = torch.clamp(topk_index, max=probs.shape[-1] - 1)
         topk_p = torch.gather(probs, dim=1, index=topk_index)
 
         tp_group = (
@@ -1323,6 +1369,9 @@ class EagleDraftWorker(BaseDraftWorker):
         self,
         logits: torch.Tensor,
         forward_batch: ForwardBatch,
+        *,
+        base_positions: Optional[torch.Tensor] = None,
+        step: int = 0,
     ) -> Tuple[
         torch.Tensor,
         torch.Tensor,
@@ -1357,7 +1406,12 @@ class EagleDraftWorker(BaseDraftWorker):
                 top_ps = self._get_welmv4_mtp_draft_top_p(forward_batch, top_logits)
                 probs = top_p_renorm_prob(probs, top_ps)
 
-            topk_p, topk_pos = self._sample_welmv4_mtp_probs_top1(probs)
+            topk_p, topk_pos = self._sample_welmv4_mtp_probs_top1(
+                probs,
+                forward_batch,
+                base_positions=base_positions,
+                step=step,
+            )
             topk_index = torch.gather(top_indices, dim=-1, index=topk_pos)
             tp_group = (
                 get_attention_tp_group()
@@ -1384,11 +1438,21 @@ class EagleDraftWorker(BaseDraftWorker):
             top_ps = self._get_welmv4_mtp_draft_top_p(forward_batch, logits)
             probs = top_p_renorm_prob(probs, top_ps)
 
-        topk_p, topk_index = self._sample_welmv4_mtp_probs_top1(probs)
+        topk_p, topk_index = self._sample_welmv4_mtp_probs_top1(
+            probs,
+            forward_batch,
+            base_positions=base_positions,
+            step=step,
+        )
         return topk_p, topk_index, probs.contiguous(), None, None
 
     def _select_or_sample_welmv4_mtp_draft_topk(
-        self, logits: torch.Tensor, forward_batch: ForwardBatch
+        self,
+        logits: torch.Tensor,
+        forward_batch: ForwardBatch,
+        *,
+        base_positions: Optional[torch.Tensor] = None,
+        step: int = 0,
     ) -> Tuple[
         torch.Tensor,
         torch.Tensor,
@@ -1397,7 +1461,12 @@ class EagleDraftWorker(BaseDraftWorker):
         Optional[torch.Tensor],
     ]:
         if self._should_sample_welmv4_mtp_draft(forward_batch):
-            return self._sample_welmv4_mtp_draft_top1(logits, forward_batch)
+            return self._sample_welmv4_mtp_draft_top1(
+                logits,
+                forward_batch,
+                base_positions=base_positions,
+                step=step,
+            )
 
         topk_p, topk_index = self._select_welmv4_mtp_draft_topk(logits, forward_batch)
         return topk_p, topk_index, None, None, None
@@ -2550,7 +2619,10 @@ class EagleDraftWorker(BaseDraftWorker):
                         draft_topk_indices,
                         draft_topk_values,
                     ) = self._select_or_sample_welmv4_mtp_draft_topk(
-                        logits_output.next_token_logits, forward_batch
+                        logits_output.next_token_logits,
+                        forward_batch,
+                        base_positions=base_positions,
+                        step=step,
                     )
                 else:
                     (

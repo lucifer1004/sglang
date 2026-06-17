@@ -745,9 +745,9 @@ class WelmMTPDraftProposalCudaGraphRunner:
             sampling_info is not None
             and getattr(sampling_info, "sampling_seed", None) is not None
         ):
-            base_positions = self.buffers.positions[
-                self.buffers.custom_last_index[:raw_bs]
-            ]
+            base_positions = (forward_batch.seq_lens[:raw_bs] - 1).to(
+                dtype=self.buffers.positions.dtype
+            )
             deterministic_uniforms = welm_mtp_deterministic_uniforms(
                 sampling_info=sampling_info,
                 positions=base_positions,
