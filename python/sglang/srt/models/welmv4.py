@@ -2544,7 +2544,13 @@ class Qwen2MoeAttention(nn.Module):
             if need_attn_tp_reduce_for_o_norm:
                 output = attention_tensor_model_parallel_all_reduce(output)
             if welm_use_previous_precision():
-                output = self.o_norm(output)
+                # Match the v0.5.6 previous-precision baseline. The native
+                # PyTorch path avoids sgl_kernel.rmsnorm rounding differences
+                # across image builds.
+                if isinstance(self.o_norm, RMSNorm):
+                    output = self.o_norm.forward_native(output)
+                else:
+                    output = self.o_norm(output)
             else:
                 output, _ = self.o_norm(output)
             if self.o_norm_needs_attn_tp_reduce and self.attn_tp_rank != 0:
