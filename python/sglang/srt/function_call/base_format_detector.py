@@ -50,6 +50,7 @@ class BaseFormatDetector(ABC):
         # Critical for serving layer to calculate remaining content when streaming ends.
         # Each index corresponds to a tool_id. Example: ['{"location": "San Francisco"', '{"temp": 72']
         self.streamed_args_for_tool: List[str] = []
+        self._logged_unknown_tool_names: set[str] = set()
 
         # Token configuration (override in subclasses)
         self.bot_token = ""
@@ -215,15 +216,24 @@ class BaseFormatDetector(ABC):
                     current_text[start_idx : start_idx + end_idx]
                 )
 
-                # Validate tool name if present
+                # Validate tool name if present. Unknown tools are dropped by
+                # default, but can be forwarded for compatibility with
+                # non-streaming parsing when explicitly enabled.
                 if "name" in obj and obj["name"] not in self._tool_indices:
-                    # Invalid tool name - reset state
-                    self._buffer = ""
-                    self.current_tool_id = -1
-                    self.current_tool_name_sent = False
-                    if self.streamed_args_for_tool:
-                        self.streamed_args_for_tool.pop()
-                    return StreamingParseResult()
+                    unknown_name = obj["name"]
+                    if unknown_name not in self._logged_unknown_tool_names:
+                        logger.warning(
+                            f"Model attempted to call undefined function: {unknown_name}"
+                        )
+                        self._logged_unknown_tool_names.add(unknown_name)
+                    if not envs.SGLANG_FORWARD_UNKNOWN_TOOLS.get():
+                        # Invalid tool name - reset state
+                        self._buffer = ""
+                        self.current_tool_id = -1
+                        self.current_tool_name_sent = False
+                        if self.streamed_args_for_tool:
+                            self.streamed_args_for_tool.pop()
+                        return StreamingParseResult()
 
                 # Handle parameters/arguments consistency
                 # NOTE: we assume here that the obj is always partial of a single tool call
@@ -246,7 +256,10 @@ class BaseFormatDetector(ABC):
             if not self.current_tool_name_sent:
                 function_name = current_tool_call.get("name")
 
-                if function_name and function_name in self._tool_indices:
+                if function_name and (
+                    function_name in self._tool_indices
+                    or envs.SGLANG_FORWARD_UNKNOWN_TOOLS.get()
+                ):
                     # If this is a new tool (current_tool_id was -1), initialize it
                     if self.current_tool_id == -1:
                         self.current_tool_id = 0
