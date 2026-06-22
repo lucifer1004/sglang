@@ -36,6 +36,7 @@ from sglang.srt.managers.io_struct import (
 from sglang.srt.managers.multi_tokenizer_mixin import MultiHttpWorkerDetokenizerMixin
 from sglang.srt.observability.cpu_monitor import start_cpu_monitor_thread
 from sglang.srt.server_args import PortArgs, ServerArgs
+from sglang.srt.state_capturer.routed_experts import encode_routed_experts_payload
 from sglang.srt.utils import (
     configure_logger,
     freeze_gc,
@@ -80,7 +81,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
         port_args: PortArgs,
     ):
         # Init inter-process communication
-        self.init_ipc_channels(port_args)
+        self.init_ipc_channels(port_args, server_args)
 
         # Init tokenizer
         self.init_tokenizer(server_args)
@@ -91,14 +92,18 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
         # Init dispatcher
         self.init_request_dispatcher()
 
-    def init_ipc_channels(self, port_args: PortArgs):
+    def init_ipc_channels(self, port_args: PortArgs, server_args: ServerArgs):
         context = zmq.Context(2)
         self.recv_from_scheduler = get_zmq_socket(
             context, zmq.PULL, port_args.detokenizer_ipc_name, True
         )
-        self.send_to_tokenizer = get_zmq_socket(
-            context, zmq.PUSH, port_args.tokenizer_ipc_name, False
-        )
+        # In multi-tokenizer mode, results are pushed back to each TokenizerWorker
+        # directly via SocketMapping inside multi_http_worker_event_loop, so the
+        # single send_to_tokenizer socket is unused.
+        if server_args.tokenizer_worker_num == 1:
+            self.send_to_tokenizer = get_zmq_socket(
+                context, zmq.PUSH, port_args.tokenizer_ipc_name, False
+            )
 
     def init_tokenizer(self, server_args: ServerArgs):
         if server_args.skip_tokenizer_init:
@@ -332,10 +337,6 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
         """
         if data_list is None:
             return None
-        from sglang.srt.layers.moe.routed_experts_capturer import (
-            encode_routed_experts_payload,
-        )
-
         return [
             encode_routed_experts_payload(item) if item is not None else None
             for item in data_list
@@ -353,6 +354,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             if self.routed_experts_store_dsn
             else self._b64_encode_per_request(recv_obj.routed_experts)
         )
+        indexer_topk = self._b64_encode_per_request(recv_obj.indexer_topk)
         return BatchStrOutput(
             rids=recv_obj.rids,
             http_worker_ipcs=recv_obj.http_worker_ipcs,
@@ -365,8 +367,8 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             cached_tokens=recv_obj.cached_tokens,
             cached_tokens_details=recv_obj.cached_tokens_details,
             spec_verify_ct=recv_obj.spec_verify_ct,
-            spec_accepted_drafts=recv_obj.spec_accepted_drafts,
-            spec_acceptance_histogram=recv_obj.spec_acceptance_histogram,
+            spec_num_correct_drafts=recv_obj.spec_num_correct_drafts,
+            spec_correct_drafts_histogram=recv_obj.spec_correct_drafts_histogram,
             input_token_logprobs_val=recv_obj.input_token_logprobs_val,
             input_token_logprobs_idx=recv_obj.input_token_logprobs_idx,
             output_token_logprobs_val=recv_obj.output_token_logprobs_val,
@@ -382,6 +384,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             output_token_entropy_val=recv_obj.output_token_entropy_val,
             output_hidden_states=recv_obj.output_hidden_states,
             routed_experts=routed_experts,
+            indexer_topk=indexer_topk,
             customized_info=recv_obj.customized_info,
             placeholder_tokens_idx=None,
             placeholder_tokens_val=None,

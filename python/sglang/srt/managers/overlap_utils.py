@@ -86,7 +86,7 @@ class FutureMap:
         # Get a reference for each tensor
         topk_p0 = draft_input.topk_p[0]
         topk_index0 = draft_input.topk_index[0]
-        verified_id0 = draft_input.verified_id[0]
+        bonus_tokens0 = draft_input.bonus_tokens[0]
         new_seq_lens0 = draft_input.new_seq_lens[0]
 
         self.topk_p_buf = torch.empty(
@@ -99,9 +99,9 @@ class FutureMap:
             dtype=topk_index0.dtype,
             device=self.device,
         )
-        self.verified_id_buf = torch.empty(
-            (self.future_buffer_len, *verified_id0.shape),
-            dtype=verified_id0.dtype,
+        self.bonus_tokens_buf = torch.empty(
+            (self.future_buffer_len, *bonus_tokens0.shape),
+            dtype=bonus_tokens0.dtype,
             device=self.device,
         )
         self.new_seq_lens_buf = torch.empty(
@@ -267,7 +267,7 @@ class FutureMap:
             indices.record_stream(torch.get_device_module(self.device).current_stream())
             draft_input.topk_p = self.topk_p_buf[indices]
             draft_input.topk_index = self.topk_index_buf[indices]
-            draft_input.verified_id = self.verified_id_buf[indices]
+            draft_input.bonus_tokens = self.bonus_tokens_buf[indices]
             draft_input.new_seq_lens = self.new_seq_lens_buf[indices]
             if hasattr(self, "welm_mtp_deferred_prefill_draft_buf"):
                 draft_input.welm_mtp_deferred_prefill_draft_mask = (
@@ -390,7 +390,7 @@ class FutureMap:
 
         self.topk_p_buf[intv] = draft_input.topk_p
         self.topk_index_buf[intv] = draft_input.topk_index
-        self.verified_id_buf[intv] = draft_input.verified_id
+        self.bonus_tokens_buf[intv] = draft_input.bonus_tokens
         self.new_seq_lens_buf[intv] = draft_input.new_seq_lens
         deferred_mask = getattr(
             draft_input, "welm_mtp_deferred_prefill_draft_mask", None

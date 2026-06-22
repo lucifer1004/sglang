@@ -29,7 +29,6 @@ WELM_OE_FUSED_DECODE_GEMM_ENV = "SGLANG_WELM_OE_FUSED_DECODE_GEMM"
 WELM_OE_IMPL_FUSED_NGRAM_HASH = "fused_ngram_hash"
 WELM_OE_HASH_INCOMPATIBLE_ENVS = (
     "SGLANG_DUMP_ACTIVATIONS",
-    "WELM_USE_PREVIOUS_PRECISION",
 )
 SPECIALIZED_WELM_OE_GRAMS = (2, 2, 3, 3)
 SPECIALIZED_WELM_OE_BRANCHES = 4
@@ -257,12 +256,25 @@ def fill_welm_oe_hash_inputs(
 
     if forward_mode is not None and forward_mode.is_decode():
         num_segments = input_ids.numel()
+        real_segments = len(prefix_rows[0]) if prefix_rows else 0
         for row in prefix_rows:
-            if len(row) != num_segments:
+            if len(row) != real_segments:
                 raise RuntimeError(
-                    "WeLM OE hash prefix rows must match decode tokens: "
-                    f"{len(row)} vs {num_segments}."
+                    "WeLM OE hash prefix rows must be uniform: "
+                    f"{len(row)} vs {real_segments}."
                 )
+        if real_segments > num_segments:
+            raise RuntimeError(
+                "WeLM OE hash prefix rows exceed decode tokens: "
+                f"{real_segments} vs {num_segments}."
+            )
+        if real_segments < num_segments:
+            # AttnDP/MLP sync may pad input_ids for communication alignment.
+            # Pad prefix rows with zeros so the kernel can iterate the full
+            # padded length, then zero out the padding region of hashed_out
+            # so synthetic padding tokens contribute zeroed hash buckets.
+            pad_count = num_segments - real_segments
+            prefix_rows = [row + [0] * pad_count for row in prefix_rows]
         welm_oe_hash_decode_from_prefixes_cuda(
             input_ids,
             _flatten_hash_prefixes(prefix_rows),
@@ -271,6 +283,8 @@ def fill_welm_oe_hash_inputs(
             hashed_out,
             vocab_size,
         )
+        if real_segments < num_segments:
+            hashed_out[:, real_segments:].zero_()
         return
 
     extend_start_loc = getattr(forward_batch, "extend_start_loc", None)

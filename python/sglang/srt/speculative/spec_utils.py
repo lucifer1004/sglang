@@ -4,7 +4,7 @@ import logging
 import os
 import time
 from contextlib import contextmanager
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 import torch
 import triton
@@ -56,17 +56,233 @@ def spec_need_hidden_states(server_args: Optional[ServerArgs] = None) -> bool:
     if server_args is None:
         server_args = get_global_server_args()
 
-    # TODO(lsyin): also skip when 1) step = 1 or 2) standalone draft model
+    # STANDALONE drafts don't consume `spec_info.hidden_states` (vanilla LLM).
+    # multi_layer_eagle handles hidden_states internally, not via FutureMap.
+    # TODO(lsyin): also skip when step == 1.
+    if server_args.speculative_algorithm == "STANDALONE":
+        return False
     return not server_args.enable_multi_layer_eagle
+
+
+def uses_welmv4_nextn_draft(model_runner) -> bool:
+    hf_config = getattr(getattr(model_runner, "model_config", None), "hf_config", None)
+    archs = getattr(hf_config, "architectures", None) or []
+    return archs[:1] == ["WeLMV4MoeForCausalLMNextN"]
+
+
+def mark_welmv4_mtp_draft_decode(forward_batch, model_runner) -> None:
+    if uses_welmv4_nextn_draft(model_runner) and forward_batch.forward_mode.is_decode():
+        forward_batch.welm_mtp_use_base_kv_cache = True
+
+
+WELMV4_KV_MIRROR_STATES_KEY = "welm_kv_mirror_states"
+
+
+def _get_welmv4_mtp_mirror_imitated_layers(model_runner) -> List[int]:
+    hf_config = getattr(getattr(model_runner, "model_config", None), "hf_config", None)
+    num_hidden_layers = getattr(hf_config, "num_hidden_layers", 0)
+    num_nextn_predict_layers = getattr(hf_config, "num_nextn_predict_layers", 0)
+    mirror_layers = getattr(hf_config, "kv_mirror_layers", []) or []
+    imitated_layers = getattr(hf_config, "kv_mirror_imitated_layers", []) or []
+    layers = []
+    for mirror, imitated in zip(mirror_layers, imitated_layers):
+        mirror = int(mirror)
+        imitated = int(imitated)
+        if (
+            num_hidden_layers <= mirror < num_hidden_layers + num_nextn_predict_layers
+            and 0 <= imitated < num_hidden_layers
+        ):
+            layers.append(imitated)
+    return layers
+
+
+def get_welmv4_mtp_kv_mirror_tensor_size(model_runner) -> int:
+    hf_config = getattr(getattr(model_runner, "model_config", None), "hf_config", None)
+    if hf_config is None:
+        return 0
+
+    num_attention_heads = getattr(hf_config, "num_attention_heads")
+    num_key_value_heads = getattr(hf_config, "num_key_value_heads")
+    head_dim = getattr(
+        hf_config,
+        "head_dim",
+        model_runner.model_config.hidden_size // num_attention_heads,
+    )
+    return max(1, num_key_value_heads // model_runner.tp_size) * head_dim
+
+
+def make_welmv4_mtp_kv_mirror_state_buffers(
+    model_runner,
+    max_rows: int,
+) -> Dict[str, torch.Tensor]:
+    if not uses_welmv4_nextn_draft(model_runner):
+        return {}
+
+    tensor_size = get_welmv4_mtp_kv_mirror_tensor_size(model_runner)
+    if tensor_size <= 0:
+        return {}
+
+    buffers = {}
+    dtype = model_runner.model_config.dtype
+    device = model_runner.device
+    for layer_idx in _get_welmv4_mtp_mirror_imitated_layers(model_runner):
+        buffers[f"{layer_idx}.k"] = torch.zeros(
+            (max_rows, tensor_size), dtype=dtype, device=device
+        )
+        buffers[f"{layer_idx}.v"] = torch.zeros(
+            (max_rows, tensor_size), dtype=dtype, device=device
+        )
+    return buffers
+
+
+def build_welmv4_mtp_model_specific_states(
+    buffers: Optional[Dict[str, torch.Tensor]],
+    rows: int,
+) -> Optional[Dict[str, Dict[int, Tuple[torch.Tensor, torch.Tensor]]]]:
+    if not buffers:
+        return None
+
+    kv_mirror_states = {}
+    for key, tensor in buffers.items():
+        layer_idx, suffix = key.split(".", 1)
+        pair = kv_mirror_states.setdefault(int(layer_idx), [None, None])
+        pair[0 if suffix == "k" else 1] = tensor[:rows]
+
+    kv_mirror_states = {
+        layer_idx: (k, v)
+        for layer_idx, (k, v) in kv_mirror_states.items()
+        if k is not None and v is not None
+    }
+    if not kv_mirror_states:
+        return None
+    return {WELMV4_KV_MIRROR_STATES_KEY: kv_mirror_states}
+
+
+def copy_welmv4_mtp_kv_mirror_states_to_buffers(
+    dst_buffers: Optional[Dict[str, torch.Tensor]],
+    model_specific_states,
+    rows: int,
+) -> None:
+    if not dst_buffers:
+        return
+
+    for buffer in dst_buffers.values():
+        if buffer.shape[0] > rows:
+            buffer[rows:].zero_()
+
+    kv_mirror_states = (model_specific_states or {}).get(WELMV4_KV_MIRROR_STATES_KEY)
+    if not isinstance(kv_mirror_states, dict):
+        for buffer in dst_buffers.values():
+            buffer[:rows].zero_()
+        return
+
+    for key, dst in dst_buffers.items():
+        layer_idx, suffix = key.split(".", 1)
+        tensors = kv_mirror_states.get(int(layer_idx))
+        if not tensors:
+            dst[:rows].zero_()
+            continue
+        src = tensors[0 if suffix == "k" else 1]
+        if not isinstance(src, torch.Tensor):
+            dst[:rows].zero_()
+            continue
+        dst[:rows].copy_(src[:rows])
+
+
+def slice_welmv4_mtp_kv_mirror_states(model_specific_states, indices=None):
+    if not model_specific_states:
+        return None
+
+    kv_mirror_states = model_specific_states.get(WELMV4_KV_MIRROR_STATES_KEY)
+    if not isinstance(kv_mirror_states, dict):
+        return None
+
+    sliced_states = {}
+    for layer_idx, tensors in kv_mirror_states.items():
+        if not isinstance(tensors, (tuple, list)) or len(tensors) != 2:
+            continue
+        k, v = tensors
+        if not isinstance(k, torch.Tensor) or not isinstance(v, torch.Tensor):
+            continue
+        if indices is None:
+            sliced_states[int(layer_idx)] = (k, v)
+        else:
+            sliced_states[int(layer_idx)] = (k[indices], v[indices])
+
+    if not sliced_states:
+        return None
+
+    ret = dict(model_specific_states)
+    ret[WELMV4_KV_MIRROR_STATES_KEY] = sliced_states
+    return ret
+
+
+def concat_welmv4_mtp_kv_mirror_states(lhs, rhs):
+    lhs_kv = (lhs or {}).get(WELMV4_KV_MIRROR_STATES_KEY)
+    rhs_kv = (rhs or {}).get(WELMV4_KV_MIRROR_STATES_KEY)
+    if not isinstance(lhs_kv, dict):
+        return rhs
+    if not isinstance(rhs_kv, dict):
+        return lhs
+
+    merged = {}
+    for layer_idx, lhs_tensors in lhs_kv.items():
+        rhs_tensors = rhs_kv.get(layer_idx)
+        if not rhs_tensors:
+            continue
+        lhs_k, lhs_v = lhs_tensors
+        rhs_k, rhs_v = rhs_tensors
+        if not all(isinstance(t, torch.Tensor) for t in (lhs_k, lhs_v, rhs_k, rhs_v)):
+            continue
+        merged[int(layer_idx)] = (
+            torch.cat([lhs_k, rhs_k], dim=0),
+            torch.cat([lhs_v, rhs_v], dim=0),
+        )
+    if not merged:
+        return lhs
+
+    ret = dict(lhs)
+    ret[WELMV4_KV_MIRROR_STATES_KEY] = merged
+    return ret
+
+
+def refresh_welmv4_mtp_oe_context_for_draft_extend(
+    batch,
+    input_ids: torch.Tensor,
+    extend_lens: List[int],
+    extend_num_tokens: Optional[int] = None,
+) -> None:
+    oe_context = getattr(batch, "oe_context", None)
+    if oe_context is None or not getattr(oe_context, "input_ids_grams", None):
+        return
+
+    if extend_num_tokens is None:
+        extend_num_tokens = sum(extend_lens)
+
+    resized_grams = []
+    for gram in oe_context.input_ids_grams:
+        if gram is None:
+            resized_grams.append(None)
+            continue
+        if gram.shape[0] < extend_num_tokens:
+            gram = torch.cat(
+                [gram, gram.new_zeros(extend_num_tokens - gram.shape[0])],
+                dim=0,
+            )
+        else:
+            gram = gram[:extend_num_tokens]
+        resized_grams.append(gram)
+    oe_context.input_ids_grams = resized_grams
+    oe_context.refresh_for_draft_extend(input_ids, extend_lens)
 
 
 @triton.jit
 def create_extend_after_decode_spec_info(
-    verified_id,
+    accept_tokens,
     seq_lens,
     accept_lens,
     positions,
-    new_verified_id,
+    bonus_tokens_ptr,
     bs_upper: tl.constexpr,
 ):
     pid = tl.program_id(axis=0)
@@ -83,8 +299,8 @@ def create_extend_after_decode_spec_info(
     tl.store(positions_ptr + offsets, seq_length - accept_len + offsets, mask)
 
     accept_len_cumsum += accept_len - 1
-    verified_id_data = tl.load(verified_id + accept_len_cumsum)
-    tl.store(new_verified_id + pid, verified_id_data)
+    bonus_token = tl.load(accept_tokens + accept_len_cumsum)
+    tl.store(bonus_tokens_ptr + pid, bonus_token)
 
 
 @triton.jit
@@ -361,7 +577,7 @@ def align_evict_mask_to_page_size(
 def get_target_cache_loc(
     tgt_cache_loc,
     to_free_slots,
-    num_accepted_drafts,
+    num_correct_drafts,
     to_free_num_slots,
     out_cache_loc,
     num_verify_tokens: tl.constexpr,
@@ -373,9 +589,9 @@ def get_target_cache_loc(
     bs_offset = tl.arange(0, bs_upper)
 
     # write the first part to tgt_cache_loc
-    accept_len_all = tl.load(num_accepted_drafts + bs_offset, mask=bs_offset < bid)
+    accept_len_all = tl.load(num_correct_drafts + bs_offset, mask=bs_offset < bid)
     tgt_cache_loc_start = tl.sum(accept_len_all) + bid
-    copy_len = tl.load(num_accepted_drafts + bid) + 1
+    copy_len = tl.load(num_correct_drafts + bid) + 1
     out_cache_loc_row = tl.load(
         out_cache_loc + bid * num_verify_tokens + offset, mask=offset < copy_len
     )
@@ -408,7 +624,7 @@ def get_src_tgt_cache_loc(
     seq_lens: torch.Tensor,
     out_cache_loc: torch.Tensor,
     accept_index: torch.Tensor,
-    num_accepted_drafts: torch.Tensor,
+    num_correct_drafts: torch.Tensor,
     draft_token_num: int,
     page_size: int,
 ):
@@ -416,7 +632,7 @@ def get_src_tgt_cache_loc(
     tgt_cache_loc = torch.empty_like(src_cache_loc)
     extended_len = seq_lens + draft_token_num
     keep_len = torch.minimum(
-        (seq_lens + num_accepted_drafts + 1 + page_size - 1) // page_size * page_size,
+        (seq_lens + num_correct_drafts + 1 + page_size - 1) // page_size * page_size,
         extended_len,
     )
     to_free_num_slots = extended_len - keep_len
@@ -427,25 +643,25 @@ def get_src_tgt_cache_loc(
 def filter_finished_cache_loc_kernel(
     out_cache_loc,
     tgt_cache_loc,
-    num_accepted_drafts,
-    num_accepted_drafts_filter,
+    num_correct_drafts,
+    num_accept_tokens_filter,
     bs_upper: tl.constexpr,
     num_verify_tokens_upper: tl.constexpr,
 ):
     bid = tl.program_id(0)
     bs_offset = tl.arange(0, bs_upper)
 
-    num_accepted_drafts_all = tl.load(
-        num_accepted_drafts + bs_offset, mask=bs_offset < bid
+    num_correct_drafts_all = tl.load(
+        num_correct_drafts + bs_offset, mask=bs_offset < bid
     )
-    old_start = tl.sum(num_accepted_drafts_all) + bid
+    old_start = tl.sum(num_correct_drafts_all) + bid
 
-    num_accepted_drafts_filter_all = tl.load(
-        num_accepted_drafts_filter + bs_offset, mask=bs_offset < bid
+    num_accept_tokens_filter_all = tl.load(
+        num_accept_tokens_filter + bs_offset, mask=bs_offset < bid
     )
-    new_start = tl.sum(num_accepted_drafts_filter_all)
+    new_start = tl.sum(num_accept_tokens_filter_all)
 
-    copy_len = tl.load(num_accepted_drafts_filter + bid)
+    copy_len = tl.load(num_accept_tokens_filter + bid)
     copy_offset = tl.arange(0, num_verify_tokens_upper)
     value = tl.load(
         tgt_cache_loc + old_start + copy_offset, mask=copy_offset < copy_len
@@ -456,20 +672,76 @@ def filter_finished_cache_loc_kernel(
 
 
 @torch.compile(dynamic=True, disable=_is_npu)
-def create_num_accepted_drafts_filter(
-    num_accepted_drafts: torch.Tensor,
+def create_num_accept_tokens_filter(
+    num_correct_drafts: torch.Tensor,
     unfinished_index_device: torch.Tensor,
     seq_lens: torch.Tensor,
 ):
-    num_accepted_drafts_filter = torch.zeros_like(num_accepted_drafts)
-    num_accepted_drafts_filter[unfinished_index_device] = (
-        num_accepted_drafts[unfinished_index_device] + 1
+    num_accept_tokens_filter = torch.zeros_like(num_correct_drafts)
+    num_accept_tokens_filter[unfinished_index_device] = (
+        num_correct_drafts[unfinished_index_device] + 1
     )
-    seq_lens.add_(num_accepted_drafts + 1)
-    return num_accepted_drafts_filter
+    seq_lens.add_(num_correct_drafts + 1)
+    return num_accept_tokens_filter
+
+
+def _select_top_k_tokens_first(
+    topk_p: torch.Tensor,
+    topk_index: torch.Tensor,
+    hidden_states: Optional[torch.Tensor],
+    topk: int,
+):
+    input_ids = topk_index.flatten()
+    if hidden_states is not None:
+        hidden_states = hidden_states.repeat_interleave(topk, dim=0)
+
+    tree_info = (
+        topk_p.unsqueeze(1),  # (b, 1, topk)
+        topk_index,  # (b, topk)
+        torch.arange(-1, topk, dtype=torch.long, device=input_ids.device).expand(
+            topk_p.shape[0], -1
+        ),  # (b, topk + 1) — expand avoids the allocation of repeat
+    )
+    return input_ids, hidden_states, topk_p, tree_info
 
 
 @torch.compile(dynamic=True, disable=_is_npu)
+def _select_top_k_tokens_later(
+    i: int,
+    topk_p: torch.Tensor,
+    topk_index: torch.Tensor,
+    hidden_states: torch.Tensor,
+    scores: torch.Tensor,
+    topk: int,
+):
+    topk_sq = topk * topk
+
+    expand_scores = scores.unsqueeze(2) * topk_p.view(-1, topk, topk)
+    # (b, topk, 1) * (b, topk, topk) -> (b, topk, topk)
+
+    topk_cs_p, topk_cs_index = fast_topk(
+        expand_scores.flatten(start_dim=1), topk, dim=-1
+    )  # (b, topk)
+
+    topk_index = topk_index.view(-1, topk_sq)
+    input_ids = torch.gather(topk_index, 1, topk_cs_index).flatten()
+
+    if hidden_states is not None and hidden_states.shape[0] > 0:
+        flat_cs = topk_cs_index.flatten()
+        batch_offsets = torch.arange(
+            0, hidden_states.shape[0], step=topk, device=flat_cs.device
+        )
+        selected_input_index = flat_cs // topk + batch_offsets.repeat_interleave(topk)
+        hidden_states = hidden_states[selected_input_index]
+
+    tree_info = (
+        expand_scores,  # (b, topk, topk)
+        topk_index,  # (b, topk * topk)
+        topk_cs_index + (topk_sq * (i - 1) + topk),  # (b, topk)
+    )
+    return input_ids, hidden_states, topk_cs_p, tree_info
+
+
 def select_top_k_tokens(
     i: int,
     topk_p: torch.Tensor,
@@ -479,51 +751,16 @@ def select_top_k_tokens(
     topk: int,
 ):
     if i == 0:
-        # The first step after extend
-        input_ids = topk_index.flatten()
-        if hidden_states is not None:
-            hidden_states = hidden_states.repeat_interleave(topk, dim=0)
-        scores = topk_p  # shape: (b, topk)
-
-        tree_info = (
-            topk_p.unsqueeze(1),  # shape: (b, 1, topk)
-            topk_index,  # shape: (b, topk)
-            torch.arange(-1, topk, dtype=torch.long, device=input_ids.device)
-            .unsqueeze(0)
-            .repeat(topk_p.shape[0], 1),  # shape: (b, topk + 1)
-        )
-    else:
-        # The later decode steps
-        expand_scores = torch.mul(
-            scores.unsqueeze(2), topk_p.reshape(-1, topk, topk)
-        )  # (b, topk, 1) x (b, topk ,topk) -> (b, topk, topk)
-        topk_cs_p, topk_cs_index = fast_topk(
-            expand_scores.flatten(start_dim=1), topk, dim=-1
-        )  # (b, topk)
-        scores = topk_cs_p  # shape: (b, topk)
-
-        topk_index = topk_index.reshape(-1, topk**2)
-        input_ids = torch.gather(topk_index, index=topk_cs_index, dim=1).flatten()
-
-        if hidden_states.shape[0] > 0:
-            selected_input_index = topk_cs_index.flatten() // topk + torch.arange(
-                0, hidden_states.shape[0], step=topk, device=topk_index.device
-            ).repeat_interleave(topk)
-            hidden_states = hidden_states[selected_input_index, :]
-
-        tree_info = (
-            expand_scores,  # shape: (b, topk, topk)
-            topk_index,  # shape: (b, topk * topk)
-            topk_cs_index + (topk**2 * (i - 1) + topk),  # shape: (b, topk)
-        )
-
-    return input_ids, hidden_states, scores, tree_info
+        return _select_top_k_tokens_first(topk_p, topk_index, hidden_states, topk)
+    return _select_top_k_tokens_later(
+        i, topk_p, topk_index, hidden_states, scores, topk
+    )
 
 
 def generate_simulated_accept_index(
     accept_index,
     predict,
-    num_accepted_drafts,
+    num_correct_drafts,
     bs,
     spec_steps,
     simulate_acc_len: float = SIMULATE_ACC_LEN,
@@ -568,7 +805,7 @@ def generate_simulated_accept_index(
     sim_accept_index[:, :simulate_acc_len] = accept_indx_first_col + torch.arange(
         simulate_acc_len, device=accept_index.device
     )
-    num_accepted_drafts.fill_(simulate_acc_len - 1)
+    num_correct_drafts.fill_(simulate_acc_len - 1)
     predict.fill_(100)  # some legit token id
     return sim_accept_index
 
@@ -597,29 +834,29 @@ def traverse_tree(
         if curr == 0:
             # the first token generated by the target model, and thus it is always
             # accepted from the previous iteration
-            accepted = True
+            is_accepted = True
         else:
             parent_bitmask = allocate_token_bitmask[parent_pos]
             curr_token_id = draft_tokens[curr]
             if vocab_size and curr_token_id >= vocab_size:
-                accepted = False
+                is_accepted = False
             else:
                 # 32 boolean bitmask values are packed into 32-bit integers
-                accepted = (
+                is_accepted = (
                     parent_bitmask[curr_token_id // 32] & (1 << (curr_token_id % 32))
                 ) != 0
 
-        if accepted:
+        if is_accepted:
             if curr != 0:
                 # Accept the current token
-                grammar.accept_token(draft_tokens[curr])
+                grammar.accept_token(int(draft_tokens[curr]))
             if not grammar.is_terminated():
                 # Generate the bitmask for the current token
                 grammar.fill_vocab_mask(allocate_token_bitmask, curr)
                 if retrieve_next_token[curr] != -1:
                     # Visit the child node
                     dfs(
-                        retrieve_next_token[curr],
+                        int(retrieve_next_token[curr]),
                         retrieve_next_token,
                         retrieve_next_sibling,
                         curr,
@@ -632,7 +869,7 @@ def traverse_tree(
         if retrieve_next_sibling[curr] != -1:
             # Visit the sibling node
             dfs(
-                retrieve_next_sibling[curr],
+                int(retrieve_next_sibling[curr]),
                 retrieve_next_token,
                 retrieve_next_sibling,
                 parent_pos,
@@ -784,3 +1021,5 @@ def get_last_loc_large_page_size_large_top_k(
         extend_lens,
         last_page_lens,
     )
+
+

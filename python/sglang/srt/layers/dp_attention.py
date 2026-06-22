@@ -120,10 +120,18 @@ class _DpGatheredBufferWrapper:
         dp_max_padding: bool,
         global_num_tokens: Optional[List[int]] = None,
     ):
-        cls._global_dp_buffer_len = global_dp_buffer_len
-        cls._local_dp_buffer_len = local_dp_buffer_len
+        cls._global_dp_buffer_len = (
+            int(global_dp_buffer_len) if global_dp_buffer_len is not None else None
+        )
+        cls._local_dp_buffer_len = (
+            int(local_dp_buffer_len) if local_dp_buffer_len is not None else None
+        )
         cls._dp_max_padding = dp_max_padding
-        cls._global_num_tokens = global_num_tokens
+        cls._global_num_tokens = (
+            [int(x) for x in global_num_tokens]
+            if global_num_tokens is not None
+            else None
+        )
 
     @classmethod
     def _concrete_dim(cls, value, name: str) -> int:
@@ -141,10 +149,10 @@ class _DpGatheredBufferWrapper:
             ) from exc
 
     @classmethod
-    def get_global_dp_buffer(cls) -> torch.Tensor:
+    def get_global_dp_buffer(cls, group: GroupCoordinator) -> torch.Tensor:
         global_len = cls._concrete_dim(cls._global_dp_buffer_len, "global_len")
         hidden_size = cls._concrete_dim(cls._hidden_size, "hidden_size")
-        with use_symmetric_memory(get_tp_group(), disabled=not cls._dp_max_padding):
+        with use_symmetric_memory(group, disabled=not cls._dp_max_padding):
             try:
                 buffer = torch.empty(
                     (global_len, hidden_size),
@@ -163,10 +171,10 @@ class _DpGatheredBufferWrapper:
         return buffer
 
     @classmethod
-    def get_local_dp_buffer(cls) -> torch.Tensor:
+    def get_local_dp_buffer(cls, group: GroupCoordinator) -> torch.Tensor:
         local_len = cls._concrete_dim(cls._local_dp_buffer_len, "local_len")
         hidden_size = cls._concrete_dim(cls._hidden_size, "hidden_size")
-        with use_symmetric_memory(get_tp_group(), disabled=not cls._dp_max_padding):
+        with use_symmetric_memory(group, disabled=not cls._dp_max_padding):
             try:
                 buffer = torch.empty(
                     (local_len, hidden_size),
@@ -238,12 +246,12 @@ def set_dp_buffer_len(
     )
 
 
-def get_global_dp_buffer() -> torch.Tensor:
-    return _DpGatheredBufferWrapper.get_global_dp_buffer()
+def get_global_dp_buffer(group: GroupCoordinator) -> torch.Tensor:
+    return _DpGatheredBufferWrapper.get_global_dp_buffer(group=group)
 
 
-def get_local_dp_buffer() -> torch.Tensor:
-    return _DpGatheredBufferWrapper.get_local_dp_buffer()
+def get_local_dp_buffer(group: GroupCoordinator) -> torch.Tensor:
+    return _DpGatheredBufferWrapper.get_local_dp_buffer(group=group)
 
 
 def get_global_dp_buffer_len() -> int:
@@ -445,6 +453,23 @@ def get_dp_local_info(forward_batch: ForwardBatch) -> Tuple[torch.Tensor, torch.
         forward_batch.dp_local_num_tokens = local_num_tokens
 
     return forward_batch.dp_local_start_pos, forward_batch.dp_local_num_tokens
+
+
+def get_dp_local_slice_cpu(
+    forward_batch: ForwardBatch,
+    can_run_graph: bool,
+    cuda_graph_batch: Optional[int],
+) -> Tuple[int, int]:
+    # CPU (start, length) slice for DP-local data in a rank-padded buffer.
+    # Returns Python ints (no D2H sync) and handles the cuda-graph-padded layout.
+    global_num_tokens = forward_batch.global_num_tokens_cpu
+    dp_rank = get_attention_dp_rank()
+    local_num_tokens = global_num_tokens[dp_rank]
+    if can_run_graph:
+        local_start_pos = dp_rank * cuda_graph_batch
+    else:
+        local_start_pos = sum(global_num_tokens[:dp_rank])
+    return local_start_pos, local_num_tokens
 
 
 @triton.jit

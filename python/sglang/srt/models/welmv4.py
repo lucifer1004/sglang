@@ -33,6 +33,7 @@ from sglang.srt.distributed import (
     get_pp_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
+    get_tp_group,
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.distributed.communication_op import (
@@ -396,6 +397,17 @@ def _get_welm_kv_mirror_states(
             WELM_KV_MIRROR_STATES_KEY, _empty_welm_kv_mirror_states()
         )
     )
+
+
+def _clone_welm_kv_mirror_states(
+    kv_mirror_states: Optional[Dict[int, Tuple[torch.Tensor, torch.Tensor]]],
+) -> Dict[int, Tuple[torch.Tensor, torch.Tensor]]:
+    if not kv_mirror_states:
+        return _empty_welm_kv_mirror_states()
+    return {
+        layer_idx: (mirror_k, mirror_v)
+        for layer_idx, (mirror_k, mirror_v) in kv_mirror_states.items()
+    }
 
 
 def _set_welm_kv_mirror_states(
@@ -2533,7 +2545,13 @@ class Qwen2MoeAttention(nn.Module):
             if need_attn_tp_reduce_for_o_norm:
                 output = attention_tensor_model_parallel_all_reduce(output)
             if welm_use_previous_precision():
-                output = self.o_norm(output)
+                # Match the v0.5.6 previous-precision baseline. The native
+                # PyTorch path avoids sgl_kernel.rmsnorm rounding differences
+                # across image builds.
+                if isinstance(self.o_norm, RMSNorm):
+                    output = self.o_norm.forward_native(output)
+                else:
+                    output = self.o_norm(output)
             else:
                 output, _ = self.o_norm(output)
             if self.o_norm_needs_attn_tp_reduce and self.attn_tp_rank != 0:
@@ -2866,7 +2884,7 @@ class Qwen2MoeDecoderLayer(nn.Module):
 
                 if get_attention_dp_size() != 1:
                     local_hidden_states = hidden_states
-                    hidden_states = get_global_dp_buffer()
+                    hidden_states = get_global_dp_buffer(get_tp_group())
                     dp_gather_partial(hidden_states, local_hidden_states, forward_batch)
                     hidden_states_fp32 = hidden_states.to(torch.float32)
         else:
@@ -3197,6 +3215,7 @@ class Qwen2MoeModel(nn.Module):
             hidden_states = pp_proxy_tensors["hidden_states"]
             residual = pp_proxy_tensors.tensors.get("residual", None)
             kv_mirror_states = _unpack_welm_kv_mirror_states(pp_proxy_tensors)
+        mtp_kv_mirror_states = None
 
         aux_hidden_states = []
         use_previous_precision = welm_use_previous_precision()
@@ -3240,7 +3259,23 @@ class Qwen2MoeModel(nn.Module):
                         residual,
                         kv_mirror_states,
                     )
+                    if (
+                        mtp_kv_mirror_states is None
+                        and forward_batch.spec_algorithm is not None
+                        and forward_batch.spec_algorithm.is_eagle()
+                        and not forward_batch.forward_mode.is_draft_extend(
+                            include_v2=True
+                        )
+                        and kv_mirror_states
+                    ):
+                        mtp_kv_mirror_states = _clone_welm_kv_mirror_states(
+                            kv_mirror_states
+                        )
         _set_welm_kv_mirror_states(forward_batch, kv_mirror_states)
+        if mtp_kv_mirror_states:
+            model_specific_states = dict(forward_batch.model_specific_states or {})
+            model_specific_states[WELM_KV_MIRROR_STATES_KEY] = mtp_kv_mirror_states
+            forward_batch.model_specific_states = model_specific_states
         if not self.pp_group.is_last_rank:
             proxy_tensors = {"hidden_states": hidden_states}
             if residual is not None:

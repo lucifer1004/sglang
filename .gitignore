@@ -8,19 +8,19 @@ __pycache__/
 
 # Distribution / packaging
 .Python
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
+**/build/
+**/develop-eggs/
+**/dist/
+**/downloads/
+**/eggs/
 .eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
-share/python-wheels/
+**/lib/
+**/lib64/
+**/parts/
+**/sdist/
+**/var/
+**/wheels/
+**/share/python-wheels/
 *.egg-info/
 .installed.cfg
 *.egg
@@ -226,15 +226,10 @@ work_dirs/
 *.exe
 *.out
 *.app
-
-compile_commands.json
-
 *.iml
 
 # VSCode
 .vscode
-
-1
 
 # Autoenv
 .env.leave
@@ -242,9 +237,12 @@ compile_commands.json
 # Rust lib
 Cargo.lock
 
+# Generated vision test fixtures (regenerate with: python scripts/generate_vision_golden.py)
+sgl-model-gateway/tests/fixtures/golden/
+
+# Other repos
 lmms-eval
 
-**/.claude/
 **/.serena/
 ctags/
 outputs/
@@ -278,3 +276,4 @@ sgl-kernel/csrc/**/*_musa/
 *.ply
 *.npz
 artifacts/
+.claude/scheduled_tasks.lock

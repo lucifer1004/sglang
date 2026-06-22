@@ -117,6 +117,21 @@ logger = logging.getLogger(__name__)
 WELM_KV_MIRROR_PP_KEY_PREFIX = "welm_kv_mirror"
 
 
+def _is_welm_v4_model_config(model_config) -> bool:
+    for config in (
+        getattr(model_config, "hf_config", None),
+        getattr(model_config, "hf_text_config", None),
+    ):
+        if config is None:
+            continue
+        if getattr(config, "model_type", None) == "welmv4_moe":
+            return True
+        archs = getattr(config, "architectures", None) or []
+        if any(str(arch).startswith("WeLMV4") for arch in archs):
+            return True
+    return False
+
+
 def _welm_kv_mirror_packed_len(numel: int) -> int:
     try:
         tp_size = get_attention_tp_size()
@@ -220,6 +235,8 @@ class DecodeInputBuffers(ForwardInputBuffers):
         kv_mirror_tensor_size: Optional[int] = None,
         ne_token_table: Optional[torch.Tensor] = None,
         is_hybrid_swa: bool = False,
+        hc_hidden_size: Optional[int] = None,
+        pp_residual_dtype: Optional[torch.dtype] = None,
         welm_oe_fused_decode_output_max_bs: int = 0,
         welm_oe_fused_decode_output_hidden_size: int = 0,
     ) -> "DecodeInputBuffers":
@@ -254,7 +271,7 @@ class DecodeInputBuffers(ForwardInputBuffers):
             seq_lens = torch.full((max_bs,), seq_len_fill_value, dtype=torch.int32)
             out_cache_loc = torch.zeros((max_num_token,), dtype=cache_loc_dtype)
             out_cache_loc_swa = (
-                torch.zeros((max_num_token,), dtype=torch.int64)
+                torch.zeros((max_num_token,), dtype=torch.int32)
                 if is_hybrid_swa
                 else None
             )
@@ -269,25 +286,6 @@ class DecodeInputBuffers(ForwardInputBuffers):
                 (max_num_token, vocab_size),
                 dtype=torch.float,
             )
-            router_replay_global_num_token = (
-                max_num_token * dp_size if require_mlp_tp_gather else max_num_token
-            )
-            router_replay_topk_ids = torch.zeros(
-                (
-                    router_replay_global_num_token,
-                    router_replay_num_layers,
-                    router_replay_top_k,
-                ),
-                dtype=torch.int32,
-            )
-            router_replay_mask = torch.zeros(
-                (router_replay_global_num_token,), dtype=torch.bool
-            )
-            router_replay_local_topk_ids = torch.zeros(
-                (max_num_token, router_replay_num_layers, router_replay_top_k),
-                dtype=torch.int32,
-            )
-            router_replay_local_mask = torch.zeros((max_num_token,), dtype=torch.bool)
             mamba_track_indices = (
                 torch.zeros((max_bs,), dtype=torch.int64)
                 if enable_mamba_track
@@ -298,10 +296,16 @@ class DecodeInputBuffers(ForwardInputBuffers):
             )
 
             if pp_size > 1:
+                # mHC (e.g. DSV4) flattens residual into hidden_states (size = hc_hidden_size).
+                is_mhc = hc_hidden_size is not None
+                hs = hc_hidden_size if is_mhc else hidden_size
                 pp_proxy_tensors = {
-                    "hidden_states": torch.zeros((max_bs, hidden_size), dtype=dtype),
-                    "residual": torch.zeros((max_bs, hidden_size), dtype=torch.float32),
+                    "hidden_states": torch.zeros((max_bs, hs), dtype=dtype),
                 }
+                if not is_mhc:
+                    pp_proxy_tensors["residual"] = torch.zeros(
+                        (max_bs, hidden_size), dtype=pp_residual_dtype or dtype
+                    )
                 if kv_mirror_layers and kv_mirror_tensor_size:
                     for layer_idx in kv_mirror_layers:
                         pp_proxy_tensors[
@@ -328,6 +332,16 @@ class DecodeInputBuffers(ForwardInputBuffers):
             else:
                 global_num_tokens_gpu = torch.zeros((1,), dtype=torch.int32)
                 global_num_tokens_for_logprob_gpu = torch.zeros((1,), dtype=torch.int32)
+
+            router_shape = (
+                max_num_token,
+                router_replay_num_layers,
+                router_replay_top_k,
+            )
+            router_replay_topk_ids = torch.zeros(router_shape, dtype=torch.int32)
+            router_replay_mask = torch.zeros((max_num_token,), dtype=torch.bool)
+            router_replay_local_topk_ids = torch.zeros(router_shape, dtype=torch.int32)
+            router_replay_local_mask = torch.zeros((max_num_token,), dtype=torch.bool)
 
             ngram_embedding_info = (
                 NgramEmbeddingInfo(
@@ -395,6 +409,12 @@ class DecodeInputBuffers(ForwardInputBuffers):
         if bs != raw_bs:
             self.seq_lens.fill_(seq_len_fill_value)
             self.out_cache_loc.zero_()
+            # Padded SWA indices left over from a previous replay would point
+            # into real SWA slots, so set_kv_buffer on padded tokens would
+            # corrupt active requests' KV. Zero the whole buffer so padded
+            # positions map to the sentinel slot (matches piecewise runner).
+            if self.out_cache_loc_swa is not None:
+                self.out_cache_loc_swa.zero_()
             if self.mamba_track_indices is not None:
                 self.mamba_track_indices.zero_()
             if self.mamba_track_mask is not None:
@@ -477,9 +497,12 @@ class DecodeInputBuffers(ForwardInputBuffers):
                 if (
                     shape is not None
                     and key.startswith(f"{WELM_KV_MIRROR_PP_KEY_PREFIX}.")
-                    and src.dim() == 1
                 ):
-                    src = src[: math.prod(shape)].view(shape)
+                    dim = _welm_kv_mirror_packed_len(math.prod(shape))
+                    src = src.view(-1)[:dim]
+                    dsts.append(buf.view(-1)[:dim])
+                    srcs.append(src)
+                    continue
                 dim = src.shape[0]
                 dsts.append(buf[:dim])
                 srcs.append(src)
@@ -604,6 +627,12 @@ _capture_lora_variant: Optional[str] = None
 
 def get_is_capture_mode():
     return is_capture_mode
+
+
+def compile_in_capture_mode(func):
+    if get_is_capture_mode():
+        return torch.compile(func)
+    return func
 
 
 def get_capture_lora_variant() -> Optional[str]:
@@ -1065,6 +1094,14 @@ class CudaGraphRunner:
                 model_runner.token_table if self.use_ngram_embedding else None
             ),
             is_hybrid_swa=model_runner.is_hybrid_swa,
+            hc_hidden_size=getattr(
+                self.model_runner.model_config, "hc_hidden_size", None
+            ),
+            pp_residual_dtype=(
+                torch.float32
+                if _is_welm_v4_model_config(self.model_runner.model_config)
+                else None
+            ),
             welm_oe_fused_decode_output_max_bs=welm_oe_fused_max_bs,
             welm_oe_fused_decode_output_hidden_size=welm_oe_fused_hidden_size,
         )
@@ -1351,11 +1388,11 @@ class CudaGraphRunner:
         graph = self._create_device_graph()
         stream = self.stream
         num_tokens = bs * self.num_tokens_per_bs
+        model_input_len = bs if self.scale_seq_factor > 1 else num_tokens
 
         # Graph inputs
         # For scale_seq, the model takes bs input tokens and internally
         # expands to bs*scale hidden states. input_ids must be bs, not num_tokens.
-        model_input_len = bs if self.scale_seq_factor > 1 else num_tokens
         input_ids = buffers.input_ids[:model_input_len]
         req_pool_indices = buffers.req_pool_indices[:bs]
         seq_lens = buffers.seq_lens[:bs]
@@ -1376,7 +1413,7 @@ class CudaGraphRunner:
         # populate_from_forward_batch).
         buffers.num_token_non_padded[...] = num_tokens
         if (
-            enable_num_token_non_padded(self.model_runner.server_args)
+            enable_num_token_non_padded()
             and self.require_gathered_buffer
             and not self.nsa_enable_prefill_cp
         ):
@@ -1426,6 +1463,9 @@ class CudaGraphRunner:
             global_dp_buffer_len = num_tokens
         else:
             global_dp_buffer_len = None
+        router_replay_num_tokens = num_tokens
+        if self.require_gathered_buffer:
+            router_replay_num_tokens = num_tokens * buffers.global_num_tokens_gpu.numel()
 
         spec_info = self.get_spec_info(num_tokens)
         if self.capture_hidden_mode != CaptureHiddenMode.FULL:
@@ -1457,8 +1497,6 @@ class CudaGraphRunner:
         else:
             assert self.enable_pdmux
             attn_backend = self.model_runner.decode_attn_backend_group[stream_idx]
-
-        router_replay_num_tokens = global_dp_buffer_len or num_tokens
 
         forward_batch = ForwardBatch(
             forward_mode=self.capture_forward_mode,
@@ -1630,11 +1668,13 @@ class CudaGraphRunner:
             self.device_module.synchronize()
             self.model_runner.tp_group.barrier()
             run_once()
+            attn_backend.on_after_cuda_graph_warmup()
 
         if get_global_graph_memory_pool() is None:
             set_global_graph_memory_pool(self.device_module.graph_pool_handle())
         # Set graph pool id globally to be able to use symmetric memory
         set_graph_pool_id(get_global_graph_memory_pool())
+
         out = self._capture_graph(
             graph, get_global_graph_memory_pool(), stream, run_once
         )
@@ -1708,9 +1748,7 @@ class CudaGraphRunner:
             require_gathered_buffer=self.require_gathered_buffer,
             num_tokens_per_bs=self.num_tokens_per_bs,
             nsa_enable_prefill_cp=self.nsa_enable_prefill_cp,
-            enable_num_token_non_padded_flag=enable_num_token_non_padded(
-                self.model_runner.server_args
-            ),
+            enable_num_token_non_padded_flag=enable_num_token_non_padded(),
             pp_proxy_tensors=pp_proxy_tensors,
         )
 
@@ -1818,6 +1856,9 @@ class CudaGraphRunner:
             attn_backend = self.model_runner.decode_attn_backend_group[stream_idx]
         else:
             attn_backend = self.attn_backend
+        # FIXME: implicit channel for backends (dsv4) that need forward_batch
+        # in replay metadata prep. Should become a real param on the interface.
+        attn_backend._replay_forward_batch = forward_batch
         attn_backend.init_forward_metadata_replay_cuda_graph(
             bs,
             buffers.req_pool_indices[:bs],
@@ -1828,6 +1869,7 @@ class CudaGraphRunner:
             forward_batch.spec_info,
             seq_lens_cpu=buffers.seq_lens_cpu[:bs],
         )
+        attn_backend._replay_forward_batch = None
 
         # Store fields
         self.raw_bs = raw_bs
@@ -1875,6 +1917,7 @@ class CudaGraphRunner:
         )
         with ctx:
             self.graphs[graph_key].replay()
+
         output = self.output_buffers[graph_key]
 
         if isinstance(output, LogitsProcessorOutput):
@@ -1963,6 +2006,12 @@ class CudaGraphRunner:
             if self.model_runner.is_draft_worker:
                 raise RuntimeError("This should not happen.")
             else:
+
+                capture_mode = (
+                    CaptureHiddenMode.NULL
+                    if self.model_runner.spec_algorithm.is_standalone()
+                    else CaptureHiddenMode.FULL
+                )
                 spec_info = EagleVerifyInput(
                     draft_token=None,
                     custom_mask=self.buffers.custom_mask,
@@ -1974,7 +2023,7 @@ class CudaGraphRunner:
                     spec_steps=self.speculative_num_steps,
                     topk=self.model_runner.server_args.speculative_eagle_topk,
                     draft_token_num=self.speculative_num_draft_tokens,
-                    capture_hidden_mode=CaptureHiddenMode.FULL,
+                    capture_hidden_mode=capture_mode,
                     seq_lens_sum=None,
                     seq_lens_cpu=None,
                 )

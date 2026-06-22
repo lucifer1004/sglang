@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Copyright 2023-2024 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -17,6 +19,7 @@
 """Inference-only Qwen2MoE model compatible with HuggingFace weights."""
 
 import logging
+from contextlib import nullcontext
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
@@ -27,6 +30,7 @@ from transformers import PretrainedConfig
 from sglang.srt.batch_overlap.two_batch_overlap import model_forward_maybe_tbo
 from sglang.srt.distributed import (
     get_moe_data_parallel_world_size,
+    get_moe_expert_parallel_world_size,
     get_pp_group,
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
@@ -36,6 +40,7 @@ from sglang.srt.distributed.parallel_state import (
 )
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
+from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
@@ -68,22 +73,19 @@ from sglang.srt.layers.moe.utils import (
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.layers.rotary_embedding import (
-    LinearScalingRotaryEmbedding,
-    RotaryEmbedding,
-    _yarn_find_correction_range,
-    _yarn_linear_ramp_mask,
-    yarn_get_mscale,
-)
+from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.utils.cp_utils import (
     cp_all_gather_rerange_output,
+    cp_split_and_rebuild_data,
+    cp_split_and_rebuild_position,
     is_prefill_context_parallel_enabled,
 )
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.server_args import get_global_server_args
@@ -94,9 +96,18 @@ from sglang.srt.utils import (
     is_cpu,
     is_cuda,
     is_hip,
+    is_npu,
     make_layers,
     use_intel_amx_backend,
 )
+
+if is_npu():
+    from sglang.srt.hardware_backend.npu.cmo import (
+        shared_expert_on_independent_stream,
+        wait_share_stream,
+    )
+
+from sglang.srt.environ import envs
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
 logger = logging.getLogger(__name__)
@@ -192,46 +203,7 @@ class Qwen2MoeMLP(nn.Module):
         return x
 
 
-def expert_bias_routing(
-    hidden_states: torch.Tensor,
-    gating_output: torch.Tensor,
-    topk: int,
-    expert_bias: torch.Tensor,
-    renormalize: bool = False,
-    score_func: str = "sigmoid",
-):
-    assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
-    if score_func == "softmax":
-        scores = torch.softmax(gating_output, dim=-1).type_as(gating_output)
-    else:
-        scores = torch.sigmoid(gating_output).type_as(gating_output)
-
-    scores_for_routing = scores + expert_bias
-    _, indices = torch.topk(scores_for_routing, topk, dim=-1)
-    topk_scores = torch.gather(scores, dim=1, index=indices).type_as(scores)
-
-    return topk_scores, indices
-
-
-def sigmoid_routing_function(
-    hidden_states: torch.Tensor,
-    gating_output: torch.Tensor,
-    topk: int,
-    renormalize: bool,
-    correction_bias: Optional[torch.Tensor] = None,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    # if softmax, then use qwen3 moe's routing function
-    scores = torch.sigmoid(gating_output).type_as(gating_output)
-    scores_for_routing = scores
-    if correction_bias is not None:
-        scores_for_routing = scores + correction_bias
-    _, indices = torch.topk(scores_for_routing, topk, dim=-1)
-    topk_scores = torch.gather(scores, dim=1, index=indices).type_as(scores)
-    return topk_scores, indices
-
-
 class Qwen2MoeSparseMoeBlock(nn.Module):
-
     def __init__(
         self,
         layer_id: int,
@@ -244,7 +216,6 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
     ):
         super().__init__()
         self.tp_size = get_tensor_model_parallel_world_size()
-        self.expert_bias = torch.nn.Parameter(torch.zeros((config.num_experts)))
         self.layer_id = layer_id
         self.alt_stream = alt_stream
         if self.tp_size > config.num_experts:
@@ -275,33 +246,10 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         if self.enable_shared_expert_fusion:
             self.num_fused_shared_experts = self.num_shared_experts
 
-        self.router_score_func = (
-            config.router_score_func
-            if hasattr(config, "router_score_func")
-            else "softmax"
-        )
-        if config.moe_routing_type == "expert_bias":
-            from functools import partial
-
-            custom_routing_function = partial(
-                expert_bias_routing,
-                expert_bias=self.expert_bias,
-                score_func=self.router_score_func,
-            )
-            self.custom_routing_function = custom_routing_function
-        else:
-            if self.router_score_func == "softmax":
-                self.custom_routing_function = None
-            elif self.router_score_func == "sigmoid":
-                self.custom_routing_function = sigmoid_routing_function
-            else:
-                raise ValueError(f"Unknown router_score_func: {self.router_score_func}")
-
         self.topk = TopK(
             top_k=config.num_experts_per_tok,
-            layer_id=self.layer_id,
             renormalize=config.norm_topk_prob,
-            custom_routing_function=self.custom_routing_function,
+            layer_id=layer_id,
         )
 
         self.experts = get_moe_impl_class(quant_config)(
@@ -347,15 +295,23 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 quant_config=quant_config,
                 reduce_results=False,
                 prefix=add_prefix("shared_expert", prefix),
+                **(
+                    dict(tp_rank=0, tp_size=1)
+                    if get_moe_a2a_backend().is_deepep()
+                    else {}
+                ),
             )
         else:
             self.shared_expert = None
-
-        self.shared_expert_gate = None
-        has_shared_expert_gate = getattr(
-            config, "has_shared_expert_gate", True
-        )  # default to true since qwen2_moe always has it
-        if has_shared_expert_gate:
+        if _is_cpu and _is_cpu_amx_available:
+            self.shared_expert_gate = ReplicatedLinear(
+                config.hidden_size,
+                1,
+                bias=False,
+                quant_config=None,
+                prefix=add_prefix("shared_expert_gate", prefix),
+            )
+        else:
             self.shared_expert_gate = torch.nn.Linear(config.hidden_size, 1, bias=False)
 
         if get_moe_a2a_backend().is_deepep():
@@ -436,11 +392,21 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         return shared_output
 
     def _forward_deepep(self, hidden_states: torch.Tensor, forward_batch: ForwardBatch):
+        enable_dual_stream = (
+            is_npu()
+            and envs.SGLANG_NPU_USE_MULTI_STREAM.get()
+            and forward_batch.forward_mode.is_cuda_graph()
+        )
         shared_output = None
         if hidden_states.shape[0] > 0:
             # router_logits: (num_tokens, n_experts)
             router_logits, _ = self.gate(hidden_states)
-            shared_output = self._forward_shared_experts(hidden_states)
+            if enable_dual_stream:
+                shared_output = shared_expert_on_independent_stream(
+                    hidden_states.clone(), self._forward_shared_experts
+                )
+            else:
+                shared_output = self._forward_shared_experts(hidden_states)
             topk_output = self.topk(
                 hidden_states,
                 router_logits,
@@ -459,6 +425,8 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             hidden_states=hidden_states,
             topk_output=topk_output,
         )
+        if enable_dual_stream:
+            wait_share_stream()
 
         if shared_output is not None:
             final_hidden_states.add_(shared_output)
@@ -495,22 +463,26 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: Optional[ForwardBatch] = None,
         use_reduce_scatter: bool = False,
+        should_allreduce_fusion: bool = False,
     ) -> torch.Tensor:
-        should_allreduce_fusion = False
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
-        shared_output = None
-        if self.shared_expert is not None:
-            shared_output = self.shared_expert(hidden_states)
-            if self.shared_expert_gate is not None:
-                shared_output = (
-                    F.sigmoid(self.shared_expert_gate(hidden_states)) * shared_output
-                )
 
-        # router_logits: (num_tokens, n_experts)
-        router_logits, _ = self.gate(hidden_states)
-        topk_output = self.topk(hidden_states, router_logits)
-        final_hidden_states = self.experts(hidden_states, topk_output)
+        if get_moe_a2a_backend().is_deepep():
+            return self._forward_deepep(hidden_states, forward_batch)
+
+        if (
+            self.alt_stream is not None
+            and hidden_states.shape[0] > 0
+            and get_is_capture_mode()
+        ):
+            final_hidden_states, shared_output = self.forward_normal_dual_stream(
+                hidden_states
+            )
+        else:
+            shared_output = self._forward_shared_experts(hidden_states)
+            final_hidden_states = self._forward_router_experts(hidden_states)
+
         if shared_output is not None:
             # In-place add is required to keep final_hidden_states in the
             # symmetric memory pool (when --enable-symm-mem is used).
@@ -527,203 +499,17 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         return final_hidden_states.view(num_tokens, hidden_dim)
 
 
-class Qwen2MoeYarnScalingRotaryEmbedding(RotaryEmbedding):
-    def __init__(
-        self,
-        head_size: int,
-        rotary_dim: int,
-        max_position_embeddings: int,
-        base: int,
-        is_neox_style: bool,
-        scaling_factor: float,
-        dtype: torch.dtype,
-        *,
-        extrapolation_factor: float = 1,
-        attn_factor: float = 1,
-        beta_fast: int = 32,
-        beta_slow: int = 1,
-        mscale: float = 1,
-        mscale_all_dim: float = 0,
-        compress: float = 0,
-        max_position: int = 40 * 4096,
-    ) -> None:
-        self.scaling_factor = scaling_factor
-        self.extrapolation_factor = extrapolation_factor
-        self.attn_factor = attn_factor
-        self.beta_fast = beta_fast
-        self.beta_slow = beta_slow
-        self.compress = compress
-        super().__init__(
-            head_size, rotary_dim, max_position_embeddings, base, is_neox_style, dtype
-        )
-
-        self.mscale = mscale
-        self.mscale_all_dim = mscale_all_dim
-        self.max_position = max_position
-        inv_freq_extra = 1.0 / (
-            self.base
-            ** (
-                torch.arange(0, self.rotary_dim, 2, dtype=torch.float32)
-                / self.rotary_dim
-            )
-        )
-        inv_freq_inter = 1.0 / (
-            self.scaling_factor
-            * self.base
-            ** (
-                torch.arange(0, self.rotary_dim, 2, dtype=torch.float32)
-                / self.rotary_dim
-            )
-        )
-        self.register_buffer("inv_freq_extra", inv_freq_extra, persistent=False)
-        self.register_buffer("inv_freq_inter", inv_freq_inter, persistent=False)
-
-        self.cos_sin_cache = self._update_cos_sin_cache(self.max_position)
-
-    def _update_cos_sin_cache(self, seqlen: int):
-        """Update cos/sin cache with YaRN scaling"""
-        low, high = _yarn_find_correction_range(
-            self.beta_fast,
-            self.beta_slow,
-            self.rotary_dim,
-            self.base,
-            self.max_position_embeddings,
-        )
-        inv_freq_mask = 1.0 - _yarn_linear_ramp_mask(
-            low, high, self.rotary_dim // 2, dtype=torch.float32
-        ).to(device=self.inv_freq_inter.device)
-
-        inv_freq = (
-            self.inv_freq_inter * (1 - inv_freq_mask)
-            + self.inv_freq_extra * inv_freq_mask
-        )
-
-        seq = (
-            torch.arange(seqlen, device=self.inv_freq_extra.device, dtype=torch.float32)
-            * self.compress
-        )
-
-        freqs = torch.outer(seq, inv_freq)
-
-        _mscale = float(
-            yarn_get_mscale(self.scaling_factor, self.mscale)
-            / yarn_get_mscale(self.scaling_factor, self.mscale_all_dim)
-        )
-
-        _cos_cached = (torch.cos(freqs) * _mscale).to(torch.float32)
-        _sin_cached = (torch.sin(freqs) * _mscale).to(torch.float32)
-        cache = torch.cat((_cos_cached, _sin_cached), dim=-1)
-        return cache
-
-
-_ROPE_DICT: Dict[Tuple, RotaryEmbedding] = {}
-
-
-def get_rope(
-    head_size: int,
-    rotary_dim: int,
-    max_position: int,
-    base: int,
-    is_neox_style: bool = True,
-    compress: float = 1.0,
-    rope_scaling: Optional[Dict[str, Any]] = None,
-    dtype: Optional[torch.dtype] = None,
-    partial_rotary_factor: float = 1.0,
-) -> RotaryEmbedding:
-    if dtype is None:
-        dtype = torch.get_default_dtype()
-    if rope_scaling is not None:
-        # Transforms every value that is a list into a tuple for caching calls
-        rope_scaling_tuple = {
-            k: tuple(v) if isinstance(v, list) else v for k, v in rope_scaling.items()
-        }
-        rope_scaling_args = tuple(rope_scaling_tuple.items())
-    else:
-        rope_scaling_args = None
-    if partial_rotary_factor < 1.0:
-        rotary_dim = int(rotary_dim * partial_rotary_factor)
-    key = (
-        head_size,
-        rotary_dim,
-        max_position,
-        base,
-        is_neox_style,
-        rope_scaling_args,
-        dtype,
-    )
-    if key in _ROPE_DICT:
-        return _ROPE_DICT[key]
-
-    if rope_scaling is None:
-        raise ValueError(f"Please set RoPE scaling")
-    else:
-        scaling_type = rope_scaling["type"]
-
-        if scaling_type == "linear":
-            scaling_factor = rope_scaling["factor"]
-            rotary_emb = LinearScalingRotaryEmbedding(
-                head_size,
-                rotary_dim,
-                max_position,
-                base,
-                is_neox_style,
-                scaling_factor,
-                dtype,
-            )
-
-        elif scaling_type == "yarn":
-            scaling_factor = rope_scaling["factor"]
-            original_max_position = rope_scaling["original_max_position_embeddings"]
-            extra_kwargs = {
-                k: v
-                for k, v in rope_scaling.items()
-                if k
-                in (
-                    "extrapolation_factor",
-                    "attn_factor",
-                    "beta_fast",
-                    "beta_slow",
-                    "mscale",
-                    "mscale_all_dim",
-                )
-            }
-            rotary_emb = Qwen2MoeYarnScalingRotaryEmbedding(
-                head_size,
-                rotary_dim,
-                original_max_position,
-                base,
-                is_neox_style,
-                scaling_factor,
-                dtype,
-                **extra_kwargs,
-                compress=compress,
-                max_position=max_position,
-            )
-        else:
-            raise ValueError(f"Unknown RoPE scaling type {scaling_type}")
-    _ROPE_DICT[key] = rotary_emb
-    return rotary_emb
-
-
 class Qwen2MoeAttention(nn.Module):
-
     def __init__(
         self,
         hidden_size: int,
         num_heads: int,
         num_kv_heads: int,
-        head_dim: int,
         layer_id: int = 0,
         rope_theta: float = 10000,
         rope_scaling: Optional[Dict[str, Any]] = None,
-        compress: float = 1.0,
         max_position_embeddings: int = 8192,
         qkv_bias: int = True,
-        out_bias: int = False,
-        qk_norm: bool = False,
-        k_norm: bool = False,
-        qk_rope_head_dim: int = 0,
-        qk_norm_eps: float = 1e-5,
         quant_config: Optional[QuantizationConfig] = None,
         dual_chunk_attention_config: Optional[dict[str, Any]] = None,
         prefix: str = "",
@@ -747,25 +533,12 @@ class Qwen2MoeAttention(nn.Module):
             # the KV heads across multiple tensor parallel GPUs.
             assert attn_tp_size % self.total_num_kv_heads == 0
         self.num_kv_heads = max(1, self.total_num_kv_heads // attn_tp_size)
-        self.head_dim = head_dim
+        self.head_dim = hidden_size // self.total_num_heads
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim**-0.5
         self.rope_theta = rope_theta
-        self.compress = compress
         self.max_position_embeddings = max_position_embeddings
-        self.qk_rope_head_dim = qk_rope_head_dim
-        self.qk_norm = qk_norm
-        self.only_k_norm = k_norm
-
-        self.q_norm = (
-            RMSNorm(self.head_dim, eps=qk_norm_eps) if self.qk_norm else nn.Identity()
-        )
-        self.k_norm = (
-            RMSNorm(self.head_dim, eps=qk_norm_eps)
-            if self.qk_norm or self.only_k_norm
-            else nn.Identity()
-        )
 
         self.qkv_proj = QKVParallelLinear(
             hidden_size,
@@ -782,7 +555,7 @@ class Qwen2MoeAttention(nn.Module):
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.head_dim,
             hidden_size,
-            bias=out_bias,
+            bias=False,
             quant_config=quant_config,
             tp_rank=attn_tp_rank,
             tp_size=attn_tp_size,
@@ -790,25 +563,13 @@ class Qwen2MoeAttention(nn.Module):
             prefix=add_prefix("o_proj", prefix),
         )
 
-        if rope_scaling is None:
-            rope_scaling = {"type": "linear", "factor": 1 / self.compress}
-        else:
-            assert self.compress == 1.0, "Compress must be 1.0 for custom rope scaling."
-            if rope_scaling["type"] == "yarn":
-                mscale_all_dim = rope_scaling.get("mscale_all_dim", False)
-                apply_softmax_scale = rope_scaling.get("apply_softmax_scale", False)
-                scaling_factor = rope_scaling["factor"]
-                if apply_softmax_scale and mscale_all_dim:
-                    mscale = yarn_get_mscale(scaling_factor, float(mscale_all_dim))
-                    self.scaling = self.scaling * mscale * mscale
-
         self.rotary_emb = get_rope(
-            self.qk_rope_head_dim,
-            rotary_dim=self.qk_rope_head_dim,
+            self.head_dim,
+            rotary_dim=self.head_dim,
             max_position=max_position_embeddings,
             base=rope_theta,
-            compress=self.compress,
             rope_scaling=rope_scaling,
+            dual_chunk_attention_config=dual_chunk_attention_config,
         )
         self.attn = RadixAttention(
             self.num_heads,
@@ -828,60 +589,13 @@ class Qwen2MoeAttention(nn.Module):
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        q_shape = q.shape
-        k_shape = k.shape
-
-        q_by_head = q.view(*q.shape[:-1], q.shape[-1] // self.head_dim, self.head_dim)
-        if self.qk_norm:
-            q_by_head = self.q_norm.forward_native(q_by_head)
-        q = q_by_head.view(q.shape)
-
-        k_by_head = k.view(*k.shape[:-1], k.shape[-1] // self.head_dim, self.head_dim)
-        if self.qk_norm or self.only_k_norm:
-            k_by_head = self.k_norm.forward_native(k_by_head)
-        k = k_by_head.view(k.shape)
-
-        qk_nope_head_dim = self.head_dim - self.qk_rope_head_dim
-        if qk_nope_head_dim > 0:
-            q_nope, q_pe = q.view(q_by_head.shape).split(
-                [qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
-            )
-            k_nope, k_pe = k.view(k_by_head.shape).split(
-                [qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
-            )
-
-            q_pe = q_pe.reshape(
-                (*q_shape[:-1], q_shape[-1] // self.head_dim * self.qk_rope_head_dim)
-            )
-            k_pe = k_pe.reshape(
-                (*k_shape[:-1], k_shape[-1] // self.head_dim * self.qk_rope_head_dim)
-            )
-            q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
-
-            q_pe = q_pe.reshape(
-                (*q_shape[:-1], q_shape[-1] // self.head_dim, -1)
-            ).clone()
-            k_pe = k_pe.reshape(
-                (*k_shape[:-1], k_shape[-1] // self.head_dim, -1)
-            ).clone()
-
-            q = q.reshape(q_by_head.shape)
-            k = k.reshape(k_by_head.shape)
-
-            q[..., qk_nope_head_dim:] = q_pe
-            k[..., qk_nope_head_dim:] = k_pe
-
-            q = q.view(q_shape)
-            k = k.view(k_shape)
-        else:
-            q, k = self.rotary_emb(positions, q, k)
+        q, k = self.rotary_emb(positions, q, k)
         attn_output = self.attn(q, k, v, forward_batch)
         output, _ = self.o_proj(attn_output)
         return output
 
 
 class Qwen2MoeDecoderLayer(nn.Module):
-
     def __init__(
         self,
         config: PretrainedConfig,
@@ -893,43 +607,23 @@ class Qwen2MoeDecoderLayer(nn.Module):
         super().__init__()
         self.config = config
         self.hidden_size = config.hidden_size
-        rope_theta = getattr(config, "rope_theta", 10000)
-        rope_scaling = getattr(config, "rope_scaling", None)
+        rope_theta, rope_scaling = get_rope_config(config)
         max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
-        if getattr(config, "qkv_bias", None) is not None:
-            qkv_bias = getattr(config, "qkv_bias")
-        elif getattr(config, "qkv_proj_bias", None) is not None:
-            qkv_bias = getattr(config, "qkv_proj_bias")
-        else:
-            qkv_bias = True
+        qkv_bias = getattr(config, "qkv_bias", True)
         dual_chunk_attention_config = getattr(
             config, "dual_chunk_attention_config", None
         )
-        qk_norm = getattr(config, "qk_norm", False)
-        k_norm = getattr(config, "k_norm", False)
-        out_bias = getattr(config, "out_proj_bias", False)
-        head_dim = getattr(
-            config, "head_dim", self.hidden_size // config.num_attention_heads
-        )
-        qk_rope_head_dim = getattr(config, "qk_rope_head_dim", head_dim)
         self.self_attn = Qwen2MoeAttention(
             hidden_size=self.hidden_size,
             num_heads=config.num_attention_heads,
             num_kv_heads=config.num_key_value_heads,
-            head_dim=head_dim,
             layer_id=layer_id,
             rope_theta=rope_theta,
             rope_scaling=rope_scaling,
-            compress=config.rotary_compress,
             max_position_embeddings=max_position_embeddings,
-            qk_norm=qk_norm,
-            k_norm=k_norm,
-            qk_rope_head_dim=qk_rope_head_dim,
-            qk_norm_eps=config.rms_norm_eps,
             quant_config=quant_config,
             dual_chunk_attention_config=dual_chunk_attention_config,
             qkv_bias=qkv_bias,
-            out_bias=out_bias,
             prefix=add_prefix("self_attn", prefix),
         )
 
@@ -938,16 +632,17 @@ class Qwen2MoeDecoderLayer(nn.Module):
         self.attn_tp_size = get_attention_tp_size()
         self.attn_tp_rank = get_attention_tp_rank()
 
-        # Qwen2MoE all layers are sparse (include nextn layers)
+        # Qwen2MoE all layers are sparse and have no nextn now
         self.is_layer_sparse = True
         is_previous_layer_sparse = True
+        is_next_layer_sparse = True
 
         self.layer_scatter_modes = LayerScatterModes.init_new(
             layer_id=layer_id,
             num_layers=config.num_hidden_layers,
             is_layer_sparse=self.is_layer_sparse,
             is_previous_layer_sparse=is_previous_layer_sparse,
-            is_next_layer_sparse=True,
+            is_next_layer_sparse=is_next_layer_sparse,
         )
 
         if self.is_layer_sparse:
@@ -983,10 +678,18 @@ class Qwen2MoeDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
+        captured_last_layer_outputs: Optional[List[torch.Tensor]] = None,
+        **kwargs,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
 
-        hidden_states, residual = self.layer_communicator.prepare_attn(
-            hidden_states, residual, forward_batch
+        hidden_states, residual = (
+            self.layer_communicator.prepare_attn_and_capture_last_layer_outputs(
+                hidden_states,
+                residual,
+                forward_batch,
+                captured_last_layer_outputs=captured_last_layer_outputs,
+                **kwargs,
+            )
         )
 
         if hidden_states.shape[0] != 0:
@@ -1025,7 +728,6 @@ class Qwen2MoeModel(nn.Module):
     ) -> None:
         super().__init__()
         self.config = config
-        self.padding_idx = getattr(config, "pad_token_id", None)
         self.vocab_size = config.vocab_size
         self.pp_group = get_pp_group()
 
@@ -1090,6 +792,15 @@ class Qwen2MoeModel(nn.Module):
             hidden_states = pp_proxy_tensors["hidden_states"]
             residual = pp_proxy_tensors["residual"]
 
+        if (
+            is_prefill_context_parallel_enabled()
+            and forward_batch.forward_mode.is_context_parallel_extend()
+            and forward_batch.attn_cp_metadata is not None
+        ):
+            if self.pp_group.is_first_rank:
+                hidden_states = cp_split_and_rebuild_data(forward_batch, hidden_states)
+            positions = cp_split_and_rebuild_position(forward_batch, positions)
+
         aux_hidden_states = []
         if forward_batch.can_run_tbo:
             hidden_states, residual = model_forward_maybe_tbo(
@@ -1103,17 +814,25 @@ class Qwen2MoeModel(nn.Module):
             )
         else:
             for i in range(self.start_layer, self.end_layer):
-                if i in self.layers_to_capture:
-                    aux_hidden_states.append(
-                        hidden_states + residual
-                        if residual is not None
-                        else hidden_states
-                    )
-                with get_global_expert_distribution_recorder().with_current_layer(i):
+                ctx = (
+                    nullcontext()
+                    if not get_global_server_args().disable_piecewise_cuda_graph
+                    else get_global_expert_distribution_recorder().with_current_layer(i)
+                )
+                with ctx:
                     layer = self.layers[i]
                     hidden_states, residual = layer(
-                        positions, hidden_states, forward_batch, residual
+                        positions,
+                        hidden_states,
+                        forward_batch,
+                        residual,
+                        captured_last_layer_outputs=(
+                            aux_hidden_states
+                            if getattr(layer, "_is_layer_to_capture", False)
+                            else None
+                        ),
                     )
+
         if not self.pp_group.is_last_rank:
             return PPProxyTensors(
                 {
@@ -1255,20 +974,7 @@ class Qwen2MoeForCausalLM(nn.Module):
     def end_layer(self):
         return self.model.end_layer
 
-    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]], is_nextn=False):
-        if is_nextn:
-            if hasattr(self.config, "num_nextn_predict_layers"):
-                num_nextn_layers = self.config.num_nextn_predict_layers
-                assert num_nextn_layers == 1, "Only 1 nextn layer is supported"
-                # compatible with old design
-                nextn_layer_id = (
-                    0
-                    if self.config.num_hidden_layers == 1
-                    else self.config.num_hidden_layers
-                )
-            else:
-                raise ValueError("num_nextn_predict_layers is not in the config")
-
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("qkv_proj", "q_proj", "q"),
@@ -1286,44 +992,7 @@ class Qwen2MoeForCausalLM(nn.Module):
         )
 
         params_dict = dict(self.named_parameters())
-        if is_nextn:
-            nextn_layer_prefix = f"model.layers.{nextn_layer_id}"
-            nextn_spec_weight_names = [
-                "shared_head.norm",
-                "eh_proj",
-                "enorm",
-                "hnorm",
-            ]
         for name, loaded_weight in weights:
-            if not is_nextn:
-                if hasattr(self.config, "num_nextn_predict_layers"):
-                    num_nextn_layers = self.config.num_nextn_predict_layers
-                    if num_nextn_layers > 0 and name.startswith("model.layers"):
-                        name_list = name.split(".")
-                        if (
-                            len(name_list) >= 3
-                            and int(name_list[2]) >= self.config.num_hidden_layers
-                        ):
-                            continue
-            else:
-                if not name.startswith(nextn_layer_prefix):
-                    continue
-
-                # Use shared head and embed weights from target model
-                if "shared_head.head" in name or "embed_tokens" in name:
-                    continue
-
-                is_decoder = True
-                # For nextn specific weights
-                for weight_name in nextn_spec_weight_names:
-                    if weight_name in name:
-                        name = name.replace(nextn_layer_prefix, "model")
-                        is_decoder = False
-                        break
-                # For decoder layer weights
-                if is_decoder:
-                    name = name.replace(nextn_layer_prefix, "model.decoder")
-
             layer_id = get_layer_id(name)
             if (
                 layer_id is not None
@@ -1414,7 +1083,7 @@ class Qwen2MoeForCausalLM(nn.Module):
                 ]
             )  # Specific layers for EAGLE3 support
         else:
-            self.model.layers_to_capture = [val + 1 for val in layer_ids]
+            self.model.set_eagle3_layers_to_capture([val + 1 for val in layer_ids])
 
 
 EntryClass = Qwen2MoeForCausalLM

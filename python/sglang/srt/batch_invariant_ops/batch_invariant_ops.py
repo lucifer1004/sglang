@@ -960,7 +960,6 @@ def enable_batch_invariant_mode(enable_bmm: bool = True):
         "aten::_log_softmax", _log_softmax_batch_invariant, dispatch_key
     )
     _batch_invariant_LIB.impl("aten::mean.dim", mean_batch_invariant, dispatch_key)
-
     if enable_bmm:
         _batch_invariant_LIB.impl("aten::bmm", bmm_batch_invariant, dispatch_key)
         # Also monkeypatch torch.bmm directly as a fallback

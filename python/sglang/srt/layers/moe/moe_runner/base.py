@@ -50,6 +50,7 @@ class MoeRunnerConfig:
     gemm1_alpha: Optional[float] = None
     gemm1_clamp_limit: Optional[float] = None
     swiglu_clamp_limit: Optional[float] = None
+    swiglu_limit: Optional[float] = None
 
 
 @dataclass

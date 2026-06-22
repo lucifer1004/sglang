@@ -64,8 +64,8 @@ class WelmMTPDraftProposalInputBuffers(ForwardInputBuffers):
     seq_lens: torch.Tensor
     seq_lens_cpu: torch.Tensor
     extend_seq_lens: torch.Tensor
-    num_accepted_drafts: torch.Tensor
-    num_accepted_tokens: torch.Tensor
+    num_correct_drafts: torch.Tensor
+    num_accept_tokens: torch.Tensor
     custom_last_index: torch.Tensor
     custom_last_cache_loc: torch.Tensor
     next_token_logits_buffer: torch.Tensor
@@ -206,10 +206,10 @@ class WelmMTPDraftProposalCudaGraphRunner:
             extend_seq_lens = torch.full(
                 (self.max_bs,), self.num_tokens_per_bs, dtype=torch.int32
             )
-            num_accepted_drafts = torch.full(
+            num_correct_drafts = torch.full(
                 (self.max_bs,), self.num_tokens_per_bs - 1, dtype=torch.int32
             )
-            num_accepted_tokens = torch.full(
+            num_accept_tokens = torch.full(
                 (self.max_bs,), self.num_tokens_per_bs, dtype=torch.int32
             )
             custom_last_index = (
@@ -350,8 +350,8 @@ class WelmMTPDraftProposalCudaGraphRunner:
             seq_lens=seq_lens,
             seq_lens_cpu=seq_lens_cpu,
             extend_seq_lens=extend_seq_lens,
-            num_accepted_drafts=num_accepted_drafts,
-            num_accepted_tokens=num_accepted_tokens,
+            num_correct_drafts=num_correct_drafts,
+            num_accept_tokens=num_accept_tokens,
             custom_last_index=custom_last_index,
             custom_last_cache_loc=custom_last_cache_loc,
             next_token_logits_buffer=next_token_logits_buffer,
@@ -1009,12 +1009,12 @@ class WelmMTPDraftProposalCudaGraphRunner:
         if not isinstance(spec_info, EagleDraftInput):
             return False
         if (
-            spec_info.num_accepted_tokens_cpu is None
-            or spec_info.num_accepted_tokens is None
-            or spec_info.num_accepted_drafts is None
+            spec_info.num_accept_tokens_cpu is None
+            or spec_info.num_accept_tokens is None
+            or spec_info.num_correct_drafts is None
         ):
             return False
-        accepted_lens_cpu = [int(x) for x in spec_info.num_accepted_tokens_cpu]
+        accepted_lens_cpu = [int(x) for x in spec_info.num_accept_tokens_cpu]
         if len(accepted_lens_cpu) != raw_bs:
             return False
         index = bisect.bisect_left(self.capture_bs, cuda_graph_bs)
@@ -1074,8 +1074,8 @@ class WelmMTPDraftProposalCudaGraphRunner:
         seq_lens_cpu = buffers.seq_lens_cpu[:bs]
         extend_seq_lens = buffers.extend_seq_lens[:bs]
         extend_seq_lens_cpu = self.extend_seq_lens_cpu[:bs]
-        num_accepted_drafts = buffers.num_accepted_drafts[:bs]
-        num_accepted_tokens = buffers.num_accepted_tokens[:bs]
+        num_correct_drafts = buffers.num_correct_drafts[:bs]
+        num_accept_tokens = buffers.num_accept_tokens[:bs]
         custom_last_index = buffers.custom_last_index[:bs]
         custom_last_cache_loc = buffers.custom_last_cache_loc[:bs]
         next_token_logits_buffer = buffers.next_token_logits_buffer[:bs]
@@ -1118,10 +1118,10 @@ class WelmMTPDraftProposalCudaGraphRunner:
         spec_info = EagleDraftInput(
             hidden_states=hidden_states,
             mirrored_kv_indices=mirrored_kv_indices,
-            num_accepted_drafts=num_accepted_drafts,
-            num_accepted_tokens=num_accepted_tokens,
-            num_accepted_drafts_cpu=[self.num_tokens_per_bs - 1] * bs,
-            num_accepted_tokens_cpu=[self.num_tokens_per_bs] * bs,
+            num_correct_drafts=num_correct_drafts,
+            num_accept_tokens=num_accept_tokens,
+            num_correct_drafts_cpu=[self.num_tokens_per_bs - 1] * bs,
+            num_accept_tokens_cpu=[self.num_tokens_per_bs] * bs,
             capture_hidden_mode=capture_hidden_mode,
             num_tokens_per_req=self.num_tokens_per_bs,
             num_tokens_for_logprob_per_req=self.num_tokens_per_bs,
@@ -1318,7 +1318,7 @@ class WelmMTPDraftProposalCudaGraphRunner:
         graph_num_tokens = bs * self.num_tokens_per_bs
         spec_info = forward_batch.spec_info
         assert isinstance(spec_info, EagleDraftInput)
-        accepted_lens_cpu = [int(x) for x in spec_info.num_accepted_tokens_cpu]
+        accepted_lens_cpu = [int(x) for x in spec_info.num_accept_tokens_cpu]
         padded_lens_cpu = self._make_padded_accept_lens(accepted_lens_cpu, bs)
         if spec_info.hidden_states is None:
             raise RuntimeError(
@@ -1381,8 +1381,8 @@ class WelmMTPDraftProposalCudaGraphRunner:
             device=buffers.extend_seq_lens.device,
         )
         buffers.extend_seq_lens[:bs].copy_(padded_lens)
-        buffers.num_accepted_tokens[:bs].copy_(padded_lens)
-        buffers.num_accepted_drafts[:bs].copy_(padded_lens - 1)
+        buffers.num_accept_tokens[:bs].copy_(padded_lens)
+        buffers.num_correct_drafts[:bs].copy_(padded_lens - 1)
         self.extend_seq_lens_cpu[:bs] = padded_lens_cpu
 
         if buffers.welm_mtp_oe_hash_out is not None and raw_bs > 0:

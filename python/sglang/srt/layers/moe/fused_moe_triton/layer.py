@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Adapted from https://github.com/vllm-project/vllm/blob/a6221a144af772fd1a68fe7e627935dc53e81738/vllm/model_executor/layers/fused_moe/layer.py
 
 import logging
@@ -80,7 +82,7 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 def create_moe_dispatcher(moe_runner_config: MoeRunnerConfig) -> BaseDispatcher:
     a2a_backend = get_moe_a2a_backend()
-    if a2a_backend.is_none():
+    if a2a_backend.is_none() or a2a_backend.is_megamoe():
         return StandardDispatcher(moe_runner_config)
     elif (
         a2a_backend.is_deepep()
@@ -179,6 +181,7 @@ class FusedMoE(torch.nn.Module):
         gemm1_alpha: Optional[float] = None,
         gemm1_clamp_limit: Optional[float] = None,
         swiglu_clamp_limit: Optional[float] = None,
+        swiglu_limit: Optional[float] = None,
         use_weight_loader_fused: bool = False,
         with_bias=False,
         routing_method_type: Optional[RoutingMethodType] = None,
@@ -226,6 +229,7 @@ class FusedMoE(torch.nn.Module):
             get_moe_runner_backend().is_flashinfer_trtllm()
             or get_moe_runner_backend().is_flashinfer_trtllm_routed()
         )
+        self.use_deep_gemm = get_moe_runner_backend().is_deep_gemm()
 
         # flashinfer_trtllm kernel requires intermediate_size to be a multiple of 128
         # Pad the intermediate_size_per_partition if necessary
@@ -239,6 +243,8 @@ class FusedMoE(torch.nn.Module):
 
         self.quant_config = quant_config
         self.use_flashinfer_mxfp4_moe = get_moe_runner_backend().is_flashinfer_mxfp4()
+        if swiglu_limit is None:
+            swiglu_limit = swiglu_clamp_limit
         # TODO maybe we should remove this `if`, since `Mxfp4MoEMethod` does another round-up logic
         if (
             self.quant_config is not None
@@ -265,7 +271,8 @@ class FusedMoE(torch.nn.Module):
             routed_scaling_factor=routed_scaling_factor,
             gemm1_alpha=gemm1_alpha,
             gemm1_clamp_limit=gemm1_clamp_limit,
-            swiglu_clamp_limit=swiglu_clamp_limit,
+            swiglu_clamp_limit=swiglu_limit,
+            swiglu_limit=swiglu_limit,
             is_gated=is_gated,
             routing_method_type=routing_method_type,
         )
@@ -284,7 +291,9 @@ class FusedMoE(torch.nn.Module):
                 self.quant_method = quant_config.get_quant_method(self, prefix)
             if self.quant_method is None:
                 self.quant_method = UnquantizedFusedMoEMethod(
-                    self.use_triton_kernels, self.use_flashinfer_trtllm_moe
+                    self.use_triton_kernels,
+                    self.use_flashinfer_trtllm_moe,
+                    self.use_deep_gemm,
                 )
 
         self.quant_method.create_weights(

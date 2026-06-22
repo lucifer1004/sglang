@@ -169,18 +169,26 @@ COPY python/pyproject.toml /sgl-workspace/python/pyproject.toml
 
 RUN "${VENV_PATH}/bin/python" - <<'PY'
 import pathlib
+import re
 
 path = pathlib.Path("/sgl-workspace/python/pyproject.toml")
 text = path.read_text()
-replacements = {
-    '"cuda-python>=13.0",': '"cuda-python>=12,<13",',
-    '"sglang-kernel==0.4.2",': '"sglang-kernel==0.4.2.post1+cu129",',
-    '"nvidia-cutlass-dsl==4.4.2",': '"nvidia-cutlass-dsl==4.5.0",',
-}
-for old, new in replacements.items():
-    if old not in text:
-        raise SystemExit(f"expected dependency line not found in {path}: {old}")
-    text = text.replace(old, new, 1)
+
+def replace_dependency_line(text: str, package: str, replacement: str) -> str:
+    pattern = re.compile(
+        rf'(?m)^(\s*)"{re.escape(package)}(?:\[[^\]]+\])?[^"]*",(\s*(?:#.*)?)$'
+    )
+    text, count = pattern.subn(rf'\1"{replacement}",\2', text, count=1)
+    if count != 1:
+        raise SystemExit(f"expected dependency for {package!r} not found in {path}")
+    return text
+
+for package, replacement in (
+    ("cuda-python", "cuda-python>=12,<13"),
+    ("sglang-kernel", "sglang-kernel==0.4.2.post2+cu129"),
+    ("nvidia-cutlass-dsl", "nvidia-cutlass-dsl==4.5.0"),
+):
+    text = replace_dependency_line(text, package, replacement)
 path.write_text(text)
 PY
 
@@ -259,7 +267,7 @@ PY
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv pip install --python "${VENV_PATH}/bin/python" \
         --index-url "${SGLANG_KERNEL_INDEX_URL}" \
-        "sglang-kernel==0.4.2.post1+cu129"
+        "sglang-kernel==0.4.2.post2+cu129"
 
 RUN "${VENV_PATH}/bin/python" - <<'PY' > /tmp/sglang-runtime-requirements.txt
 import pathlib
@@ -267,6 +275,7 @@ import tomllib
 
 pyproject = pathlib.Path("/sgl-workspace/python/pyproject.toml")
 data = tomllib.loads(pyproject.read_text())
+deep_gemm_version = None
 for dep in data["project"]["dependencies"]:
     dep_lower = dep.strip().lower()
     if dep_lower.startswith("cuda-python"):
@@ -277,12 +286,26 @@ for dep in data["project"]["dependencies"]:
         continue
     elif dep_lower.startswith("sglang-kernel=="):
         continue
+    elif dep_lower.startswith("sgl-deep-gemm=="):
+        deep_gemm_version = dep.split("==", 1)[1].strip()
+        continue
     else:
         print(dep)
+if not deep_gemm_version:
+    raise SystemExit("expected sgl-deep-gemm dependency not found")
+pathlib.Path("/tmp/sgl-deep-gemm-version.txt").write_text(deep_gemm_version)
 PY
 
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv pip install --python "${VENV_PATH}/bin/python" -r /tmp/sglang-runtime-requirements.txt
+
+RUN --mount=type=cache,target=/root/.cache/uv <<'BASH'
+set -euo pipefail
+SGL_DEEP_GEMM_VERSION="$(cat /tmp/sgl-deep-gemm-version.txt)"
+uv pip install --python "${VENV_PATH}/bin/python" \
+    "https://github.com/sgl-project/whl/releases/download/v${SGL_DEEP_GEMM_VERSION}/sgl_deep_gemm-${SGL_DEEP_GEMM_VERSION}+cu129-py3-none-manylinux2014_$(uname -m).whl" \
+    --force-reinstall
+BASH
 
 COPY sgl-model-gateway /sgl-workspace/sgl-model-gateway
 
@@ -316,18 +339,26 @@ COPY rust/sglang-grpc /sgl-workspace/rust/sglang-grpc
 
 RUN "${VENV_PATH}/bin/python" - <<'PY'
 import pathlib
+import re
 
 path = pathlib.Path("/sgl-workspace/python/pyproject.toml")
 text = path.read_text()
-replacements = {
-    '"cuda-python>=13.0",': '"cuda-python>=12,<13",',
-    '"sglang-kernel==0.4.2",': '"sglang-kernel==0.4.2.post1+cu129",',
-    '"nvidia-cutlass-dsl==4.4.2",': '"nvidia-cutlass-dsl==4.5.0",',
-}
-for old, new in replacements.items():
-    if old not in text:
-        raise SystemExit(f"expected dependency line not found in {path}: {old}")
-    text = text.replace(old, new, 1)
+
+def replace_dependency_line(text: str, package: str, replacement: str) -> str:
+    pattern = re.compile(
+        rf'(?m)^(\s*)"{re.escape(package)}(?:\[[^\]]+\])?[^"]*",(\s*(?:#.*)?)$'
+    )
+    text, count = pattern.subn(rf'\1"{replacement}",\2', text, count=1)
+    if count != 1:
+        raise SystemExit(f"expected dependency for {package!r} not found in {path}")
+    return text
+
+for package, replacement in (
+    ("cuda-python", "cuda-python>=12,<13"),
+    ("sglang-kernel", "sglang-kernel==0.4.2.post2+cu129"),
+    ("nvidia-cutlass-dsl", "nvidia-cutlass-dsl==4.5.0"),
+):
+    text = replace_dependency_line(text, package, replacement)
 path.write_text(text)
 PY
 
@@ -341,6 +372,7 @@ import pathlib
 import sys
 import sysconfig
 
+import deep_gemm
 import sglang
 import torch
 
@@ -358,6 +390,7 @@ print(f"python_include={include_dir}")
 print(f"sglang={version('sglang')}")
 print(f"torch={torch.__version__}, torch_cuda={torch.version.cuda}")
 print(f"cuda-python={cuda_python}")
+print(f"deep_gemm={version('sgl-deep-gemm')}, deep_gemm_module={deep_gemm.__file__}")
 print(f"sglang_module={sglang.__file__}")
 PY
 

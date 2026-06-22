@@ -481,7 +481,7 @@ class EAGLEWorker(TpModelWorker):
             return GenerationBatchResult(
                 logits_output=logits_output,
                 next_token_ids=next_token_ids,
-                num_accepted_drafts=0,
+                num_correct_drafts=0,
                 can_run_cuda_graph=can_run_cuda_graph,
             )
         else:
@@ -503,7 +503,7 @@ class EAGLEWorker(TpModelWorker):
 
             if get_global_tracing_enabled():
                 for idx, req in enumerate(batch.reqs):
-                    accepted = verify_output.num_accepted_drafts_per_req_cpu[idx]
+                    accepted = verify_output.num_correct_drafts_per_req_cpu[idx]
                     req.time_stats.set_spec_verify_end_time(accepted_tokens=accepted)
 
             set_time_batch(
@@ -519,7 +519,7 @@ class EAGLEWorker(TpModelWorker):
                 # when DP attention is enabled, but it is slow. Skip it for now.
                 if (
                     self.server_args.enable_dp_attention
-                    or batch.spec_info.verified_id.shape[0] > 0
+                    or batch.spec_info.bonus_tokens.shape[0] > 0
                 ):
                     # decode is not finished
                     self.forward_draft_extend_after_decode(batch)
@@ -531,19 +531,19 @@ class EAGLEWorker(TpModelWorker):
             controller = getattr(self, "adaptive_controller", None)
             if controller is not None:
                 controller.on_verify_complete(
-                    verify_output.num_accepted_drafts_per_req_cpu
+                    verify_output.num_correct_drafts_per_req_cpu
                 )
 
             return GenerationBatchResult(
                 logits_output=logits_output,
-                next_token_ids=verify_output.verified_id,
-                num_accepted_drafts=sum(verify_output.num_accepted_drafts_per_req_cpu),
-                num_accepted_drafts_per_req_cpu=verify_output.num_accepted_drafts_per_req_cpu,
+                next_token_ids=verify_output.bonus_tokens,
+                num_correct_drafts=sum(verify_output.num_correct_drafts_per_req_cpu),
+                num_correct_drafts_per_req_cpu=verify_output.num_correct_drafts_per_req_cpu,
                 can_run_cuda_graph=can_run_cuda_graph,
             )
 
     def check_forward_draft_extend_after_decode(self, batch: ScheduleBatch):
-        local_need_forward = batch.spec_info.verified_id.shape[0] > 0
+        local_need_forward = batch.spec_info.bonus_tokens.shape[0] > 0
         if not self.server_args.enable_dp_attention:
             return local_need_forward
 
@@ -603,7 +603,7 @@ class EAGLEWorker(TpModelWorker):
         if batch.sampling_info.penalizer_orchestrator.is_required:
             # This is a relaxed version of penalties for speculative decoding.
             batch.sampling_info.penalizer_orchestrator.cumulate_output_tokens(
-                spec_info.verified_id.to(torch.int64)
+                spec_info.bonus_tokens.to(torch.int64)
             )
 
         # Allocate cache locations
@@ -794,7 +794,7 @@ class EAGLEWorker(TpModelWorker):
             retrieve_next_sibling,
             draft_tokens,
         ) = build_tree_kernel_efficient(
-            spec_info.verified_id,
+            spec_info.bonus_tokens,
             parent_list,
             top_scores_index,
             draft_tokens,
@@ -1013,7 +1013,7 @@ class EAGLEWorker(TpModelWorker):
 
         accepted_length = (
             torch.tensor(
-                res.num_accepted_drafts_per_req_cpu,
+                res.num_correct_drafts_per_req_cpu,
                 device=logits_output.hidden_states.device,
                 dtype=torch.int64,
             )
@@ -1100,7 +1100,7 @@ class EAGLEWorker(TpModelWorker):
         """
         batch.spec_info = EagleDraftInput(
             hidden_states=hidden_states,
-            verified_id=next_token_ids,
+            bonus_tokens=next_token_ids,
             num_tokens_per_req=1,
             num_tokens_for_logprob_per_req=1,
             model_specific_states=model_specific_states,
@@ -1129,13 +1129,13 @@ class EAGLEWorker(TpModelWorker):
         seq_lens_backup = batch.seq_lens.clone()
         seq_lens_cpu_backup = batch.seq_lens_cpu.clone()
         req_pool_indices_backup = batch.req_pool_indices
-        num_accepted_drafts_backup = batch.spec_info.num_accepted_drafts.clone()
-        num_accepted_tokens_backup = batch.spec_info.num_accepted_tokens.clone()
+        num_correct_drafts_backup = batch.spec_info.num_correct_drafts.clone()
+        num_accept_tokens_backup = batch.spec_info.num_accept_tokens.clone()
         return_logprob_backup = batch.return_logprob
 
         input_is_idle = batch.forward_mode.is_idle()
 
-        if not input_is_idle and batch.spec_info.verified_id.numel() == 0:
+        if not input_is_idle and batch.spec_info.bonus_tokens.numel() == 0:
             batch = batch.copy()
             batch.prepare_for_idle()
             hidden_size = (
@@ -1218,8 +1218,8 @@ class EAGLEWorker(TpModelWorker):
         batch.seq_lens = seq_lens_backup
         batch.seq_lens_cpu = seq_lens_cpu_backup
         batch.req_pool_indices = req_pool_indices_backup
-        batch.spec_info.num_accepted_drafts = num_accepted_drafts_backup
-        batch.spec_info.num_accepted_tokens = num_accepted_tokens_backup
+        batch.spec_info.num_correct_drafts = num_correct_drafts_backup
+        batch.spec_info.num_accept_tokens = num_accept_tokens_backup
         batch.return_logprob = return_logprob_backup
 
     def capture_for_decode(

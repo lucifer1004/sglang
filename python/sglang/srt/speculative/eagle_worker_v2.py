@@ -62,7 +62,7 @@ from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative.eagle_info_v2 import (
     assign_extend_cache_locs,
     fill_accepted_out_cache_loc,
-    fill_new_verified_id,
+    fill_new_bonus_tokens,
 )
 from sglang.srt.speculative.eagle_utils import (
     TreeMaskMode,
@@ -779,10 +779,10 @@ class EagleDraftWorker(BaseDraftWorker):
         if history_state is not None:
             forward_batch.spec_info.welm_mtp_oe_history_state = history_state
             return history_state
-        first_token_ids = getattr(draft_input, "verified_id", None)
+        first_token_ids = getattr(draft_input, "bonus_tokens", None)
         if first_token_ids is None:
             raise RuntimeError(
-                "WeLMV4 MTP fused OE hash draft-decode path requires verified_id."
+                "WeLMV4 MTP fused OE hash draft-decode path requires bonus_tokens."
             )
         prefix_rows = getattr(draft_input, "welm_mtp_oe_prefix_rows", None)
         history_state = self._init_welmv4_mtp_oe_history_from_context(
@@ -3189,7 +3189,7 @@ class EagleDraftWorker(BaseDraftWorker):
             retrieve_next_sibling,
             draft_tokens,
         ) = build_tree_kernel_efficient(
-            draft_input.verified_id,
+            draft_input.bonus_tokens,
             parent_list,
             top_scores_index,
             draft_tokens,
@@ -3396,7 +3396,7 @@ class EagleDraftWorker(BaseDraftWorker):
             empty_i32 = torch.empty((0,), dtype=torch.int32, device=self.device)
             return EagleDraftInput(
                 hidden_states=target_hidden_states[:0],
-                verified_id=next_token_ids[:0],
+                bonus_tokens=next_token_ids[:0],
                 new_seq_lens=empty_i32,
                 num_tokens_per_req=1,
                 num_tokens_for_logprob_per_req=1,
@@ -3416,7 +3416,7 @@ class EagleDraftWorker(BaseDraftWorker):
             ):
                 next_draft_input = EagleDraftInput(
                     hidden_states=target_hidden_states,
-                    verified_id=next_token_ids,
+                    bonus_tokens=next_token_ids,
                     new_seq_lens=batch.seq_lens,
                     num_tokens_per_req=1,
                     num_tokens_for_logprob_per_req=1,
@@ -3456,7 +3456,7 @@ class EagleDraftWorker(BaseDraftWorker):
         # Construct spec_info
         next_draft_input = EagleDraftInput(
             hidden_states=target_hidden_states,
-            verified_id=next_token_ids,
+            bonus_tokens=next_token_ids,
             new_seq_lens=batch.seq_lens,
             # draft mode is same with decode mode, only 1 token per req
             num_tokens_per_req=1,
@@ -3603,10 +3603,10 @@ class EagleDraftWorker(BaseDraftWorker):
             if next_draft_input.hidden_states is None
             else next_draft_input.hidden_states
         )
-        draft_input.verified_id = (
+        draft_input.bonus_tokens = (
             empty_i32
-            if next_draft_input.verified_id is None
-            else next_draft_input.verified_id
+            if next_draft_input.bonus_tokens is None
+            else next_draft_input.bonus_tokens
         )
         draft_input.new_seq_lens = (
             empty_i32
@@ -3614,21 +3614,21 @@ class EagleDraftWorker(BaseDraftWorker):
             else next_draft_input.new_seq_lens
         )
         draft_input.verify_done = next_draft_input.verify_done
-        draft_input.num_accepted_drafts = (
+        draft_input.num_correct_drafts = (
             empty_i32
-            if next_draft_input.num_accepted_drafts is None
-            else next_draft_input.num_accepted_drafts
+            if next_draft_input.num_correct_drafts is None
+            else next_draft_input.num_correct_drafts
         )
-        draft_input.num_accepted_tokens = (
+        draft_input.num_accept_tokens = (
             empty_i32
-            if next_draft_input.num_accepted_tokens is None
-            else next_draft_input.num_accepted_tokens
+            if next_draft_input.num_accept_tokens is None
+            else next_draft_input.num_accept_tokens
         )
-        draft_input.num_accepted_drafts_cpu = list(
-            next_draft_input.num_accepted_drafts_cpu or []
+        draft_input.num_correct_drafts_cpu = list(
+            next_draft_input.num_correct_drafts_cpu or []
         )
-        draft_input.num_accepted_tokens_cpu = list(
-            next_draft_input.num_accepted_tokens_cpu or []
+        draft_input.num_accept_tokens_cpu = list(
+            next_draft_input.num_accept_tokens_cpu or []
         )
         draft_input.num_tokens_for_logprob_per_req = 1
         draft_input.mirrored_kv_indices = next_draft_input.mirrored_kv_indices
@@ -3663,7 +3663,7 @@ class EagleDraftWorker(BaseDraftWorker):
         batch.return_logprob = False
         batch.return_hidden_states = False
 
-        return draft_input.verified_id.to(dtype=torch.int64)
+        return draft_input.bonus_tokens.to(dtype=torch.int64)
 
     @staticmethod
     def _packed_accept_path_positions(
@@ -3793,16 +3793,16 @@ class EagleDraftWorker(BaseDraftWorker):
                         draft_input.hidden_states = (
                             batch_result.logits_output.hidden_states[accepted_indices]
                         )
-                    draft_input.verified_id = next_draft_input.verified_id
+                    draft_input.bonus_tokens = next_draft_input.bonus_tokens
                     draft_input.new_seq_lens = next_draft_input.new_seq_lens
                     draft_input.verify_done = next_draft_input.verify_done
                     draft_input.num_tokens_for_logprob_per_req = 1
-                    draft_input.num_accepted_drafts = batch_result.accept_lens - 1
-                    draft_input.num_accepted_tokens = batch_result.accept_lens
-                    draft_input.num_accepted_drafts_cpu = [
+                    draft_input.num_correct_drafts = batch_result.accept_lens - 1
+                    draft_input.num_accept_tokens = batch_result.accept_lens
+                    draft_input.num_correct_drafts_cpu = [
                         int(x) - 1 for x in accept_lens_cpu
                     ]
-                    draft_input.num_accepted_tokens_cpu = [
+                    draft_input.num_accept_tokens_cpu = [
                         int(x) for x in accept_lens_cpu
                     ]
                     draft_input.mirrored_kv_indices = accepted_indices
@@ -3834,7 +3834,7 @@ class EagleDraftWorker(BaseDraftWorker):
                     batch.capture_hidden_mode = CaptureHiddenMode.LAST
                     batch.forward_mode = ForwardMode.DRAFT_EXTEND
                     batch.is_extend_in_batch = True
-                    first_input_ids = next_draft_input.verified_id
+                    first_input_ids = next_draft_input.bonus_tokens
 
                 forward_batch = ForwardBatch.init_new(batch, self.draft_runner)
                 forward_batch.return_logprob = False
@@ -4008,11 +4008,11 @@ class EagleDraftWorker(BaseDraftWorker):
         if welmv4_mtp_oe_next_history is not None:
             next_draft_input.welm_mtp_oe_history_state = welmv4_mtp_oe_next_history
 
-        if forward_batch.spec_info.num_accepted_drafts is None:
+        if forward_batch.spec_info.num_correct_drafts is None:
             # `batch_result.accept_lens` already includes the bonus token, so use it
-            # directly for `num_accepted_tokens` and subtract 1 for `num_accepted_drafts`.
-            forward_batch.spec_info.num_accepted_drafts = batch_result.accept_lens - 1
-            forward_batch.spec_info.num_accepted_tokens = batch_result.accept_lens
+            # directly for `num_accept_tokens` and subtract 1 for `num_correct_drafts`.
+            forward_batch.spec_info.num_correct_drafts = batch_result.accept_lens - 1
+            forward_batch.spec_info.num_accept_tokens = batch_result.accept_lens
 
         # Run draft extend batch in the main compute stream
         can_cuda_graph = (
@@ -4634,24 +4634,24 @@ class EAGLEWorkerV2(BaseSpecWorker):
             )
 
         if not batch.forward_mode.is_idle():
-            verified_id = torch.empty_like(accept_lens, dtype=torch.int32)
+            bonus_tokens = torch.empty_like(accept_lens, dtype=torch.int32)
             if self.topk > 1:
-                fill_new_verified_id[(bs,)](
+                fill_new_bonus_tokens[(bs,)](
                     next_token_ids,
                     accept_lens,
-                    verified_id,
+                    bonus_tokens,
                     self.speculative_num_draft_tokens,
                 )
             else:
-                all_verified_id = predict[accept_index]
-                fill_new_verified_id[(bs,)](
-                    all_verified_id,
+                all_bonus_tokens = predict[accept_index]
+                fill_new_bonus_tokens[(bs,)](
+                    all_bonus_tokens,
                     accept_lens,
-                    verified_id,
+                    bonus_tokens,
                     self.speculative_num_draft_tokens,
                 )
         else:
-            verified_id = torch.empty((0,), device=self.device, dtype=torch.int32)
+            bonus_tokens = torch.empty((0,), device=self.device, dtype=torch.int32)
 
         if batch.return_logprob and not batch.forward_mode.is_idle():
             compute_spec_v2_logprobs(
@@ -4663,7 +4663,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
         # Construct the next draft input
         next_draft_input = EagleDraftInput(
-            verified_id=verified_id,
+            bonus_tokens=bonus_tokens,
             new_seq_lens=new_seq_lens,
             verify_done=verify_done,
             hidden_states=packed_hidden_states,
@@ -4679,6 +4679,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
             spec_accept_index=accept_index,
             routed_experts_output=forward_batch_output.routed_experts_output,
             welm_mtp_accepted_draft_token_ids=welm_mtp_accepted_draft_token_ids,
+            speculative_num_draft_tokens=self.speculative_num_draft_tokens,
         )
 
     def _mamba_verify_update(
@@ -4748,7 +4749,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
         self,
         batch: ModelWorkerBatch,
         accept_index: torch.Tensor,
-        num_accepted_drafts: torch.Tensor,
+        num_correct_drafts: torch.Tensor,
     ):
         """
         Move accepted tokens to the target KV cache.
@@ -4756,7 +4757,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
         Args:
             batch: The batch to run.
             accept_index: The index of the accepted tokens.
-            num_accepted_drafts: The length of the accepted tokens.
+            num_correct_drafts: The length of the accepted tokens.
         """
         bs = len(batch.seq_lens)
         size = bs * self.speculative_num_draft_tokens
@@ -4773,7 +4774,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
             batch.req_pool_indices,
             self.req_to_token_pool.req_to_token,
             batch.seq_lens,
-            batch.seq_lens + num_accepted_drafts,
+            batch.seq_lens + num_correct_drafts,
             tgt_cache_loc,
             self.req_to_token_pool.req_to_token.shape[1],
             next_power_of_2(bs),

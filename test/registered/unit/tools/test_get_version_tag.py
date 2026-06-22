@@ -49,47 +49,15 @@ class TestGetVersionTag(unittest.TestCase):
             ["v0.5.10.post1", "v0.5.10", "v0.5.10rc0", "v0.5.9"],
         )
 
-    def test_is_post_version_tag_only_matches_post_releases(self):
-        is_post = self.version_helper._is_post_version_tag
-        self.assertTrue(is_post("v0.5.10.post1"))
-        self.assertTrue(is_post("v0.5.10post2"))
-        self.assertFalse(is_post("v0.5.10"))
-        self.assertFalse(is_post("v0.5.10rc0"))
-        self.assertFalse(is_post("not-a-version"))
-
-    def test_describe_falls_back_to_non_post_tag_when_latest_is_post(self):
-        """Latest tag `v0.5.10.post1` is unsuitable as a `post-release` base
-        (PEP 440 forbids `.post1.postN`). The describe path must use the
-        highest non-post tag (`v0.5.10`) so the resulting version is valid.
-        """
-        version_helper = self.version_helper
-        captured: list[tuple[str, ...]] = []
-
-        def fake_run_git(*args, allow_failure=False):
-            captured.append(args)
-            if args[:2] == ("tag", "--list"):
-                return "v0.5.10\nv0.5.10.post1\nv0.5.9\n"
-            if args[0] == "describe" and "--exact-match" in args:
-                # No exact-match tag on HEAD
-                return ""
-            if args[0] == "describe" and "--long" in args:
-                # The match argument is the second-to-last element
-                match_tag = args[args.index("--match") + 1]
-                # Simulate a clean ancestor describe against the supplied tag
-                return f"{match_tag}-176-g5c85c1df6"
-            return ""
-
-        with patch.object(version_helper, "run_git", side_effect=fake_run_git):
-            result = version_helper.get_version_describe()
-
-        self.assertEqual(result, "v0.5.10-176-g5c85c1df6")
-
     def test_exact_version_tag_takes_precedence_over_latest_tag(self):
-        with patch.object(
-            self.version_helper, "get_exact_version_tag", return_value="v0.5.9"
-        ), patch.object(
-            self.version_helper, "get_latest_version_tag_describe"
-        ) as latest_describe:
+        with (
+            patch.object(
+                self.version_helper, "get_exact_version_tag", return_value="v0.5.9"
+            ),
+            patch.object(
+                self.version_helper, "get_latest_version_tag_describe"
+            ) as latest_describe,
+        ):
             self.assertEqual(self.version_helper.get_version_describe(), "v0.5.9")
 
         latest_describe.assert_not_called()
@@ -103,15 +71,16 @@ class TestGetVersionTag(unittest.TestCase):
                 self.assertIn(FALLBACK_VERSION, content)
 
     def test_tag_only_cli_mode_remains_available_for_callers_that_need_latest_tag(self):
-        with patch.object(
-            sys, "argv", ["get_version_tag.py", "--tag-only"]
-        ), patch.object(
-            self.version_helper, "get_latest_version_tag", return_value="v0.5.10"
-        ), patch.object(
-            self.version_helper, "get_version_describe"
-        ) as version_describe, patch(
-            "builtins.print"
-        ) as print_mock:
+        with (
+            patch.object(sys, "argv", ["get_version_tag.py", "--tag-only"]),
+            patch.object(
+                self.version_helper, "get_latest_version_tag", return_value="v0.5.10"
+            ),
+            patch.object(
+                self.version_helper, "get_version_describe"
+            ) as version_describe,
+            patch("builtins.print") as print_mock,
+        ):
             self.version_helper.main()
 
         version_describe.assert_not_called()

@@ -20,6 +20,7 @@ from sglang.srt.utils.common import (
     crash_on_warnings,
     get_bool_env_var,
     is_cuda,
+    is_musa,
     is_npu,
 )
 
@@ -32,6 +33,15 @@ if is_cuda():
         top_k_renorm_prob,
         top_p_renorm_prob,
     )
+
+if is_musa():
+    from sgl_kernel import (
+        min_p_sampling_from_probs,
+        top_k_renorm_prob,
+        top_k_top_p_sampling_from_probs,
+        top_p_renorm_prob,
+    )
+
 
 if is_npu():
     import torch_npu
@@ -575,6 +585,11 @@ def multinomial_with_seed(
     """
     n, m = logprobs.shape
     seed = seed.to(torch.uint64)
+    # AttnDP/MLP sync may make `positions` longer than `seed` (padding tokens
+    # for communication alignment). The murmur kernel requires equal shapes
+    # and only uses the first `n` positions, so trim here.
+    if positions.shape[0] != n:
+        positions = positions[:n]
     col_indices = torch.arange(m, device=logprobs.device)
     hashed = murmur_hash32(seed, positions, col_indices)
 
