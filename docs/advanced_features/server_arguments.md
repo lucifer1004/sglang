@@ -156,7 +156,9 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--device` | The device to use ('cuda', 'xpu', 'hpu', 'npu', 'cpu'). Defaults to auto-detection if not specified. | `None` | Type: str |
 | `--tensor-parallel-size`<br>`--tp-size` | The tensor parallelism size. | `1` | Type: int |
 | `--pipeline-parallel-size`<br>`--pp-size` | The pipeline parallelism size. | `1` | Type: int |
-| `--attention-context-parallel-size`<br>`--attn-cp-size`| The attention context parallelism size. | `1` | Type: int|
+| `--attn-cp-size` | The attention context parallelism size. | `1` | Type: int |
+| `--attn-cp-mode` | The attention context parallelism mode. 'sharded-kv' enables sharded-KV AttnCP for both prefill KV writes and decode KV reads. | `none` | `none`, `sharded-kv` |
+| `--attn-cp-kv-chunk-size` | Logical-token chunk size for sharded-KV AttnCP ownership. Fixed at server startup. | `1024` | Type: int |
 | `--moe-data-parallel-size`<br>`--moe-dp-size`| The moe data parallelism size. | `1` | Type: int|
 | `--pp-max-micro-batch-size` | The maximum micro batch size in pipeline parallelism. | `None` | Type: int |
 | `--pp-async-batch-depth` | The async batch depth of pipeline parallelism. | `0` | Type: int |

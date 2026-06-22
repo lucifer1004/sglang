@@ -41,6 +41,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchResult,
 )
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+from sglang.srt.mem_cache.cp_sharded_allocator import unwrap_cp_sharded_allocator
 from sglang.srt.mem_cache.events import KVCacheEventMixin
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
@@ -339,7 +340,10 @@ class LRUList:
 
 class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
     def __init__(self, params: CacheInitParams):
-        assert isinstance(params.token_to_kv_pool_allocator, SWATokenToKVPoolAllocator)
+        assert isinstance(
+            unwrap_cp_sharded_allocator(params.token_to_kv_pool_allocator),
+            SWATokenToKVPoolAllocator,
+        )
         self.req_to_token_pool = params.req_to_token_pool
         self.token_to_kv_pool_allocator = params.token_to_kv_pool_allocator
         self.page_size = params.page_size

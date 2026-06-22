@@ -100,6 +100,13 @@ def _use_welm_legacy_dp_buffer(forward_batch: ForwardBatch) -> bool:
 def _get_dp_buffer_group(forward_batch: ForwardBatch, default_group):
     return get_tp_group() if _use_welm_legacy_dp_buffer(forward_batch) else default_group
 
+
+def _is_sharded_kv_context_parallel() -> bool:
+    try:
+        return get_global_server_args().attn_cp_mode == "sharded-kv"
+    except ValueError:
+        return False
+
 if _use_aiter:
     from aiter.ops.rmsnorm import add_rmsnorm_quant as _aiter_add_rmsnorm_quant
     from aiter.ops.rmsnorm import rmsnorm_quant as _aiter_rmsnorm_quant
@@ -794,6 +801,13 @@ class CommunicateContext:
         tp_size = get_tensor_model_parallel_world_size()
         tp_rank = get_tensor_model_parallel_rank()
         moe_cp_size = get_moe_cp_size()
+        if _is_sharded_kv_context_parallel():
+            # Sharded-KV AttnCP keeps hidden states full-sequence and keeps
+            # MLP/MoE on the normal TP group. The CP axis is only used inside
+            # the attention KV residency/gather path.
+            attn_cp_size = 1
+            attn_cp_rank = 0
+            moe_cp_size = 1
         process_group_sizes = {
             ScatterMode.SCATTERED: 1,
             ScatterMode.TP_ATTN_FULL: attn_tp_size,

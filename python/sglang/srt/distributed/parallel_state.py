@@ -1463,6 +1463,7 @@ def init_model_parallel_group(
 _TP: Optional[GroupCoordinator] = None
 _ATTN_TP: Optional[GroupCoordinator] = None
 _ATTN_CP: Optional[GroupCoordinator] = None
+_SHARDED_KV_CP: Optional[GroupCoordinator] = None
 
 # duplicate GroupCoordinator for prefill in PD-Multiplexing
 _PDMUX_PREFILL_TP_GROUP: Optional[GroupCoordinator] = None
@@ -1497,6 +1498,13 @@ def get_attn_cp_group() -> GroupCoordinator:
         _ATTN_CP is not None
     ), "attention context model parallel group is not initialized"
     return _ATTN_CP
+
+
+def get_sharded_kv_cp_group() -> GroupCoordinator:
+    assert (
+        _SHARDED_KV_CP is not None
+    ), "sharded-KV context parallel group is not initialized"
+    return _SHARDED_KV_CP
 
 
 _MOE_DP: Optional[GroupCoordinator] = None
@@ -1567,7 +1575,13 @@ def graph_capture(stream: Optional[torch.cuda.Stream] = None):
     ):
         with contextlib.ExitStack() as stack:
             seen = {id(_TP)}
-            for group in (_MOE_EP, _MOE_TP):
+            for group in (
+                _ATTN_CP,
+                _ATTN_TP,
+                _SHARDED_KV_CP,
+                _MOE_EP,
+                _MOE_TP,
+            ):
                 if group is not None and id(group) not in seen:
                     seen.add(id(group))
                     stack.enter_context(group.graph_capture(context))
@@ -1752,6 +1766,45 @@ def init_distributed_environment(
         ), "world group already initialized with a different world size"
 
 
+def compute_sharded_kv_cp_group_ranks(
+    tensor_model_parallel_size: int,
+    attention_context_model_parallel_size: int,
+    attention_data_parallel_size: int,
+    num_tensor_model_parallel_groups: int,
+) -> list[list[int]]:
+    """Build sharded-KV CP group ranks."""
+    if attention_context_model_parallel_size <= 0:
+        raise ValueError("attention_context_model_parallel_size must be positive")
+    if attention_data_parallel_size <= 0:
+        raise ValueError("attention_data_parallel_size must be positive")
+    if num_tensor_model_parallel_groups <= 0:
+        raise ValueError("num_tensor_model_parallel_groups must be positive")
+    if tensor_model_parallel_size % (
+        attention_context_model_parallel_size * attention_data_parallel_size
+    ):
+        raise ValueError(
+            "tensor_model_parallel_size must be divisible by "
+            "attention_context_model_parallel_size * attention_data_parallel_size"
+        )
+
+    cp_size = attention_context_model_parallel_size
+    sharded_attn_tp_size = tensor_model_parallel_size // (
+        cp_size * attention_data_parallel_size
+    )
+    per_attn_dp_size = sharded_attn_tp_size * cp_size
+
+    sharded_kv_cp_group_ranks = []
+    for tp_group_idx in range(num_tensor_model_parallel_groups):
+        tp_base = tp_group_idx * tensor_model_parallel_size
+        for dp_idx in range(attention_data_parallel_size):
+            dp_base = tp_base + dp_idx * per_attn_dp_size
+            for sharded_attn_tp_idx in range(sharded_attn_tp_size):
+                st = dp_base + sharded_attn_tp_idx * cp_size
+                sharded_kv_cp_group_ranks.append(list(range(st, st + cp_size)))
+
+    return sharded_kv_cp_group_ranks
+
+
 def initialize_model_parallel(
     tensor_model_parallel_size: int = 1,
     expert_model_parallel_size: int = 1,
@@ -1930,6 +1983,31 @@ def initialize_model_parallel(
             use_torch_symm_mem_allreduce=False,
             use_message_queue_broadcaster=envs.SGLANG_USE_MESSAGE_QUEUE_BROADCASTER.get(),
             group_name="attention_tp",
+            recovered_rank=recovered_rank,
+        )
+
+    global _SHARDED_KV_CP
+    assert (
+        _SHARDED_KV_CP is None
+    ), "sharded-KV context parallel group is already initialized"
+
+    sharded_kv_cp_ranks = compute_sharded_kv_cp_group_ranks(
+        tensor_model_parallel_size,
+        attn_cp_size,
+        attn_dp_size,
+        num_tensor_model_parallel_groups,
+    )
+    if attn_cp_size == 1:
+        _SHARDED_KV_CP = _ATTN_CP
+    elif attn_cp_size == tensor_model_parallel_size and attn_dp_size == 1:
+        _SHARDED_KV_CP = _TP
+    else:
+        _SHARDED_KV_CP = init_model_parallel_group(
+            sharded_kv_cp_ranks,
+            get_world_group().local_rank,
+            backend,
+            use_message_queue_broadcaster=envs.SGLANG_USE_MESSAGE_QUEUE_BROADCASTER.get(),
+            group_name="sharded_kv_cp",
             recovered_rank=recovered_rank,
         )
 
@@ -2197,6 +2275,16 @@ def get_attn_context_model_parallel_rank():
     return get_attn_cp_group().rank_in_group
 
 
+def get_sharded_kv_context_model_parallel_world_size():
+    """Return world size for the sharded-KV context parallel group."""
+    return get_sharded_kv_cp_group().world_size
+
+
+def get_sharded_kv_context_model_parallel_rank():
+    """Return my rank for the sharded-KV context parallel group."""
+    return get_sharded_kv_cp_group().rank_in_group
+
+
 def get_pipeline_model_parallel_world_size():
     """Return world size for the pipeline model parallel group."""
     return get_pp_group().world_size
@@ -2243,27 +2331,41 @@ def get_moe_tensor_parallel_rank():
 def destroy_model_parallel():
     """Set the groups to none and destroy them."""
     global _TP
+    global _PP
+    global _MOE_EP
+    global _MOE_TP
+    global _ATTN_CP
+    global _ATTN_TP
+    global _MOE_DP
+    global _SHARDED_KV_CP
+    global _PDMUX_PREFILL_TP_GROUP
+
+    # Destroy _SHARDED_KV_CP first since it may alias _TP/_ATTN_CP/_ATTN_TP.
+    if (
+        _SHARDED_KV_CP
+        and _SHARDED_KV_CP is not _TP
+        and _SHARDED_KV_CP is not _ATTN_CP
+        and _SHARDED_KV_CP is not _ATTN_TP
+    ):
+        _SHARDED_KV_CP.destroy()
+    _SHARDED_KV_CP = None
+
     if _TP:
         _TP.destroy()
     _TP = None
 
-    global _PP
     if _PP:
         _PP.destroy()
     _PP = None
 
-    global _MOE_EP
     if _MOE_EP:
         _MOE_EP.destroy()
     _MOE_EP = None
 
-    global _MOE_TP
     if _MOE_TP:
         _MOE_TP.destroy()
     _MOE_TP = None
 
-    global _ATTN_CP
-    global _MOE_DP
     # Destroy _MOE_DP before _ATTN_CP since it may alias _ATTN_CP.
     # Only destroy if not aliasing another group.
     if _MOE_DP and _MOE_DP is not _ATTN_CP and _MOE_DP is not _TP:
@@ -2273,12 +2375,10 @@ def destroy_model_parallel():
         _ATTN_CP.destroy()
     _ATTN_CP = None
 
-    global _ATTN_TP
     if _ATTN_TP:
         _ATTN_TP.destroy()
     _ATTN_TP = None
 
-    global _PDMUX_PREFILL_TP_GROUP
     if _PDMUX_PREFILL_TP_GROUP:  # type: ignore[union-attr]
         _PDMUX_PREFILL_TP_GROUP.destroy()
     _PDMUX_PREFILL_TP_GROUP = None

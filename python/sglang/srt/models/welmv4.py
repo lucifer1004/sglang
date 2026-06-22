@@ -75,6 +75,7 @@ from sglang.srt.layers.rotary_embedding import (
     yarn_get_mscale,
 )
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
+from sglang.srt.layers.utils.cp_utils import is_cp_kv_sharded
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -124,6 +125,8 @@ _WELM_GRAPH_DUMP_MISSING = set()
 _WELM_TRUE_ENV_VALUES = {"1", "true", "yes", "on"}
 _WELM_DUMP_ENABLED = (
     os.getenv("SGLANG_DUMP_ACTIVATIONS", "0").strip().lower()
+    in _WELM_TRUE_ENV_VALUES
+    or os.getenv("SGLANG_WELM_DUMP_ACTIVATIONS", "0").strip().lower()
     in _WELM_TRUE_ENV_VALUES
 )
 _WELM_MTP_DUMP_ENABLED = (
@@ -421,6 +424,16 @@ def _set_welm_kv_mirror_states(
     forward_batch.model_specific_states = model_specific_states
 
 
+def _get_welm_head_shard_start(param_numel: int, module: Optional[nn.Module]) -> int:
+    if module is not None and hasattr(module, "attn_tp_rank"):
+        tp_rank = int(module.attn_tp_rank)
+    elif is_cp_kv_sharded():
+        tp_rank = get_tensor_model_parallel_rank()
+    else:
+        tp_rank = get_attention_tp_rank()
+    return tp_rank * int(param_numel)
+
+
 def _pack_welm_kv_mirror_pp_tensor(
     proxy_tensors: Dict[str, Any],
     key: str,
@@ -491,12 +504,25 @@ def _unpack_welm_kv_mirror_states(
     }
 
 
+def _welm_needs_input_logprobs(forward_batch: ForwardBatch) -> bool:
+    if not getattr(forward_batch, "return_logprob", False):
+        return False
+    extend_lens = getattr(forward_batch, "extend_seq_lens_cpu", None)
+    start_lens = getattr(forward_batch, "extend_logprob_start_lens_cpu", None)
+    if extend_lens is None or start_lens is None:
+        return False
+    return any(
+        int(extend_len) - int(start_len) > 0
+        for extend_len, start_len in zip(extend_lens, start_lens)
+    )
+
+
 def _welm_should_contract_kv_mirror(forward_batch: ForwardBatch) -> bool:
     return forward_batch.enable_welm_kv_mirror_opt and (
         forward_batch.forward_mode.is_extend_without_speculative()
         or forward_batch.forward_mode.is_draft_extend(include_v2=True)
         or getattr(forward_batch, "welm_mtp_merge_kv_fill_draft", False)
-    )
+    ) and not _welm_needs_input_logprobs(forward_batch)
 
 
 def _welm_should_contract_idle_extend_dp_metadata(
@@ -2102,8 +2128,12 @@ class Qwen2MoeAttention(nn.Module):
         super().__init__()
         self.hidden_size = hidden_size
 
-        attn_tp_rank = get_attention_tp_rank()
-        attn_tp_size = get_attention_tp_size()
+        if is_cp_kv_sharded():
+            attn_tp_rank = get_tensor_model_parallel_rank()
+            attn_tp_size = get_tensor_model_parallel_world_size()
+        else:
+            attn_tp_rank = get_attention_tp_rank()
+            attn_tp_size = get_attention_tp_size()
         self.attn_tp_size = attn_tp_size
         self.attn_tp_rank = attn_tp_rank
 
@@ -3874,7 +3904,11 @@ class WeLMV4MoeForCausalLM(nn.Module):
                     if name in params_dict.keys():
                         param = params_dict[name]
                         if "attn_sink" in name:
-                            start = get_attention_tp_rank() * param.numel()
+                            attn_prefix = name.rsplit(".attn_sink", 1)[0]
+                            current_attn = modules_dict.get(attn_prefix)
+                            start = _get_welm_head_shard_start(
+                                param.numel(), current_attn
+                            )
                             param.data.copy_(
                                 loaded_weight[start : start + param.numel()]
                             )

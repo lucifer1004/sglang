@@ -43,10 +43,14 @@ class SWAComponent(TreeComponent):
     """
 
     def __init__(self, cache: UnifiedRadixCache, params: CacheInitParams):
+        from sglang.srt.mem_cache.cp_sharded_allocator import (
+            unwrap_cp_sharded_allocator,
+        )
         from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
 
         assert isinstance(
-            cache.token_to_kv_pool_allocator, SWATokenToKVPoolAllocator
+            unwrap_cp_sharded_allocator(cache.token_to_kv_pool_allocator),
+            SWATokenToKVPoolAllocator,
         ), f"SWAComponent requires SWATokenToKVPoolAllocator, got {type(cache.token_to_kv_pool_allocator)}"
         super().__init__(cache, params)
         self.sliding_window_size = params.sliding_window_size

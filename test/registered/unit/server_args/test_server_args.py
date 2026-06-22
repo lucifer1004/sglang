@@ -4,6 +4,7 @@ import unittest
 from unittest.mock import MagicMock, patch
 
 from sglang.srt.server_args import PortArgs, ServerArgs, prepare_server_args
+from sglang.srt.configs.model_config import AttentionArch
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN,
@@ -66,6 +67,125 @@ class TestWelmOeArgs(unittest.TestCase):
             },
         ):
             server_args._handle_welm_oe_hash_kernel_args()
+
+
+class TestShardedKvContextParallelArgs(unittest.TestCase):
+    def _fake_mha_config(self, q_heads=24, kv_heads=2):
+        model_config = MagicMock()
+        model_config.attention_arch = AttentionArch.MHA
+        model_config.get_total_num_attention_heads.return_value = q_heads
+        model_config.get_total_num_kv_heads.return_value = kv_heads
+        return model_config
+
+    def test_cli_parses_sharded_kv_args(self):
+        server_args = prepare_server_args(
+            [
+                "--model-path",
+                "dummy",
+                "--attn-cp-size",
+                "4",
+                "--attn-cp-mode",
+                "sharded-kv",
+                "--attn-cp-kv-chunk-size",
+                "128",
+            ]
+        )
+
+        self.assertEqual(server_args.attn_cp_size, 4)
+        self.assertEqual(server_args.attn_cp_mode, "sharded-kv")
+        self.assertEqual(server_args.attn_cp_kv_chunk_size, 128)
+
+    def test_sharded_kv_mode_enables_prefill_cp(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            tp_size=8,
+            attn_cp_size=4,
+            attn_cp_mode="sharded-kv",
+            attn_cp_kv_chunk_size=128,
+            attention_backend="fa3",
+        )
+        server_args.model_config = self._fake_mha_config()
+        server_args._handle_page_size()
+        server_args._handle_context_parallelism()
+
+        self.assertTrue(server_args.enable_prefill_context_parallel)
+
+    def test_sharded_kv_disables_radix_cache(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            tp_size=8,
+            attn_cp_size=4,
+            attn_cp_mode="sharded-kv",
+            attention_backend="fa3",
+        )
+        server_args.model_config = self._fake_mha_config()
+        server_args._handle_page_size()
+        server_args._handle_context_parallelism()
+
+        self.assertTrue(server_args.disable_radix_cache)
+
+    def test_attn_cp_size_requires_mode(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            tp_size=8,
+            attn_cp_size=4,
+        )
+        server_args._handle_page_size()
+
+        with self.assertRaisesRegex(ValueError, "--attn-cp-mode sharded-kv"):
+            server_args._handle_context_parallelism()
+
+    def test_sharded_kv_requires_page_size_one(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            tp_size=8,
+            attn_cp_size=4,
+            attn_cp_mode="sharded-kv",
+            page_size=16,
+        )
+
+        with self.assertRaisesRegex(ValueError, "--page-size 1"):
+            server_args._handle_context_parallelism()
+
+    def test_sharded_kv_requires_positive_chunk_size(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            tp_size=8,
+            attn_cp_size=4,
+            attn_cp_mode="sharded-kv",
+            attn_cp_kv_chunk_size=0,
+        )
+        server_args._handle_page_size()
+
+        with self.assertRaisesRegex(ValueError, "--attn-cp-kv-chunk-size"):
+            server_args._handle_context_parallelism()
+
+    def test_sharded_kv_requires_fa3_backend(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            tp_size=8,
+            attn_cp_size=4,
+            attn_cp_mode="sharded-kv",
+            attention_backend="triton",
+        )
+        server_args._handle_page_size()
+
+        with self.assertRaisesRegex(ValueError, "requires FA3 attention backend"):
+            server_args._handle_context_parallelism()
+
+    def test_sharded_kv_requires_fused_qkv_head_layout(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            tp_size=8,
+            attn_cp_size=4,
+            attn_cp_mode="sharded-kv",
+            attention_backend="fa3",
+        )
+        server_args.model_config = self._fake_mha_config(q_heads=24, kv_heads=4)
+        server_args._handle_page_size()
+
+        with self.assertRaisesRegex(ValueError, "attention_tp_size == total_num_kv_heads"):
+            server_args._handle_context_parallelism()
 
 
 class TestLoadBalanceMethod(unittest.TestCase):

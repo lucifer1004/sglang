@@ -35,7 +35,10 @@ import torch
 
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.layers.attention.nsa.utils import is_nsa_prefill_cp_in_seq_split
-from sglang.srt.layers.utils.cp_utils import is_prefill_context_parallel_enabled
+from sglang.srt.layers.utils.cp_utils import (
+    is_cp_kv_sharded,
+    is_prefill_context_parallel_enabled,
+)
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
@@ -44,6 +47,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
     zero_match_result,
 )
+from sglang.srt.mem_cache.cp_sharded_allocator import unwrap_cp_sharded_allocator
 from sglang.srt.mem_cache.hisparse_memory_pool import (
     DeepSeekV4HiSparseTokenToKVPoolAllocator,
 )
@@ -460,7 +464,7 @@ class PrefillAdder:
         # DeepSeek V4 HiSparse wraps an SWATokenToKVPoolAllocator internally and
         # exposes the full SWA allocator interface.
         self.is_hybrid_swa = isinstance(
-            self.token_to_kv_pool_allocator,
+            unwrap_cp_sharded_allocator(self.token_to_kv_pool_allocator),
             (SWATokenToKVPoolAllocator, DeepSeekV4HiSparseTokenToKVPoolAllocator),
         )
         self.is_hybrid_ssm_cache = self.tree_cache.supports_mamba()
@@ -472,7 +476,12 @@ class PrefillAdder:
         )
         self.nsa_prefill_cp_in_seq_split = is_nsa_prefill_cp_in_seq_split()
         self.max_running_requests = max_running_requests
-        self.prefill_context_parallel_enabled = is_prefill_context_parallel_enabled()
+        # The legacy prefill-CP path only supports one request per prefill batch.
+        # Sharded-KV AttnCP keeps Q full-sequence and only shards KV residency, so
+        # it can keep normal scheduler batching semantics.
+        self.prefill_context_parallel_enabled = (
+            is_prefill_context_parallel_enabled() and not is_cp_kv_sharded()
+        )
         self.prefill_max_requests = prefill_max_requests
         self.prefill_delayer_single_pass = prefill_delayer_single_pass
         self.max_prefill_bs = max_prefill_bs

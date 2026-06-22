@@ -19,6 +19,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
     MatchResult,
 )
+from sglang.srt.mem_cache.cp_sharded_allocator import unwrap_cp_sharded_allocator
 from sglang.srt.mem_cache.hisparse_memory_pool import (
     DeepSeekV4HiSparseTokenToKVPoolAllocator,
 )
@@ -124,7 +125,7 @@ class SWAChunkCache(ChunkCache):
     def __init__(self, params: CacheInitParams):
         # DeepSeek V4 HiSparse wraps SWATokenToKVPoolAllocator and exposes the same API.
         assert isinstance(
-            params.token_to_kv_pool_allocator,
+            unwrap_cp_sharded_allocator(params.token_to_kv_pool_allocator),
             (
                 SWATokenToKVPoolAllocator,
                 DeepSeekV4HiSparseTokenToKVPoolAllocator,

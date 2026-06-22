@@ -747,7 +747,13 @@ def get_batch_sizes_to_capture(model_runner: ModelRunner, num_tokens_per_bs=1):
     if require_gathered_buffer(server_args):
         mul_base *= get_attention_tp_size()
 
-    if mul_base % get_attention_cp_size() != 0:
+    # Sharded-KV CP keeps each decode request as a full-Q request and only shards
+    # KV residency. Its CUDA graph bucket should therefore stay aligned with the
+    # original request batch size; otherwise a single-request decode is replayed
+    # through a bs=2 graph when attn_cp_size=2, which can change WeLM MoE/OE
+    # numerics around tie tokens.
+    skip_cp_bucket_alignment = server_args.attn_cp_mode == "sharded-kv"
+    if not skip_cp_bucket_alignment and mul_base % get_attention_cp_size() != 0:
         mul_base *= get_attention_cp_size()
 
     # pad `num_max_requests` to avoid being filtered out

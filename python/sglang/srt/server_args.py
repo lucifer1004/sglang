@@ -268,7 +268,7 @@ ENCODER_TRANSFER_BACKEND_CHOICES = ["zmq_to_scheduler", "zmq_to_tokenizer", "moo
 
 NSA_PREFILL_CP_SPLIT_CHOICES = ["in-seq-split", "round-robin-split"]
 
-PREFILL_CP_SPLIT_CHOICES = ["in-seq-split"]
+ATTN_CP_MODE_CHOICES = ["none", "sharded-kv"]
 
 DEFAULT_LORA_EVICTION_POLICY = "lru"
 
@@ -554,6 +554,8 @@ class ServerArgs:
     load_balance_method: str = "auto"
 
     attn_cp_size: int = 1
+    attn_cp_mode: str = "none"
+    attn_cp_kv_chunk_size: int = 1024
     moe_dp_size: int = 1
 
     # Multi-node distributed serving
@@ -804,9 +806,8 @@ class ServerArgs:
     enable_precise_embedding_interpolation: bool = False
     enable_fused_moe_sum_all_reduce: bool = False
 
-    # Context parallelism
+    # Derived context-parallel internals.
     enable_prefill_context_parallel: bool = False
-    prefill_cp_mode: str = "in-seq-split"
 
     # Dynamic batch tokenizer
     enable_dynamic_batch_tokenizer: bool = False
@@ -1394,8 +1395,8 @@ class ServerArgs:
         # 15. Expert distribution recorder
         if self.enable_eplb or self.expert_distribution_recorder_mode is not None:
             self.disable_piecewise_cuda_graph = True
-        # 16. Context parallel
-        if self.attn_cp_size > 1:
+        # 16. Context parallel. Sharded-KV CP has its own graph-safe path.
+        if self.attn_cp_size > 1 and self.attn_cp_mode != "sharded-kv":
             self.disable_piecewise_cuda_graph = True
         # 18. CUDA Graph debug mode
         if self.debug_cuda_graph:
@@ -2186,7 +2187,7 @@ class ServerArgs:
                         f"enable_dp_attention={self.enable_dp_attention}, "
                         f"attn_cp_size={self.attn_cp_size}). "
                         "Set --tp, --dp, --enable-dp-attention, and "
-                        "--attention-context-parallel-size so the effective "
+                        "--attn-cp-size so the effective "
                         f"attention TP size is {expected_attn_tp_size}."
                     )
 
@@ -3064,18 +3065,19 @@ class ServerArgs:
             )
 
     def _handle_context_parallelism(self):
-        if self.attn_cp_size > 1:
-            # The tp_size is the world size, not the real tensor parallel size
-            assert (
-                self.tp_size % self.attn_cp_size == 0
-            ), "tp_size must be divisible by attn_cp_size"
-            assert (
-                self.tp_size % (self.dp_size * self.attn_cp_size) == 0
-            ), "tp_size must be divisible by dp_size * attn_cp_size"
-
-            assert (
-                not self.enable_aiter_allreduce_fusion
-            ), "Aiter allreduce fusion is not supported with context parallelism"
+        if self.attn_cp_mode not in ATTN_CP_MODE_CHOICES:
+            raise ValueError(
+                f"--attn-cp-mode must be one of {ATTN_CP_MODE_CHOICES}, "
+                f"got {self.attn_cp_mode!r}"
+            )
+        if self.attn_cp_mode == "none":
+            if self.attn_cp_size > 1:
+                raise ValueError(
+                    "--attn-cp-size > 1 requires --attn-cp-mode sharded-kv"
+                )
+            self.enable_prefill_context_parallel = False
+        else:
+            self._handle_sharded_kv_context_parallelism()
 
         if self.moe_dp_size > 1:
             # The tp_size is the world size, not the real tensor parallel size
@@ -3100,6 +3102,91 @@ class ServerArgs:
             assert (
                 self.moe_dp_size == 1
             ), "attn_cp_size != moe_dp_size is only supported when moe_dp_size == 1"
+
+    def _handle_sharded_kv_context_parallelism(self):
+        if self.attn_cp_kv_chunk_size <= 0:
+            raise ValueError("--attn-cp-kv-chunk-size must be positive")
+        if self.attn_cp_size <= 1:
+            raise ValueError("--attn-cp-mode sharded-kv requires --attn-cp-size > 1")
+
+        self.enable_prefill_context_parallel = True
+
+        # The tp_size is the world size, not the real tensor parallel size.
+        assert (
+            self.tp_size % self.attn_cp_size == 0
+        ), "tp_size must be divisible by attn_cp_size"
+        assert (
+            self.tp_size % (self.dp_size * self.attn_cp_size) == 0
+        ), "tp_size must be divisible by dp_size * attn_cp_size"
+        assert (
+            not self.enable_aiter_allreduce_fusion
+        ), "Aiter allreduce fusion is not supported with context parallelism"
+
+        if self.dp_size != 1 or self.enable_dp_attention:
+            raise ValueError(
+                "--attn-cp-mode sharded-kv currently supports only single-DP "
+                "serving with --data-parallel-size 1 and DP attention disabled"
+            )
+        if self.page_size != 1:
+            raise ValueError(
+                "--attn-cp-mode sharded-kv currently requires --page-size 1"
+            )
+        if self.kv_cache_dtype != "auto":
+            raise ValueError(
+                "--attn-cp-mode sharded-kv currently requires --kv-cache-dtype auto"
+            )
+        if self.cpu_offload_gb > 0 or self.enable_hierarchical_cache:
+            raise ValueError(
+                "--attn-cp-mode sharded-kv currently does not support CPU KV "
+                "offload or hierarchical cache"
+            )
+        if not self.disable_radix_cache:
+            logger.warning(
+                "Radix cache is disabled because --attn-cp-mode sharded-kv "
+                "uses DUMMY slots and sharded logical capacity accounting."
+            )
+            self.disable_radix_cache = True
+
+        prefill_backend, decode_backend = self.get_attention_backends()
+        if prefill_backend != "fa3" or decode_backend != "fa3":
+            raise ValueError(
+                "--attn-cp-mode sharded-kv currently requires FA3 attention "
+                f"backend for both prefill and decode, got "
+                f"prefill={prefill_backend!r}, decode={decode_backend!r}"
+            )
+
+        model_config = self.get_model_config()
+        from sglang.srt.configs.model_config import AttentionArch
+
+        if model_config.attention_arch == AttentionArch.MLA:
+            raise ValueError("--attn-cp-mode sharded-kv does not support MLA")
+
+        total_q_heads = model_config.get_total_num_attention_heads()
+        total_kv_heads = model_config.get_total_num_kv_heads()
+        attn_tp_size = self.tp_size // self.dp_size // self.attn_cp_size
+        if attn_tp_size != total_kv_heads:
+            raise ValueError(
+                "--attn-cp-mode sharded-kv with fused QKV currently requires "
+                "attention_tp_size == total_num_kv_heads; got "
+                f"attention_tp_size={attn_tp_size}, "
+                f"total_num_kv_heads={total_kv_heads}. "
+                "Models outside this layout need a custom KV projection shard."
+            )
+        if total_q_heads % self.tp_size != 0:
+            raise ValueError(
+                "--attn-cp-mode sharded-kv requires total Q heads divisible "
+                f"by tp_size, got total_q_heads={total_q_heads}, tp_size={self.tp_size}"
+            )
+
+        gqa_group_size = total_q_heads // total_kv_heads
+        q_heads_per_sharded_attn_tp = total_q_heads // attn_tp_size
+        if q_heads_per_sharded_attn_tp % gqa_group_size != 0:
+            raise ValueError(
+                "--attn-cp-mode sharded-kv requires sharded attention TP "
+                "head ranges to align with GQA groups; got "
+                f"q_heads_per_sharded_attn_tp={q_heads_per_sharded_attn_tp}, "
+                f"gqa_group_size={gqa_group_size}"
+            )
 
     def _handle_data_parallelism(self):
         if self.dp_size == 1:
@@ -5225,11 +5312,23 @@ class ServerArgs:
             help="The tensor parallelism size.",
         )
         parser.add_argument(
-            "--attention-context-parallel-size",
             "--attn-cp-size",
             type=int,
             default=ServerArgs.attn_cp_size,
             help="The attention context parallelism size.",
+        )
+        parser.add_argument(
+            "--attn-cp-mode",
+            type=str,
+            default=ServerArgs.attn_cp_mode,
+            choices=ATTN_CP_MODE_CHOICES,
+            help="The attention context parallelism mode. 'sharded-kv' enables sharded-KV AttnCP for both prefill KV writes and decode KV reads.",
+        )
+        parser.add_argument(
+            "--attn-cp-kv-chunk-size",
+            type=int,
+            default=ServerArgs.attn_cp_kv_chunk_size,
+            help="Logical-token chunk size for sharded-KV AttnCP ownership. Fixed at server startup.",
         )
         parser.add_argument(
             "--moe-data-parallel-size",
@@ -6977,18 +7076,6 @@ class ServerArgs:
             "'round-robin-split' distributes tokens across ranks based on token_idx %% cp_size. It supports multi-batch prefill, fused MoE, and FP8 KV cache.",
         )
         parser.add_argument(
-            "--enable-prefill-context-parallel",
-            action="store_true",
-            help="Enable context parallelism used in the prefill phase",
-        )
-        parser.add_argument(
-            "--prefill-cp-mode",
-            type=str,
-            default=ServerArgs.prefill_cp_mode,
-            choices=PREFILL_CP_SPLIT_CHOICES,
-            help="Token splitting mode for the prefill phase under context parallelism. Optional values: 'in-seq-split' (default)",
-        )
-        parser.add_argument(
             "--enable-fused-qk-norm-rope",
             action="store_true",
             help="Enable fused qk normalization and rope rotary embedding.",
@@ -7350,13 +7437,19 @@ class ServerArgs:
     def from_cli_args(cls, args: argparse.Namespace):
         args.tp_size = args.tensor_parallel_size
         args.pp_size = args.pipeline_parallel_size
-        args.attn_cp_size = args.attention_context_parallel_size
         args.moe_dp_size = args.moe_data_parallel_size
         args.dp_size = args.data_parallel_size
         args.ep_size = args.expert_parallel_size
 
-        attrs = [attr.name for attr in dataclasses.fields(cls)]
-        return cls(**{attr: getattr(args, attr) for attr in attrs})
+        kwargs = {}
+        for field in dataclasses.fields(cls):
+            if hasattr(args, field.name):
+                kwargs[field.name] = getattr(args, field.name)
+            elif field.default is not dataclasses.MISSING:
+                kwargs[field.name] = field.default
+            elif field.default_factory is not dataclasses.MISSING:
+                kwargs[field.name] = field.default_factory()
+        return cls(**kwargs)
 
     def url(self, port: Optional[int] = None):
         scheme = "https" if self.ssl_certfile else "http"

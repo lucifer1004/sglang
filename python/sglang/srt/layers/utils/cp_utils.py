@@ -40,29 +40,30 @@ class ContextParallelMetadata:
 
 
 def is_prefill_context_parallel_enabled():
-    return get_global_server_args().enable_prefill_context_parallel
+    try:
+        return get_global_server_args().enable_prefill_context_parallel
+    except ValueError:
+        return False
 
 
-def is_prefill_cp_in_seq_split():
-    return (
-        is_prefill_context_parallel_enabled()
-        and get_global_server_args().prefill_cp_mode == "in-seq-split"
-    )
+def is_cp_kv_sharded():
+    try:
+        return get_global_server_args().attn_cp_mode == "sharded-kv"
+    except ValueError:
+        return False
 
 
 def can_cp_split(seq_len: int, cp_size: int, forward_batch):
     # CP metadata (zigzag split) only supports batch=1 for now.
     cur_cp_seq_len = seq_len // (cp_size * 2)
-    if (
+    return (
         cur_cp_seq_len != 0
         and cp_size > 1
         and forward_batch.forward_mode.is_context_parallel_extend()
         and is_prefill_context_parallel_enabled()
+        and not is_cp_kv_sharded()
         and forward_batch.seq_lens_cpu.shape[0] == 1
-    ):
-        return True
-    else:
-        return False
+    )
 
 
 def cp_split_and_rebuild_data(forward_batch, input_: torch.Tensor):

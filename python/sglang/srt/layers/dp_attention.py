@@ -50,6 +50,15 @@ _is_hip = is_hip()
 _USE_ROCM700A_WA = _is_hip and get_bool_env_var("SGLANG_USE_ROCM700A")
 
 
+def _is_sharded_kv_context_parallel() -> bool:
+    try:
+        from sglang.srt.server_args import get_global_server_args
+
+        return get_global_server_args().attn_cp_mode == "sharded-kv"
+    except ValueError:
+        return False
+
+
 class DpPaddingMode(IntEnum):
 
     # Padding tokens to max length and then gather tokens using `all_gather_into_tensor`
@@ -373,14 +382,20 @@ def is_allocation_symmetric() -> bool:
 
 
 def get_attention_tp_group() -> GroupCoordinator:
+    if _is_sharded_kv_context_parallel():
+        return get_tp_group()
     return get_attn_tp_group()
 
 
 def get_attention_tp_rank() -> int:
+    if _is_sharded_kv_context_parallel():
+        return get_tensor_model_parallel_rank()
     return get_attn_tensor_model_parallel_rank()
 
 
 def get_attention_tp_size() -> int:
+    if _is_sharded_kv_context_parallel():
+        return get_tensor_model_parallel_world_size()
     return get_attn_tensor_model_parallel_world_size()
 
 
@@ -671,6 +686,8 @@ def is_enable_moe_cp_allgather() -> bool:
     from sglang.srt.server_args import get_global_server_args
 
     sa = get_global_server_args()
+    if sa.attn_cp_mode == "sharded-kv":
+        return False
     return sa.attn_cp_size > sa.moe_dp_size
 
 

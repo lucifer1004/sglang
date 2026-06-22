@@ -15,6 +15,15 @@ from .parallel_state import (
 )
 
 
+def _is_sharded_kv_context_parallel() -> bool:
+    try:
+        from sglang.srt.server_args import get_global_server_args
+
+        return get_global_server_args().attn_cp_mode == "sharded-kv"
+    except ValueError:
+        return False
+
+
 def tensor_model_parallel_all_reduce(input_: torch.Tensor) -> torch.Tensor:
     """All-reduce the input tensor across model parallel group."""
     return get_tp_group().all_reduce(input_)
@@ -64,6 +73,8 @@ def broadcast_tensor_dict(
 
 def attention_tensor_model_parallel_all_reduce(input_: torch.Tensor) -> torch.Tensor:
     """All-reduce the input tensor across attention parallel group."""
+    if _is_sharded_kv_context_parallel():
+        return get_tp_group().all_reduce(input_)
     return get_attn_tp_group().all_reduce(input_)
 
 
@@ -71,6 +82,8 @@ def attention_tensor_model_parallel_quant_all_reduce(
     input_: torch.Tensor,
 ) -> torch.Tensor:
     """All-reduce the input tensor across attention parallel group."""
+    if _is_sharded_kv_context_parallel():
+        return get_tp_group().quant_all_reduce(input_)
     return get_attn_tp_group().quant_all_reduce(input_)
 
 

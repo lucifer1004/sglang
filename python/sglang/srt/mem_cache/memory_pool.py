@@ -143,6 +143,14 @@ def _set_kv_buffer_impl(
         v_cache[indices] = v_rows.view_as(v_cache[indices])
 
 
+# Sharded-KV CP stores `cache_loc[i] == 0` for non-owner tokens. We DO NOT
+# data-dependently filter slot 0 out of `set_kv_buffer` writes here, because
+# CUDA graph capture cannot branch on GPU masks or produce dynamic-shaped
+# tensors. Slot 0 is overwritten by every non-owner write, but it is filtered
+# out by attention metadata and allocator free paths before any real KV
+# read/release.
+
+
 class ReqToTokenPool:
     """A memory pool that maps a request to its token locations."""
 
@@ -1773,7 +1781,6 @@ class MLATokenToKVPool(KVCache):
         cache_k_rope: torch.Tensor,
     ):
         layer_id = layer.layer_id
-
         if _is_hip and self.use_nsa and self.dtype == fp8_dtype:
             # HIP FP8 path uses raw MLA KV layout (nope + rope) without per-block scales.
             # Fuse BF16/FP16 -> FP8 cast with paged KV write.
@@ -1957,7 +1964,6 @@ class MLATokenToKVPoolFP4(MLATokenToKVPool):
         cache_k_rope: torch.Tensor,
     ):
         layer_id = layer.layer_id
-
         if self.nsa_kv_cache_store_fp8:
             # original cache_k: (num_tokens, num_heads 1, hidden 576); we unsqueeze the page_size=1 dim here
             # TODO no need to cat

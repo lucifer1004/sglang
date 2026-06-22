@@ -72,6 +72,10 @@ from sglang.srt.mem_cache.common import (
     evict_from_tree_cache,
     release_kv_cache,
 )
+from sglang.srt.mem_cache.cp_sharded_allocator import unwrap_cp_sharded_allocator
+from sglang.srt.mem_cache.hisparse_memory_pool import (
+    DeepSeekV4HiSparseTokenToKVPoolAllocator,
+)
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
@@ -1873,7 +1877,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         return_logprob = any(req.return_logprob for req in reqs)
 
         is_hybrid_swa = False
-        if isinstance(token_to_kv_pool_allocator, SWATokenToKVPoolAllocator):
+        unwrapped_allocator = unwrap_cp_sharded_allocator(token_to_kv_pool_allocator)
+        if isinstance(
+            unwrapped_allocator,
+            (SWATokenToKVPoolAllocator, DeepSeekV4HiSparseTokenToKVPoolAllocator),
+        ):
             is_hybrid_swa = True
 
         batch = cls(
