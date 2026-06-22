@@ -72,6 +72,12 @@ Its core features include:
    advanced_features/sglang_for_rl.md
 
 .. toctree::
+   :maxdepth: 1
+   :caption: WeLM
+
+   welm/welmv4_mtp_server.md
+
+.. toctree::
    :maxdepth: 2
    :caption: Supported Models
 
