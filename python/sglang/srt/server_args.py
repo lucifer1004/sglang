@@ -501,6 +501,9 @@ class ServerArgs:
     log_requests_level: int = 2
     log_requests_format: str = "text"
     log_requests_target: Optional[List[str]] = None
+    request_trace_record_dir: Optional[str] = None
+    request_trace_max_bytes: int = 1 << 30
+    request_trace_backup_count: int = 5
     uvicorn_access_log_exclude_prefixes: List[str] = dataclasses.field(
         default_factory=lambda: list(DEFAULT_UVICORN_ACCESS_LOG_EXCLUDE_PREFIXES)
     )
@@ -5508,6 +5511,24 @@ class ServerArgs:
             default=ServerArgs.log_requests_target,
             help="Target(s) for request logging: 'stdout' and/or directory path(s) for file output. "
             "Can specify multiple targets, e.g., '--log-requests-target stdout /my/path'. ",
+        )
+        parser.add_argument(
+            "--request-trace-record-dir",
+            type=str,
+            default=ServerArgs.request_trace_record_dir,
+            help="Directory for gzip-compressed JSONL request trace records. If unset, request trace recording is disabled.",
+        )
+        parser.add_argument(
+            "--request-trace-max-bytes",
+            type=int,
+            default=ServerArgs.request_trace_max_bytes,
+            help="Maximum bytes per request trace file before size-based rotation.",
+        )
+        parser.add_argument(
+            "--request-trace-backup-count",
+            type=int,
+            default=ServerArgs.request_trace_backup_count,
+            help="Number of rotated request trace files to keep.",
         )
         parser.add_argument(
             "--uvicorn-access-log-exclude-prefixes",

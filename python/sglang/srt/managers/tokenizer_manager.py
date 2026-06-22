@@ -119,6 +119,12 @@ from sglang.srt.utils.hf_transformers_utils import (
 )
 from sglang.srt.utils.network import get_zmq_socket
 from sglang.srt.utils.request_logger import RequestLogger
+from sglang.srt.utils.request_trace import (
+    add_generation_output_ids,
+    add_generation_prompt_ids,
+    current_request_trace,
+    request_trace_enabled,
+)
 from sglang.srt.utils.watchdog import Watchdog
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 
@@ -1280,6 +1286,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self,
         tokenized_obj: Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput],
     ):
+        self._record_request_trace_prompt_ids(tokenized_obj)
         tokenized_obj.time_stats.set_api_server_dispatch_time()
         tokenized_obj = wrap_shm_features(tokenized_obj)
         self.send_to_scheduler.send_pyobj(tokenized_obj)
@@ -1297,9 +1304,51 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         else:
             batch_req = BatchTokenizedEmbeddingReqInput(batch=tokenized_objs)
 
+        for tokenized_obj in tokenized_objs:
+            self._record_request_trace_prompt_ids(tokenized_obj)
+
         set_time_batch(tokenized_objs, "set_api_server_dispatch_time")
         self.send_to_scheduler.send_pyobj(batch_req)
         set_time_batch(tokenized_objs, "set_api_server_dispatch_finish_time")
+
+    @staticmethod
+    def _record_request_trace_prompt_ids(
+        tokenized_obj: Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput],
+    ) -> None:
+        if not request_trace_enabled() or not isinstance(
+            tokenized_obj, TokenizedGenerateReqInput
+        ):
+            return
+        trace = current_request_trace.get(None)
+        if trace is None:
+            return
+        add_generation_prompt_ids(
+            trace=trace,
+            generation_rid=tokenized_obj.rid,
+            prompt_token_ids=tokenized_obj.input_ids,
+        )
+
+    def _record_request_trace_output_ids(
+        self,
+        obj: Union[GenerateReqInput, EmbeddingReqInput],
+        out: Dict[Any, Any],
+        is_stream: bool,
+        finished: bool,
+    ) -> None:
+        if not request_trace_enabled() or not isinstance(obj, GenerateReqInput):
+            return
+        trace = current_request_trace.get(None)
+        if trace is None:
+            return
+
+        add_generation_output_ids(
+            trace=trace,
+            generation_rid=obj.rid,
+            output_ids=out.get("output_ids"),
+            meta_info=out.get("meta_info"),
+            is_delta=is_stream and self.server_args.incremental_streaming_output,
+            finished=finished,
+        )
 
     def _coalesce_streaming_chunks(
         self,
@@ -1457,9 +1506,15 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         out, state, is_stream
                     )
                     if abort_out is not None:
+                        self._record_request_trace_output_ids(
+                            obj, abort_out, is_stream, finished=True
+                        )
                         yield abort_out
                         break
 
+                self._record_request_trace_output_ids(
+                    obj, out, is_stream, finished=True
+                )
                 yield out
                 break
 
@@ -1470,6 +1525,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     out["meta_info"][
                         "response_sent_to_client_ts"
                     ] = state.time_stats.get_response_sent_to_client_realtime()
+                self._record_request_trace_output_ids(
+                    obj, out, is_stream, finished=False
+                )
                 yield out
             else:
                 if (

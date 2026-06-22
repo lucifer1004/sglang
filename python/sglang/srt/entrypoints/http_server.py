@@ -173,6 +173,10 @@ from sglang.srt.utils.json_response import (
     dumps_json,
     orjson_response,
 )
+from sglang.srt.utils.request_trace import (
+    configure_request_trace_recording,
+    trace_http_request,
+)
 from sglang.srt.utils.watchdog import SubprocessWatchdog
 from sglang.utils import get_exception_traceback
 from sglang.version import __version__
@@ -297,6 +301,14 @@ async def lifespan(fast_api_app: FastAPI):
         server_args = await init_multi_tokenizer()
         warmup_thread_kwargs = dict(server_args=server_args)
         thread_label = f"MultiTokenizer-{_global_state.tokenizer_manager.worker_id}"
+
+    configure_request_trace_recording(
+        record_dir=server_args.request_trace_record_dir,
+        max_bytes=server_args.request_trace_max_bytes,
+        backup_count=server_args.request_trace_backup_count,
+        model_path=server_args.model_path,
+        tokenizer_path=server_args.tokenizer_path,
+    )
 
     # Add prometheus middleware
     if server_args.enable_metrics:
@@ -702,6 +714,7 @@ if os.environ.get("DUMPER_SERVER_PORT") == "reuse":
     methods=["POST", "PUT"],
     response_class=SGLangORJSONResponse,
 )
+@trace_http_request(endpoint="/generate")
 async def generate_request(obj: GenerateReqInput, request: Request):
     """Handle a generate request."""
     if obj.stream:
@@ -1481,6 +1494,7 @@ async def continue_generation(obj: ContinueGenerationReqInput, request: Request)
 
 
 @app.post("/v1/completions", dependencies=[Depends(validate_json_request)])
+@trace_http_request(endpoint="/v1/completions")
 async def openai_v1_completions(request: CompletionRequest, raw_request: Request):
     """OpenAI-compatible text completion endpoint."""
     return await raw_request.app.state.openai_serving_completion.handle_request(
@@ -1489,6 +1503,7 @@ async def openai_v1_completions(request: CompletionRequest, raw_request: Request
 
 
 @app.post("/v1/chat/completions", dependencies=[Depends(validate_json_request)])
+@trace_http_request(endpoint="/v1/chat/completions")
 async def openai_v1_chat_completions(
     request: ChatCompletionRequest, raw_request: Request
 ):
@@ -1664,6 +1679,7 @@ async def v1_score_request(request: ScoringRequest, raw_request: Request):
 
 
 @app.post("/v1/responses", dependencies=[Depends(validate_json_request)])
+@trace_http_request(endpoint="/v1/responses")
 async def v1_responses_request(request: dict, raw_request: Request):
     """Endpoint for the responses API with reasoning support."""
 
@@ -1759,6 +1775,7 @@ async def ollama_show(request: OllamaShowRequest, raw_request: Request):
 
 
 @app.post("/v1/messages", dependencies=[Depends(validate_json_request)])
+@trace_http_request(endpoint="/v1/messages")
 async def anthropic_v1_messages(
     request: AnthropicMessagesRequest, raw_request: Request
 ):
@@ -1899,6 +1916,7 @@ def _execute_server_warmup(server_args: ServerArgs):
             "temperature": 0,
             "max_new_tokens": max_new_tokens,
         },
+        "no_logs": True,
     }
     if server_args.skip_tokenizer_init:
         json_data["input_ids"] = [[10, 11, 12] for _ in range(server_args.dp_size)]
@@ -1971,6 +1989,7 @@ def _execute_server_warmup(server_args: ServerArgs):
                     "max_new_tokens": 8,
                     "ignore_eos": True,
                 },
+                "no_logs": True,
                 "bootstrap_host": [FAKE_BOOTSTRAP_HOST] * server_args.dp_size,
                 # This is a hack to ensure fake transfer is enabled during prefill warmup
                 # ensure each dp rank has a unique bootstrap_room during prefill warmup
