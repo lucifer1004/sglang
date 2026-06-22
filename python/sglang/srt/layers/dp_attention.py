@@ -26,6 +26,11 @@ from sglang.srt.distributed import (
     get_tp_group,
     tensor_model_parallel_all_reduce,
 )
+from sglang.srt.distributed.parallel_state import (
+    get_suffix_parallel_group as _get_suffix_parallel_group,
+    get_suffix_parallel_rank as _get_suffix_parallel_rank,
+    get_suffix_parallel_world_size as _get_suffix_parallel_world_size,
+)
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
@@ -45,6 +50,10 @@ _ATTN_DP_SIZE: Optional[int] = None
 _LOCAL_ATTN_DP_SIZE: Optional[int] = None
 _LOCAL_ATTN_DP_RANK: Optional[int] = None
 _ENABLE_DP_ATTENTION_FLAG: bool = False
+_ENABLE_SUFFIX_PARALLEL_FLAG: bool = False
+
+_SUFFIX_SCATTER_GRAPH_WORKSPACES: List[torch.Tensor] = []
+_SUFFIX_GATHER_GRAPH_WORKSPACES: List[Tuple[torch.Tensor, torch.Tensor]] = []
 
 _is_hip = is_hip()
 _USE_ROCM700A_WA = _is_hip and get_bool_env_var("SGLANG_USE_ROCM700A")
@@ -339,12 +348,14 @@ def initialize_dp_attention(
 ):
     global _ATTN_DP_RANK, _ATTN_DP_SIZE
     global _LOCAL_ATTN_DP_SIZE, _LOCAL_ATTN_DP_RANK, _ENABLE_DP_ATTENTION_FLAG
+    global _ENABLE_SUFFIX_PARALLEL_FLAG
     enable_dp_attention = server_args.enable_dp_attention
     dp_size = server_args.dp_size
     moe_dense_tp_size = server_args.moe_dense_tp_size
     attn_cp_size = server_args.attn_cp_size
 
     _ENABLE_DP_ATTENTION_FLAG = enable_dp_attention
+    _ENABLE_SUFFIX_PARALLEL_FLAG = server_args.enable_suffix_parallel
 
     tp_rank = get_tensor_model_parallel_rank()
     tp_size = get_tensor_model_parallel_world_size()
@@ -375,6 +386,10 @@ def initialize_dp_attention(
 
 def is_dp_attention_enabled() -> bool:
     return _ENABLE_DP_ATTENTION_FLAG
+
+
+def is_suffix_parallel_enabled() -> bool:
+    return _ENABLE_SUFFIX_PARALLEL_FLAG
 
 
 def is_allocation_symmetric() -> bool:
@@ -409,6 +424,22 @@ def get_attention_cp_rank() -> int:
 
 def get_attention_cp_size() -> int:
     return get_attn_context_model_parallel_world_size()
+
+
+def get_suffix_parallel_group() -> GroupCoordinator:
+    return _get_suffix_parallel_group()
+
+
+def get_suffix_parallel_size() -> int:
+    if not is_suffix_parallel_enabled():
+        return 1
+    return _get_suffix_parallel_world_size()
+
+
+def get_suffix_parallel_rank() -> int:
+    if not is_suffix_parallel_enabled():
+        return 0
+    return _get_suffix_parallel_rank()
 
 
 def get_attention_dp_rank() -> int:
@@ -657,7 +688,22 @@ def attn_cp_reduce_scatter_tensor(output: torch.Tensor, input: torch.Tensor):
 
 
 def attn_tp_all_reduce(input: torch.Tensor):
-    return get_attention_tp_group().all_reduce(input)
+    group = get_attention_tp_group()
+    try:
+        is_capturing = torch.cuda.is_current_stream_capturing()
+    except Exception:
+        is_capturing = False
+    pynccl_comm = getattr(group, "pynccl_comm", None)
+    if is_capturing and pynccl_comm is not None:
+        from sglang.srt.utils.common import get_current_device_stream_fast
+
+        with pynccl_comm.change_state(
+            enable=True, stream=get_current_device_stream_fast()
+        ):
+            pynccl_comm.all_reduce(input)
+        return input
+    group._all_reduce_in_place(input)
+    return input
 
 
 def attn_tp_all_gather_into_tensor(output: torch.Tensor, input: torch.Tensor):
@@ -697,3 +743,60 @@ def moe_cp_all_gather_into_tensor(output: torch.Tensor, input: torch.Tensor):
 
 def attn_tp_all_gather(output_list: List[torch.Tensor], input: torch.Tensor):
     return get_attention_tp_group().all_gather(input, output_tensor_list=output_list)
+
+
+def suffix_scatter(hidden: torch.Tensor) -> torch.Tensor:
+    sf = get_suffix_parallel_size()
+    if sf <= 1:
+        return hidden
+    sp_rank = get_suffix_parallel_rank()
+    n_token = hidden.shape[0]
+    assert (
+        n_token % sf == 0
+    ), f"suffix_scatter: n_token={n_token} not divisible by sf={sf}"
+    try:
+        is_capturing = torch.cuda.is_current_stream_capturing()
+    except Exception:
+        is_capturing = False
+    if is_capturing:
+        out = torch.empty(
+            (n_token // sf, hidden.shape[-1]),
+            dtype=hidden.dtype,
+            device=hidden.device,
+        )
+        out.copy_(hidden[sp_rank::sf])
+        _SUFFIX_SCATTER_GRAPH_WORKSPACES.append(out)
+        return out
+    return hidden[sp_rank::sf].contiguous()
+
+
+def suffix_gather(local: torch.Tensor) -> torch.Tensor:
+    sf = get_suffix_parallel_size()
+    if sf <= 1:
+        return local
+    local = local.contiguous()
+    n_logical, hidden_dim = local.shape
+    try:
+        is_capturing = torch.cuda.is_current_stream_capturing()
+    except Exception:
+        is_capturing = False
+    gathered = torch.empty(
+        (sf * n_logical, hidden_dim), dtype=local.dtype, device=local.device
+    )
+    if is_capturing:
+        out = torch.empty_like(gathered)
+        _SUFFIX_GATHER_GRAPH_WORKSPACES.append((gathered, out))
+    else:
+        out = None
+    get_suffix_parallel_group()._all_gather_into_tensor(gathered, local)
+    if out is not None:
+        out.view(n_logical, sf, hidden_dim).copy_(
+            gathered.view(sf, n_logical, hidden_dim).transpose(0, 1)
+        )
+        return out
+    return (
+        gathered.view(sf, n_logical, hidden_dim)
+        .transpose(0, 1)
+        .reshape(sf * n_logical, hidden_dim)
+        .contiguous()
+    )

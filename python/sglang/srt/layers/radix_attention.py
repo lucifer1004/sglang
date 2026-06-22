@@ -72,6 +72,9 @@ class RadixAttention(nn.Module):
         attn_type: AttentionType = AttentionType.DECODER,
         use_irope: bool = False,
         prefix: str = "",
+        scale_seq_attn_per_suffix: bool = False,
+        scale_seq_factor: int = 1,
+        suffix_parallel: bool = False,
     ):
         super().__init__()
         self.tp_q_head_num = num_heads
@@ -102,6 +105,9 @@ class RadixAttention(nn.Module):
         self.logit_capping_method = logit_capping_method
         self.xai_temperature_len = -1
         self.is_kv_mirror = False
+        self.scale_seq_attn_per_suffix = scale_seq_attn_per_suffix
+        self.scale_seq_factor = max(int(scale_seq_factor), 1)
+        self.suffix_parallel = suffix_parallel and scale_seq_attn_per_suffix
 
     def forward(
         self,

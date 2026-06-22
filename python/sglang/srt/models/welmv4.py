@@ -49,10 +49,16 @@ from sglang.srt.layers.communicator import (
 )
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
+    attn_tp_all_reduce,
     get_attention_dp_size,
+    get_suffix_parallel_rank,
+    get_suffix_parallel_size,
     get_attention_tp_rank,
     get_attention_tp_size,
     is_dp_attention_enabled,
+    is_suffix_parallel_enabled,
+    suffix_gather,
+    suffix_scatter,
 )
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
@@ -84,6 +90,7 @@ from sglang.srt.layers.welmv4_op import (
     WelmV4FusedRMSNorm,
     WelmV4InplaceRotaryEmbedding,
     inplace_sigmoid_mul,
+    inplace_sigmoid_mul_legacy,
     mmq_style_add_residual,
     mmq_style_expert_bias_topk,
     mmq_style_k_rms_norm,
@@ -113,6 +120,16 @@ from sglang.srt.environ import Envs
 logger = logging.getLogger(__name__)
 
 _is_cuda = is_cuda()
+if _is_cuda:
+    try:
+        # The old scale-seq reference used sgl-kernel's internal RMSNorm path;
+        # the public wrapper may dispatch to FlashInfer and round 1 ULP higher.
+        from sgl_kernel.elementwise import _rmsnorm_internal as _sgl_rmsnorm_internal
+    except ImportError:
+        _sgl_rmsnorm_internal = None
+else:
+    _sgl_rmsnorm_internal = None
+
 WELM_KV_MIRROR_PP_KEY_PREFIX = "welm_kv_mirror"
 WELM_KV_MIRROR_STATES_KEY = "welm_kv_mirror_states"
 _WELM_DUMP_PROCESS_DIR = None
@@ -157,6 +174,31 @@ class WelmV4CommunicatorRMSNorm(nn.Module):
         if not args and not kwargs and residual is None and isinstance(output, tuple):
             return output[0]
         return output
+
+
+def _welm_previous_precision_rmsnorm(norm: RMSNorm, x: torch.Tensor) -> torch.Tensor:
+    if x.numel() == 0:
+        return x
+    if (
+        _sgl_rmsnorm_internal is None
+        or not x.is_cuda
+        or norm.variance_size_override is not None
+    ):
+        return norm.forward_native(x)
+
+    needs_reshape = x.dim() != 2
+    if needs_reshape:
+        original_shape = x.shape
+        x = x.contiguous().reshape(-1, original_shape[-1])
+    elif not x.is_contiguous():
+        x = x.contiguous()
+
+    out = _sgl_rmsnorm_internal(
+        x, norm.weight.data, norm.variance_epsilon, None, None
+    )
+    if needs_reshape:
+        out = out.reshape(original_shape)
+    return out
 
 
 def _welm_dump_enabled() -> bool:
@@ -1357,9 +1399,28 @@ class ImitateQkvMultiBankKvProjection(BaseWelmQkvProjection):
         parts = qkv.split(splits, dim=-1)
         q, k, v = parts[0], parts[1], parts[2]
         for i, mirror_idx in enumerate(self.mirror_layer_indices):
+            mirror_k = parts[3 + 2 * i]
+            mirror_v = parts[3 + 2 * i + 1]
+            if attn.suffix_parallel:
+                layerwise = getattr(attn, "scale_seq_attn_per_suffix_layerwise", ())
+                consumer_per_suffix = bool(
+                    layerwise and len(layerwise) > mirror_idx and layerwise[mirror_idx]
+                )
+                mirror_extend = (
+                    (
+                        getattr(forward_batch, "enable_kv_mirror", False)
+                        or getattr(forward_batch, "enable_welm_kv_mirror_opt", False)
+                    )
+                    and forward_batch.forward_mode.is_extend_without_speculative()
+                )
+                if not consumer_per_suffix or mirror_extend:
+                    kv_dim = mirror_k.shape[-1]
+                    mirror_kv = suffix_gather(torch.cat([mirror_k, mirror_v], dim=-1))
+                    mirror_k = mirror_kv[..., :kv_dim].contiguous()
+                    mirror_v = mirror_kv[..., kv_dim:].contiguous()
             kv_mirror_states[mirror_idx] = (
-                parts[3 + 2 * i],
-                parts[3 + 2 * i + 1],
+                mirror_k,
+                mirror_v,
             )
         return q, k, v, hidden_states
 
@@ -1676,24 +1737,28 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 f"the number of experts {config.num_experts}."
             )
 
-        moe_clamp_limits = getattr(
-            config, "moe_expert_swiglu_clamp_limit_layerwise", []
-        )
-        moe_clamp_limit = (
-            moe_clamp_limits[self.config_layer_id]
-            if self.config_layer_id < len(moe_clamp_limits)
-            and moe_clamp_limits[self.config_layer_id] > 0
-            else None
-        )
-        shared_clamp_limits = getattr(
-            config, "shared_expert_swiglu_clamp_limit_layerwise", []
-        )
-        shared_clamp_limit = (
-            shared_clamp_limits[self.config_layer_id]
-            if self.config_layer_id < len(shared_clamp_limits)
-            and shared_clamp_limits[self.config_layer_id] > 0
-            else None
-        )
+        if welm_use_previous_precision():
+            moe_clamp_limit = None
+            shared_clamp_limit = None
+        else:
+            moe_clamp_limits = getattr(
+                config, "moe_expert_swiglu_clamp_limit_layerwise", []
+            )
+            moe_clamp_limit = (
+                moe_clamp_limits[self.config_layer_id]
+                if self.config_layer_id < len(moe_clamp_limits)
+                and moe_clamp_limits[self.config_layer_id] > 0
+                else None
+            )
+            shared_clamp_limits = getattr(
+                config, "shared_expert_swiglu_clamp_limit_layerwise", []
+            )
+            shared_clamp_limit = (
+                shared_clamp_limits[self.config_layer_id]
+                if self.config_layer_id < len(shared_clamp_limits)
+                and shared_clamp_limits[self.config_layer_id] > 0
+                else None
+            )
 
         self.router_score_func = (
             config.router_score_func
@@ -2124,6 +2189,8 @@ class Qwen2MoeAttention(nn.Module):
         total_layer_num: int = 1,
         num_nextn_predict_layers: int = 0,
         is_nextn: bool = False,
+        scale_seq_times: int = 0,
+        scale_seq_attn_per_suffix_layerwise=(),
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
@@ -2226,6 +2293,24 @@ class Qwen2MoeAttention(nn.Module):
         else:
             self.attn_sink = None
 
+        self.scale_seq_times = scale_seq_times
+        self.scale_seq_attn_per_suffix_layerwise = scale_seq_attn_per_suffix_layerwise
+        if (
+            scale_seq_attn_per_suffix_layerwise
+            and self.config_layer_idx is not None
+            and len(scale_seq_attn_per_suffix_layerwise) > self.config_layer_idx
+            and scale_seq_attn_per_suffix_layerwise[self.config_layer_idx]
+        ):
+            assert scale_seq_times > 0, (
+                f"scale_seq_attn_per_suffix_layerwise[{self.config_layer_idx}]=True "
+                f"requires scale_seq_times > 0, got {scale_seq_times}"
+            )
+            self.scale_seq_attn_per_suffix = True
+            self.scale_seq_factor = scale_seq_times + 1
+        else:
+            self.scale_seq_attn_per_suffix = False
+            self.scale_seq_factor = 1
+
         qkv_proj_kwargs = dict(
             hidden_size=hidden_size,
             head_dim=self.head_dim,
@@ -2238,6 +2323,10 @@ class Qwen2MoeAttention(nn.Module):
             tp_size=attn_tp_size,
         )
 
+        global_tp_size = get_tensor_model_parallel_world_size()
+        self.o_proj_suffix_parallel_reduce = (
+            is_suffix_parallel_enabled() and attn_tp_size < global_tp_size
+        )
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.head_dim,
             hidden_size,
@@ -2245,7 +2334,10 @@ class Qwen2MoeAttention(nn.Module):
             quant_config=quant_config,
             tp_rank=attn_tp_rank,
             tp_size=attn_tp_size,
-            reduce_results=not is_dp_attention_enabled(),
+            reduce_results=(
+                not is_dp_attention_enabled()
+                and not self.o_proj_suffix_parallel_reduce
+            ),
             prefix=add_prefix("o_proj", prefix),
         )
         self.o_norm_needs_attn_tp_reduce = (
@@ -2292,6 +2384,14 @@ class Qwen2MoeAttention(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("attn", prefix),
             sliding_window_size=self.sliding_window_size,
+            scale_seq_attn_per_suffix=self.scale_seq_attn_per_suffix,
+            scale_seq_factor=self.scale_seq_factor,
+            suffix_parallel=(
+                self.scale_seq_attn_per_suffix and is_suffix_parallel_enabled()
+            ),
+        )
+        self.suffix_parallel = (
+            self.scale_seq_attn_per_suffix and is_suffix_parallel_enabled()
         )
         self.gated_self_attention_headwise = True
         if self.gated_self_attention_headwise:
@@ -2363,6 +2463,14 @@ class Qwen2MoeAttention(nn.Module):
                 f"model.mtp.0.decoder.{self.layer_idx}.layer.self_attn"
             )
             _welm_dump_tensor(f"{mtp_dump_prefix}.input", hidden_states)
+
+        scp_per_suffix = self.suffix_parallel
+        if scp_per_suffix:
+            sf = get_suffix_parallel_size()
+            sp_rank = get_suffix_parallel_rank()
+            hidden_states = suffix_scatter(hidden_states)
+            positions = positions[sp_rank::sf].contiguous()
+
         if dump_this_layer:
             _welm_dump_tensor(f"{dump_prefix}.positions", positions)
             if forward_batch.extend_seq_lens is not None:
@@ -2396,6 +2504,9 @@ class Qwen2MoeAttention(nn.Module):
             raise RuntimeError(
                 "WeLMV4 attention requires K/V in the merged WeLM MTP path."
             )
+        if scp_per_suffix and k is not None and k.shape[0] != q.shape[0]:
+            k = suffix_scatter(k)
+            v = suffix_scatter(v)
         if dump_this_layer:
             _welm_dump_tensor(f"{dump_prefix}.positions", positions)
             _welm_dump_tensor(f"{dump_prefix}.q_pre_rope", q)
@@ -2421,6 +2532,7 @@ class Qwen2MoeAttention(nn.Module):
             # fuse: implement a high precision and fused k_norm
             if self.qk_norm or self.only_k_norm:
                 if welm_use_previous_precision():
+                    k_by_head = k.reshape(-1, self.head_dim)
                     k_by_head, _ = self.k_norm(k_by_head)
                 else:
                     k_by_head = mmq_style_k_rms_norm(
@@ -2432,6 +2544,12 @@ class Qwen2MoeAttention(nn.Module):
                 )
             k = k_by_head.view(k.shape)
 
+        def _scale_rope_positions(pos: torch.Tensor) -> torch.Tensor:
+            if self.scale_seq_attn_per_suffix and self.scale_seq_factor > 1:
+                return pos // self.scale_seq_factor
+            return pos
+
+        rope_positions = _scale_rope_positions(positions)
         qk_nope_head_dim = self.head_dim - self.qk_rope_head_dim
         k_for_rope = k
         if qk_nope_head_dim > 0:
@@ -2458,6 +2576,7 @@ class Qwen2MoeAttention(nn.Module):
                         and active_indices.numel() != output_size
                     ):
                         last_query_positions = last_query_positions[active_indices]
+                    last_query_positions = _scale_rope_positions(last_query_positions)
                     if (
                         last_query_positions.shape[0]
                         != forward_batch.custom_last_index.numel()
@@ -2467,7 +2586,7 @@ class Qwen2MoeAttention(nn.Module):
                             f"{last_query_positions.shape[0]} vs "
                             f"{forward_batch.custom_last_index.numel()}."
                         )
-                rotary_positions = positions
+                rotary_positions = rope_positions
                 kv_fill_positions = getattr(
                     forward_batch, "welm_mtp_kv_fill_positions", None
                 )
@@ -2477,8 +2596,10 @@ class Qwen2MoeAttention(nn.Module):
                     and k_for_rope.shape[0] != positions.shape[0]
                 ):
                     if kv_fill_positions.shape[0] == k_for_rope.shape[0]:
-                        rotary_positions = kv_fill_positions.to(
-                            device=positions.device, dtype=positions.dtype
+                        rotary_positions = _scale_rope_positions(
+                            kv_fill_positions.to(
+                                device=positions.device, dtype=positions.dtype
+                            )
                         )
                     elif (
                         last_query_positions is not None
@@ -2500,12 +2621,12 @@ class Qwen2MoeAttention(nn.Module):
                     last_query_positions=last_query_positions,
                 )
             else:
-                self.rotary_emb.forward_cuda(positions, q, k_for_rope)
+                self.rotary_emb.forward_cuda(rope_positions, q, k_for_rope)
             q = q.view(q_shape)
             if has_kv:
                 k = k_for_rope.view(k_shape)
         else:
-            q, k_for_rope = self.rotary_emb(positions, q, k_for_rope)
+            q, k_for_rope = self.rotary_emb(rope_positions, q, k_for_rope)
             if has_kv:
                 k = k_for_rope
         if dump_this_layer:
@@ -2538,7 +2659,10 @@ class Qwen2MoeAttention(nn.Module):
                     f"model.layers.{self.layer_idx}.attn.router.0", gate.squeeze(-1)
                 )
             attn_output = attn_output.view(attn_shape[0], self.num_heads, -1)
-            inplace_sigmoid_mul(gate, attn_output)
+            if welm_use_previous_precision():
+                inplace_sigmoid_mul_legacy(gate, attn_output)
+            else:
+                inplace_sigmoid_mul(gate, attn_output)
             attn_output = attn_output.view(attn_shape)
             if dump_this_layer:
                 _welm_dump_tensor(f"{dump_prefix}.gated_attn_output", attn_output)
@@ -2551,6 +2675,10 @@ class Qwen2MoeAttention(nn.Module):
             output = hidden_states.new_empty((0, self.hidden_size))
         else:
             output, _ = self.o_proj(attn_output)
+            if self.o_proj_suffix_parallel_reduce and (
+                output.shape[0] != 0 or needs_empty_dp_collectives
+            ):
+                output = attn_tp_all_reduce(output)
         if (
             _welm_should_contract_kv_mirror(forward_batch)
             and self.kv_mirror_layer_idx in self.kv_mirror_layers
@@ -2570,21 +2698,20 @@ class Qwen2MoeAttention(nn.Module):
         if self.use_o_norm and not skip_o_norm:
             need_attn_tp_reduce_for_o_norm = (
                 self.o_norm_needs_attn_tp_reduce
+                and not self.o_proj_suffix_parallel_reduce
                 and (output.shape[0] != 0 or needs_empty_dp_collectives)
             )
             if need_attn_tp_reduce_for_o_norm:
                 output = attention_tensor_model_parallel_all_reduce(output)
             if welm_use_previous_precision():
-                # Match the v0.5.6 previous-precision baseline. The native
-                # PyTorch path avoids sgl_kernel.rmsnorm rounding differences
-                # across image builds.
-                if isinstance(self.o_norm, RMSNorm):
-                    output = self.o_norm.forward_native(output)
-                else:
-                    output = self.o_norm(output)
+                output = _welm_previous_precision_rmsnorm(self.o_norm, output)
             else:
                 output, _ = self.o_norm(output)
-            if self.o_norm_needs_attn_tp_reduce and self.attn_tp_rank != 0:
+            if (
+                self.o_norm_needs_attn_tp_reduce
+                and not self.o_proj_suffix_parallel_reduce
+                and self.attn_tp_rank != 0
+            ):
                 # prepare_mlp reduces across attn-TP again; keep the full value
                 # only on rank 0 so the later reduce does not double count it.
                 output = torch.zeros_like(output)
@@ -2592,6 +2719,8 @@ class Qwen2MoeAttention(nn.Module):
                 _welm_dump_tensor(
                     f"model.layers.{self.layer_idx}.attn.mixer.o_norm_out", output
                 )
+        if scp_per_suffix:
+            output = suffix_gather(output)
         if dump_this_layer:
             _welm_dump_tensor(f"model.layers.{self.layer_idx}.attn.mixer.0", output)
         if mtp_dump_attention_io:
@@ -2646,6 +2775,9 @@ class Qwen2MoeDecoderLayer(nn.Module):
         self.enable_attn_sink_layerwise = getattr(
             config, "enable_attn_sink_layerwise", []
         )
+        self.scale_seq_attn_per_suffix_layerwise = getattr(
+            config, "scale_seq_attn_per_suffix_layerwise", []
+        )
         self.ppln = getattr(config, "ppln", False)
         o_norm = getattr(config, "o_norm", False)
         self.prenorm_layer_idx = getattr(config, "prenorm_layer_idx", [])
@@ -2690,6 +2822,8 @@ class Qwen2MoeDecoderLayer(nn.Module):
             total_layer_num=total_layer_num,
             num_nextn_predict_layers=num_nextn_predict_layers,
             is_nextn=is_nextn,
+            scale_seq_times=scale_seq_times,
+            scale_seq_attn_per_suffix_layerwise=self.scale_seq_attn_per_suffix_layerwise,
         )
         self.layer_id = layer_id
         self.config_layer_id = config_layer_id
@@ -2944,8 +3078,10 @@ class Qwen2MoeDecoderLayer(nn.Module):
                     f"model.layers.{self.layer_id}.norm_after_attn.residual", residual
                 )
         # For DP with padding, reduce scatter can be used instead of all-reduce.
-        use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
-            forward_batch
+        use_reduce_scatter = (
+            forward_batch.dp_padding_mode is not None
+            and not is_suffix_parallel_enabled()
+            and self.layer_communicator.should_use_reduce_scatter(forward_batch)
         )
         can_use_final_components = (
             not use_previous_precision

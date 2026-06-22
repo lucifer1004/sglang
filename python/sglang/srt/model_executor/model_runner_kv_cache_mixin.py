@@ -42,7 +42,12 @@ from sglang.srt.mem_cache.memory_pool import (
     NSATokenToKVPool,
     ReqToTokenPool,
 )
-from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool, SWATokenToKVPoolAllocator
+from sglang.srt.mem_cache.swa_memory_pool import (
+    SWAKVPool,
+    SWATokenToKVPoolAllocator,
+    SuffixKVPool,
+    SuffixTokenToKVPoolAllocator,
+)
 from sglang.srt.utils.common import (
     get_available_gpu_memory,
     is_float4_e2m1fn_x2,
@@ -583,7 +588,40 @@ class ModelRunnerKVCacheMixin:
                     end_layer=self.end_layer,
                 )
         else:
-            if self.is_hybrid_swa:
+            if self.server_args.enable_suffix_parallel:
+                from sglang.srt.model_executor.pool_configurator import (
+                    get_suffix_parallel_layer_ids,
+                )
+
+                _, suffix_layer_ids, swa_layer_ids, full_layer_ids, _ = (
+                    get_suffix_parallel_layer_ids(self)
+                )
+                self.model_config.suffix_attention_layer_ids = suffix_layer_ids
+                self.model_config.swa_attention_layer_ids = swa_layer_ids
+                self.model_config.full_attention_layer_ids = full_layer_ids
+
+                self.token_to_kv_pool = SuffixKVPool(
+                    size=self.full_max_total_num_tokens,
+                    size_suffix=self.suffix_max_total_num_tokens,
+                    size_swa=self.swa_max_total_num_tokens,
+                    dtype=self.kv_cache_dtype,
+                    head_num=self.model_config.get_num_kv_heads(
+                        get_attention_tp_size()
+                    ),
+                    head_dim=self.model_config.head_dim,
+                    v_head_dim=self.model_config.v_head_dim,
+                    suffix_attention_layer_ids=suffix_layer_ids,
+                    swa_attention_layer_ids=swa_layer_ids,
+                    full_attention_layer_ids=full_layer_ids,
+                    enable_kvcache_transpose=False,
+                    device=self.device,
+                    enable_memory_saver=self.server_args.enable_memory_saver,
+                    enable_alt_stream=not self.server_args.enable_pdmux,
+                    enable_kv_cache_copy=(
+                        self.server_args.speculative_algorithm is not None
+                    ),
+                )
+            elif self.is_hybrid_swa:
                 kwargs = {}
                 if self.is_hybrid_swa_compress:
                     kwargs = {
@@ -732,7 +770,17 @@ class ModelRunnerKVCacheMixin:
                         need_sort=need_sort,
                     )
             else:
-                if self.is_hybrid_swa:
+                if self.server_args.enable_suffix_parallel:
+                    self.token_to_kv_pool_allocator = SuffixTokenToKVPoolAllocator(
+                        self.full_max_total_num_tokens,
+                        self.suffix_max_total_num_tokens,
+                        dtype=self.kv_cache_dtype,
+                        device=self.device,
+                        kvcache=self.token_to_kv_pool,
+                        need_sort=need_sort,
+                        size_swa=self.swa_max_total_num_tokens,
+                    )
+                elif self.is_hybrid_swa:
                     self.token_to_kv_pool_allocator = SWATokenToKVPoolAllocator(
                         full_kv_pool_size,
                         swa_kv_pool_size,
@@ -805,7 +853,21 @@ class ModelRunnerKVCacheMixin:
 
         else:
             assert self.is_draft_worker
-            if self.is_hybrid_swa:
+            if self.server_args.enable_suffix_parallel:
+                suffix_allocator = unwrap_cp_sharded_allocator(
+                    self.token_to_kv_pool_allocator
+                )
+                suffix_allocator = getattr(
+                    suffix_allocator, "logical_attn_allocator", suffix_allocator
+                )
+                assert suffix_allocator.__class__ == SuffixTokenToKVPoolAllocator
+                self.token_to_kv_pool.full_to_suffix_index_mapping = (
+                    suffix_allocator.full_to_suffix_index_mapping
+                )
+                self.token_to_kv_pool.full_to_swa_index_mapping = (
+                    suffix_allocator.full_to_swa_index_mapping
+                )
+            elif self.is_hybrid_swa:
                 swa_allocator = unwrap_cp_sharded_allocator(
                     self.token_to_kv_pool_allocator
                 )
@@ -889,7 +951,11 @@ class ModelRunnerKVCacheMixin:
         """Apply a resolved MemoryPoolConfig and initialize pools."""
         self.max_total_num_tokens = config.max_total_num_tokens
         self.max_running_requests = config.max_running_requests
-        if self.is_hybrid_swa:
+        if self.server_args.enable_suffix_parallel:
+            self.full_max_total_num_tokens = config.full_max_total_num_tokens
+            self.swa_max_total_num_tokens = config.swa_max_total_num_tokens or 0
+            self.suffix_max_total_num_tokens = config.suffix_max_total_num_tokens
+        elif self.is_hybrid_swa:
             self.full_max_total_num_tokens = config.full_max_total_num_tokens
             self.swa_max_total_num_tokens = config.swa_max_total_num_tokens
 

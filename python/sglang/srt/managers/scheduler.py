@@ -916,7 +916,31 @@ class Scheduler(
         )
 
         if effective_chunked_prefill_size is not None and self.disable_radix_cache:
-            if not self.is_hybrid_swa:
+            if server_args.enable_suffix_parallel:
+                from sglang.srt.mem_cache.chunk_cache import SuffixChunkCache
+
+                windows = getattr(
+                    self.model_config.hf_config, "sliding_window_size_layerwise", []
+                )
+                per_suffix = getattr(
+                    self.model_config.hf_config,
+                    "scale_seq_attn_per_suffix_layerwise",
+                    [],
+                )
+                swa_windows = [
+                    window
+                    for idx, window in enumerate(windows)
+                    if window is not None
+                    and 0 < window < self.model_config.context_len
+                    and not (idx < len(per_suffix) and bool(per_suffix[idx]))
+                ]
+                swa_window = (
+                    min(swa_windows)
+                    if server_args.suffix_parallel_swa_pool and swa_windows
+                    else 0
+                )
+                self.tree_cache = SuffixChunkCache(params, swa_window=swa_window)
+            elif not self.is_hybrid_swa:
                 from sglang.srt.mem_cache.chunk_cache import ChunkCache
 
                 self.tree_cache = ChunkCache(params)

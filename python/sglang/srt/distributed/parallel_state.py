@@ -1463,6 +1463,7 @@ def init_model_parallel_group(
 _TP: Optional[GroupCoordinator] = None
 _ATTN_TP: Optional[GroupCoordinator] = None
 _ATTN_CP: Optional[GroupCoordinator] = None
+_SUFFIX_PARALLEL: Optional[GroupCoordinator] = None
 _SHARDED_KV_CP: Optional[GroupCoordinator] = None
 
 # duplicate GroupCoordinator for prefill in PD-Multiplexing
@@ -1498,6 +1499,13 @@ def get_attn_cp_group() -> GroupCoordinator:
         _ATTN_CP is not None
     ), "attention context model parallel group is not initialized"
     return _ATTN_CP
+
+
+def get_suffix_parallel_group() -> GroupCoordinator:
+    assert (
+        _SUFFIX_PARALLEL is not None
+    ), "suffix parallel group is not initialized"
+    return _SUFFIX_PARALLEL
 
 
 def get_sharded_kv_cp_group() -> GroupCoordinator:
@@ -1578,6 +1586,7 @@ def graph_capture(stream: Optional[torch.cuda.Stream] = None):
             for group in (
                 _ATTN_CP,
                 _ATTN_TP,
+                _SUFFIX_PARALLEL,
                 _SHARDED_KV_CP,
                 _MOE_EP,
                 _MOE_TP,
@@ -1811,6 +1820,7 @@ def initialize_model_parallel(
     pipeline_model_parallel_size: int = 1,
     attention_data_parallel_size: int = 1,
     attention_context_model_parallel_size: int = 1,
+    suffix_parallel_size: int = 1,
     moe_data_model_parallel_size: int = 1,
     backend: Optional[str] = None,
     duplicate_tp_group: bool = False,
@@ -1916,31 +1926,50 @@ def initialize_model_parallel(
 
     attn_dp_size = attention_data_parallel_size
     attn_cp_size = attention_context_model_parallel_size
-    attn_tp_size = tensor_model_parallel_size // attn_cp_size // attn_dp_size
+    suffix_parallel_size = max(int(suffix_parallel_size), 1)
+    assert (
+        tensor_model_parallel_size
+        % (attn_cp_size * attn_dp_size * suffix_parallel_size)
+        == 0
+    ), (
+        "tensor_model_parallel_size must be divisible by "
+        "attention_context_model_parallel_size * attention_data_parallel_size * "
+        f"suffix_parallel_size, got tp={tensor_model_parallel_size}, "
+        f"attn_cp={attn_cp_size}, attn_dp={attn_dp_size}, "
+        f"suffix_parallel={suffix_parallel_size}"
+    )
+    attn_tp_size = (
+        tensor_model_parallel_size
+        // attn_cp_size
+        // attn_dp_size
+        // suffix_parallel_size
+    )
 
     global _ATTN_CP
     assert (
         _ATTN_CP is None
     ), "attention context model parallel group is already initialized"
-    if attn_cp_size == tensor_model_parallel_size:
+    if attn_cp_size == tensor_model_parallel_size and suffix_parallel_size == 1:
         _ATTN_CP = _TP
     else:
         group_ranks = []
         for tp_group_idx in range(num_tensor_model_parallel_groups):
             for dp_idx in range(attn_dp_size):
-                for attn_tp_idx in range(attn_tp_size):
-                    st = (
-                        tp_group_idx * tensor_model_parallel_size
-                        + dp_idx * attn_tp_size * attn_cp_size
-                        + attn_tp_idx
-                    )
-                    en = (
-                        tp_group_idx * tensor_model_parallel_size
-                        + (dp_idx + 1) * attn_tp_size * attn_cp_size
-                        + attn_tp_idx
-                    )
-                    ranks = list(range(st, en, attn_tp_size))
-                    group_ranks.append(ranks)
+                for suffix_idx in range(suffix_parallel_size):
+                    for attn_tp_idx in range(attn_tp_size):
+                        base = tp_group_idx * tensor_model_parallel_size
+                        ranks = [
+                            base
+                            + (
+                                (dp_idx * attn_cp_size + cp_idx)
+                                * suffix_parallel_size
+                                + suffix_idx
+                            )
+                            * attn_tp_size
+                            + attn_tp_idx
+                            for cp_idx in range(attn_cp_size)
+                        ]
+                        group_ranks.append(ranks)
         _ATTN_CP = init_model_parallel_group(
             group_ranks,
             get_world_group().local_rank,
@@ -1956,22 +1985,30 @@ def initialize_model_parallel(
     assert (
         _ATTN_TP is None
     ), "attention tensor model parallel group is already initialized"
-    if attn_tp_size == tensor_model_parallel_size:
+    if (
+        attn_tp_size == tensor_model_parallel_size
+        and suffix_parallel_size == 1
+        and attn_cp_size == 1
+        and attn_dp_size == 1
+    ):
         _ATTN_TP = _TP
     else:
         group_ranks = []
         for tp_group_idx in range(num_tensor_model_parallel_groups):
-            for cp_dp_combined_idx in range(attn_cp_size * attn_dp_size):
-                st = (
-                    tp_group_idx * tensor_model_parallel_size
-                    + cp_dp_combined_idx * attn_tp_size
-                )
-                en = (
-                    tp_group_idx * tensor_model_parallel_size
-                    + (cp_dp_combined_idx + 1) * attn_tp_size
-                )
-                ranks = list(range(st, en))
-                group_ranks.append(ranks)
+            base = tp_group_idx * tensor_model_parallel_size
+            for dp_idx in range(attn_dp_size):
+                for cp_idx in range(attn_cp_size):
+                    for suffix_idx in range(suffix_parallel_size):
+                        st = (
+                            base
+                            + (
+                                (dp_idx * attn_cp_size + cp_idx)
+                                * suffix_parallel_size
+                                + suffix_idx
+                            )
+                            * attn_tp_size
+                        )
+                        group_ranks.append(list(range(st, st + attn_tp_size)))
 
         _ATTN_TP = init_model_parallel_group(
             group_ranks,
@@ -1983,6 +2020,42 @@ def initialize_model_parallel(
             use_torch_symm_mem_allreduce=False,
             use_message_queue_broadcaster=envs.SGLANG_USE_MESSAGE_QUEUE_BROADCASTER.get(),
             group_name="attention_tp",
+            recovered_rank=recovered_rank,
+        )
+
+    global _SUFFIX_PARALLEL
+    assert (
+        _SUFFIX_PARALLEL is None
+    ), "suffix parallel group is already initialized"
+    if suffix_parallel_size > 1:
+        group_ranks = []
+        for tp_group_idx in range(num_tensor_model_parallel_groups):
+            base = tp_group_idx * tensor_model_parallel_size
+            for dp_idx in range(attn_dp_size):
+                for cp_idx in range(attn_cp_size):
+                    for attn_tp_idx in range(attn_tp_size):
+                        ranks = [
+                            base
+                            + (
+                                (dp_idx * attn_cp_size + cp_idx)
+                                * suffix_parallel_size
+                                + suffix_idx
+                            )
+                            * attn_tp_size
+                            + attn_tp_idx
+                            for suffix_idx in range(suffix_parallel_size)
+                        ]
+                        group_ranks.append(ranks)
+        _SUFFIX_PARALLEL = init_model_parallel_group(
+            group_ranks,
+            get_world_group().local_rank,
+            backend,
+            use_pynccl=True,
+            use_mscclpp_allreduce=False,
+            use_custom_allreduce=False,
+            use_torch_symm_mem_allreduce=False,
+            use_message_queue_broadcaster=envs.SGLANG_USE_MESSAGE_QUEUE_BROADCASTER.get(),
+            group_name="suffix_parallel",
             recovered_rank=recovered_rank,
         )
 
@@ -2275,6 +2348,21 @@ def get_attn_context_model_parallel_rank():
     return get_attn_cp_group().rank_in_group
 
 
+# SUFFIX_PARALLEL
+def get_suffix_parallel_world_size():
+    """Return world size for the suffix parallel group."""
+    if _SUFFIX_PARALLEL is None:
+        return 1
+    return get_suffix_parallel_group().world_size
+
+
+def get_suffix_parallel_rank():
+    """Return my rank for the suffix parallel group."""
+    if _SUFFIX_PARALLEL is None:
+        return 0
+    return get_suffix_parallel_group().rank_in_group
+
+
 def get_sharded_kv_context_model_parallel_world_size():
     """Return world size for the sharded-KV context parallel group."""
     return get_sharded_kv_cp_group().world_size
@@ -2337,10 +2425,11 @@ def destroy_model_parallel():
     global _ATTN_CP
     global _ATTN_TP
     global _MOE_DP
+    global _SUFFIX_PARALLEL
     global _SHARDED_KV_CP
     global _PDMUX_PREFILL_TP_GROUP
 
-    # Destroy _SHARDED_KV_CP first since it may alias _TP/_ATTN_CP/_ATTN_TP.
+    # Destroy groups that may alias _TP/_ATTN_CP/_ATTN_TP before their aliases.
     if (
         _SHARDED_KV_CP
         and _SHARDED_KV_CP is not _TP
@@ -2349,6 +2438,14 @@ def destroy_model_parallel():
     ):
         _SHARDED_KV_CP.destroy()
     _SHARDED_KV_CP = None
+    if (
+        _SUFFIX_PARALLEL
+        and _SUFFIX_PARALLEL is not _TP
+        and _SUFFIX_PARALLEL is not _ATTN_CP
+        and _SUFFIX_PARALLEL is not _ATTN_TP
+    ):
+        _SUFFIX_PARALLEL.destroy()
+    _SUFFIX_PARALLEL = None
 
     if _TP:
         _TP.destroy()

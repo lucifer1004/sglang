@@ -764,6 +764,27 @@ def sigmoid_mul_kernel(
         tl.store(y + y_off, out_data, mask=mask)
 
 
+@triton.jit
+def sigmoid_mul_legacy_kernel(
+    x: tl.tensor,
+    y: tl.tensor,
+    rows: int,
+    cols: tl.constexpr,
+    y_row_stride: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    NUM_SMS,
+):
+    row_start = tl.program_id(0)
+    col_off = tl.arange(0, BLOCK_SIZE)
+    mask = col_off < cols
+    for row_id in tl.range(row_start, rows, NUM_SMS, num_stages=4):
+        y_off = row_id * y_row_stride + col_off
+        y_data = tl.load(y + y_off, mask=mask, other=0.0)
+        x_data = tl.load(x + row_id).to(tl.float32)
+        out_data = tl.sigmoid(x_data) * y_data
+        tl.store(y + y_off, out_data.to(y.dtype.element_ty), mask=mask)
+
+
 # return sigmoid(x) * y
 def inplace_sigmoid_mul(x: torch.Tensor, y: torch.Tensor):
     num_sms = _get_num_sms(multiplier=8)
@@ -772,6 +793,17 @@ def inplace_sigmoid_mul(x: torch.Tensor, y: torch.Tensor):
     block_size = triton.next_power_of_2(cols)
     assert x.is_contiguous()
     sigmoid_mul_kernel[(num_sms,)](x, y, rows, cols, y.stride(-2), block_size, num_sms)
+
+
+def inplace_sigmoid_mul_legacy(x: torch.Tensor, y: torch.Tensor):
+    num_sms = _get_num_sms(multiplier=8)
+    cols = y.shape[-1]
+    rows = y.numel() // cols
+    block_size = triton.next_power_of_2(cols)
+    assert x.is_contiguous()
+    sigmoid_mul_legacy_kernel[
+        (num_sms,)
+    ](x, y, rows, cols, y.stride(-2), block_size, num_sms)
 
 
 @triton.jit

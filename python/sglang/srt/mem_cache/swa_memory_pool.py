@@ -293,6 +293,224 @@ class SWAKVPool(BaseSWAKVPool):
             self.swa_kv_pool.load_cpu_copy(swa_kv_cpu, swa_indices)
 
 
+class SuffixKVPool(KVCache):
+    """Three-way KV cache for suffix-parallel WeLM scale-seq layers."""
+
+    def __init__(
+        self,
+        size: int,
+        size_suffix: int,
+        dtype: torch.dtype,
+        head_num: int,
+        head_dim: int,
+        suffix_attention_layer_ids: List[int],
+        full_attention_layer_ids: List[int],
+        enable_kvcache_transpose: bool,
+        device: str,
+        size_swa: int = 0,
+        swa_attention_layer_ids: Optional[List[int]] = None,
+        token_to_kv_pool_class: KVCache = MHATokenToKVPool,
+        **kwargs,
+    ):
+        swa_attention_layer_ids = swa_attention_layer_ids or []
+        self.size = size
+        self.size_swa = size_swa
+        self.size_suffix = size_suffix
+        self.dtype = dtype
+        self.head_num = head_num
+        self.head_dim = head_dim
+        self.device = device
+        self.suffix_layer_nums = len(suffix_attention_layer_ids)
+        self.swa_layer_nums = len(swa_attention_layer_ids)
+        self.full_layer_nums = len(full_attention_layer_ids)
+        self.enable_swa = self.swa_layer_nums > 0
+        self.start_layer = 0
+        self.page_size = 1
+        self.swa_loc = None
+
+        kwargs["page_size"] = 1
+        kwargs["enable_memory_saver"] = False
+        kwargs["head_num"] = head_num
+        kwargs["head_dim"] = head_dim
+        kwargs["device"] = device
+        assert not enable_kvcache_transpose
+
+        self.enable_custom_mem_pool, self.custom_mem_pool, _ = (
+            maybe_init_custom_mem_pool(device=self.device)
+        )
+
+        self.suffix_kv_pool = token_to_kv_pool_class(
+            size=size_suffix,
+            dtype=dtype,
+            layer_num=self.suffix_layer_nums,
+            **kwargs,
+        )
+        self.full_kv_pool = token_to_kv_pool_class(
+            size=size,
+            dtype=dtype,
+            layer_num=self.full_layer_nums,
+            **kwargs,
+        )
+        self.swa_kv_pool = (
+            token_to_kv_pool_class(
+                size=size_swa,
+                dtype=dtype,
+                layer_num=self.swa_layer_nums,
+                **kwargs,
+            )
+            if self.enable_swa
+            else None
+        )
+
+        self.layers_mapping: Dict[int, Tuple[int, str]] = {}
+        for local_id, global_layer_id in enumerate(full_attention_layer_ids):
+            self.layers_mapping[global_layer_id] = (local_id, "full")
+        for local_id, global_layer_id in enumerate(swa_attention_layer_ids):
+            self.layers_mapping[global_layer_id] = (local_id, "swa")
+        for local_id, global_layer_id in enumerate(suffix_attention_layer_ids):
+            self.layers_mapping[global_layer_id] = (local_id, "suffix")
+        self.full_to_suffix_index_mapping: Optional[torch.Tensor] = None
+        self.full_to_swa_index_mapping: Optional[torch.Tensor] = None
+
+        k_size, v_size = self.get_kv_size_bytes()
+        self.mem_usage = (k_size + v_size) / GB
+        logger.info(
+            f"SuffixKVPool mem usage: {self.mem_usage:.2f} GB, "
+            f"suffix size: {self.size_suffix}, swa size: {self.size_swa}, "
+            f"full size: {self.size}"
+        )
+
+    def register_mapping(
+        self,
+        full_to_suffix_index_mapping: torch.Tensor,
+        full_to_swa_index_mapping: Optional[torch.Tensor],
+    ):
+        self.full_to_suffix_index_mapping = full_to_suffix_index_mapping
+        self.full_to_swa_index_mapping = full_to_swa_index_mapping
+
+    def get_kv_size_bytes(self):
+        k_size, v_size = self.full_kv_pool.get_kv_size_bytes()
+        k_size_suffix, v_size_suffix = self.suffix_kv_pool.get_kv_size_bytes()
+        k_size += k_size_suffix
+        v_size += v_size_suffix
+        if self.enable_swa:
+            k_size_swa, v_size_swa = self.swa_kv_pool.get_kv_size_bytes()
+            k_size += k_size_swa
+            v_size += v_size_swa
+        return k_size, v_size
+
+    def get_contiguous_buf_infos(self):
+        return self.full_kv_pool.get_contiguous_buf_infos()
+
+    def get_state_buf_infos(self):
+        return self.suffix_kv_pool.get_contiguous_buf_infos()
+
+    def _pool_of(self, kind: str):
+        if kind == "suffix":
+            return self.suffix_kv_pool
+        if kind == "swa":
+            return self.swa_kv_pool
+        return self.full_kv_pool
+
+    def get_key_buffer(self, layer_id: int):
+        local_id, kind = self.layers_mapping[layer_id]
+        return self._pool_of(kind).get_key_buffer(local_id)
+
+    def get_value_buffer(self, layer_id: int):
+        local_id, kind = self.layers_mapping[layer_id]
+        return self._pool_of(kind).get_value_buffer(local_id)
+
+    def get_kv_buffer(self, layer_id: int):
+        local_id, kind = self.layers_mapping[layer_id]
+        return self._pool_of(kind).get_kv_buffer(local_id)
+
+    def is_suffix_layer(self, layer_id: int) -> bool:
+        return self.layers_mapping[layer_id][1] == "suffix"
+
+    def is_swa_layer(self, layer_id: int) -> bool:
+        return self.layers_mapping[layer_id][1] == "swa"
+
+    def set_swa_loc(self, loc: torch.Tensor):
+        self.swa_loc = loc
+
+    def translate_loc_from_full_to_suffix(self, kv_indices: torch.Tensor):
+        assert self.full_to_suffix_index_mapping is not None
+        return self.full_to_suffix_index_mapping[kv_indices].to(torch.int32)
+
+    def translate_loc_from_full_to_swa(self, kv_indices: torch.Tensor):
+        assert self.full_to_swa_index_mapping is not None
+        return self.full_to_swa_index_mapping[kv_indices].to(torch.int32)
+
+    def set_kv_buffer(
+        self,
+        layer: RadixAttention,
+        loc: torch.Tensor,
+        cache_k: torch.Tensor,
+        cache_v: torch.Tensor,
+        k_scale: float = 1.0,
+        v_scale: float = 1.0,
+    ):
+        layer_id = layer.layer_id
+        local_id, kind = self.layers_mapping[layer_id]
+        if kind == "suffix":
+            if self.full_to_suffix_index_mapping is not None:
+                loc = self.translate_loc_from_full_to_suffix(loc)
+        elif kind == "swa":
+            if self.full_to_swa_index_mapping is not None:
+                loc = self.translate_loc_from_full_to_swa(loc)
+
+        self._pool_of(kind).set_kv_buffer(
+            None,
+            loc,
+            cache_k,
+            cache_v,
+            k_scale,
+            v_scale,
+            layer_id_override=local_id,
+        )
+
+    def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
+        self.full_kv_pool.move_kv_cache(tgt_loc, src_loc)
+        tgt_loc_suffix = self.translate_loc_from_full_to_suffix(tgt_loc)
+        src_loc_suffix = self.translate_loc_from_full_to_suffix(src_loc)
+        self.suffix_kv_pool.move_kv_cache(tgt_loc_suffix, src_loc_suffix)
+        if self.enable_swa:
+            tgt_loc_swa = self.translate_loc_from_full_to_swa(tgt_loc)
+            src_loc_swa = self.translate_loc_from_full_to_swa(src_loc)
+            self.swa_kv_pool.move_kv_cache(tgt_loc_swa, src_loc_swa)
+
+    def get_cpu_copy(self, indices, mamba_indices=None):
+        full_kv_cpu = self.full_kv_pool.get_cpu_copy(indices)
+        suffix_kv_cpu = None
+        swa_kv_cpu = None
+        if self.full_to_suffix_index_mapping is not None:
+            suffix_indices = self.full_to_suffix_index_mapping[indices]
+            suffix_indices = suffix_indices[suffix_indices > 0]
+            suffix_kv_cpu = self.suffix_kv_pool.get_cpu_copy(suffix_indices)
+        if self.enable_swa and self.full_to_swa_index_mapping is not None:
+            swa_indices = self.full_to_swa_index_mapping[indices]
+            swa_indices = swa_indices[swa_indices > 0]
+            swa_kv_cpu = self.swa_kv_pool.get_cpu_copy(swa_indices)
+        return {"full": full_kv_cpu, "suffix": suffix_kv_cpu, "swa": swa_kv_cpu}
+
+    def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None):
+        self.full_kv_pool.load_cpu_copy(kv_cache_cpu["full"], indices)
+        suffix_kv_cpu = kv_cache_cpu.get("suffix")
+        if suffix_kv_cpu is not None and self.full_to_suffix_index_mapping is not None:
+            suffix_indices = self.full_to_suffix_index_mapping[indices]
+            suffix_indices = suffix_indices[suffix_indices > 0]
+            self.suffix_kv_pool.load_cpu_copy(suffix_kv_cpu, suffix_indices)
+        swa_kv_cpu = kv_cache_cpu.get("swa")
+        if (
+            self.enable_swa
+            and swa_kv_cpu is not None
+            and self.full_to_swa_index_mapping is not None
+        ):
+            swa_indices = self.full_to_swa_index_mapping[indices]
+            swa_indices = swa_indices[swa_indices > 0]
+            self.swa_kv_pool.load_cpu_copy(swa_kv_cpu, swa_indices)
+
+
 class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     """Allocator for SWA hybrid KV cache."""
 
@@ -635,6 +853,214 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.full_attn_allocator.clear()
         # Note: the last item is -1, we don't clear it, see the comment in __init__
         self.full_to_swa_index_mapping[:-1].fill_(0)
+        self.is_not_in_free_group = True
+        self.free_group = []
+
+    def get_cpu_copy(self, indices, mamba_indices=None):
+        return self._kvcache.get_cpu_copy(indices, mamba_indices=mamba_indices)
+
+    def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None):
+        return self._kvcache.load_cpu_copy(
+            kv_cache_cpu, indices, mamba_indices=mamba_indices
+        )
+
+
+class SuffixTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
+    """Allocator for suffix-parallel KV cache.
+
+    External indices stay in the expanded full-token space. Suffix layers map
+    only this rank's suffix track to compact logical suffix slots.
+    """
+
+    def __init__(
+        self,
+        size: int,
+        size_suffix: int,
+        dtype: torch.dtype,
+        device: str,
+        kvcache: SuffixKVPool,
+        need_sort: bool,
+        size_swa: int = 0,
+    ):
+        super().__init__(size, 1, dtype, device, kvcache, need_sort)
+        assert isinstance(kvcache, SuffixKVPool)
+        self._size_full = size
+        self._size_suffix = size_suffix
+        self._size_swa = size_swa
+        self.enable_swa = size_swa > 0 and kvcache.enable_swa
+
+        self.full_attn_allocator = TokenToKVPoolAllocator(
+            size, dtype, device, kvcache.full_kv_pool, need_sort
+        )
+        self.suffix_attn_allocator = TokenToKVPoolAllocator(
+            size_suffix, dtype, device, kvcache.suffix_kv_pool, need_sort
+        )
+        self.full_to_suffix_index_mapping = torch.cat(
+            [
+                torch.zeros(size + 1, dtype=torch.int64, device=device),
+                torch.tensor([-1], dtype=torch.int64, device=device),
+            ]
+        )
+        if self.enable_swa:
+            self.swa_attn_allocator = TokenToKVPoolAllocator(
+                size_swa, dtype, device, kvcache.swa_kv_pool, need_sort
+            )
+            self.full_to_swa_index_mapping = torch.cat(
+                [
+                    torch.zeros(size + 1, dtype=torch.int64, device=device),
+                    torch.tensor([-1], dtype=torch.int64, device=device),
+                ]
+            )
+        else:
+            self.swa_attn_allocator = None
+            self.full_to_swa_index_mapping = None
+
+        self.clear()
+        self._kvcache.register_mapping(
+            self.full_to_suffix_index_mapping, self.full_to_swa_index_mapping
+        )
+
+    def _sf_and_rank(self):
+        from sglang.srt.layers.dp_attention import (
+            get_suffix_parallel_rank,
+            get_suffix_parallel_size,
+        )
+
+        return get_suffix_parallel_size(), get_suffix_parallel_rank()
+
+    def available_size(self):
+        return self.full_attn_allocator.available_size()
+
+    def full_available_size(self):
+        return self.full_attn_allocator.available_size()
+
+    def suffix_available_size(self):
+        return self.suffix_attn_allocator.available_size()
+
+    def swa_available_size(self):
+        return (
+            self.swa_attn_allocator.available_size() if self.enable_swa else 0
+        )
+
+    @property
+    def size_full(self):
+        return self._size_full
+
+    @property
+    def size_suffix(self):
+        return self._size_suffix
+
+    @property
+    def size_swa(self):
+        return self._size_swa
+
+    def debug_print(self) -> str:
+        msg = (
+            f"#suffix-available-size: {self.suffix_attn_allocator.available_size()}, "
+            f"#full-attn-available-size: {self.full_attn_allocator.available_size()}, "
+        )
+        if self.enable_swa:
+            msg += f"#swa-available-size: {self.swa_attn_allocator.available_size()}, "
+        return msg
+
+    def get_kvcache(self):
+        return self._kvcache
+
+    def translate_loc_from_full_to_suffix(self, kv_indices: torch.Tensor):
+        return self._kvcache.translate_loc_from_full_to_suffix(kv_indices)
+
+    def translate_loc_from_full_to_swa(self, kv_indices: torch.Tensor):
+        return self._kvcache.translate_loc_from_full_to_swa(kv_indices)
+
+    def alloc(self, need_size: int):
+        sf, sp_rank = self._sf_and_rank()
+        if need_size > self.full_attn_allocator.available_size():
+            return None
+        assert (
+            need_size % sf == 0
+        ), f"Suffix allocator need_size={need_size} is not divisible by sf={sf}"
+        n_logical = need_size // sf
+        if n_logical > self.suffix_attn_allocator.available_size():
+            return None
+        if self.enable_swa and need_size > self.swa_attn_allocator.available_size():
+            return None
+
+        alloc_full_indices = self.full_attn_allocator.alloc(need_size)
+        alloc_suffix_indices = self.suffix_attn_allocator.alloc(n_logical)
+        assert alloc_full_indices is not None
+        assert alloc_suffix_indices is not None
+
+        track_full = alloc_full_indices[sp_rank::sf]
+        self.full_to_suffix_index_mapping[track_full] = alloc_suffix_indices
+        if self.enable_swa:
+            alloc_swa_indices = self.swa_attn_allocator.alloc(need_size)
+            assert alloc_swa_indices is not None
+            self.full_to_swa_index_mapping[alloc_full_indices] = alloc_swa_indices
+        return alloc_full_indices
+
+    def free(self, free_index: torch.Tensor):
+        if free_index.numel() == 0:
+            return
+
+        if self.is_not_in_free_group:
+            self.full_attn_allocator.free(free_index)
+            self.free_suffix(free_index)
+            if self.enable_swa:
+                self.free_swa(free_index)
+        else:
+            self.free_group.append(free_index)
+
+        assert (
+            self.full_attn_allocator.available_size() <= self.full_attn_allocator.size
+        )
+        assert (
+            self.suffix_attn_allocator.available_size()
+            <= self.suffix_attn_allocator.size
+        )
+        if self.enable_swa:
+            assert (
+                self.swa_attn_allocator.available_size()
+                <= self.swa_attn_allocator.size
+            )
+
+    def free_suffix(self, free_index: torch.Tensor):
+        suffix_indices = self.full_to_suffix_index_mapping[free_index]
+        suffix_indices = suffix_indices[suffix_indices > 0]
+        if suffix_indices.numel() > 0:
+            self.suffix_attn_allocator.free(suffix_indices)
+        self.full_to_suffix_index_mapping[free_index] = 0
+
+    def free_swa(self, free_index: torch.Tensor):
+        if not self.enable_swa:
+            return
+        swa_indices = self.full_to_swa_index_mapping[free_index]
+        swa_indices = swa_indices[swa_indices > 0]
+        if swa_indices.numel() > 0:
+            self.swa_attn_allocator.free(swa_indices)
+        self.full_to_swa_index_mapping[free_index] = 0
+
+    def backup_state(self):
+        state = [
+            self.full_attn_allocator.backup_state(),
+            self.suffix_attn_allocator.backup_state(),
+        ]
+        if self.enable_swa:
+            state.append(self.swa_attn_allocator.backup_state())
+        return state
+
+    def restore_state(self, state):
+        self.full_attn_allocator.restore_state(state[0])
+        self.suffix_attn_allocator.restore_state(state[1])
+        if self.enable_swa:
+            self.swa_attn_allocator.restore_state(state[2])
+
+    def clear(self):
+        self.suffix_attn_allocator.clear()
+        self.full_attn_allocator.clear()
+        self.full_to_suffix_index_mapping[:-1].fill_(0)
+        if self.enable_swa:
+            self.swa_attn_allocator.clear()
+            self.full_to_swa_index_mapping[:-1].fill_(0)
         self.is_not_in_free_group = True
         self.free_group = []
 

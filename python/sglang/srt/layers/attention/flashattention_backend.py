@@ -1061,6 +1061,158 @@ class FlashAttentionBackend(AttentionBackend):
 
         self.forward_metadata = metadata
 
+    def _per_suffix_attn_compute(
+        self,
+        q: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        metadata: FlashAttentionMetadata,
+        sinks: Optional[torch.Tensor] = None,
+        causal: bool = True,
+    ) -> torch.Tensor:
+        assert not self.use_mla, "per-suffix attention does not support MLA"
+        assert not layer.is_cross_attention
+
+        sf = layer.scale_seq_factor
+        assert sf > 1, f"per-suffix attention called with scale_seq_factor={sf}"
+        assert self.page_size == sf, (
+            f"per-suffix attention requires page_size == scale_seq_factor ({sf}), "
+            f"got page_size={self.page_size}"
+        )
+
+        n_token = q.shape[0]
+        n_q_heads = layer.tp_q_head_num
+        n_kv_heads = layer.tp_k_head_num
+        head_dim = layer.head_dim
+        v_head_dim = layer.v_head_dim
+        assert n_token % sf == 0
+        n_logical = n_token // sf
+
+        q_fold = (
+            q.contiguous()
+            .view(n_logical, sf, n_q_heads, head_dim)
+            .reshape(n_logical, sf * n_q_heads, head_dim)
+        )
+
+        key_cache, value_cache = forward_batch.token_to_kv_pool.get_kv_buffer(
+            layer.layer_id
+        )
+        key_cache_fold = key_cache.view(-1, sf, n_kv_heads, head_dim).reshape(
+            -1, 1, sf * n_kv_heads, head_dim
+        )
+        value_cache_fold = value_cache.view(-1, sf, n_kv_heads, v_head_dim).reshape(
+            -1, 1, sf * n_kv_heads, v_head_dim
+        )
+
+        kwargs = {}
+        if self.fa_impl_ver != 3:
+            kwargs["ver"] = self.fa_impl_ver
+        if sinks is not None:
+            kwargs["sinks"] = sinks.repeat(sf)
+
+        sliding = layer.sliding_window_size
+        window_size = (
+            (sliding, 0) if sliding is not None and sliding > 0 else (-1, -1)
+        )
+        o = flash_attn_with_kvcache(
+            q=q_fold,
+            k_cache=key_cache_fold,
+            v_cache=value_cache_fold,
+            page_table=metadata.page_table,
+            cache_seqlens=metadata.cache_seqlens_int32 // sf,
+            cu_seqlens_q=(metadata.cu_seqlens_q // sf).to(torch.int32),
+            cu_seqlens_k_new=(metadata.cu_seqlens_k // sf).to(torch.int32),
+            max_seqlen_q=(metadata.max_seq_len_q + sf - 1) // sf,
+            softmax_scale=layer.scaling,
+            causal=causal,
+            window_size=window_size,
+            softcap=layer.logit_cap,
+            **kwargs,
+        )
+        return o.view(n_logical, sf, n_q_heads, v_head_dim).reshape(
+            n_token, n_q_heads * v_head_dim
+        )
+
+    def _per_suffix_scp_attn_compute(
+        self,
+        q: torch.Tensor,
+        k: Optional[torch.Tensor],
+        v: Optional[torch.Tensor],
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        metadata: FlashAttentionMetadata,
+        sinks: Optional[torch.Tensor] = None,
+        causal: bool = True,
+        save_kv_cache: bool = True,
+    ) -> torch.Tensor:
+        from sglang.srt.layers.dp_attention import (
+            get_suffix_parallel_rank,
+            get_suffix_parallel_size,
+        )
+
+        assert not self.use_mla, "suffix-parallel attention does not support MLA"
+        assert not layer.is_cross_attention
+
+        sf = get_suffix_parallel_size()
+        sp_rank = get_suffix_parallel_rank()
+        assert sf > 1, f"suffix-parallel attention called with sf={sf}"
+        pool = forward_batch.token_to_kv_pool
+
+        if save_kv_cache and k is not None:
+            assert v is not None
+            cache_loc = forward_batch.out_cache_loc
+            track_loc = cache_loc[sp_rank::sf].contiguous()
+            pool.set_kv_buffer(layer, track_loc, k, v, layer.k_scale, layer.v_scale)
+
+        n_q_heads = layer.tp_q_head_num
+        n_kv_heads = layer.tp_k_head_num
+        head_dim = layer.head_dim
+        v_head_dim = layer.v_head_dim
+
+        key_cache, value_cache = pool.get_kv_buffer(layer.layer_id)
+        key_cache = key_cache.view(-1, 1, n_kv_heads, head_dim)
+        value_cache = value_cache.view(-1, 1, n_kv_heads, v_head_dim)
+
+        page_table_track = metadata.page_table[:, sp_rank::sf].contiguous()
+        page_table = pool.translate_loc_from_full_to_suffix(page_table_track)
+        kwargs = {}
+        if self.fa_impl_ver != 3:
+            kwargs["ver"] = self.fa_impl_ver
+        if sinks is not None:
+            kwargs["sinks"] = sinks
+
+        sliding = layer.sliding_window_size
+        window_size = (
+            (sliding, 0) if sliding is not None and sliding > 0 else (-1, -1)
+        )
+        o = flash_attn_with_kvcache(
+            q=q.contiguous().view(-1, n_q_heads, head_dim),
+            k_cache=key_cache,
+            v_cache=value_cache,
+            page_table=page_table,
+            cache_seqlens=metadata.cache_seqlens_int32 // sf,
+            cu_seqlens_q=(metadata.cu_seqlens_q // sf).to(torch.int32),
+            cu_seqlens_k_new=(metadata.cu_seqlens_k // sf).to(torch.int32),
+            max_seqlen_q=(metadata.max_seq_len_q + sf - 1) // sf,
+            softmax_scale=layer.scaling,
+            causal=causal,
+            window_size=window_size,
+            softcap=layer.logit_cap,
+            **kwargs,
+        )
+        return o.view(-1, n_q_heads * v_head_dim)
+
+    @staticmethod
+    def _is_scp_suffix_layer(layer: RadixAttention, forward_batch: ForwardBatch) -> bool:
+        if getattr(layer, "scale_seq_attn_per_suffix", False) and getattr(
+            layer, "suffix_parallel", False
+        ):
+            return True
+        is_suffix_layer = getattr(
+            getattr(forward_batch, "token_to_kv_pool", None), "is_suffix_layer", None
+        )
+        return bool(is_suffix_layer is not None and is_suffix_layer(layer.layer_id))
+
     def forward_extend(
         self,
         q: torch.Tensor,
@@ -1074,6 +1226,19 @@ class FlashAttentionBackend(AttentionBackend):
         k_rope: Optional[torch.Tensor] = None,
         sinks: Optional[torch.Tensor] = None,
     ):
+        if self._is_scp_suffix_layer(layer, forward_batch):
+            return self._per_suffix_scp_attn_compute(
+                q=q,
+                k=k,
+                v=v,
+                layer=layer,
+                forward_batch=forward_batch,
+                metadata=self.forward_metadata,
+                sinks=sinks,
+                causal=not layer.is_cross_attention,
+                save_kv_cache=save_kv_cache,
+            )
+
         if k is not None:
             assert v is not None
 
@@ -1112,6 +1277,25 @@ class FlashAttentionBackend(AttentionBackend):
                     and k.shape[0] == custom_last_cache_loc.numel()
                 ):
                     cache_loc = custom_last_cache_loc
+                if not self.use_mla and k.shape[0] != cache_loc.numel():
+                    pool = getattr(forward_batch, "token_to_kv_pool", None)
+                    pool_mapping = getattr(pool, "layers_mapping", None)
+                    pool_kind = (
+                        pool_mapping.get(layer.layer_id)
+                        if isinstance(pool_mapping, dict)
+                        else None
+                    )
+                    raise RuntimeError(
+                        "FlashAttention KV store shape mismatch before pool write: "
+                        f"layer_id={layer.layer_id}, "
+                        f"scale_seq_attn_per_suffix={getattr(layer, 'scale_seq_attn_per_suffix', None)}, "
+                        f"suffix_parallel={getattr(layer, 'suffix_parallel', None)}, "
+                        f"pool_kind={pool_kind}, "
+                        f"forward_mode={forward_batch.forward_mode}, "
+                        f"q_shape={tuple(q.shape)}, k_shape={tuple(k.shape)}, "
+                        f"v_shape={tuple(v.shape)}, cache_loc_numel={cache_loc.numel()}, "
+                        f"out_cache_loc_numel={getattr(forward_batch, 'out_cache_loc', cache_loc).numel()}"
+                    )
                 if not self.use_mla:
                     forward_batch.token_to_kv_pool.set_kv_buffer(
                         layer, cache_loc, k, v, layer.k_scale, layer.v_scale
@@ -1130,6 +1314,16 @@ class FlashAttentionBackend(AttentionBackend):
 
         # Use precomputed metadata across all layers
         metadata = self.forward_metadata
+
+        if getattr(layer, "scale_seq_attn_per_suffix", False):
+            return self._per_suffix_attn_compute(
+                q=q,
+                layer=layer,
+                forward_batch=forward_batch,
+                metadata=metadata,
+                sinks=sinks,
+                causal=not layer.is_cross_attention,
+            )
 
         # Calculate window size (can be moved to metadata if layer properties don't change)
         # we don't do layer.sliding_window_size - 1 since in model.get_attention_sliding_window_size() we already - 1
@@ -1286,6 +1480,16 @@ class FlashAttentionBackend(AttentionBackend):
             cache_seqlens = metadata.cache_seqlens_int32
             max_seqlen_q = metadata.max_seq_len_q
             cu_seqlens_k = metadata.cu_seqlens_k
+
+        pool = getattr(forward_batch, "token_to_kv_pool", None)
+        if (
+            not use_local_attn
+            and not layer.is_cross_attention
+            and getattr(pool, "full_to_swa_index_mapping", None) is not None
+            and getattr(pool, "is_swa_layer", None) is not None
+            and pool.is_swa_layer(layer.layer_id)
+        ):
+            page_table = pool.translate_loc_from_full_to_swa(page_table)
 
         # Use Flash Attention for prefill
         if not self.use_mla:
@@ -1640,6 +1844,20 @@ class FlashAttentionBackend(AttentionBackend):
         k_rope: Optional[torch.Tensor] = None,
         sinks: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        assert self.fa_impl_ver in [3], "Only FA3 support decoding"
+        if self._is_scp_suffix_layer(layer, forward_batch):
+            return self._per_suffix_scp_attn_compute(
+                q=q,
+                k=k,
+                v=v,
+                layer=layer,
+                forward_batch=forward_batch,
+                metadata=self.forward_metadata,
+                sinks=sinks,
+                causal=not layer.is_cross_attention,
+                save_kv_cache=save_kv_cache,
+            )
+
         if k is not None:
             assert v is not None
             if save_kv_cache:
@@ -1648,6 +1866,25 @@ class FlashAttentionBackend(AttentionBackend):
                     if not layer.is_cross_attention
                     else forward_batch.encoder_out_cache_loc
                 )
+                if not self.use_mla and k.shape[0] != cache_loc.numel():
+                    pool = getattr(forward_batch, "token_to_kv_pool", None)
+                    pool_mapping = getattr(pool, "layers_mapping", None)
+                    pool_kind = (
+                        pool_mapping.get(layer.layer_id)
+                        if isinstance(pool_mapping, dict)
+                        else None
+                    )
+                    raise RuntimeError(
+                        "FlashAttention KV decode store shape mismatch before pool write: "
+                        f"layer_id={layer.layer_id}, "
+                        f"scale_seq_attn_per_suffix={getattr(layer, 'scale_seq_attn_per_suffix', None)}, "
+                        f"suffix_parallel={getattr(layer, 'suffix_parallel', None)}, "
+                        f"pool_kind={pool_kind}, "
+                        f"forward_mode={forward_batch.forward_mode}, "
+                        f"q_shape={tuple(q.shape)}, k_shape={tuple(k.shape)}, "
+                        f"v_shape={tuple(v.shape)}, cache_loc_numel={cache_loc.numel()}, "
+                        f"out_cache_loc_numel={getattr(forward_batch, 'out_cache_loc', cache_loc).numel()}"
+                    )
                 if not self.use_mla:
                     forward_batch.token_to_kv_pool.set_kv_buffer(
                         layer, cache_loc, k, v, layer.k_scale, layer.v_scale
@@ -1662,6 +1899,16 @@ class FlashAttentionBackend(AttentionBackend):
 
         # Use precomputed metadata across all layers
         metadata = self.forward_metadata
+        if getattr(layer, "scale_seq_attn_per_suffix", False):
+            return self._per_suffix_attn_compute(
+                q=q,
+                layer=layer,
+                forward_batch=forward_batch,
+                metadata=metadata,
+                sinks=sinks,
+                causal=not layer.is_cross_attention,
+            )
+
         local_attn_metadata = getattr(metadata, "local_attn_metadata", None)
         use_local_attn = (
             self.has_local_attention
@@ -1837,6 +2084,14 @@ class FlashAttentionBackend(AttentionBackend):
                 cache_seqlens = metadata.cache_seqlens_int32
                 cu_seqlens_k = metadata.cu_seqlens_k
                 max_seqlen_q = metadata.max_seq_len_q
+                pool = getattr(forward_batch, "token_to_kv_pool", None)
+                if (
+                    not layer.is_cross_attention
+                    and getattr(pool, "full_to_swa_index_mapping", None) is not None
+                    and getattr(pool, "is_swa_layer", None) is not None
+                    and pool.is_swa_layer(layer.layer_id)
+                ):
+                    page_table = pool.translate_loc_from_full_to_swa(page_table)
                 q_reshaped = q.contiguous().view(
                     -1, layer.tp_q_head_num, layer.head_dim
                 )

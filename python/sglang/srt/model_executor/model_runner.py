@@ -1265,12 +1265,26 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 moe_a2a_backend=self.server_args.moe_a2a_backend,
                 recovered_rank=self.server_args.elastic_ep_rejoin,
             )
+            suffix_parallel_size = 1
+            if self.server_args.enable_suffix_parallel:
+                scale_seq_times = getattr(
+                    self.model_config.hf_config, "scale_seq_times", 0
+                )
+                suffix_parallel_size = (
+                    self.server_args.suffix_parallel_size or scale_seq_times + 1
+                )
+                assert suffix_parallel_size > 1, (
+                    "enable_suffix_parallel requires scale_seq_times > 0 or an "
+                    f"explicit suffix_parallel_size > 1, got {suffix_parallel_size}"
+                )
+
             initialize_model_parallel(
                 tensor_model_parallel_size=self.tp_size,
                 attention_data_parallel_size=self.dp_size,
                 pipeline_model_parallel_size=self.pp_size,
                 expert_model_parallel_size=self.moe_ep_size,
                 attention_context_model_parallel_size=self.attn_cp_size,
+                suffix_parallel_size=suffix_parallel_size,
                 moe_data_model_parallel_size=self.moe_dp_size,
                 duplicate_tp_group=self.server_args.enable_pdmux,
                 enable_symm_mem=self.server_args.enable_symm_mem,
@@ -2306,7 +2320,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     @property
     def max_token_pool_size(self):
         """Return the max token pool size considering hybrid swa settings."""
-        if self.is_hybrid_swa:
+        if self.server_args.enable_suffix_parallel or self.is_hybrid_swa:
             return self.full_max_total_num_tokens
         else:
             return self.max_total_num_tokens

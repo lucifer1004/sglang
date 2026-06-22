@@ -13,6 +13,7 @@ import triton.language as tl
 from sglang.srt.distributed import tensor_model_parallel_all_reduce
 from sglang.srt.layers.communicator import get_attn_tp_context
 from sglang.srt.layers.dp_attention import attn_tp_all_reduce
+from sglang.srt.layers.welmv4_op import welm_use_previous_precision
 from sglang.srt.layers.vocab_parallel_embedding import get_masked_input_and_mask
 
 logger = logging.getLogger(__name__)
@@ -27,9 +28,9 @@ WELM_OE_POST_PROJ_ALL_REDUCE_ENV = "SGLANG_WELM_OE_POST_PROJ_ALL_REDUCE"
 # as this env is left disabled.
 WELM_OE_FUSED_DECODE_GEMM_ENV = "SGLANG_WELM_OE_FUSED_DECODE_GEMM"
 WELM_OE_IMPL_FUSED_NGRAM_HASH = "fused_ngram_hash"
+# WELM_USE_PREVIOUS_PRECISION takes the legacy OE path before hash-kernel code.
 WELM_OE_HASH_INCOMPATIBLE_ENVS = (
     "SGLANG_DUMP_ACTIVATIONS",
-    "WELM_USE_PREVIOUS_PRECISION",
 )
 SPECIALIZED_WELM_OE_GRAMS = (2, 2, 3, 3)
 SPECIALIZED_WELM_OE_BRANCHES = 4
@@ -495,6 +496,122 @@ def _add_oe_proj_bias(oe_proj_module, hidden_states: torch.Tensor) -> torch.Tens
     if bias is None:
         return hidden_states
     return hidden_states + bias
+
+
+def _legacy_oe_segment_lens(
+    input_ids: torch.Tensor,
+    forward_batch,
+    prefix_rows: Sequence[Sequence[int]],
+) -> list[int] | None:
+    if not prefix_rows:
+        return None
+
+    num_segments = len(prefix_rows[0])
+    raw_lens = getattr(forward_batch, "extend_seq_lens_cpu", None)
+    if raw_lens is not None:
+        if isinstance(raw_lens, torch.Tensor):
+            lens = [int(x) for x in raw_lens.tolist()]
+        else:
+            lens = [int(x) for x in raw_lens]
+        if len(lens) == num_segments and sum(lens) == input_ids.numel():
+            return lens
+
+    # Scale-seq decode carries expanded extend lengths, but input_ids are still
+    # one logical token per request.
+    if input_ids.numel() == num_segments:
+        return [1] * num_segments
+    if num_segments == 1:
+        return [int(input_ids.numel())]
+    return None
+
+
+def _legacy_shifted_tokens_from_prefixes(
+    input_ids: torch.Tensor,
+    prefix_rows: Sequence[Sequence[int]],
+    segment_lens: Sequence[int],
+    lag: int,
+) -> torch.Tensor:
+    out = torch.empty_like(input_ids, dtype=torch.int64)
+    offset = 0
+    for seg_idx, seg_len in enumerate(segment_lens):
+        seg_len = int(seg_len)
+        if seg_len <= 0:
+            continue
+        seg = input_ids[offset : offset + seg_len].to(torch.int64)
+        fill = min(lag, seg_len)
+        for j in range(fill):
+            hist_lag = lag - j
+            if hist_lag <= len(prefix_rows) and seg_idx < len(prefix_rows[hist_lag - 1]):
+                out[offset + j] = int(prefix_rows[hist_lag - 1][seg_idx])
+            else:
+                out[offset + j] = 0
+        if lag < seg_len:
+            out[offset + lag : offset + seg_len] = seg[:-lag]
+        offset += seg_len
+    return out
+
+
+def _compute_welm_oe_embedding_legacy(
+    *,
+    input_ids: torch.Tensor,
+    forward_batch,
+    base_hidden_states: torch.Tensor,
+    oe_grams: Sequence[int],
+    oe_vocab_sizes: Sequence[int],
+    vocab_size: int,
+    oe_embed_modules: Sequence,
+    oe_proj_module,
+) -> torch.Tensor | None:
+    """Old MMQ-style materialized OE path used for previous-precision parity."""
+
+    oe_context = getattr(forward_batch, "oe_context", None)
+    prefix_rows = getattr(oe_context, "legacy_prefixes", None)
+    if prefix_rows is None:
+        prefix_rows = getattr(oe_context, "hash_prefixes", None)
+    if not prefix_rows:
+        return None
+
+    if not oe_grams:
+        return base_hidden_states
+    max_gram = max(int(g) for g in oe_grams)
+    segment_lens = _legacy_oe_segment_lens(input_ids, forward_batch, prefix_rows)
+    if segment_lens is None or len(prefix_rows) < max_gram:
+        return None
+
+    input_ids_i64 = input_ids.to(torch.int64)
+    gram_cache: dict[int, torch.Tensor] = {0: input_ids_i64}
+
+    def gram_token(shift: int) -> torch.Tensor:
+        if shift not in gram_cache:
+            gram_cache[shift] = _legacy_shifted_tokens_from_prefixes(
+                input_ids_i64, prefix_rows, segment_lens, shift
+            )
+        return gram_cache[shift]
+
+    acc_cache: dict[tuple[int, int], torch.Tensor] = {}
+
+    def build_acc(depth: int, shift: int) -> torch.Tensor:
+        key = (depth, shift)
+        cached = acc_cache.get(key)
+        if cached is not None:
+            return cached
+        acc = gram_token(shift)
+        for step in range(1, depth + 1):
+            acc = acc + build_acc(step - 1, shift + step) * (vocab_size**step)
+        acc_cache[key] = acc
+        return acc
+
+    input_ids_ngram = [
+        hash_input_ids_vectorized(build_acc(depth, 0))
+        for depth in range(1, max_gram)
+    ]
+
+    emb_ngram = []
+    for idx, vocab in enumerate(oe_vocab_sizes):
+        hashed = input_ids_ngram[int(oe_grams[idx]) - 2] % int(vocab)
+        emb_ngram.append(oe_embed_modules[idx](hashed))
+    emb_new = _apply_oe_proj(oe_proj_module, torch.cat(emb_ngram, dim=-1))
+    return (base_hidden_states + emb_new) / 2.0
 
 
 def _lookup_local_embedding(module, token_ids: torch.Tensor) -> torch.Tensor:
@@ -1595,6 +1712,7 @@ def welm_embeddings(
         has_oe
         and not skip_oe_fusion
         and input_embeds is None
+        and not welm_use_previous_precision()
         and should_use_welm_oe_fused_decode_gemm()
     ):
         if scale_seq_times != 0:
@@ -1747,6 +1865,20 @@ def compute_welm_oe_embedding(
     """
     if not oe_grams:
         return base_hidden_states
+
+    if welm_use_previous_precision():
+        legacy_hidden = _compute_welm_oe_embedding_legacy(
+            input_ids=input_ids,
+            forward_batch=forward_batch,
+            base_hidden_states=base_hidden_states,
+            oe_grams=oe_grams,
+            oe_vocab_sizes=oe_vocab_sizes,
+            vocab_size=vocab_size,
+            oe_embed_modules=oe_embed_modules,
+            oe_proj_module=oe_proj_module,
+        )
+        if legacy_hidden is not None:
+            return legacy_hidden
 
     if all_reduce_fn is None:
         # Pick the all-reduce primitive that matches how the OE modules were

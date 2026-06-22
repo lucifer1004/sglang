@@ -39,6 +39,7 @@ class MemoryPoolConfig:
     max_running_requests: Optional[int] = None
     full_max_total_num_tokens: Optional[int] = None
     swa_max_total_num_tokens: Optional[int] = None
+    suffix_max_total_num_tokens: Optional[int] = None
 
     # DSV4 compressed-attention pool sizes (target only; draft workers leave at 0).
     c4_max_total_num_tokens: int = 0
@@ -296,6 +297,146 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
         return self._solve_pool_sizes(max_total_num_tokens, page_size)
 
 
+def get_suffix_parallel_layer_ids(mr: ModelRunner):
+    hf_config = mr.model_config.hf_config
+    scale_seq_times = getattr(hf_config, "scale_seq_times", 0)
+    sf = mr.server_args.suffix_parallel_size or scale_seq_times + 1
+    per_suffix_layerwise = getattr(
+        hf_config, "scale_seq_attn_per_suffix_layerwise", []
+    )
+    sliding_window_layerwise = getattr(hf_config, "sliding_window_size_layerwise", [])
+    context_len = mr.model_config.context_len
+    num_layers_for_window = max(
+        mr.model_config.num_hidden_layers,
+        getattr(mr.model_config, "num_attention_layers", 0),
+        len(sliding_window_layerwise),
+        len(per_suffix_layerwise),
+    )
+
+    def is_suffix(layer_id: int) -> bool:
+        return layer_id < len(per_suffix_layerwise) and bool(
+            per_suffix_layerwise[layer_id]
+        )
+
+    def window(layer_id: int):
+        return (
+            sliding_window_layerwise[layer_id]
+            if layer_id < len(sliding_window_layerwise)
+            else -1
+        )
+
+    candidate_windows = [
+        window(layer_id)
+        for layer_id in range(num_layers_for_window)
+        if (
+            mr.server_args.suffix_parallel_swa_pool
+            and not is_suffix(layer_id)
+            and window(layer_id) is not None
+            and 0 < window(layer_id) < context_len
+        )
+    ]
+    swa_window = min(candidate_windows) if candidate_windows else 0
+
+    suffix_layer_ids = []
+    swa_layer_ids = []
+    full_layer_ids = []
+    for layer_id in range(mr.start_layer, mr.end_layer):
+        layer_window = window(layer_id)
+        if is_suffix(layer_id):
+            suffix_layer_ids.append(layer_id)
+        elif (
+            mr.server_args.suffix_parallel_swa_pool
+            and swa_window > 0
+            and layer_window == swa_window
+        ):
+            swa_layer_ids.append(layer_id)
+        else:
+            full_layer_ids.append(layer_id)
+
+    return sf, suffix_layer_ids, swa_layer_ids, full_layer_ids, swa_window
+
+
+class SuffixParallelPoolConfigurator(MemoryPoolConfigurator):
+    """Configurator for WeLM scale-seq suffix parallel KV pools."""
+
+    def __init__(self, mr: ModelRunner):
+        model_config = mr.model_config
+        kv_cache_dtype = mr.kv_cache_dtype
+        kv_size = torch._utils._element_size(kv_cache_dtype)
+        tp_size = get_attention_tp_size()
+
+        (
+            self._sf,
+            self._suffix_layer_ids,
+            self._swa_layer_ids,
+            self._full_layer_ids,
+            _,
+        ) = get_suffix_parallel_layer_ids(mr)
+
+        self._n_full = len(self._full_layer_ids)
+        self._n_swa = len(self._swa_layer_ids)
+        self._n_suffix = len(self._suffix_layer_ids)
+        self._swa_full_tokens_ratio = (
+            mr.server_args.swa_full_tokens_ratio if self._n_swa > 0 else 0.0
+        )
+
+        per_token = (
+            model_config.get_num_kv_heads(tp_size)
+            * (model_config.head_dim + model_config.v_head_dim)
+            * kv_size
+        )
+        self._cell_size = per_token * (
+            self._n_full
+            + self._n_swa * self._swa_full_tokens_ratio
+            + self._n_suffix / self._sf
+        )
+
+    def _solve_pool_sizes(
+        self, max_total_num_tokens: int, page_size: int
+    ) -> MemoryPoolConfig:
+        def align_page_size(x: int) -> int:
+            return (x // page_size) * page_size
+
+        full_tokens = align_page_size(max_total_num_tokens)
+        suffix_tokens = max(1, full_tokens // self._sf)
+        swa_tokens = (
+            align_page_size(int(full_tokens * self._swa_full_tokens_ratio))
+            if self._n_swa > 0
+            else 0
+        )
+
+        logger.info(
+            "Use suffix parallel memory pool. full_layer_tokens=%d, "
+            "swa_layer_tokens=%d, suffix_layer_tokens=%d "
+            "(n_full=%d n_swa=%d n_suffix=%d sf=%d)",
+            full_tokens,
+            swa_tokens,
+            suffix_tokens,
+            self._n_full,
+            self._n_swa,
+            self._n_suffix,
+            self._sf,
+        )
+
+        return MemoryPoolConfig(
+            max_total_num_tokens=full_tokens,
+            full_max_total_num_tokens=full_tokens,
+            swa_max_total_num_tokens=swa_tokens,
+            suffix_max_total_num_tokens=suffix_tokens,
+        )
+
+    def calculate_pool_sizes(
+        self, available_bytes: int, page_size: int
+    ) -> MemoryPoolConfig:
+        max_total_num_tokens = int(available_bytes // self._cell_size)
+        return self._solve_pool_sizes(max_total_num_tokens, page_size)
+
+    def calculate_pool_sizes_from_max_tokens(
+        self, max_total_num_tokens: int, page_size: int
+    ) -> MemoryPoolConfig:
+        return self._solve_pool_sizes(max_total_num_tokens, page_size)
+
+
 @dataclass
 class _DSV4PoolSizes:
     full_max_total_num_tokens: int
@@ -465,6 +606,8 @@ def create_memory_pool_configurator(
     mr: ModelRunner,
 ) -> MemoryPoolConfigurator:
     """Factory: select the right configurator for the model architecture."""
+    if mr.server_args.enable_suffix_parallel:
+        return SuffixParallelPoolConfigurator(mr)
     if is_deepseek_v4(mr.model_config.hf_config) and mr.is_hybrid_swa:
         return DSV4PoolConfigurator(mr)
     if mr.is_hybrid_swa:

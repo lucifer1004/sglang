@@ -883,6 +883,9 @@ class ServerArgs:
     enable_over_encoding: bool = False
     enable_welm_kv_mirror_opt: bool = False
     prepare_n_gram_inputs: bool = False
+    enable_suffix_parallel: bool = False
+    suffix_parallel_size: int = 0
+    suffix_parallel_swa_pool: bool = False
 
     # For communications compression
     enable_quant_communications: Optional[bool] = False
@@ -996,6 +999,7 @@ class ServerArgs:
 
         # Handle data parallelism.
         self._handle_data_parallelism()
+        self._handle_suffix_parallel()
 
         # Handle context parallelism.
         self._handle_context_parallelism()
@@ -3208,6 +3212,20 @@ class ServerArgs:
             assert (
                 self.enable_dp_attention
             ), "Please enable dp attention when setting enable_dp_lm_head. "
+
+    def _handle_suffix_parallel(self):
+        if not self.enable_suffix_parallel:
+            return
+        assert (
+            not self.enable_dp_attention
+        ), "enable_suffix_parallel is not compatible with enable_dp_attention."
+        assert (
+            self.attn_cp_size == 1
+        ), "enable_suffix_parallel currently requires attn_cp_size == 1."
+        if self.suffix_parallel_size:
+            assert (
+                self.tp_size % self.suffix_parallel_size == 0
+            ), f"tp_size={self.tp_size} must be divisible by suffix_parallel_size={self.suffix_parallel_size}"
 
     def _handle_moe_kernel_config(self):
         if self.quantization == "mxfp8":
@@ -7437,6 +7455,24 @@ class ServerArgs:
             "--prepare-n-gram-inputs",
             action="store_true",
             help="Prepare N-Gram inputs.",
+        )
+        parser.add_argument(
+            "--enable-suffix-parallel",
+            action="store_true",
+            default=ServerArgs.enable_suffix_parallel,
+            help="Enable WeLM scale-seq suffix context parallelism.",
+        )
+        parser.add_argument(
+            "--suffix-parallel-size",
+            type=int,
+            default=ServerArgs.suffix_parallel_size,
+            help="Suffix-parallel degree. 0 means scale_seq_times + 1.",
+        )
+        parser.add_argument(
+            "--suffix-parallel-swa-pool",
+            action="store_true",
+            default=ServerArgs.suffix_parallel_swa_pool,
+            help="Use a separate windowed KV pool for non-suffix SWA layers under suffix parallel.",
         )
 
         parser.add_argument(

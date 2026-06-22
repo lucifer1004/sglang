@@ -810,10 +810,15 @@ class OverEncodingContext:
     NUM_GRAMS: ClassVar[int] = 3
 
     input_ids_buffer: Optional[HashInputIdsBuffer] = None
+    legacy_prefixes: Optional[List[List[int]]] = None
 
     @classmethod
     def from_extend_hash_kernel(
-        cls, reqs, logical_prefix_lens, history_width: int
+        cls,
+        reqs,
+        logical_prefix_lens,
+        history_width: int,
+        legacy_history_width: Optional[int] = None,
     ) -> "OverEncodingContext":
         """Build an extend context whose OE hashes are produced on GPU.
 
@@ -821,6 +826,19 @@ class OverEncodingContext:
         ``prefixes`` only carries the few tokens before each segment boundary
         that the hash kernel cannot read from that tensor.
         """
+        prefixes = cls._extend_prefixes(reqs, logical_prefix_lens, history_width)
+        legacy_prefixes = None
+        if legacy_history_width is not None and legacy_history_width > history_width:
+            legacy_prefixes = cls._extend_prefixes(
+                reqs, logical_prefix_lens, legacy_history_width
+            )
+        return cls(
+            input_ids_buffer=HashInputIdsBuffer(prefixes),
+            legacy_prefixes=legacy_prefixes,
+        )
+
+    @staticmethod
+    def _extend_prefixes(reqs, logical_prefix_lens, history_width: int):
         prefixes = []
         for lag in range(1, history_width + 1):
             row = []
@@ -828,11 +846,15 @@ class OverEncodingContext:
                 pos = lpl - lag
                 row.append(r.fill_ids[pos] if pos >= 0 else 0)
             prefixes.append(row)
-        return cls(input_ids_buffer=HashInputIdsBuffer(prefixes))
+        return prefixes
 
     @classmethod
     def from_decode_hash_kernel(
-        cls, reqs, enable_overlap, history_width: int
+        cls,
+        reqs,
+        enable_overlap,
+        history_width: int,
+        legacy_history_width: Optional[int] = None,
     ) -> "OverEncodingContext":
         """Build a decode context whose OE hashes are produced on GPU."""
         offsets = []
@@ -844,13 +866,24 @@ class OverEncodingContext:
         else:
             offsets = [1] * len(reqs)
 
+        prefixes = cls._decode_prefixes(reqs, offsets, history_width)
+        legacy_prefixes = None
+        if legacy_history_width is not None and legacy_history_width > history_width:
+            legacy_prefixes = cls._decode_prefixes(reqs, offsets, legacy_history_width)
+        return cls(
+            input_ids_buffer=HashInputIdsBuffer(prefixes),
+            legacy_prefixes=legacy_prefixes,
+        )
+
+    @classmethod
+    def _decode_prefixes(cls, reqs, offsets, history_width: int):
         prefixes = []
         for lag in range(1, history_width + 1):
             row = []
             for r, offset in zip(reqs, offsets):
                 row.append(cls._decode_history_token(r, lag + offset))
             prefixes.append(row)
-        return cls(input_ids_buffer=HashInputIdsBuffer(prefixes))
+        return prefixes
 
     @staticmethod
     def _decode_history_token(req, shift: int) -> int:
@@ -878,6 +911,16 @@ class OverEncodingContext:
         self.input_ids_buffer = HashInputIdsBuffer(
             [lhs + rhs for lhs, rhs in zip(self_prefixes, other_prefixes)]
         )
+        if self.legacy_prefixes is not None and other.legacy_prefixes is not None:
+            if len(self.legacy_prefixes) != len(other.legacy_prefixes):
+                raise ValueError(
+                    "Cannot merge WeLM OE legacy prefixes with different history "
+                    f"widths: {len(self.legacy_prefixes)} vs "
+                    f"{len(other.legacy_prefixes)}."
+                )
+            self.legacy_prefixes = [
+                lhs + rhs for lhs, rhs in zip(self.legacy_prefixes, other.legacy_prefixes)
+            ]
 
     def __bool__(self) -> bool:
         return self.input_ids_buffer is not None
@@ -2105,7 +2148,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 "WeLM OE CUDA hash kernel is not supported by this model config."
             )
         self.oe_context = OverEncodingContext.from_extend_hash_kernel(
-            reqs, logical_prefix_lens, max(oe_grams) - 1
+            reqs,
+            logical_prefix_lens,
+            max(oe_grams) - 1,
+            legacy_history_width=max(oe_grams),
         )
         seq_lens_tensor = torch.tensor(
             expanded_seq_lens, dtype=torch.int64, pin_memory=_pin
@@ -2791,7 +2837,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 "WeLM OE CUDA hash kernel is not supported by this model config."
             )
         self.oe_context = OverEncodingContext.from_decode_hash_kernel(
-            self.reqs, self.enable_overlap, max(oe_grams) - 1
+            self.reqs,
+            self.enable_overlap,
+            max(oe_grams) - 1,
+            legacy_history_width=max(oe_grams),
         )
 
         if self.model_config.is_encoder_decoder:
@@ -2864,6 +2913,50 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.prefix_lens = locs.tolist()
             self.extend_logprob_start_lens = [0] * bs
             self.extend_input_logprob_token_ids = None
+
+    def maybe_evict_swa(self):
+        if self.tree_cache.supports_swa():
+            sliding_window_size = self.tree_cache.sliding_window_size
+            server_args = get_global_server_args()
+
+            for idx, req in enumerate(self.reqs):
+                if self.forward_mode.is_decode():
+                    if req.decode_batch_idx % sliding_window_size == 1:
+                        self._evict_swa(req, req.seqlen - 1)
+                elif self.forward_mode.is_extend() and self.tree_cache.is_chunk_cache():
+                    pre_len = self.prefix_lens[idx]
+                    if self.enable_overlap:
+                        if req.extend_batch_idx < 2:
+                            continue
+                        pre_len = (
+                            pre_len - server_args.chunked_prefill_size
+                            if server_args.chunked_prefill_size > 0
+                            else pre_len
+                        )
+                    self._evict_swa(req, pre_len)
+
+    def _evict_swa(self, req: Req, pre_len: int):
+        assert self.tree_cache.supports_swa(), "prefix cache must support swa"
+        if hasattr(self.tree_cache, "evict_swa"):
+            self.tree_cache.evict_swa(req, pre_len)
+            return
+        sliding_window_size = self.tree_cache.sliding_window_size
+
+        if req.cache_protected_len % self.tree_cache.page_size != 0:
+            return
+
+        new_swa_evicted_seqlen = (
+            (pre_len - req.cache_protected_len) // sliding_window_size
+        ) * sliding_window_size
+        new_swa_evicted_seqlen = max(new_swa_evicted_seqlen, req.swa_evicted_seqlen)
+        if new_swa_evicted_seqlen <= req.swa_evicted_seqlen:
+            return
+
+        free_slots = self.req_to_token_pool.req_to_token[
+            req.req_pool_idx, req.swa_evicted_seqlen : new_swa_evicted_seqlen
+        ]
+        self.token_to_kv_pool_allocator.free_swa(free_slots)
+        req.swa_evicted_seqlen = new_swa_evicted_seqlen
 
     def maybe_wait_verify_done(self):
         if self.is_spec_v2:
@@ -3240,6 +3333,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     def _evict_swa(self, req: Req, pre_len: int):
         assert self.tree_cache.supports_swa(), "prefix cache must support swa"
+        if hasattr(self.tree_cache, "evict_swa"):
+            self.tree_cache.evict_swa(req, pre_len)
+            return
         sliding_window_size = self.tree_cache.sliding_window_size
 
         # For swa radix cache, we need to evict the tokens that are not in the tree cache and also not in the sliding window

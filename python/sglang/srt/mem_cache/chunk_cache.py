@@ -23,7 +23,10 @@ from sglang.srt.mem_cache.cp_sharded_allocator import unwrap_cp_sharded_allocato
 from sglang.srt.mem_cache.hisparse_memory_pool import (
     DeepSeekV4HiSparseTokenToKVPoolAllocator,
 )
-from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
+from sglang.srt.mem_cache.swa_memory_pool import (
+    SWATokenToKVPoolAllocator,
+    SuffixTokenToKVPoolAllocator,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -144,3 +147,34 @@ class SWAChunkCache(ChunkCache):
 
     def evict(self, params: EvictParams) -> EvictResult:
         return EvictResult()
+
+
+class SuffixChunkCache(SWAChunkCache):
+    """Chunk cache for suffix-parallel KV pools with optional SWA sub-pool."""
+
+    def __init__(self, params: CacheInitParams, swa_window: int):
+        assert isinstance(
+            params.token_to_kv_pool_allocator, SuffixTokenToKVPoolAllocator
+        )
+        ChunkCache.__init__(self, params)
+        self.sliding_window_size = swa_window
+        self.chunked_prefill_size = params.chunked_prefill_size
+
+    def supports_swa(self) -> bool:
+        return self.sliding_window_size is not None and self.sliding_window_size > 0
+
+    def evict_swa(self, req: Req, prelen: int):
+        window = self.sliding_window_size
+        if window is None or window <= 0:
+            return
+
+        prelen_phys = prelen * self.scale_seq_factor
+        new_swa_evicted_seqlen = prelen_phys - window - self.scale_seq_factor
+        if new_swa_evicted_seqlen <= req.swa_evicted_seqlen:
+            return
+
+        free_slots = self.req_to_token_pool.req_to_token[
+            req.req_pool_idx, req.swa_evicted_seqlen : new_swa_evicted_seqlen
+        ]
+        self.token_to_kv_pool_allocator.free_swa(free_slots)
+        req.swa_evicted_seqlen = new_swa_evicted_seqlen
