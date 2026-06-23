@@ -1038,6 +1038,11 @@ class _WelmQkvMarlinMethod:
         K = K_packed * pack_factor
         device = packed.device
 
+        if not hasattr(layer, "_original_shapes"):
+            layer._original_shapes = {}
+        layer._original_shapes["weight_packed"] = (N, K_packed)
+        layer._original_shapes["weight_scale"] = tuple(scale.shape)
+
         self.output_size_per_partition = N
         self.input_size_per_partition = K
         self.wtype = scalar_types.uint8b128 if num_bits == 8 else scalar_types.uint4b8
@@ -1051,7 +1056,17 @@ class _WelmQkvMarlinMethod:
             size_n=N,
             num_bits=num_bits,
         )
-        layer.weight_packed = nn.Parameter(repacked, requires_grad=False)
+
+        # Reuse the Marlin-format buffer from the first call so that
+        # param.data keeps the same CUDA memory address across
+        # weight-update cycles (critical for CUDA graphs).
+        cached_w = getattr(layer, "_marlin_buf_weight_packed", None)
+        if cached_w is not None and cached_w.shape == repacked.shape and cached_w.dtype == repacked.dtype:
+            cached_w.copy_(repacked)
+            layer.weight_packed.data = cached_w
+        else:
+            layer._marlin_buf_weight_packed = repacked
+            layer.weight_packed.data = repacked
 
         # Transpose and permute scales: [N, num_groups] -> permuted [num_groups, N]
         scale_t = scale.t().contiguous()
@@ -1061,7 +1076,14 @@ class _WelmQkvMarlinMethod:
             size_n=N,
             group_size=group_size,
         )
-        layer.weight_scale = nn.Parameter(scale_perm, requires_grad=False)
+
+        cached_s = getattr(layer, "_marlin_buf_weight_scale", None)
+        if cached_s is not None and cached_s.shape == scale_perm.shape and cached_s.dtype == scale_perm.dtype:
+            cached_s.copy_(scale_perm)
+            layer.weight_scale.data = cached_s
+        else:
+            layer._marlin_buf_weight_scale = scale_perm
+            layer.weight_scale.data = scale_perm
 
         # Empty g_idx (no activation reordering) and weight_zp (symmetric)
         layer.g_idx = marlin_make_empty_g_idx(device)
@@ -1074,6 +1096,26 @@ class _WelmQkvMarlinMethod:
         # Remove the BF16 weight placeholder (no longer needed)
         if hasattr(layer, "weight"):
             delattr(layer, "weight")
+
+    def restore_weights_before_loading(self, layer: nn.Module) -> None:
+        """Resize parameters back to their original (pre-Marlin) shapes before loading new weights."""
+        if not hasattr(layer, "_original_shapes"):
+            if self.output_size_per_partition is None or self.input_size_per_partition is None:
+                return
+            N = self.output_size_per_partition
+            K = self.input_size_per_partition
+            pack_factor = 32 // self.num_bits
+            layer._original_shapes = {
+                "weight_packed": (N, K // pack_factor),
+                "weight_scale": (N, K // self.group_size),
+            }
+
+        for name, orig_shape in layer._original_shapes.items():
+            param = getattr(layer, name, None)
+            if param is not None and param.shape != orig_shape:
+                param.data = torch.empty(
+                    orig_shape, dtype=param.dtype, device=param.device
+                )
 
     def apply(self, layer: nn.Module, x: torch.Tensor, bias=None) -> torch.Tensor:
         from sglang.srt.layers.quantization.marlin_utils import (

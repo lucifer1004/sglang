@@ -205,6 +205,59 @@ class CompressedTensorsWNA16(CompressedTensorsLinearScheme):
                                             weight_loader=weight_loader)
             layer.register_parameter("weight_g_idx", weight_g_idx)
 
+        if not hasattr(layer, "_original_shapes"):
+            layer._original_shapes = {}
+        layer._original_shapes["weight_packed"] = tuple(weight.shape)
+        layer._original_shapes["weight_scale"] = tuple(weight_scale.data.shape)
+
+        if not hasattr(layer, "_original_dims"):
+            layer._original_dims = {}
+        layer._original_dims["weight_packed"] = {
+            "input_dim": 1, "output_dim": 0, "packed_dim": 1,
+        }
+        if partition_scales:
+            layer._original_dims["weight_scale"] = {
+                "input_dim": 1, "output_dim": 0,
+            }
+        else:
+            layer._original_dims["weight_scale"] = {"output_dim": 0}
+
+    def restore_weights_before_loading(self, layer: torch.nn.Module) -> None:
+        """Resize parameters back to their original (pre-Marlin) shapes before loading new weights."""
+        if not hasattr(layer, "_original_shapes"):
+            c = getattr(self, "kernel_config", None)
+            if c is None:
+                return
+            K, N = c.partition_weight_shape
+            gs = self.group_size if self.group_size != -1 else K
+            layer._original_shapes = {
+                "weight_packed": (N, K // self.pack_factor),
+                "weight_scale": (N, K // gs),
+            }
+
+        for name, orig_shape in layer._original_shapes.items():
+            param = getattr(layer, name, None)
+            if param is not None and param.shape != orig_shape:
+                param.data = torch.empty(
+                    orig_shape, dtype=param.dtype, device=param.device
+                )
+
+        # permute_param_layout_ in process_weights_after_loading flips
+        # _input_dim/_output_dim/_packed_dim on the live Parameter objects.
+        # After restoring data to the original HF layout we must reset
+        # these dim attributes so that TP-aware weight_loader_v2 slices
+        # along the correct axis.
+        orig_dims = getattr(layer, "_original_dims", None)
+        if orig_dims is not None:
+            for name, dims in orig_dims.items():
+                param = getattr(layer, name, None)
+                if param is None:
+                    continue
+                for attr, val in dims.items():
+                    private = f"_{attr}"
+                    if hasattr(param, private):
+                        setattr(param, private, val)
+
     # Checkpoints are serialized in compressed-tensors format, which is
     # different from the format the kernel may want. Handle repacking here.
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
@@ -237,12 +290,23 @@ class CompressedTensorsWNA16(CompressedTensorsLinearScheme):
             if name is not None and getattr(layer, name, None) is not None:
 
                 old_param = getattr(layer, name)
-                new_param = fn(old_param)
-                # replace the parameter with torch.nn.Parameter for TorchDynamo
-                # compatibility
-                replace_parameter(
-                    layer, name, torch.nn.Parameter(new_param.data, requires_grad=False)
-                )
+                fn(old_param)  # modifies old_param.data in-place, preserving type
+
+                # Reuse the Marlin-format buffer allocated on the first call so
+                # that param.data keeps the same CUDA memory address across
+                # weight-update cycles.  This is critical when CUDA graphs or
+                # other pointer-caching mechanisms are active.
+                cache_key = f"_marlin_buf_{name}"
+                cached = getattr(layer, cache_key, None)
+                if (
+                    cached is not None
+                    and cached.shape == old_param.data.shape
+                    and cached.dtype == old_param.data.dtype
+                ):
+                    cached.copy_(old_param.data)
+                    old_param.data = cached
+                else:
+                    setattr(layer, cache_key, old_param.data)
 
         def transform_w_q(x):
             assert isinstance(x, BasevLLMParameter)
