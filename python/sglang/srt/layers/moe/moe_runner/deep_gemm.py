@@ -911,7 +911,7 @@ def _varlen_deep_gemm_silu_mul_quant(
 def _apply_swiglu_limit(
     gateup_output: torch.Tensor, swiglu_limit: float
 ) -> torch.Tensor:
-    assert swiglu_limit == 10
+    assert swiglu_limit > 0
 
     num_tokens, hidden_size_x2 = gateup_output.shape
     assert gateup_output.dtype == torch.bfloat16
