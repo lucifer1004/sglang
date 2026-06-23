@@ -388,10 +388,23 @@ class PyNcclCommunicator:
         finally:
             self.disabled = old_disable
 
-    def nccl_pause(self):
-        """Pause NCCL operations and release GPU memory (AMem NCCL plugin)."""
-        self.nccl.ncclPause(self.comm)
+    def nccl_suspend(self):
+        """Suspend the comm and free its GPU memory (``ncclCommSuspend``,
+        TCCL 2.30 / NCCL 2.30+). Caller must drain in-flight NCCL ops first
+        (e.g. via ``torch.cuda.synchronize()``). Idempotent.
+        """
+        if not getattr(self, "available", False):
+            return
+        if getattr(self, "_suspended", False):
+            return
+        self.nccl.ncclCommSuspend(self.comm)
+        self._suspended = True
 
     def nccl_resume(self):
-        """Resume NCCL operations after pause (AMem NCCL plugin)."""
-        self.nccl.ncclResume(self.comm)
+        """Resume a previously suspended comm (``ncclCommResume``). Idempotent."""
+        if not getattr(self, "available", False):
+            return
+        if not getattr(self, "_suspended", False):
+            return
+        self.nccl.ncclCommResume(self.comm)
+        self._suspended = False

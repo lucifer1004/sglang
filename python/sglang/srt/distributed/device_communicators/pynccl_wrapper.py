@@ -156,6 +156,10 @@ class Function:
     argtypes: List[Any]
 
 
+# ``ncclCommSuspend`` flag (TCCL 2.30 / NCCL 2.30+): release GPU memory.
+NCCL_SUSPEND_MEM = 0x01
+
+
 class NCCLLibrary:
     exported_functions = [
         # const char* ncclGetErrorString(ncclResult_t result)
@@ -308,16 +312,12 @@ class NCCLLibrary:
         Function("ncclGroupEnd", ncclResult_t, []),
     ]
 
-    # AMem NCCL plugin extended APIs for transparent memory offload/restore.
-    # Only registered when AMEM_ENABLE=1 so that the symbols are resolved
-    # from the AMem-patched libnccl.so / libtccl.so.
-    exported_functions_amem = [
-        # ncclResult_t ncclPause(ncclComm_t comm);
-        Function("ncclPause", ncclResult_t, [ncclComm_t]),
-        # ncclResult_t ncclResume(ncclComm_t comm);
-        Function("ncclResume", ncclResult_t, [ncclComm_t]),
-        # ncclResult_t ncclSetGroupID(int id);
-        Function("ncclSetGroupID", ncclResult_t, [ctypes.c_int]),
+    # TCCL 2.30 / NCCL 2.30+ suspend/resume; registered only if exported.
+    exported_functions_suspend = [
+        # ncclResult_t ncclCommSuspend(ncclComm_t comm, int flags);
+        Function("ncclCommSuspend", ncclResult_t, [ncclComm_t, ctypes.c_int]),
+        # ncclResult_t ncclCommResume(ncclComm_t comm);
+        Function("ncclCommResume", ncclResult_t, [ncclComm_t]),
     ]
 
     exported_functions_symm_mem = [
@@ -373,10 +373,10 @@ class NCCLLibrary:
             exported_functions = NCCLLibrary.exported_functions
             if hasattr(self.lib, "ncclCommWindowRegister"):
                 exported_functions.extend(NCCLLibrary.exported_functions_symm_mem)
-            if os.environ.get("AMEM_ENABLE", "0") == "1" and hasattr(
-                self.lib, "ncclPause"
+            if hasattr(self.lib, "ncclCommSuspend") and hasattr(
+                self.lib, "ncclCommResume"
             ):
-                exported_functions.extend(NCCLLibrary.exported_functions_amem)
+                exported_functions.extend(NCCLLibrary.exported_functions_suspend)
             for func in exported_functions:
                 f = getattr(self.lib, func.name)
                 f.restype = func.restype
@@ -571,13 +571,22 @@ class NCCLLibrary:
     def ncclGroupEnd(self) -> None:
         self.NCCL_CHECK(self._funcs["ncclGroupEnd"]())
 
-    def ncclPause(self, comm: ncclComm_t) -> None:
-        """Pause NCCL operations and release GPU memory (AMem)."""
-        self.NCCL_CHECK(self._funcs["ncclPause"](comm))
+    def has_comm_suspend(self) -> bool:
+        """Whether ``ncclCommSuspend`` / ``ncclCommResume`` are available."""
+        return (
+            "ncclCommSuspend" in self._funcs and "ncclCommResume" in self._funcs
+        )
 
-    def ncclResume(self, comm: ncclComm_t) -> None:
-        """Resume NCCL operations after pause (AMem)."""
-        self.NCCL_CHECK(self._funcs["ncclResume"](comm))
+    def ncclCommSuspend(
+        self, comm: ncclComm_t, flags: int = NCCL_SUSPEND_MEM
+    ) -> None:
+        """``ncclCommSuspend(comm, flags)`` (TCCL 2.30 / NCCL 2.30+).
+        Default ``flags=NCCL_SUSPEND_MEM`` frees the comm's GPU memory."""
+        self.NCCL_CHECK(self._funcs["ncclCommSuspend"](comm, flags))
+
+    def ncclCommResume(self, comm: ncclComm_t) -> None:
+        """Resume a previously suspended NCCL communicator."""
+        self.NCCL_CHECK(self._funcs["ncclCommResume"](comm))
 
 
 __all__ = [
@@ -588,4 +597,5 @@ __all__ = [
     "ncclComm_t",
     "cudaStream_t",
     "buffer_type",
+    "NCCL_SUSPEND_MEM",
 ]

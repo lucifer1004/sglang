@@ -12,6 +12,8 @@ from sglang.srt.constants import (
     GPU_MEMORY_TYPE_KV_CACHE,
     GPU_MEMORY_TYPE_WEIGHTS,
 )
+from sglang.srt.distributed import get_moe_ep_group, get_moe_tp_group, get_tp_group
+from sglang.srt.layers.dp_attention import get_attention_tp_group
 from sglang.srt.managers.io_struct import (
     CheckWeightsReqInput,
     CheckWeightsReqOutput,
@@ -160,6 +162,34 @@ class SchedulerUpdateWeightsMixin:
         if GPU_MEMORY_TYPE_CUDA_GRAPH in tags:
             self.memory_saver_adapter.pause(GPU_MEMORY_TYPE_CUDA_GRAPH)
 
+            # Suspend each NCCL comm to release its GPU memory
+            # (``ncclCommSuspend``, TCCL 2.30 / NCCL 2.30+). Sync first to
+            # drain in-flight ops; dedup by id since tp / attn_tp / moe_*
+            # may share one underlying PyNcclCommunicator.
+            torch.get_device_module().synchronize()
+            seen_pynccl_comms = set()
+            for group in (
+                get_tp_group(),
+                get_attention_tp_group(),
+                get_moe_ep_group(),
+                get_moe_tp_group(),
+            ):
+                if group is None:
+                    continue
+                pynccl_comm = group.pynccl_comm
+                if pynccl_comm is None:
+                    continue
+                if id(pynccl_comm) in seen_pynccl_comms:
+                    continue
+                seen_pynccl_comms.add(id(pynccl_comm))
+                if not getattr(pynccl_comm, "available", False):
+                    continue
+                if not pynccl_comm.nccl.has_comm_suspend():
+                    continue
+                pynccl_comm.nccl_suspend()
+
+        # ``ncclCommSuspend`` enqueues ``cuMemUnmap`` on NCCL's stream;
+        # sync so downstream ``cudaMemGetInfo`` sees the release.
         torch.get_device_module().synchronize()
 
         return ReleaseMemoryOccupationReqOutput()
@@ -177,6 +207,32 @@ class SchedulerUpdateWeightsMixin:
 
         if GPU_MEMORY_TYPE_CUDA_GRAPH in tags:
             self.memory_saver_adapter.resume(GPU_MEMORY_TYPE_CUDA_GRAPH)
+
+            # Resume each suspended NCCL comm; same id-dedup as release.
+            seen_pynccl_comms = set()
+            for group in (
+                get_tp_group(),
+                get_attention_tp_group(),
+                get_moe_ep_group(),
+                get_moe_tp_group(),
+            ):
+                if group is None:
+                    continue
+                pynccl_comm = group.pynccl_comm
+                if pynccl_comm is None:
+                    continue
+                if id(pynccl_comm) in seen_pynccl_comms:
+                    continue
+                seen_pynccl_comms.add(id(pynccl_comm))
+                if not getattr(pynccl_comm, "available", False):
+                    continue
+                if not pynccl_comm.nccl.has_comm_suspend():
+                    continue
+                pynccl_comm.nccl_resume()
+
+            # ``ncclCommResume`` enqueues ``cuMemMap`` on NCCL's stream;
+            # sync so subsequent collectives see fully-mapped buffers.
+            torch.get_device_module().synchronize()
 
         if GPU_MEMORY_TYPE_WEIGHTS in tags:
             self.memory_saver_adapter.resume(GPU_MEMORY_TYPE_WEIGHTS)
