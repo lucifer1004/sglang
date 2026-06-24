@@ -19,6 +19,7 @@
 import logging
 import math
 import os
+import re
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
@@ -1152,6 +1153,7 @@ class BaseWelmQkvProjection(nn.Module):
         tp_rank: int,
         tp_size: int,
         shard_layout: Tuple[str, ...] = ("q", "k", "v"),
+        use_presharded_weights: bool = False,
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
@@ -1159,6 +1161,7 @@ class BaseWelmQkvProjection(nn.Module):
         self.total_num_heads = total_num_heads
         self.total_num_kv_heads = total_num_kv_heads
         self.shard_layout = shard_layout
+        self.use_presharded_weights = use_presharded_weights
         if tp_rank is None:
             tp_rank = get_tensor_model_parallel_rank()
         if tp_size is None:
@@ -1244,6 +1247,30 @@ class BaseWelmQkvProjection(nn.Module):
             )
         else:
             self.register_parameter("bias", None)
+
+    def param_mapping(self, layer_idx: int) -> Dict[str, str]:
+        """Declare each shard slot's source HF checkpoint weight: ``{slot: hf_name}``.
+
+        Declarative single source of truth for this module's kv-mirror routing, consumed by
+        ``load_weights`` via the ``maybe_load_remote_kv_mirror_weight`` reverse lookup -- so
+        the routing is data here rather than duplicated imperative code. Own-layer slots
+        (q/k1/v1) read this layer's q/k/v_proj; per-bank mirror slots (k2_N/v2_N) read
+        ``mirror_layer_indices[N]``'s k/v_proj; legacy single-bank (k2/v2) read
+        ``mirror_layer_idx``. The decoder layer index isn't stored on the qkv module, so the
+        caller passes it (parsed from the module FQN ``model.layers.{i}.self_attn.qkv_proj``).
+        """
+        leaf = {"q": "q_proj", "k": "k_proj", "v": "v_proj"}
+        out: Dict[str, str] = {}
+        for slot in self.shard_layout:
+            m = re.match(r"^[kv]2(?:_(\d+))?$", slot)  # k2 / k2_N / v2 / v2_N -> mirror slot
+            if m is None:
+                tgt = layer_idx  # own layer: q / k1 / v1
+            elif m.group(1) is not None:
+                tgt = self.mirror_layer_indices[int(m.group(1))]  # multi-bank k2_N / v2_N
+            else:
+                tgt = self.mirror_layer_idx  # legacy single-bank k2 / v2
+            out[slot] = f"model.layers.{tgt}.self_attn.{leaf[slot[0]]}.weight"
+        return out
 
     def forward(
         self,
@@ -1351,9 +1378,11 @@ class BaseWelmQkvProjection(nn.Module):
             shard_offset = self._get_shard_slice(loaded_shard_id)[0].start
             shard_size = self._get_local_shard_size(loaded_shard_id)
             param_data = param_data.narrow(output_dim, shard_offset, shard_size)
-            shard_id = self._get_tp_shard_index(loaded_shard_id)
-            start_idx = shard_id * shard_size
-            loaded_weight = loaded_weight.narrow(output_dim, start_idx, shard_size)
+            # a presharded shard is already this rank's slice; only disk/dummy load narrows
+            if not self.use_presharded_weights:
+                shard_id = self._get_tp_shard_index(loaded_shard_id)
+                start_idx = shard_id * shard_size
+                loaded_weight = loaded_weight.narrow(output_dim, start_idx, shard_size)
         assert param_data.shape == loaded_weight.shape
         param_data.copy_(loaded_weight)
 
@@ -3801,63 +3830,33 @@ class WeLMV4MoeForCausalLM(nn.Module):
 
         params_dict = dict(self.named_parameters())
         modules_dict = dict(self.named_modules())
-        attn_by_kv_mirror_layer_idx = {
-            module.kv_mirror_layer_idx: module
-            for module in modules_dict.values()
-            if isinstance(module, Qwen2MoeAttention)
-        }
-        mirror_to_imitated, _ = _get_kv_mirror_pair_maps(
-            getattr(self.config, "kv_mirror_layers", []),
-            getattr(self.config, "kv_mirror_imitated_layers", []),
-            num_hidden_layers=getattr(
-                self.config, "num_target_hidden_layers", self.config.num_hidden_layers
-            ),
-            num_nextn_predict_layers=getattr(
-                self.config, "num_nextn_predict_layers", 0
-            ),
-            is_nextn=is_nextn,
-        )
+        # kv-mirror routing: source HF k/v_proj weight -> (imitating module, mirror slot),
+        # built from each ImitateQkv's param_mapping (the declarative single source) so the
+        # load side never re-derives the bank index / shard slot. Only mirror slots
+        # (k2_N/v2_N) route here; own-layer q/k1/v1 load locally via stacked_params_mapping.
+        kv_mirror_route = {}
+        for mod_name, module in modules_dict.items():
+            if not isinstance(module, ImitateQkvMultiBankKvProjection):
+                continue
+            for slot, hf_name in module.param_mapping(get_layer_id(mod_name)).items():
+                if slot in ("q", "k1", "v1"):
+                    continue
+                kv_mirror_route[hf_name[: -len(".weight")]] = (module, slot)
 
-        def maybe_load_remote_kv_mirror_pair_weight(
-            name: str, loaded_weight: torch.Tensor, layer_id: Optional[int]
-        ) -> bool:
-            if layer_id is None:
+        def maybe_load_remote_kv_mirror_weight(name: str, loaded_weight: torch.Tensor) -> bool:
+            target = kv_mirror_route.get(name.rpartition(".")[0])
+            if target is None:
                 return False
-            if ".self_attn.k_proj." in name:
-                base_shard = "k2"
-            elif ".self_attn.v_proj." in name:
-                base_shard = "v2"
-            else:
-                return False
-            imitated_layer_idx = mirror_to_imitated.get(layer_id)
-            if imitated_layer_idx is None:
-                return False
-            pair_attn = attn_by_kv_mirror_layer_idx.get(imitated_layer_idx)
-            if pair_attn is None:
-                return False
-            if not isinstance(pair_attn.qkv_proj, ImitateQkvMultiBankKvProjection):
-                return False
-            try:
-                bank_idx = pair_attn.qkv_proj.mirror_layer_indices.index(layer_id)
-            except ValueError:
-                return False
-            pair_shard_id = f"{base_shard}_{bank_idx}"
-            pair_qkv = pair_attn.qkv_proj
-            if name.endswith(".bias"):
-                pair_param = pair_qkv.bias
-            elif name.endswith(".weight_packed"):
-                pair_param = getattr(pair_qkv, "weight_packed", None)
-            elif name.endswith(".weight_scale"):
-                pair_param = getattr(pair_qkv, "weight_scale", None)
-            elif name.endswith(".weight_shape"):
-                pair_param = getattr(pair_qkv, "weight_shape", None)
-            elif name.endswith(".weight"):
-                pair_param = pair_qkv.weight
-            else:
-                pair_param = None
-            if pair_param is None or not hasattr(pair_param, "weight_loader"):
-                return True
-            pair_param.weight_loader(pair_param, loaded_weight, pair_shard_id)
+            module, slot = target
+            suffix = name.rsplit(".", 1)[-1]
+            pair_param = (
+                getattr(module, suffix, None)
+                if suffix
+                in ("weight", "bias", "weight_packed", "weight_scale", "weight_shape")
+                else None
+            )
+            if pair_param is not None and hasattr(pair_param, "weight_loader"):
+                pair_param.weight_loader(pair_param, loaded_weight, slot)
             return True
 
         if is_nextn:
@@ -3886,9 +3885,7 @@ class WeLMV4MoeForCausalLM(nn.Module):
                             len(name_list) >= 3
                             and int(name_list[2]) >= self.config.num_hidden_layers
                         ):
-                            maybe_load_remote_kv_mirror_pair_weight(
-                                name, loaded_weight, int(name_list[2])
-                            )
+                            maybe_load_remote_kv_mirror_weight(name, loaded_weight)
                             continue
             else:
                 name_list = name.split(".")
@@ -3951,10 +3948,7 @@ class WeLMV4MoeForCausalLM(nn.Module):
                     or layer_id >= self.model.end_layer
                 )
             ):
-                if maybe_load_remote_kv_mirror_pair_weight(
-                    name, loaded_weight, layer_id
-                ):
-                    continue
+                maybe_load_remote_kv_mirror_weight(name, loaded_weight)
                 continue
             if "rotary_emb.inv_freq" in name:
                 continue
@@ -3975,6 +3969,7 @@ class WeLMV4MoeForCausalLM(nn.Module):
                 # for mlp.experts[0].gate_gate_up_proj, which breaks load.
                 if "mlp.experts" in name:
                     continue
+                orig_name = name  # pre-qkv-fuse HF name, for kv-mirror table lookup
                 name = name.replace(weight_name, param_name)
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
@@ -4003,58 +3998,11 @@ class WeLMV4MoeForCausalLM(nn.Module):
                     and shard_id in ("k", "v")
                 ):
                     effective_shard_id = "k1" if shard_id == "k" else "v1"
-                if not (
-                    current_attn is not None
-                    and isinstance(current_attn, Qwen2MoeAttention)
-                    and isinstance(current_attn.qkv_proj, MirrorQProjection)
-                    and shard_id in ("k", "v")
-                ):
+                # A mirror-source layer (MirrorQ) keeps only q; its k/v live in the imitating
+                # layer's k2_N/v2_N slot, so the table routes them there. Everything else --
+                # including this layer's own k1/v1 -- isn't in the table and loads locally.
+                if not maybe_load_remote_kv_mirror_weight(orig_name, loaded_weight):
                     weight_loader(param, loaded_weight, effective_shard_id)
-                if (
-                    current_attn is not None
-                    and isinstance(current_attn, Qwen2MoeAttention)
-                    and isinstance(current_attn.qkv_proj, MirrorQProjection)
-                    and shard_id in ("k", "v")
-                ):
-                    pair_attn = attn_by_kv_mirror_layer_idx.get(
-                        current_attn.qkv_proj.imitated_layer_idx
-                    )
-                    pair_shard_id = None
-                    if pair_attn is not None and isinstance(
-                        pair_attn.qkv_proj, ImitateQkvMultiBankKvProjection
-                    ):
-                        try:
-                            bank_idx = pair_attn.qkv_proj.mirror_layer_indices.index(
-                                current_attn.kv_mirror_layer_idx
-                            )
-                        except ValueError:
-                            bank_idx = None
-                        if bank_idx is not None:
-                            pair_shard_id = (
-                                f"k2_{bank_idx}"
-                                if shard_id == "k"
-                                else f"v2_{bank_idx}"
-                            )
-                    if pair_shard_id is not None:
-                        pair_qkv = pair_attn.qkv_proj
-                        if name.endswith(".bias"):
-                            pair_param = pair_qkv.bias
-                        elif name.endswith(".weight_packed"):
-                            pair_param = getattr(pair_qkv, "weight_packed", None)
-                        elif name.endswith(".weight_scale"):
-                            pair_param = getattr(pair_qkv, "weight_scale", None)
-                        elif name.endswith(".weight_shape"):
-                            pair_param = getattr(pair_qkv, "weight_shape", None)
-                        elif name.endswith(".weight"):
-                            pair_param = pair_qkv.weight
-                        else:
-                            pair_param = None
-                        if pair_param is not None and hasattr(pair_param, "weight_loader"):
-                            pair_param.weight_loader(
-                                pair_param,
-                                loaded_weight,
-                                pair_shard_id,
-                            )
                 break
             else:
                 for mapping in expert_params_mapping:

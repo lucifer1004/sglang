@@ -454,6 +454,12 @@ class VocabParallelEmbedding(torch.nn.Module):
         # If param packed on the same dim we are sharding on, then
         # need to adjust offsets of loaded weight by pack_factor.
         if packed_dim is not None and packed_dim == output_dim:
+            if self.use_presharded_weights:
+                # The pack-factor offset math below assumes the full unsliced weight, so it
+                # cannot reinterpret an already-presharded slice.
+                raise NotImplementedError(
+                    "presharded loading does not support packed weights"
+                )
             packed_factor = (
                 param.packed_factor
                 if isinstance(param, BasevLLMParameter)
@@ -464,15 +470,26 @@ class VocabParallelEmbedding(torch.nn.Module):
             )
             start_idx = start_idx // packed_factor
             shard_size = shard_size // packed_factor
+        elif self.use_presharded_weights:
+            # Presharded: the shard is already this rank's slice. Divisible vocabs give
+            # org_vocab_size // tp_size == shard_size; non-divisible vocabs give this rank's
+            # org range or the full padded partition (pad rows zero-filled at the source).
+            # Accept either, then copy rows and zero the tail.
+            rows = loaded_weight.shape[output_dim]
+            assert rows in (shard_size, self.num_embeddings_per_partition), (
+                f"presharded vocab shard has {rows} rows; expected this rank's org range "
+                f"{shard_size} or padded partition {self.num_embeddings_per_partition}"
+            )
+            param[:rows].data.copy_(loaded_weight)
+            param[rows:].data.fill_(0)
+            return
         else:
-            assert loaded_weight.shape[output_dim] == (
-                self.org_vocab_size
-                // (self.tp_size if self.use_presharded_weights else 1)
-            ), f"{self.org_vocab_size=} {self.use_presharded_weights=} {loaded_weight.shape[output_dim]=}"
+            assert loaded_weight.shape[output_dim] == self.org_vocab_size, (
+                f"{self.org_vocab_size=} {loaded_weight.shape[output_dim]=}"
+            )
 
         # Copy the data.
-        if not self.use_presharded_weights:
-            loaded_weight = loaded_weight.narrow(output_dim, start_idx, shard_size)
+        loaded_weight = loaded_weight.narrow(output_dim, start_idx, shard_size)
         param[: loaded_weight.shape[0]].data.copy_(loaded_weight)
         param[loaded_weight.shape[0] :].data.fill_(0)
 
