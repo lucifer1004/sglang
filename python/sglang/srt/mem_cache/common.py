@@ -473,11 +473,14 @@ def alloc_for_extend(
     allocator = batch.tree_cache.token_to_kv_pool_allocator
     if batch.tree_cache.page_size == 1:
         if isinstance(allocator, CPShardedKVPoolAllocator):
-            positions = build_extend_positions(
-                prefix_lens_cpu, extend_lens_cpu, device=batch.device
+            positions_cpu = build_extend_positions(
+                prefix_lens_cpu, extend_lens_cpu, device="cpu"
             )
-            evict_from_tree_cache(batch.tree_cache, int(positions.numel()))
-            out_cache_loc = allocator.alloc_for_positions(positions)
+            positions = positions_cpu.to(batch.device, non_blocking=True)
+            evict_from_tree_cache(batch.tree_cache, int(positions_cpu.numel()))
+            out_cache_loc = allocator.alloc_for_positions(
+                positions, positions_cpu=positions_cpu
+            )
             if out_cache_loc is None:
                 raise RuntimeError(
                     "Prefill out of memory under CP sharded KV allocation."
@@ -565,17 +568,26 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
         if isinstance(allocator, CPShardedKVPoolAllocator):
             if batch.model_config.is_encoder_decoder:
                 locs = batch.encoder_lens + batch.seq_lens
+                locs_cpu = torch.tensor(
+                    batch.encoder_lens_cpu, dtype=torch.int64
+                ) + batch.seq_lens_cpu.to(dtype=torch.int64)
             else:
                 locs = batch.seq_lens.clone()
+                locs_cpu = batch.seq_lens_cpu.to(dtype=torch.int64)
             if token_per_req > 1:
                 offsets = torch.arange(
                     token_per_req, device=batch.device, dtype=locs.dtype
                 )
+                offsets_cpu = torch.arange(token_per_req, dtype=locs_cpu.dtype)
                 positions = (locs.unsqueeze(1) + offsets).reshape(-1)
+                positions_cpu = (locs_cpu.unsqueeze(1) + offsets_cpu).reshape(-1)
             else:
                 positions = locs
-            evict_from_tree_cache(batch.tree_cache, int(positions.numel()))
-            out_cache_loc = allocator.alloc_for_positions(positions)
+                positions_cpu = locs_cpu
+            evict_from_tree_cache(batch.tree_cache, int(positions_cpu.numel()))
+            out_cache_loc = allocator.alloc_for_positions(
+                positions, positions_cpu=positions_cpu
+            )
             if out_cache_loc is None:
                 raise RuntimeError(
                     "Decode out of memory under CP sharded KV allocation."

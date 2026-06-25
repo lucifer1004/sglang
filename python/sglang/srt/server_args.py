@@ -559,6 +559,7 @@ class ServerArgs:
     attn_cp_size: int = 1
     attn_cp_mode: str = "none"
     attn_cp_kv_chunk_size: int = 1024
+    attn_cp_decode_cuda_graph_max_seq_len: int = 0
     moe_dp_size: int = 1
 
     # Multi-node distributed serving
@@ -3113,6 +3114,10 @@ class ServerArgs:
     def _handle_sharded_kv_context_parallelism(self):
         if self.attn_cp_kv_chunk_size <= 0:
             raise ValueError("--attn-cp-kv-chunk-size must be positive")
+        if self.attn_cp_decode_cuda_graph_max_seq_len < 0:
+            raise ValueError(
+                "--attn-cp-decode-cuda-graph-max-seq-len must be non-negative"
+            )
         if self.attn_cp_size <= 1:
             raise ValueError("--attn-cp-mode sharded-kv requires --attn-cp-size > 1")
 
@@ -5350,6 +5355,17 @@ class ServerArgs:
             type=int,
             default=ServerArgs.attn_cp_kv_chunk_size,
             help="Logical-token chunk size for sharded-KV AttnCP ownership. Fixed at server startup.",
+        )
+        parser.add_argument(
+            "--attn-cp-decode-cuda-graph-max-seq-len",
+            type=int,
+            default=ServerArgs.attn_cp_decode_cuda_graph_max_seq_len,
+            help=(
+                "Maximum sequence length used for sharded-KV AttnCP dense decode "
+                "CUDA graph capture/replay. 0 auto-selects per CUDA graph batch "
+                "bucket from the KV cache capacity. Requests longer than the "
+                "selected cap fall back to eager decode."
+            ),
         )
         parser.add_argument(
             "--moe-data-parallel-size",

@@ -790,7 +790,9 @@ def set_global_graph_memory_pool(val):
     global_graph_memory_pool = val
 
 
-def _default_make_graph_key(bs, stream_idx=None, variant_label=None):
+def _default_make_graph_key(
+    bs, stream_idx=None, variant_label=None, seq_len_bucket=None
+):
     """Build a graph dict key from batch size, stream index, and lora variant.
 
     Standalone function so it can be used by CudaGraphRunner.capture() even when
@@ -798,6 +800,8 @@ def _default_make_graph_key(bs, stream_idx=None, variant_label=None):
     CudaGraphRunner and thus lack the method.
     """
     key = bs if stream_idx is None else f"{stream_idx}_{bs}"
+    if seq_len_bucket is not None:
+        key = f"{key}_s{int(seq_len_bucket)}"
     if variant_label is not None:
         key = f"{variant_label}_{key}"
     return key
@@ -901,15 +905,30 @@ class CudaGraphRunner:
         # Attention backend
         self.max_bs = max(self.capture_bs)
         self.max_num_token = self.max_bs * self.num_tokens_per_bs
+        self.enable_seq_len_graph_buckets = (
+            self.dllm_config is None
+            and self.capture_forward_mode.is_decode()
+            and getattr(self.attn_backend, "is_attn_cp_sharded_kv", False)
+        )
+        self.seq_len_fill_values_by_bs = self._build_seq_len_fill_value_buckets_by_bs()
+        self.seq_len_fill_value = max(
+            max(values) for values in self.seq_len_fill_values_by_bs.values()
+        )
+        if self.enable_seq_len_graph_buckets:
+            self.attn_backend.cuda_graph_max_seq_len = self.seq_len_fill_value
+            bucket_desc = ", ".join(
+                f"{bs}:{values}"
+                for bs, values in sorted(self.seq_len_fill_values_by_bs.items())
+            )
+            log_info_on_rank0(
+                logger, f"AttnCP cuda graph seq buckets by bs {{{bucket_desc}}}"
+            )
+        elif getattr(self.attn_backend, "is_attn_cp_sharded_kv", False):
+            self.attn_backend.cuda_graph_max_seq_len = self.seq_len_fill_value
         self.attn_backend.init_cuda_graph_state(self.max_bs, self.max_num_token)
 
         # Init PDMux if needed
         self.maybe_init_pdmux()
-        self.seq_len_fill_value = (
-            self.attn_backend.get_cuda_graph_seq_len_fill_value()
-            if self.dllm_config is None
-            else self.dllm_config.block_size
-        )
 
         # Non-zero encoder length ensures cross-attention kernels are captured in the graph.
         self.encoder_len_fill_value = (
@@ -1155,18 +1174,90 @@ class CudaGraphRunner:
                 f"Capture cuda graph failed: {e}\n{CUDA_GRAPH_CAPTURE_FAILED_MSG}"
             )
 
+    def _build_seq_len_fill_value_buckets_by_bs(self) -> Dict[int, List[int]]:
+        if self.dllm_config is not None:
+            fill_value = int(self.dllm_config.block_size)
+            return {int(bs): [fill_value] for bs in self.capture_bs}
+
+        fill_value = int(self.attn_backend.get_cuda_graph_seq_len_fill_value())
+        if not self.enable_seq_len_graph_buckets:
+            return {int(bs): [fill_value] for bs in self.capture_bs}
+
+        max_context_len = int(
+            getattr(self.attn_backend, "max_context_len", fill_value) or fill_value
+        )
+        max_seq_cap = max(1, min(fill_value, max_context_len))
+        max_total_num_tokens = int(
+            getattr(self.model_runner, "max_total_num_tokens", 0) or 0
+        )
+        default_small_bucket = int(
+            getattr(self.model_runner.server_args, "max_prefill_tokens", None)
+            or max_seq_cap
+        )
+
+        page_size = max(1, int(getattr(self.attn_backend, "page_size", 1) or 1))
+        values: Dict[int, List[int]] = {}
+        prev_bs = 0
+        for bs in sorted(int(x) for x in self.capture_bs):
+            bs_int = max(1, int(bs))
+            min_real_bs = bs_int if self.disable_padding else prev_bs + 1
+            if max_total_num_tokens > 0 and not getattr(
+                self.attn_backend, "cuda_graph_max_seq_len_is_explicit", False
+            ):
+                cap = min(max_seq_cap, max_total_num_tokens // max(1, min_real_bs))
+            else:
+                cap = max_seq_cap
+            cap = self._align_seq_len_bucket(max(1, cap), page_size)
+            buckets = [min(default_small_bucket, cap)]
+            while buckets[-1] * 2 < cap:
+                buckets.append(buckets[-1] * 2)
+            if buckets[-1] != cap:
+                buckets.append(cap)
+            values[bs_int] = sorted(
+                {self._align_seq_len_bucket(max(1, x), page_size) for x in buckets}
+            )
+            prev_bs = bs_int
+        return values
+
+    @staticmethod
+    def _align_seq_len_bucket(seq_len: int, page_size: int) -> int:
+        if page_size <= 1:
+            return int(seq_len)
+        return max(1, (int(seq_len) // page_size) * page_size)
+
+    def _seq_len_fill_values_for_bs(self, bs: int) -> List[int]:
+        return self.seq_len_fill_values_by_bs.get(int(bs), [self.seq_len_fill_value])
+
+    def _select_seq_len_fill_value_for_bs(
+        self, bs: int, max_seq_len: Optional[int] = None
+    ) -> Optional[int]:
+        buckets = self._seq_len_fill_values_for_bs(bs)
+        if max_seq_len is None:
+            return max(buckets)
+        index = bisect.bisect_left(buckets, int(max_seq_len))
+        if index >= len(buckets):
+            return None
+        return buckets[index]
+
+    def _graph_seq_len_key(self, seq_len_fill_value: Optional[int]) -> Optional[int]:
+        return int(seq_len_fill_value) if self.enable_seq_len_graph_buckets else None
+
     def maybe_init_pdmux(self):
         if self.enable_pdmux:
             self.stream_groups = get_stream_groups()
             for attn_backend in self.model_runner.decode_attn_backend_group:
+                if getattr(attn_backend, "is_attn_cp_sharded_kv", False):
+                    attn_backend.cuda_graph_max_seq_len = self.seq_len_fill_value
                 attn_backend.init_cuda_graph_state(self.max_bs, self.max_num_token)
 
     def _cache_loc_dtype(self):
         return torch.int64
 
-    def _make_graph_key(self, bs, stream_idx=None, variant_label=None):
+    def _make_graph_key(
+        self, bs, stream_idx=None, variant_label=None, seq_len_bucket=None
+    ):
         """Build a graph dict key from batch size, stream index, and lora variant."""
-        return _default_make_graph_key(bs, stream_idx, variant_label)
+        return _default_make_graph_key(bs, stream_idx, variant_label, seq_len_bucket)
 
     def _resolve_lora_variant(self, forward_batch: ForwardBatch):
         """Return the variant label for the given batch, or None if dual backends are off."""
@@ -1193,15 +1284,42 @@ class CudaGraphRunner:
         else:
             cuda_graph_bs = forward_batch.batch_size
 
+        if self.disable_padding:
+            graph_bs = int(cuda_graph_bs)
+        else:
+            index = bisect.bisect_left(self.capture_bs, cuda_graph_bs)
+            graph_bs = (
+                int(self.capture_bs[index]) if index < len(self.capture_bs) else None
+            )
+
+        max_seq_len = None
+        seq_len_bucket = None
+        if graph_bs is not None:
+            if self.enable_seq_len_graph_buckets:
+                seq_lens_cpu = forward_batch.seq_lens_cpu
+                if hasattr(seq_lens_cpu, "max"):
+                    max_seq_len = int(seq_lens_cpu.max().item())
+                else:
+                    max_seq_len = int(max(seq_lens_cpu))
+                seq_len_bucket = self._select_seq_len_fill_value_for_bs(
+                    graph_bs, max_seq_len
+                )
+            else:
+                seq_len_bucket = self._select_seq_len_fill_value_for_bs(graph_bs)
+
         variant_label = self._resolve_lora_variant(forward_batch)
         stream_idx = get_current_stream_idx() if self.enable_pdmux else None
-        graph_key = self._make_graph_key(cuda_graph_bs, stream_idx, variant_label)
-
-        is_bs_supported = (
-            graph_key in self.graphs
-            if self.disable_padding
-            else cuda_graph_bs <= self.max_bs
+        graph_key = (
+            self._make_graph_key(
+                graph_bs,
+                stream_idx,
+                variant_label,
+                self._graph_seq_len_key(seq_len_bucket),
+            )
+            if graph_bs is not None and seq_len_bucket is not None
+            else None
         )
+        is_bs_supported = graph_key in self.graphs if graph_key is not None else False
 
         if self.require_mlp_sync:
             is_bs_supported = is_bs_supported and forward_batch.can_run_dp_cuda_graph
@@ -1298,31 +1416,42 @@ class CudaGraphRunner:
                 else [(None, None)]
             )
             for i, bs in enumerate(capture_range):
-                if get_tensor_model_parallel_rank() == 0:
-                    avail_mem = get_available_gpu_memory(
-                        self.model_runner.device,
-                        self.model_runner.gpu_id,
-                        empty_cache=False,
-                    )
-                    capture_range.set_description(
-                        f"Capturing batches ({bs=} {avail_mem=:.2f} GB)"
-                    )
+                seq_len_buckets = list(reversed(self._seq_len_fill_values_for_bs(bs)))
+                for seq_len_fill_value in seq_len_buckets:
+                    if get_tensor_model_parallel_rank() == 0:
+                        avail_mem = get_available_gpu_memory(
+                            self.model_runner.device,
+                            self.model_runner.gpu_id,
+                            empty_cache=False,
+                        )
+                        capture_range.set_description(
+                            "Capturing batches "
+                            f"({bs=} seq_cap={seq_len_fill_value} "
+                            f"{avail_mem=:.2f} GB)"
+                        )
 
-                for variant_label, variant_has_lora in lora_variants:
-                    _set_capture_lora_variant(variant_label)
-                    with patch_model(
-                        self.model_runner.model,
-                        bs in self.compile_bs,
-                        num_tokens=bs * self.num_tokens_per_bs,
-                        tp_group=self.model_runner.tp_group,
-                    ) as forward:
-                        (
-                            graph,
-                            output_buffers,
-                        ) = self.capture_one_batch_size(bs, forward, stream_idx)
-                        key = _default_make_graph_key(bs, stream_idx, variant_label)
-                        self.graphs[key] = graph
-                        self.output_buffers[key] = output_buffers
+                    for variant_label, variant_has_lora in lora_variants:
+                        _set_capture_lora_variant(variant_label)
+                        with patch_model(
+                            self.model_runner.model,
+                            bs in self.compile_bs,
+                            num_tokens=bs * self.num_tokens_per_bs,
+                            tp_group=self.model_runner.tp_group,
+                        ) as forward:
+                            (
+                                graph,
+                                output_buffers,
+                            ) = self.capture_one_batch_size(
+                                bs, forward, stream_idx, seq_len_fill_value
+                            )
+                            key = _default_make_graph_key(
+                                bs,
+                                stream_idx,
+                                variant_label,
+                                self._graph_seq_len_key(seq_len_fill_value),
+                            )
+                            self.graphs[key] = graph
+                            self.output_buffers[key] = output_buffers
 
         # Trigger CUDA graph capture for specific shapes.
         # Capture the large shapes first so that the smaller shapes
@@ -1388,13 +1517,23 @@ class CudaGraphRunner:
         return torch.cuda.CUDAGraph()
 
     def capture_one_batch_size(
-        self, bs: int, forward: Callable, stream_idx: Optional[int] = None
+        self,
+        bs: int,
+        forward: Callable,
+        stream_idx: Optional[int] = None,
+        seq_len_fill_value: Optional[int] = None,
     ):
         buffers: DecodeInputBuffers = self.buffers
         graph = self._create_device_graph()
         stream = self.stream
         num_tokens = bs * self.num_tokens_per_bs
         model_input_len = bs if self.scale_seq_factor > 1 else num_tokens
+        seq_len_fill_value = (
+            self._select_seq_len_fill_value_for_bs(bs)
+            if seq_len_fill_value is None
+            else int(seq_len_fill_value)
+        )
+        assert seq_len_fill_value is not None
 
         # Graph inputs
         # For scale_seq, the model takes bs input tokens and internally
@@ -1403,6 +1542,8 @@ class CudaGraphRunner:
         req_pool_indices = buffers.req_pool_indices[:bs]
         seq_lens = buffers.seq_lens[:bs]
         seq_lens_cpu = buffers.seq_lens_cpu[:bs]
+        seq_lens.fill_(seq_len_fill_value)
+        seq_lens_cpu.fill_(seq_len_fill_value)
         out_cache_loc = buffers.out_cache_loc[:num_tokens]
         positions = buffers.positions[:num_tokens]
         if self.is_encoder_decoder:
@@ -1600,15 +1741,19 @@ class CudaGraphRunner:
             self.model_runner.lora_manager.prepare_lora_batch(forward_batch)
 
         # Attention backend
-        attn_backend.init_forward_metadata_capture_cuda_graph(
-            bs,
-            num_tokens,
-            req_pool_indices,
-            seq_lens,
-            encoder_lens,
-            forward_batch.forward_mode,
-            forward_batch.spec_info,
-        )
+        attn_backend._cuda_graph_seq_len_fill_value = seq_len_fill_value
+        try:
+            attn_backend.init_forward_metadata_capture_cuda_graph(
+                bs,
+                num_tokens,
+                req_pool_indices,
+                seq_lens,
+                encoder_lens,
+                forward_batch.forward_mode,
+                forward_batch.spec_info,
+            )
+        finally:
+            attn_backend._cuda_graph_seq_len_fill_value = None
 
         # Run and capture
         def run_once():
@@ -1744,13 +1889,30 @@ class CudaGraphRunner:
         else:
             index = bisect.bisect_left(self.capture_bs, raw_bs)
         bs = self.capture_bs[index]
+        if self.enable_seq_len_graph_buckets:
+            if forward_batch.seq_lens_cpu is not None:
+                max_seq_len = int(forward_batch.seq_lens_cpu.max().item())
+            else:
+                max_seq_len = int(forward_batch.seq_lens.max().item())
+            seq_len_fill_value = self._select_seq_len_fill_value_for_bs(
+                bs, max_seq_len
+            )
+        else:
+            max_seq_len = None
+            seq_len_fill_value = self._select_seq_len_fill_value_for_bs(bs)
+        if seq_len_fill_value is None:
+            raise RuntimeError(
+                "CUDA graph replay requested without a captured sequence bucket: "
+                f"bs={bs}, max_seq_len={max_seq_len}, "
+                f"buckets={self._seq_len_fill_values_for_bs(bs)}"
+            )
 
         buffers.populate_from_forward_batch(
             forward_batch=forward_batch,
             raw_bs=raw_bs,
             raw_num_token=raw_num_token,
             bs=bs,
-            seq_len_fill_value=self.seq_len_fill_value,
+            seq_len_fill_value=seq_len_fill_value,
             require_gathered_buffer=self.require_gathered_buffer,
             num_tokens_per_bs=self.num_tokens_per_bs,
             nsa_enable_prefill_cp=self.nsa_enable_prefill_cp,
@@ -1865,22 +2027,27 @@ class CudaGraphRunner:
         # FIXME: implicit channel for backends (dsv4) that need forward_batch
         # in replay metadata prep. Should become a real param on the interface.
         attn_backend._replay_forward_batch = forward_batch
-        attn_backend.init_forward_metadata_replay_cuda_graph(
-            bs,
-            buffers.req_pool_indices[:bs],
-            buffers.seq_lens[:bs],
-            forward_batch.seq_lens_sum + (bs - raw_bs) * self.seq_len_fill_value,
-            buffers.encoder_lens[:bs] if self.is_encoder_decoder else None,
-            self.capture_forward_mode,
-            forward_batch.spec_info,
-            seq_lens_cpu=buffers.seq_lens_cpu[:bs],
-        )
-        attn_backend._replay_forward_batch = None
+        attn_backend._cuda_graph_seq_len_fill_value = seq_len_fill_value
+        try:
+            attn_backend.init_forward_metadata_replay_cuda_graph(
+                bs,
+                buffers.req_pool_indices[:bs],
+                buffers.seq_lens[:bs],
+                forward_batch.seq_lens_sum + (bs - raw_bs) * seq_len_fill_value,
+                buffers.encoder_lens[:bs] if self.is_encoder_decoder else None,
+                self.capture_forward_mode,
+                forward_batch.spec_info,
+                seq_lens_cpu=buffers.seq_lens_cpu[:bs],
+            )
+        finally:
+            attn_backend._replay_forward_batch = None
+            attn_backend._cuda_graph_seq_len_fill_value = None
 
         # Store fields
         self.raw_bs = raw_bs
         self.raw_num_token = raw_num_token
         self.bs = bs
+        self.seq_len_bucket = seq_len_fill_value
 
         if self.model_runner.hisparse_coordinator is not None:
             self.model_runner.hisparse_coordinator.num_real_reqs.fill_(raw_bs)
@@ -1911,7 +2078,12 @@ class CudaGraphRunner:
         # Replay
         variant_label = self._resolve_lora_variant(forward_batch)
         stream_idx = get_current_stream_idx() if self.enable_pdmux else None
-        graph_key = self._make_graph_key(self.bs, stream_idx, variant_label)
+        graph_key = self._make_graph_key(
+            self.bs,
+            stream_idx,
+            variant_label,
+            self._graph_seq_len_key(getattr(self, "seq_len_bucket", None)),
+        )
         ctx = (
             self.model_runner.device_timer.wrap(
                 metadata={

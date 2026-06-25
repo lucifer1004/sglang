@@ -635,6 +635,24 @@ class GroupCoordinator:
             inplace_all_reduce(input_, group_name=self.unique_name)
             return input_
 
+    def all_reduce_coalesced(
+        self, inputs: List[torch.Tensor]
+    ) -> List[torch.Tensor]:
+        if self.world_size == 1:
+            return inputs
+        if not inputs:
+            return inputs
+
+        pynccl_comm = self.pynccl_comm
+        if pynccl_comm is not None and (
+            not pynccl_comm.disabled or self.is_symmetric_memory_enabled()
+        ):
+            with pynccl_comm.change_state(enable=True):
+                pynccl_comm.all_reduce_coalesced(inputs)
+            return inputs
+
+        return [self.all_reduce(input_) for input_ in inputs]
+
     def quant_all_reduce(self, input_: torch.Tensor) -> torch.Tensor:
         """
         User-facing quant-all-reduce function similar to all-reduce. (NPU support only)
@@ -820,6 +838,27 @@ class GroupCoordinator:
             self._all_gather_into_tensor(output, input)
         else:
             reg_all_gather_into_tensor(output, input, group_name=self.unique_name)
+
+    def all_gather_coalesced(
+        self, tensor_pairs: List[Tuple[torch.Tensor, torch.Tensor]]
+    ) -> None:
+        if self.world_size == 1:
+            for output, input_ in tensor_pairs:
+                output.copy_(input_)
+            return
+        if not tensor_pairs:
+            return
+
+        pynccl_comm = self.pynccl_comm
+        if pynccl_comm is not None and (
+            not pynccl_comm.disabled or self.is_symmetric_memory_enabled()
+        ):
+            with pynccl_comm.change_state(enable=True):
+                pynccl_comm.all_gather_coalesced(tensor_pairs)
+            return
+
+        for output, input_ in tensor_pairs:
+            self.all_gather_into_tensor(output, input_)
 
     def cp_all_gather_into_tensor_async(
         self, output: torch.Tensor, input: torch.Tensor, stream: torch.cuda.Stream

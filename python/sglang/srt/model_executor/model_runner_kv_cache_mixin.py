@@ -926,6 +926,42 @@ class ModelRunnerKVCacheMixin:
 
         return token_capacity
 
+    def _expand_sharded_kv_logical_capacity(
+        self: ModelRunner, config: MemoryPoolConfig
+    ) -> MemoryPoolConfig:
+        """Convert profiled physical-equivalent capacity to logical AttnCP capacity.
+
+        The pool configurator profiles how many full-KV tokens fit on one rank.
+        In sharded-KV AttnCP, each logical token owns KV on only one CP rank, so
+        the scheduler-visible logical capacity is cp_size times larger while
+        the physical pool allocation remains divided by cp_size in _init_pools.
+        """
+        if self.server_args.attn_cp_mode != "sharded-kv":
+            return config
+
+        cp_size = int(self.server_args.attn_cp_size)
+        if cp_size <= 1:
+            return config
+
+        profiled_max_total = int(config.max_total_num_tokens)
+
+        def scale(value):
+            return None if value is None else int(value) * cp_size
+
+        config.max_total_num_tokens *= cp_size
+        config.full_max_total_num_tokens = scale(config.full_max_total_num_tokens)
+        config.swa_max_total_num_tokens = scale(config.swa_max_total_num_tokens)
+        config.suffix_max_total_num_tokens = scale(config.suffix_max_total_num_tokens)
+
+        logger.info(
+            "AttnCP sharded-KV logical capacity: profiled_physical_equivalent_tokens=%d, "
+            "cp_size=%d, logical_max_total_num_tokens=%d",
+            profiled_max_total,
+            cp_size,
+            config.max_total_num_tokens,
+        )
+        return config
+
     def _resolve_max_num_reqs(self: ModelRunner, token_capacity: int) -> int:
         """Compute max concurrent requests (per dp worker) from the finalized
         token capacity."""
@@ -995,6 +1031,7 @@ class ModelRunnerKVCacheMixin:
 
         configurator = create_memory_pool_configurator(self)
         config = configurator.calculate_pool_sizes(available_bytes, page_size)
+        config = self._expand_sharded_kv_logical_capacity(config)
 
         # Apply external constraints (user cap, page alignment, PP sync)
         constrained = self._apply_token_constraints(config.max_total_num_tokens)

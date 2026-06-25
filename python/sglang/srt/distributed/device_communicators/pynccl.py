@@ -150,6 +150,32 @@ class PyNcclCommunicator:
             cudaStream_t(stream.cuda_stream),
         )
 
+    def all_reduce_coalesced(
+        self, tensors: list[torch.Tensor], op: ReduceOp = ReduceOp.SUM
+    ):
+        if self.disabled:
+            return
+        if not tensors:
+            return
+
+        stream = self._resolve_stream()
+        self.nccl.ncclGroupStart()
+        for tensor in tensors:
+            assert tensor.device == self.device, (
+                f"this nccl communicator is created to work on {self.device}, "
+                f"but the input tensor is on {tensor.device}"
+            )
+            self.nccl.ncclAllReduce(
+                buffer_type(tensor.data_ptr()),
+                buffer_type(tensor.data_ptr()),
+                tensor.numel(),
+                ncclDataTypeEnum.from_torch(tensor.dtype),
+                ncclRedOpTypeEnum.from_torch(op),
+                self.comm,
+                cudaStream_t(stream.cuda_stream),
+            )
+        self.nccl.ncclGroupEnd()
+
     def outplace_all_reduce(
         self,
         in_tensor: torch.Tensor,
@@ -221,6 +247,36 @@ class PyNcclCommunicator:
                 self.comm,
                 cudaStream_t(stream.cuda_stream),
             )
+
+    def all_gather_coalesced(
+        self,
+        tensor_pairs: list[tuple[torch.Tensor, torch.Tensor]],
+    ):
+        if self.disabled:
+            return
+        if not tensor_pairs:
+            return
+
+        stream = self._resolve_stream()
+        self.nccl.ncclGroupStart()
+        for output_tensor, input_tensor in tensor_pairs:
+            assert input_tensor.device == self.device, (
+                f"this nccl communicator is created to work on {self.device}, "
+                f"but the input tensor is on {input_tensor.device}"
+            )
+            assert output_tensor.device == self.device, (
+                f"this nccl communicator is created to work on {self.device}, "
+                f"but the output tensor is on {output_tensor.device}"
+            )
+            self.nccl.ncclAllGather(
+                buffer_type(input_tensor.data_ptr()),
+                buffer_type(output_tensor.data_ptr()),
+                input_tensor.numel(),
+                ncclDataTypeEnum.from_torch(input_tensor.dtype),
+                self.comm,
+                cudaStream_t(stream.cuda_stream),
+            )
+        self.nccl.ncclGroupEnd()
 
     def cp_all_gather_into_tensor(
         self,

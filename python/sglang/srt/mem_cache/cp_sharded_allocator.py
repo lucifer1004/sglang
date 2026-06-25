@@ -149,20 +149,40 @@ class CPShardedKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def alloc(self, need_size: int):
         return self.base_allocator.alloc(need_size)
 
-    def alloc_for_positions(self, positions: torch.Tensor) -> Optional[torch.Tensor]:
+    def alloc_for_positions(
+        self,
+        positions: torch.Tensor,
+        *,
+        positions_cpu: Optional[torch.Tensor] = None,
+    ) -> Optional[torch.Tensor]:
         positions = positions.to(dtype=torch.int64)
+        owner_positions = positions
+        if positions_cpu is not None:
+            if tuple(positions_cpu.shape) != tuple(positions.shape):
+                raise ValueError(
+                    "positions_cpu must have the same shape as positions, "
+                    f"got {tuple(positions_cpu.shape)} vs {tuple(positions.shape)}"
+                )
+            owner_positions = positions_cpu.to(dtype=torch.int64)
         owner_mask = (
-            get_cp_owner(positions, self.cp_size, self.cp_kv_chunk_size) == self.cp_rank
+            get_cp_owner(owner_positions, self.cp_size, self.cp_kv_chunk_size)
+            == self.cp_rank
         )
         local_count = int(owner_mask.sum().item())
-        out_slots = torch.full_like(positions, DUMMY_SLOT, dtype=torch.int64)
         if local_count == 0:
-            return out_slots
+            return torch.full_like(positions, DUMMY_SLOT, dtype=torch.int64)
 
         local_slots = self.base_allocator.alloc(local_count)
         if local_slots is None:
             return None
-        out_slots[owner_mask] = local_slots.to(device=out_slots.device)
+        if local_count == positions.numel():
+            return local_slots.to(device=positions.device).view_as(positions)
+
+        out_slots = torch.full_like(positions, DUMMY_SLOT, dtype=torch.int64)
+        owner_indices = owner_mask.reshape(-1).nonzero(as_tuple=False).squeeze(1)
+        if owner_indices.device != out_slots.device:
+            owner_indices = owner_indices.to(device=out_slots.device, non_blocking=True)
+        out_slots.view(-1)[owner_indices] = local_slots.to(device=out_slots.device)
         return out_slots
 
     def alloc_extend(

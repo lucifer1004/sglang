@@ -73,18 +73,25 @@ PD 分离(disaggregation)是后续必须支持项,但不能只靠把 prefill/dec
 都切到 FA3 解决。sharded-KV 下 PD 还需要改 KV transfer 协议、rank mapping 和
 DUMMY slot 过滤。当前设计先限定同拓扑 P/D,详见 §3.9。
 
-### 1.1 当前实现状态(2026-06-18)
+### 1.1 当前实现状态(2026-06-24)
 
-当前代码已经落地的是 **correctness-first sharded-KV** 路径:
+当前代码已经落地的是 **sharded-KV residency + decode true-sharded local-merge**:
 - Persistent KV cache 已按 CP owner 切片,非 owner token 使用 DUMMY slot 0;常驻 KV
-  显存随 `attn_cp_size` 下降。
-- Attention compute 当前为了精度对齐,先在 sharded CP group 内把本地 sharded KV
-  临时 all-reduce/gather 成 dense full-KV table,再调用 FA3。也就是说,当前实现先保证
-  "KV cache residency sharded",但还不是本文目标态的
-  "Q allgather + per-owner-chunk segment FA + LSE merge + output reduce-scatter"。
-- 因此,当前已经验证的是 **省常驻 KV 显存 + TP4 精度严格对齐**;prefill 算力分摊、
-  decode KV 读带宽下降、长上下文临时 buffer 峰值等性能收益,仍需要后续 ring/LSE
-  目标态实现和专项 benchmark 验证。
+  对同一 logical token 容量按 `attn_cp_size` 分摊。默认 auto profile 会把省下的
+  KV 显存重新用于扩大 scheduler-visible logical capacity,使 TP4+CP2 接近 TP4 的
+  `2x` logical KV 容量;如果用户显式设置较小的 `--max-total-tokens`,则该值作为
+  logical 上限,物理 KV pool 仍按 `logical / attn_cp_size` 分配。
+- Decode 默认走 full-Q local-merge:在 sharded CP group 内 Q head allgather,每个
+  rank 只读本地 owned KV shard 调 FA3,再 allgather O/LSE 并用 `merge_state_v2`
+  合并,最后切回本 rank 的 `H/TP` heads。这个路径已经避免 decode 阶段 dense
+  full-KV reconstruction,但 output 通信仍是 O/LSE allgather + 本地 merge,还不是目标态
+  `cp_lse_ag_out_rs` reduce-scatter primitive。
+- Prefill / chunked prefill 当前仍走 dense-gather correctness path。原因是已验证的
+  owner-segment local-merge 和 compact allgather+scatter prototype 在 1024-token
+  chunked prefill 形状下都更慢,不应在没有 fused kernel/FA backend 支持前替换主路径。
+- 当前精度标准是 token-level 对齐,不是 bit-wise / strict logprob 对齐。full-Q
+  local-merge 会改变浮点规约顺序,controlled strict logprob compare 仍有 `~1e0`
+  级别 max diff,但受测 prompts 和 MMLU/C-Eval token 输出保持一致。
 
 **已验证可用功能**:
 
@@ -92,24 +99,24 @@ DUMMY slot 过滤。当前设计先限定同拓扑 P/D,详见 §3.9。
 |---|---|---|
 | 基础启动参数 | 支持 | `--attn-cp-size 2 --attn-cp-mode sharded-kv --attn-cp-kv-chunk-size 1024` |
 | 拓扑 | 支持 `TP4 + CP2` | `tp_rank = sharded_attn_tp_rank * cp + sharded_cp_rank`,projection/o_proj 仍走 global TP |
-| Persistent sharded KV | 支持 | TP4 K/V 各约 18.72GB/rank;TP4+CP2 K/V 各约 9.13GB/rank(WeLM v4.5 attention-sink checkpoint) |
+| Persistent sharded KV | 支持 | slot owner 按 chunk 分配,非 owner token 使用 DUMMY slot 0;同 logical 容量下物理 KV 约为 `1/cp` |
+| Scheduler logical KV capacity | 支持 | auto profile 下 TP4+CP2 将 profiled physical-equivalent tokens 乘 `cp_size` 后暴露给 scheduler;实测 CP2 `798143` physical slots/rank 对应 `1596286` logical tokens |
 | Q/hidden 全 sequence | 支持 | sharded-KV 下禁用旧 in-seq/zigzag hidden split;QKV projection 仍全 sequence 计算 |
 | Fused QKV layout | 支持受限 | 仅支持 `attn_tp_size == total_num_kv_heads` 且 GQA 边界对齐的模型 |
-| Prefill / decode | 支持 | 两阶段都走 sharded-KV residency + FA3 dense-gather correctness path |
-| Chunked prefill | 支持 | 回归脚本使用 `chunked_prefill_size=1024`;controlled case 覆盖 64/512/1024/2048 prompt |
-| Batched request / batched decode | 支持基础场景 | controlled `/generate` 一次发送 4 个不同长度 prompt 并生成 token |
+| Prefill / chunked prefill | 支持 | sharded-KV residency + FA3 dense-gather correctness path;回归脚本使用 `chunked_prefill_size=1024` |
+| Decode / batched decode | 支持 | 默认 full-Q local-merge,支持 batched request;controlled `/generate` 一次发送 4 个不同长度 prompt 并生成 token |
 | WeLM kv mirror opt | 支持 | 回归脚本保持 `--enable-welm-kv-mirror-opt` |
 | Over encoding | 支持 | 回归脚本保持 `--enable-over-encoding` |
-| Ordinary decode cuda graph | 支持 | 回归脚本保持 cuda graph on,`--cuda-graph-max-bs 16` |
-| WeLM SWA | 支持当前 dense-gather path | FA3 看到 dense full-KV table,窗口语义与 TP4 对齐 |
-| Attention sink | 支持当前 dense-gather path | `/home/fhkong/models/WeLM-v4.5-80B-A3B-Instruct-for-debug-0529` 48 层 sink 全开,TP4 vs TP4+CP2 回归 0 diff |
+| Ordinary decode cuda graph | 支持 | full-Q local-merge 使用固定 workspace,回归保持 cuda graph on,`--cuda-graph-max-bs 16` |
+| WeLM SWA | 支持 | decode 使用 local SWA page table + local-merge;prefill 仍走 dense-gather correctness path |
+| Attention sink | 支持 | decode local-merge 中 sink 只在 CP rank 0 注入一次;attention-sink checkpoint 回归 token 对齐 |
 
 **精度回归记录**:
 
 | 模型 | 配置 | 结果 |
 |---|---|---|
-| `/home/fhkong/models/80a3_v4d5_256k_merge_thinking_kimi_k25_0502_20260503_032335/epoch_003_step_0002610` | TP4 baseline vs TP4+CP2 sharded-KV,FA3,chunked prefill,kv mirror,over encoding,cuda graph | 100/100 samples,token mismatch 0,max/mean logprob diff 0 |
-| `/home/fhkong/models/WeLM-v4.5-80B-A3B-Instruct-for-debug-0529` | 同上,且 48 层 attention sink 全开 | controlled compare `max_diff=0`;MMLU/C-Eval 100/100 samples,token mismatch 0,max/mean logprob diff 0;artifact `/tmp/welmv4_attncp_precision/20260618_165056` |
+| `/home/fhkong/models/80a3_v4d5_256k_merge_thinking_kimi_k25_0502_20260503_032335/epoch_003_step_0002610` | TP4 baseline vs TP4+CP2 sharded-KV,FA3,chunked prefill,kv mirror,over encoding,cuda graph | MMLU/C-Eval 100/100 samples token mismatch 0;controlled output token/text 一致;strict logprob 不声明 bit-wise 对齐 |
+| `/home/fhkong/models/WeLM-v4.5-80B-A3B-Instruct-for-debug-0529` | 同上,且 48 层 attention sink 全开 | controlled output token/text 一致;MMLU/C-Eval 100/100 samples token mismatch 0;strict logprob 仍可能因 local-merge 规约顺序出现 diff |
 
 **当前不支持 / 不应声明支持**:
 
@@ -119,8 +126,8 @@ DUMMY slot 过滤。当前设计先限定同拓扑 P/D,详见 §3.9。
 | `page_size > 1` | 启动期拒绝 | 当前 allocator / req_to_token_pool / metadata 都是 token-slot 语义;需要 page-level owner/DUMMY |
 | DP attention / AttnDP | 启动期拒绝 | 当前只支持 `dp_size=1`,`enable_dp_attention=False` |
 | PP | 未验证,不要声明支持 | 需要补 PP proxy tensor、metadata 生命周期、o_proj/kv mirror/cuda graph 专项回归 |
-| 非 FA3 backend | 启动期拒绝 | 当前 correctness path 依赖 FA3 `flash_attn_with_kvcache` |
-| `kv_cache_dtype != auto` / FP8/FP4 KV cache | 启动期拒绝或运行期不支持 | 当前 sharded dense-gather path 不支持 KV descale tensor |
+| 非 FA3 backend | 启动期拒绝 | 当前 prefill dense path 和 decode local-merge 都依赖 FA3 `flash_attn_with_kvcache` |
+| `kv_cache_dtype != auto` / FP8/FP4 KV cache | 启动期拒绝或运行期不支持 | 当前 sharded-KV dense/local-merge path 都未适配 KV descale tensor |
 | MLA / cross attention / encoder-decoder | 不支持 | sharded-KV path 针对 WeLM/GQA MHA 首发,MLA 与 cross-attn 需要独立设计 |
 | Radix cache / chunked prefix cache hit | 自动禁用 | DUMMY slot 与跨 CP prefix hit 语义尚未适配 |
 | CPU KV offload / hierarchical cache | 启动期拒绝 | offload/load/free 路径必须识别 DUMMY slot,当前未实现 |
@@ -132,21 +139,101 @@ DUMMY slot 过滤。当前设计先限定同拓扑 P/D,详见 §3.9。
 
 **当前主要风险**:
 
-1. **文档目标态与当前实现形态不同**:当前 dense-gather path 保证精度和常驻 KV 省显存,
-   但不代表最终 ring/LSE path 的数值、峰值显存和性能。后续切到 segment/LSE 时需要重新
-   跑完整精度回归,尤其是 attention sink、SWA、over encoding、kv mirror。
-2. **临时 full-KV buffer 峰值**:TP4+CP2 常驻 KV 已减半,但 attention 内部会临时构造
-   dense full KV。长上下文、cuda graph capture bucket 或大 batch 下可能重新抬高峰值显存。
-3. **Attention sink 后续改造风险**:dense-gather path 只调用一次 FA,天然不会重复注入
-   sink;真正 segment/LSE path 必须保证 sink 只由一个 CP rank 注入一次,否则 softmax
+1. **文档目标态与当前实现形态仍不同**:decode 已经是 true-sharded local-merge,
+   但 prefill 仍是 dense-gather,output merge 也还不是 fused `cp_lse_ag_out_rs`。
+   后续切到 segment/LSE 或 reduce-scatter primitive 时需要重新跑完整精度回归,尤其是
+   attention sink、SWA、over encoding、kv mirror。
+2. **strict logprob 不等价**:decode local-merge 改变跨 CP shard 的 softmax state
+   规约顺序,当前只声明 output token/text 对齐。若业务要求 strict logprob 对齐,必须
+   回退 dense correctness path 或实现更接近单次 FA 数值行为的低层 primitive。
+3. **Prefill 临时 full-KV buffer 峰值**:TP4+CP2 常驻 KV 已减半,但 prefill/chunked
+   prefill 仍会临时构造 dense full KV。长上下文、cuda graph capture bucket 或大 batch
+   下可能重新抬高峰值显存。
+4. **Attention sink 后续改造风险**:decode local-merge 当前约定只由 CP rank 0 注入
+   sink;任何新的 segment/LSE/reduce-scatter path 都必须保持这个不变量,否则 softmax
    denominator 会重复计数。
-4. **DUMMY slot 旁路风险**:任何扫描 `req_to_token_pool` 的新路径(cache write、debug dump、
+5. **DUMMY slot 旁路风险**:任何扫描 `req_to_token_pool` 的新路径(cache write、debug dump、
    offload、PD transfer、abort/retract)如果漏过滤 slot 0,可能出现误释放、误传输或读空 KV。
-5. **`cp_kv_chunk_size` 工作负载敏感**:默认 1024 有利于连续 KV segment,但短请求负载可能
+6. **`cp_kv_chunk_size` 工作负载敏感**:默认 1024 有利于连续 KV segment,但短请求负载可能
    偏向低 CP rank;正确性测试建议用 128/256 覆盖 owner 边界,性能基线覆盖 512/1024/2048。
-6. **组合特性缺口**:当前回归覆盖单机 TP4/CP2、kv mirror、over encoding、chunked prefill、
+7. **组合特性缺口**:当前回归覆盖单机 TP4/CP2、kv mirror、over encoding、chunked prefill、
    ordinary cuda graph、attention sink;尚未覆盖 PD、PP、DP attention、piecewise graph、
    spec decode、高并发 abort/retract 等组合。
+
+### 1.2 性能定位更新(2026-06-24)
+
+当前 `perf/welm-v4-optimization` 分支上的 sharded-KV CP 已经从 dense correctness
+path 推进到 decode local-merge 默认路径,但还没有达到本文目标态的 fused
+`cp_lse_ag_out_rs` / prefill 分摊路径。
+
+最新 8k input / 512 output / concurrency=4 / 16 prompts 回测:
+
+| 配置 | Output throughput | Mean TTFT | Mean ITL | Peak memory |
+|---|---:|---:|---:|---:|
+| TP4 | `336.06 tok/s` | `1623.15 ms` | `8.76 ms` | `81665 MiB` |
+| TP4+CP2 sharded-KV local-merge decode | `281.98 tok/s` | `1837.94 ms` | `10.63 ms` | `63299 MiB` |
+
+结论:
+
+- **精度按当前任务标准对齐**:TP4 vs TP4+CP2 controlled output token/text 一致,
+  MMLU/C-Eval 100 samples `token mismatch=0`。strict logprob 不声明等价。
+- **常驻 KV 显存已经下降**:8k/512/c4 场景峰值显存从约 `81.7 GiB/rank` 降到
+  `63.3 GiB/rank`。
+- **性能 gap 仍存在但已不是 dense path 的 2x ITL**:当前 TP4+CP2 相比 TP4
+  TTFT 约 `+13.2%`,ITL 约 `+21.4%`。这是当前需要继续优化的真实基线。
+- Service decode profile 显示,local-merge 后 FA 本身变快,主要慢点转移到每层 CP
+  collectives 和 merge/copy overhead:CP2 每 decode step 约 `97` 个 NCCL kernel
+  (`2*num_layers + 1`),NCCL 时间约 `0.664 ms/step`,TP4 对应约 `0.014 ms/step`。
+- 已做的低风险 cleanup 只能带来小幅收益:Q allgather 后的 full-Q layout pack 已从
+  per-CP slice copy 改成单次 strided copy,局部 microbench 中 CP2 pack 从
+  `~16.2 us` 降到 `~6.9 us`,端到端 CP2 ITL 从 `10.71 ms` 小幅降到 `10.63 ms`。
+- 已验证 `LSE allgather + Triton LSE reduce + Triton O scale/pack +
+  reduce_scatter` 的 runtime 实验路径精度可过,但端到端无收益:
+  `/tmp/welmv4_attncp_precision/20260624_100330` 中 TP4 vs TP4+CP2 token
+  mismatch `0/100`、max/mean logprob diff `0.00e+00`;对应 benchmark
+  `/tmp/welmv4_attncp_perf/20260624_100804` 中 TP4+CP2 ITL `10.6318 ms`,
+  与默认 local-merge 的 `10.6340 ms` 属于噪声级,TTFT 还略差。该临时
+  runtime 分支已移除,只保留 standalone benchmark prototype 作后续参考。
+- 独立 one-layer CUDA graph microbench 显示,当前 full-Q local-merge 是已测 decode
+  变体里最快的普通组合:`target_sharded_fullq ~= 61.6 us/layer`,q-loop
+  `~= 100 us/layer`,slice all-to-all `~= 67.8 us/layer`。
+- Attention sink 有可见但非主导成本:禁用 sink 后 full-Q local-merge 从约
+  `61.6 us/layer` 降到 `55.5 us/layer`,约 `6 us/layer`。现有 path 已缓存
+  full sink,暂时没有证据表明 repeated sink allgather 是瓶颈。
+- Prefill/TTFT gap 仍要单独看。当前 chunked prefill 仍使用 dense reconstruction;
+  已测 segment local-merge 和 compact allgather+scatter 都慢于当前 dense path。
+- 训练 overlap 代码不能直接搬到 serving decode:Q gather 必须在 FA 前完成,O/LSE
+  merge 必须在 o_proj 前完成;gate/router 等后续计算依赖 attention 输出,不能隐藏前置
+  Q gather。
+
+已证伪/不建议继续投入的方向:
+
+- **q-loop 服务端路径**:数值可用但比 full-Q local-merge 慢,已从 runtime
+  `flashattention_backend.py` 移除;只在 microbench 中保留历史对照价值。
+- **Python-level / runtime 组合式 `LSE allgather + O reduce_scatter`**:数学正确,
+  但 torch 版慢;Triton pack/reduce runtime 实验精度通过,端到端 ITL 与默认
+  local-merge 持平(`10.6340 ms` → `10.6318 ms`),没有实质收益。要有收益
+  需要更底层 fused comm/merge primitive,不是简单 Python/NCCL 组合。
+- **Prefill segment local-merge**:在 1024-token chunked prefill 下多次 FA launch +
+  merge 的成本高于 dense reconstruction。
+- **Python-level compact all-gather 重建**:精度可过,但 benchmark 无收益或更慢;额外的
+  compact buffer scatter、page-table reconstruction 和 workspace 成本抵消通信收益。
+- **单纯 page_table 切片 / graph cap 微调**:不能改变 decode local-merge 的主要每层
+  Q/O/LSE collective 结构,不是当前 gap 的主修复。
+- **直接搬训练 overlap 代码**:训练侧 overlap 主要隐藏 QKV projection all2all,而 serving
+  decode 的瓶颈在 attention 内部依赖链上,不能直接解决。
+
+下一步最小可行优化切口:
+
+1. 先固定当前真实基线,不要继续做零散优化:8k/512/c4 下 TTFT `+13.2%`,ITL
+   `+21.4%`,token 输出对齐,常驻 KV 显存下降约 `17.9 GiB/rank`。
+2. 如果继续优化 decode,优先目标不是再加一个 Python 通信组合,而是减少每层 CP
+   collective/merge 开销:例如 fused `cp_lse_ag_out_rs`、更低层的 LSE merge + O
+   exchange primitive,或能减少 `2*num_layers` 级 NCCL launch 的实现。
+3. 如果继续优化 TTFT/prefill,需要新的 FA backend 或 fused reconstruction,让 FA 能高效
+   消费 owner-segmented KV;已测 Python segment loop 和 compact AG 都不够好。
+4. 任何新优化都必须先用 one-layer microbench 证明超过当前 full-Q local-merge,再进服务端
+   benchmark 和精度回归。否则容易把代码复杂度加大,但不缩小 TTFT/ITL gap。
 
 ---
 
@@ -519,6 +606,12 @@ slot_count_per_rank = max_total_tokens / cp_size × num_kv_heads_local × head_d
                     = max_total_tokens / cp × (K / attn_tp) × D
 ```
 
+其中 `max_total_tokens` 在 sharded-KV mode 下表示 scheduler-visible logical token
+容量。auto profile 会先按普通 TP full-KV 估出每 rank 可承载的 physical-equivalent
+tokens,再乘 `attn_cp_size` 作为 logical capacity;底层 KV pool 分配时仍除以
+`attn_cp_size`,保证每 rank 的物理 KV slot 数接近 profile 结果。用户显式传入
+`--max-total-tokens` 时,该值直接作为 logical cap,不会再被自动乘 `attn_cp_size`。
+
 **Slot owner 规则(首版固定)**:
 - `page_size = 1`。`page_size > 1` 启动时必须拒绝或 fallback 到非 sharded-KV 路径,
   不能 silent 进入 sharded-KV。
@@ -726,6 +819,7 @@ KV cache transfer 必须保持 "KV 按 CP owner 永久切片" 的语义。
 | 模型 attention 层(`welmv4.py` 首发)| QKV proj 使用 global `QKVParallelLinear(tp_size=tp_size)`;强 assert `attn_tp_size == num_kv_heads`;attention forward 入口加 sharded_kv_cp_group 内 Q/headwise 参数 allgather + 出口 cp_lse_ag_out_rs;保留 WeLM kv mirror / over encoding row contraction 语义 | ~260 行 |
 | `o_proj` | 保持现有 `RowParallelLinear(tp_size=tp_size)` + 全 tp_group all_reduce,不引入 sharded_kv_attn_tp_group 特殊路径 | 0 行(直接复用)|
 | `cp_utils.py` | 1) 新加 `cp_q_allgather_head` 原语(sharded_kv_cp_group 内 head 维 allgather);2) 新加 `cp_lse_ag_out_rs`(LSE allgather + 跨 cp merge + heads reduce_scatter);3) 删 V1 的 ring-pass-kv 相关 helper | +250 行,-200 行 |
+| `sgl-kernel` / graph-safe decode primitive | 新增 full-attention decode sharded-KV primitive 或 wrapper:复用 FA3 paged-KV partial attention(`flash_attn_with_kvcache` 支持 `return_softmax_lse=True`),但把 Q-head gather workspace、partial O/LSE workspace、CP partial state merge 和 local TP head slice 输出组织成固定 shape。不能只靠 Python 多 FA loop;已有 q-granular Python 路径 eager 慢且 cuda graph capture 卡住 | ~300-600 行(取决于是否扩展 FA3 op) |
 | 新建 `mem_cache/cp_sharded_allocator.py` + attention metadata | 切片 slot 分配器、per-rank compact page table、local cache_seqlens、local_kv_positions、owner/DUMMY slot 映射与 release/rollback/overlap 生命周期过滤 | ~550-750 行 |
 | `attention/flashattention_backend.py` | 新增 sharded-KV path:Q allgather → per-owner-chunk segment loop FA + local LSE merge → cp_lse_ag_out_rs。prefill 和 decode 走同一个函数,差异只在写池规则;支持 chunked prefill、SWA、sink、kv mirror contraction、over encoding positions | ~420 行 |
 | 模型层入口/出口 | 入口 cp_split / 出口 cp_gather 接线**移除**(本方案 hidden 不切);首版仅 WeLM fused QKV 约束内落地 | -50 行(净减少)|
@@ -778,6 +872,7 @@ attention 还走 replicated KV(shadow path),仅校验 group 构造 + slot 分配
 |---|---|
 | 2.1 sharded-KV attention forward:Q allgather → per-chunk segment FA → cp_lse_ag_out_rs | 单测对拍 replicated 路径 |
 | 2.2 Per-owner-chunk segment causal mask(拆 FA + LSE merge 的 portable 路径) | mask 单测 + 边界 case(chunk 边界、SWA window 边界)|
+| 2.3a Decode full-attention prototype primitive:固定 workspace + 原始 TP Q-head 粒度 partial attention + CP partial merge + local head slice | 单层 microbench + controlled decode token 不漂;graph capture 至少覆盖 bs=1/2/4/8/12/16 |
 | 2.3 KV pool 切片写入(只 owner 写,其他 DUMMY)| 内存占用 ÷ cp |
 | 2.4 Chunked prefill:Q allgather + 本 rank pool owned KV segment loop(prefix + self 统一)| 长 prompt 对拍 baseline |
 | 2.5 Decode 同 path(seq_len=B,KV 来源 pool)| Decode 数学对拍 |
