@@ -4,7 +4,7 @@ import bisect
 import contextlib
 from dataclasses import dataclass
 from functools import partial
-from typing import TYPE_CHECKING, Callable, Optional
+from typing import TYPE_CHECKING, Callable, List, Optional
 
 import torch
 import torch.nn.functional as F
@@ -188,6 +188,15 @@ class WelmMTPDraftProposalCudaGraphRunner:
         self.seq_len_fill_value = (
             self.draft_extend_attn_backend.get_cuda_graph_seq_len_fill_value()
         )
+        # MR !151 added seq_len bucketing to CudaGraphRunner.capture(); mirror
+        # the interface here so CudaGraphRunner.capture(self) (duck-typed) works.
+        # The draft proposal graph is DRAFT_EXTEND (not decode) and does not use
+        # AttnCP sharded-KV bucketing, so each bs maps to a single fill value and
+        # the graph key carries no seq_len bucket suffix.
+        self.seq_len_fill_values_by_bs = {
+            int(bs): [self.seq_len_fill_value] for bs in self.capture_bs
+        }
+        self.enable_seq_len_graph_buckets = False
         self.extend_seq_lens_cpu = [self.num_tokens_per_bs] * self.max_bs
 
         if self.enable_torch_compile:
@@ -1071,10 +1080,36 @@ class WelmMTPDraftProposalCudaGraphRunner:
         with ctx:
             self.graphs[self.bs].replay()
 
+    def _seq_len_fill_values_for_bs(self, bs: int) -> List[int]:
+        return self.seq_len_fill_values_by_bs.get(int(bs), [self.seq_len_fill_value])
+
+    def _graph_seq_len_key(self, seq_len_fill_value: Optional[int]):
+        # Draft proposal graphs are not bucketed by seq_len (no AttnCP sharded
+        # KV, non-decode mode). Returning None keeps replay's
+        # self.graphs[self.bs] lookup consistent with capture's graph key
+        # (no "_s{N}" suffix is appended).
+        return None
+
+    def _post_process_after_profile(self, prof):
+        # Reuse CudaGraphRunner's implementation for parity when
+        # enable_profile_cuda_graph is set.
+        CudaGraphRunner._post_process_after_profile(self, prof)
+
     def capture(self):
         CudaGraphRunner.capture(self)
 
-    def capture_one_batch_size(self, bs: int, forward: Callable, stream_idx: int = 0):
+    def capture_one_batch_size(
+        self,
+        bs: int,
+        forward: Callable,
+        stream_idx: int = 0,
+        seq_len_fill_value: Optional[int] = None,
+    ):
+        fill_value = (
+            int(seq_len_fill_value)
+            if seq_len_fill_value is not None
+            else self.seq_len_fill_value
+        )
         buffers = self.buffers
         graph = self._create_graph()
         stream = self.stream
@@ -1161,7 +1196,7 @@ class WelmMTPDraftProposalCudaGraphRunner:
             req_to_token_pool=self.model_runner.req_to_token_pool,
             token_to_kv_pool=self.model_runner.token_to_kv_pool,
             out_cache_loc=out_cache_loc,
-            seq_lens_sum=int(self.seq_len_fill_value) * bs,
+            seq_lens_sum=int(fill_value) * bs,
             return_logprob=False,
             positions=positions,
             mrope_positions=mrope_positions,
