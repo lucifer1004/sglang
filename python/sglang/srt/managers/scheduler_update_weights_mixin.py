@@ -23,6 +23,8 @@ from sglang.srt.managers.io_struct import (
     GetWeightsByNameReqOutput,
     InitWeightsUpdateGroupReqInput,
     InitWeightsUpdateGroupReqOutput,
+    PostProcessWeightsReqInput,
+    PostProcessWeightsReqOutput,
     ReleaseMemoryOccupationReqInput,
     ReleaseMemoryOccupationReqOutput,
     ResumeMemoryOccupationReqInput,
@@ -35,8 +37,6 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromIPCReqOutput,
     UpdateWeightsFromTensorReqInput,
     UpdateWeightsFromTensorReqOutput,
-    PostProcessWeightsReqInput,
-    PostProcessWeightsReqOutput,
 )
 
 if TYPE_CHECKING:
@@ -70,14 +70,27 @@ class SchedulerUpdateWeightsMixin:
     def init_weights_update_group(
         self: Scheduler, recv_req: InitWeightsUpdateGroupReqInput
     ):
-        """Initialize the online model parameter update group."""
+        """Initialize the online model parameter update group.
+
+        NOTE: only the target worker joins the NCCL process group. The draft
+        worker does NOT join (it shares ``tp_rank`` with the target, so it
+        cannot take a distinct rank in the same group, and a separate group
+        would require trainer-side coordination). Instead the draft receives
+        weights in-process through ``update_weights_from_distributed``, which
+        mirrors how ``update_weights_from_tensor`` updates both models from one
+        set of tensors. Therefore ``init``/``destroy`` do not touch the draft.
+        """
         success, message = self.tp_worker.init_weights_update_group(recv_req)
         return InitWeightsUpdateGroupReqOutput(success, message)
 
     def destroy_weights_update_group(
         self: Scheduler, recv_req: DestroyWeightsUpdateGroupReqInput
     ):
-        """Destroy the online model parameter update group."""
+        """Destroy the online model parameter update group.
+
+        NOTE: see ``init_weights_update_group`` — the draft never joins the
+        NCCL group, so there is nothing to destroy on the draft side.
+        """
         success, message = self.tp_worker.destroy_weights_update_group(recv_req)
         return DestroyWeightsUpdateGroupReqOutput(success, message)
 
@@ -85,12 +98,38 @@ class SchedulerUpdateWeightsMixin:
         self,
         recv_req: UpdateWeightsFromDistributedReqInput,
     ) -> Tuple[bool, str]:
-        """Update the online model parameter."""
-        success, message = self.tp_worker.update_weights_from_distributed(recv_req)
-        if success:
-            self.flush_cache_after_weight_update(recv_req)
-        else:
+        """Update the online model parameter.
+
+        The target receives the weights once via the NCCL process group, then
+        both the target and the draft model are loaded in-process from the same
+        received tensors. This mirrors ``update_weights_from_tensor`` and avoids
+        the draft having to join the NCCL group (which is impossible: the draft
+        shares ``tp_rank`` with the target, and the trainer allocates no extra
+        ranks for it). The trainer is expected to broadcast the union of target
+        and draft (e.g. MTP/NEXTN) parameters; each model's ``load_weights``
+        skips parameter names it does not own.
+        """
+        success, message, received = self.tp_worker.receive_weights_from_distributed(
+            recv_req
+        )
+        if not success:
             logger.error(message)
+            return UpdateWeightsFromDistributedReqOutput(success, message)
+
+        # Load into the target model.
+        success, message = self.tp_worker.load_weights_from_distributed(received)
+        if not success:
+            logger.error(message)
+            return UpdateWeightsFromDistributedReqOutput(success, message)
+
+        # Load the same received tensors into the draft model in-process.
+        if self.draft_worker is not None and received:
+            success, message = self.draft_worker.load_weights_from_distributed(received)
+            if not success:
+                logger.error(message)
+                return UpdateWeightsFromDistributedReqOutput(success, message)
+
+        self.flush_cache_after_weight_update(recv_req)
         return UpdateWeightsFromDistributedReqOutput(success, message)
 
     def update_weights_from_tensor(

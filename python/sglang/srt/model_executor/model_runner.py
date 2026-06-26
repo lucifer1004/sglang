@@ -141,20 +141,16 @@ from sglang.srt.model_executor.cuda_graph_runner import (
     DecodeInputBuffers,
     set_torch_compile_config,
 )
+from sglang.srt.model_executor.forward_batch_context import set_current_forward_batch
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
     ForwardMode,
     PPProxyTensors,
 )
-from sglang.srt.model_executor.forward_batch_context import set_current_forward_batch
 from sglang.srt.model_executor.hook_manager import register_forward_hooks
 from sglang.srt.model_executor.model_runner_kv_cache_mixin import (
     ModelRunnerKVCacheMixin,
-)
-from sglang.srt.models.welm_perf_opt import (
-    get_welm_oe_hash_config,
-    should_use_welm_oe_hash_kernel,
 )
 from sglang.srt.model_executor.piecewise_cuda_graph_runner import (
     PiecewiseCudaGraphRunner,
@@ -168,6 +164,10 @@ from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
 )
 from sglang.srt.model_loader.utils import set_default_torch_dtype
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.models.welm_perf_opt import (
+    get_welm_oe_hash_config,
+    should_use_welm_oe_hash_kernel,
+)
 from sglang.srt.platforms import current_platform
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.server_args import (
@@ -1997,6 +1997,90 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             logger.error(message)
             return False, message
 
+    def receive_weights_from_distributed(
+        self,
+        names,
+        dtypes,
+        shapes,
+        group_name,
+        load_format: Optional[str] = None,
+    ):
+        """Receive weights from rank 0 via ``_model_update_group`` WITHOUT
+        loading them into the model.
+
+        Returns ``(success, message, received_weights)`` where
+        ``received_weights`` is a list of ``(name, tensor)`` filled by the NCCL
+        broadcast. This lets the scheduler load the same received tensors into
+        multiple in-process models (e.g. the target model and the speculative
+        draft model) while performing the NCCL broadcast only once: the draft
+        model shares the GPU/process with the target and therefore cannot join
+        the process group with a distinct rank. Mirrors
+        ``update_weights_from_distributed`` minus the ``load_weights`` step.
+        """
+        assert group_name in self._model_update_group, (
+            f"Group {group_name} not in {list(self._model_update_group.keys())}. "
+            "Please call `init_weights_update_group` first."
+        )
+
+        if load_format == "flattened_bucket":
+            return self._receive_bucketed_weights_from_distributed(
+                names, dtypes, shapes, group_name
+            )
+        try:
+            weights = []
+            handles = []
+            for name, dtype, shape in zip(names, dtypes, shapes):
+                target_dtype = (
+                    dtype if isinstance(dtype, torch.dtype) else getattr(torch, dtype)
+                )
+                weight = torch.empty(shape, dtype=target_dtype, device=self.device)
+                handles.append(
+                    torch.distributed.broadcast(
+                        weight,
+                        src=0,
+                        group=self._model_update_group[group_name],
+                        async_op=True,
+                    )
+                )
+                weights.append((name, weight))
+            for handle in handles:
+                handle.wait()
+            return True, "Succeeded to receive parameter online.", weights
+        except Exception as e:
+            error_msg = f"Failed to receive parameter online: {e}."
+            logger.error(error_msg)
+            return False, error_msg, []
+
+    def _receive_bucketed_weights_from_distributed(
+        self, names, dtypes, shapes, group_name
+    ):
+        try:
+            named_tensors = []
+            for name, dtype, shape in zip(names, dtypes, shapes):
+                target_dtype = (
+                    dtype if isinstance(dtype, torch.dtype) else getattr(torch, dtype)
+                )
+                named_tensors.append(
+                    (name, torch.empty(shape, dtype=target_dtype, device=self.device))
+                )
+            bucket = FlattenedTensorBucket(named_tensors=named_tensors)
+            flattened_tensor = bucket.get_flattened_tensor()
+            torch.distributed.broadcast(
+                flattened_tensor,
+                src=0,
+                group=self._model_update_group[group_name],
+            )
+            reconstructed_tensors = list(bucket.reconstruct_tensors())
+            return (
+                True,
+                "Succeeded to receive parameter online.",
+                reconstructed_tensors,
+            )
+        except Exception as e:
+            error_msg = f"Failed to receive parameter online: {e}."
+            logger.error(error_msg)
+            return False, error_msg, []
+
     def update_weights_from_distributed(
         self,
         names,
@@ -2704,10 +2788,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         hf_config = self.model_config.hf_config
         kv_mirror_layers = []
         kv_mirror_tensor_size = None
-        if (
-            self.server_args.pp_size > 1
-            and self.server_args.enable_welm_kv_mirror_opt
-        ):
+        if self.server_args.pp_size > 1 and self.server_args.enable_welm_kv_mirror_opt:
             num_hidden_layers = getattr(hf_config, "num_hidden_layers", 0)
             kv_mirror_layers = [
                 int(layer_idx)

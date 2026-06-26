@@ -29,13 +29,13 @@ from sglang.srt.managers.io_struct import (
     InitWeightsUpdateGroupReqInput,
     LoadLoRAAdapterFromTensorsReqInput,
     LoadLoRAAdapterReqInput,
+    PostProcessWeightsReqInput,
     SendWeightsToRemoteInstanceReqInput,
     UnloadLoRAAdapterReqInput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromIPCReqInput,
     UpdateWeightsFromTensorReqInput,
-    PostProcessWeightsReqInput,
 )
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch, ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
@@ -155,6 +155,39 @@ class BaseTpWorker(ABC):
             recv_req.load_format,
         )
         return success, message
+
+    def receive_weights_from_distributed(
+        self, recv_req: UpdateWeightsFromDistributedReqInput
+    ):
+        """Receive weights from rank 0 via the process group without loading.
+
+        Returns ``(success, message, received_weights)``. The caller (scheduler
+        mixin) loads ``received_weights`` into the target model and, when a
+        draft model is present, into the draft model in-process — so the NCCL
+        broadcast runs only once while both models get updated. The draft model
+        cannot join the process group itself because it shares ``tp_rank`` with
+        the target.
+        """
+        success, message, received = self.model_runner.receive_weights_from_distributed(
+            recv_req.names,
+            recv_req.dtypes,
+            recv_req.shapes,
+            recv_req.group_name,
+            recv_req.load_format,
+        )
+        return success, message, received
+
+    def load_weights_from_distributed(self, received):
+        """Load already-received (name, tensor) pairs into this worker's model.
+
+        Used by the scheduler mixin to load weights that were received once via
+        NCCL into additional in-process models (the speculative draft worker).
+        v1 spec workers (EAGLE/FrozenKVMTP/MultiLayerEagle) inherit this and
+        load into their own draft ``model_runner``; v2 spec workers override it
+        to reach their inner draft runner.
+        """
+        self.model_runner.model.load_weights(received)
+        return True, "Succeeded to update model weights."
 
     def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
 

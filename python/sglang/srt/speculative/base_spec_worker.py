@@ -40,3 +40,17 @@ class BaseSpecWorker(ABC):
         controller without forcing a GPU→CPU sync in the worker hot path.
         """
         pass
+
+    def load_weights_from_distributed(self, received):
+        """Load already-received (name, tensor) pairs into the draft model.
+
+        Called by the scheduler mixin after the target received the weights
+        once via NCCL. Subclasses that own draft weights (e.g. EAGLEWorkerV2,
+        MultiLayerEagleWorkerV2) override this to reach their inner draft
+        runner. The default raises so missing overrides are caught early.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not implement "
+            "load_weights_from_distributed; draft weights cannot be updated "
+            "via the distributed path."
+        )

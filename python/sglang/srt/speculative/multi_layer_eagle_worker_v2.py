@@ -833,3 +833,14 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
             if not success:
                 return success, message
         return True, "Succeeded to update model weights."
+
+    def load_weights_from_distributed(self, received):
+        """Load already-received (name, tensor) pairs into every draft layer.
+
+        Mirrors ``update_weights_from_disk``'s fan-out over
+        ``draft_runner_list``. The target receives weights once via NCCL in the
+        scheduler mixin; here each draft runner loads them in-process.
+        """
+        for i in range(self.speculative_num_steps):
+            self._draft_worker.draft_runner_list[i].model.load_weights(received)
+        return True, "Succeeded to update draft model weights."

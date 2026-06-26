@@ -350,6 +350,16 @@ class DFlashWorker:
         # to flush here.
         pass
 
+    def load_weights_from_distributed(self, received):
+        """Load already-received (name, tensor) pairs into the draft model.
+
+        DFlash owns an independent draft model (``draft_model_runner``). The
+        target received the weights once via NCCL in the scheduler mixin; this
+        loads the same tensors into the draft model in-process.
+        """
+        self.draft_model_runner.model.load_weights(received)
+        return True, "Succeeded to update draft model weights."
+
     def _gather_req_to_token_masked(
         self,
         *,
