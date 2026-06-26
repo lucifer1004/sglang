@@ -125,9 +125,11 @@ class CompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
         layer.register_parameter("w2_weight_packed", w2_weight)
         set_weight_attrs(w2_weight, extra_weight_attrs)
 
-        # In the case where we have actorder/g_idx,
-        # we do not partition the w2 scales
-        load_full_w2 = (self.actorder != "static") and self.group_size != -1
+        # In the case where we have actorder/g_idx, we do not partition the w2
+        # scales. For non-actorder compressed-tensors checkpoints, the Marlin
+        # MoE kernel receives only the local W2 K shard, so W2 scales should
+        # stay sharded with the local W2 weight shard.
+        load_full_w2 = self.actorder not in (None, "static") and self.group_size != -1
 
         if load_full_w2:
             w2_scales_size = intermediate_size_per_partition * layer.moe_tp_size
