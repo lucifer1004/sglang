@@ -126,7 +126,12 @@ class SchedulerMetricsMixin:
             self.is_stats_logging_rank
             or self.server_args.enable_metrics_for_all_schedulers
         )
-        self.enable_mfu_metrics = False
+        self.enable_mfu_metrics = self.server_args.enable_mfu_metrics
+        if self.enable_mfu_metrics:
+            self._init_estimated_perf_constants()
+            self._mfu_log_flops = 0.0
+            self._mfu_log_read_bytes = 0.0
+            self._mfu_log_write_bytes = 0.0
 
         if self.enable_metrics:
             engine_type = DisaggregationMode.to_engine_type(
@@ -153,12 +158,6 @@ class SchedulerMetricsMixin:
                 enable_streaming_session=self.server_args.enable_streaming_session,
                 server_args=self.server_args,
             )
-            self.enable_mfu_metrics = self.server_args.enable_mfu_metrics
-            if self.enable_mfu_metrics:
-                self._init_estimated_perf_constants()
-                self._mfu_log_flops = 0.0
-                self._mfu_log_read_bytes = 0.0
-                self._mfu_log_write_bytes = 0.0
 
         self.fwd_occupancy = float("nan")
 
@@ -341,14 +340,19 @@ class SchedulerMetricsMixin:
         hf_text_config = model_config.hf_text_config
 
         hidden_size = float(model_config.hidden_size)
-        num_layers = float(getattr(model_config, "num_attention_layers", 0))
+        num_layers = int(
+            getattr(model_config, "num_attention_layers", None)
+            or getattr(model_config, "num_hidden_layers", 0)
+        )
         head_dim = float(getattr(model_config, "head_dim", 0))
         num_attn_heads = float(model_config.get_num_attention_heads(self.tp_size))
         num_kv_heads = float(model_config.get_num_kv_heads(self.tp_size))
+        tp_size = max(1, int(getattr(self, "tp_size", 1)))
         intermediate_size = getattr(hf_text_config, "intermediate_size", None)
         if intermediate_size is None:
             intermediate_size = getattr(hf_text_config, "ffn_hidden_size", 0)
         intermediate_size = float(intermediate_size)
+        vocab_size = float(getattr(model_config, "vocab_size", 0))
 
         dtype_num_bytes = getattr(model_config.dtype, "itemsize", None)
         if dtype_num_bytes is None:
@@ -360,22 +364,87 @@ class SchedulerMetricsMixin:
         cache_bytes = float(dtype_num_bytes)
 
         # Linear-layer FLOPs per token on one GPU.
-        attn_linear_flops = (
-            2.0 * hidden_size * head_dim * (num_attn_heads + 2.0 * num_kv_heads)
-            + 2.0 * hidden_size * head_dim * num_attn_heads
+        self._mfu_num_layers = num_layers
+        self._mfu_attn_q_flops = 2.0 * hidden_size * num_attn_heads * head_dim
+        self._mfu_attn_kv_flops = 2.0 * hidden_size * (2.0 * num_kv_heads * head_dim)
+        self._mfu_attn_o_flops = 2.0 * (num_attn_heads * head_dim) * hidden_size
+
+        is_welmv4 = getattr(hf_text_config, "model_type", "") == "welmv4_moe"
+        self._mfu_attn_gate_flops = (
+            2.0 * hidden_size * num_attn_heads if is_welmv4 else 0.0
         )
-        mlp_flops = (
-            6.0 * hidden_size * intermediate_size if intermediate_size > 0 else 0.0
+
+        moe_intermediate_size = getattr(hf_text_config, "moe_intermediate_size", None)
+        shared_expert_intermediate_size = getattr(
+            hf_text_config, "shared_expert_intermediate_size", None
+        )
+        has_shared_expert_gate = bool(
+            getattr(hf_text_config, "has_shared_expert_gate", True)
+        )
+        num_experts_per_tok = getattr(hf_text_config, "num_experts_per_tok", None)
+        num_experts = getattr(hf_text_config, "num_experts", None)
+        if (
+            is_welmv4
+            and moe_intermediate_size is not None
+            and shared_expert_intermediate_size is not None
+            and num_experts_per_tok is not None
+            and num_experts is not None
+        ):
+            # WeLM MoE has a replicated router and TP-sharded routed/shared experts.
+            router_flops = 2.0 * hidden_size * float(num_experts)
+            routed_moe_flops = (
+                6.0
+                * hidden_size
+                * float(num_experts_per_tok)
+                * float(moe_intermediate_size)
+                / tp_size
+            )
+            shared_moe_flops = (
+                6.0 * hidden_size * float(shared_expert_intermediate_size) / tp_size
+            )
+            shared_gate_flops = 2.0 * hidden_size if has_shared_expert_gate else 0.0
+            self._mfu_mlp_flops = (
+                router_flops
+                + routed_moe_flops
+                + shared_moe_flops
+                + shared_gate_flops
+            )
+        else:
+            self._mfu_mlp_flops = (
+                6.0 * hidden_size * intermediate_size if intermediate_size > 0 else 0.0
+            )
+
+        self._mfu_lm_head_flops = (
+            2.0 * hidden_size * vocab_size / tp_size if vocab_size > 0 else 0.0
+        )
+        self._mfu_q_o_gate_flops = (
+            self._mfu_attn_q_flops
+            + self._mfu_attn_o_flops
+            + self._mfu_attn_gate_flops
+        )
+        self._mfu_linear_flops_per_layer = (
+            self._mfu_q_o_gate_flops
+            + self._mfu_attn_kv_flops
+            + self._mfu_mlp_flops
         )
         self._linear_flops_per_token = max(
-            0.0, (attn_linear_flops + mlp_flops) * num_layers
+            0.0, self._mfu_linear_flops_per_layer * num_layers
         )
 
-        # Attention dot-product FLOPs coefficient to multiply token-context product.
-        # attn_qk + attn_av = 4 * q * TC * d * L
-        self._attn_dot_flops_coeff = 4.0 * num_attn_heads * head_dim * num_layers
+        # Attention dot-product FLOPs coefficient per token-context pair on one GPU.
+        # attn_qk + attn_av = 4 * q_heads * context * head_dim
+        self._mfu_attn_ctx_flops = 4.0 * num_attn_heads * head_dim
+        self._attn_dot_flops_coeff = self._mfu_attn_ctx_flops * num_layers
+        self._mfu_sliding_windows = self._init_mfu_sliding_windows(num_layers)
+        self._mfu_kv_mirror_layers = self._init_mfu_kv_mirror_layers(num_layers)
+        self._mfu_enable_welm_kv_mirror_opt = bool(
+            getattr(self.server_args, "enable_welm_kv_mirror_opt", False)
+        )
 
         # KV cache bytes (write one K and one V vector per generated token).
+        self._kv_cache_bytes_per_token_per_layer = (
+            2.0 * num_kv_heads * head_dim * cache_bytes
+        )
         self._kv_cache_bytes_per_token = (
             2.0 * num_layers * num_kv_heads * head_dim * cache_bytes
         )
@@ -418,19 +487,245 @@ class SchedulerMetricsMixin:
             num_attn_heads * head_dim * act_bytes * num_layers
         )
 
-    def _estimate_prefill_perf(
-        self: Scheduler, num_tokens: int
+    def _mfu_get_config_value(self: Scheduler, name: str, default=None):
+        for cfg in (
+            getattr(self.model_config, "hf_text_config", None),
+            getattr(self.model_config, "hf_config", None),
+            self.model_config,
+        ):
+            if cfg is not None and hasattr(cfg, name):
+                value = getattr(cfg, name)
+                if value is not None:
+                    return value
+        return default
+
+    @staticmethod
+    def _mfu_to_int_list(value) -> Optional[List[int]]:
+        if value is None:
+            return None
+        if hasattr(value, "tolist"):
+            value = value.tolist()
+        if isinstance(value, (int, float)):
+            return [int(value)]
+        return [int(x) for x in value]
+
+    @classmethod
+    def _mfu_get_int_list_attr(cls, obj, *names: str) -> Optional[List[int]]:
+        for name in names:
+            value = getattr(obj, name, None)
+            if value is None:
+                continue
+            return cls._mfu_to_int_list(value)
+        return None
+
+    @staticmethod
+    def _mfu_window_plus_current(window, max_position_embeddings: int) -> Optional[int]:
+        if window is None:
+            return None
+        window = int(window)
+        if window <= 0 or window >= max_position_embeddings:
+            return None
+        return window + 1
+
+    def _init_mfu_sliding_windows(
+        self: Scheduler, num_layers: int
+    ) -> Tuple[Optional[int], ...]:
+        max_position_embeddings = int(
+            self._mfu_get_config_value("max_position_embeddings", 10**18)
+        )
+        layerwise = self._mfu_get_config_value("sliding_window_size_layerwise", None)
+        if layerwise is not None and not isinstance(layerwise, (int, float, str)):
+            windows = list(layerwise)
+            return tuple(
+                self._mfu_window_plus_current(
+                    windows[i] if i < len(windows) else None,
+                    max_position_embeddings,
+                )
+                for i in range(num_layers)
+            )
+
+        scalar_window = None
+        for key in ("sliding_window_size", "sliding_window", "window_size"):
+            scalar_window = self._mfu_get_config_value(key, None)
+            if scalar_window is not None:
+                break
+        window = self._mfu_window_plus_current(scalar_window, max_position_embeddings)
+        return tuple(window for _ in range(num_layers))
+
+    def _init_mfu_kv_mirror_layers(self: Scheduler, num_layers: int) -> set[int]:
+        mirror_layers = self._mfu_get_config_value("kv_mirror_layers", []) or []
+        imitated_layers = self._mfu_get_config_value("kv_mirror_imitated_layers", []) or []
+        valid_layers: set[int] = set()
+        for mirror, imitated in zip(mirror_layers, imitated_layers):
+            mirror = int(mirror)
+            imitated = int(imitated)
+            if 0 <= mirror < num_layers and 0 <= imitated < num_layers:
+                valid_layers.add(mirror)
+        return valid_layers
+
+    def _mfu_prefill_items(
+        self: Scheduler, batch: Optional[ScheduleBatch], num_tokens: int, num_seqs: int
+    ) -> List[Tuple[int, int]]:
+        if batch is not None:
+            extend_lens = self._mfu_get_int_list_attr(
+                batch, "extend_lens", "extend_seq_lens_cpu", "extend_seq_lens"
+            )
+            prefix_lens = self._mfu_get_int_list_attr(
+                batch, "prefix_lens", "extend_prefix_lens_cpu", "extend_prefix_lens"
+            )
+            seq_lens_value = getattr(batch, "seq_lens_cpu", None)
+            if seq_lens_value is None:
+                seq_lens_value = getattr(batch, "seq_lens", None)
+            seq_lens = self._mfu_to_int_list(seq_lens_value)
+            chunked_prefill_size = int(
+                getattr(self.server_args, "chunked_prefill_size", 0) or 0
+            )
+            if not extend_lens and seq_lens and len(seq_lens) == max(1, num_seqs):
+                inferred_extend_lens = None
+                if len(seq_lens) == 1 and num_tokens <= seq_lens[0]:
+                    inferred_extend_lens = [num_tokens]
+                elif sum(seq_lens) == num_tokens:
+                    inferred_extend_lens = list(seq_lens)
+                else:
+                    per_seq_len, remainder = divmod(num_tokens, len(seq_lens))
+                    can_infer_uniform_extend = (
+                        remainder == 0
+                        and per_seq_len > 0
+                        and all(seq_len >= per_seq_len for seq_len in seq_lens)
+                        and (
+                            (
+                                chunked_prefill_size > 0
+                                and per_seq_len == chunked_prefill_size
+                            )
+                            or len(set(seq_lens)) == 1
+                        )
+                    )
+                    if can_infer_uniform_extend:
+                        inferred_extend_lens = [per_seq_len] * len(seq_lens)
+
+                if inferred_extend_lens is not None:
+                    return [
+                        (
+                            max(0, int(seq_len) - int(extend_len)),
+                            max(0, int(extend_len)),
+                        )
+                        for seq_len, extend_len in zip(seq_lens, inferred_extend_lens)
+                        if int(extend_len) > 0
+                    ]
+            if extend_lens and sum(extend_lens) == num_tokens:
+                if prefix_lens is None or len(prefix_lens) != len(extend_lens):
+                    prefix_lens = [0] * len(extend_lens)
+                if seq_lens is not None and len(seq_lens) == len(extend_lens):
+                    for i, (seq_len, extend_len) in enumerate(zip(seq_lens, extend_lens)):
+                        derived_prefix_len = int(seq_len) - int(extend_len)
+                        if derived_prefix_len > prefix_lens[i]:
+                            prefix_lens[i] = derived_prefix_len
+                reqs = getattr(batch, "reqs", None) or []
+                if reqs and len(reqs) == len(extend_lens):
+                    for i, (req, extend_len) in enumerate(zip(reqs, extend_lens)):
+                        if prefix_lens[i] > 0:
+                            continue
+                        extend_batch_idx = int(getattr(req, "extend_batch_idx", 0) or 0)
+                        if extend_batch_idx <= 1:
+                            continue
+                        origin_len = len(getattr(req, "origin_input_ids", []) or [])
+                        if origin_len <= extend_len:
+                            continue
+                        chunk_size = (
+                            chunked_prefill_size
+                            if chunked_prefill_size > 0
+                            else extend_len
+                        )
+                        inferred_prefix_len = (extend_batch_idx - 1) * chunk_size
+                        prefix_lens[i] = min(
+                            max(0, inferred_prefix_len),
+                            max(0, origin_len - int(extend_len)),
+                        )
+                return [
+                    (max(0, int(prefix_len)), max(0, int(extend_len)))
+                    for prefix_len, extend_len in zip(prefix_lens, extend_lens)
+                    if int(extend_len) > 0
+                ]
+
+        num_seqs = max(1, int(num_seqs))
+        base_len, remainder = divmod(num_tokens, num_seqs)
+        return [
+            (0, base_len + (1 if idx < remainder else 0))
+            for idx in range(num_seqs)
+            if base_len + (1 if idx < remainder else 0) > 0
+        ]
+
+    @staticmethod
+    def _mfu_prefill_context_sum(
+        prefix_len: int, extend_len: int, window_plus_current: Optional[int]
+    ) -> float:
+        if extend_len <= 0:
+            return 0.0
+        if window_plus_current is None:
+            return extend_len * prefix_len + extend_len * (extend_len + 1) / 2.0
+
+        uncapped = min(extend_len, max(0, window_plus_current - prefix_len))
+        return (
+            uncapped * prefix_len
+            + uncapped * (uncapped + 1) / 2.0
+            + (extend_len - uncapped) * window_plus_current
+        )
+
+    @staticmethod
+    def _mfu_last_context(
+        prefix_len: int, extend_len: int, window_plus_current: Optional[int]
+    ) -> float:
+        if extend_len <= 0:
+            return 0.0
+        context = prefix_len + extend_len
+        if window_plus_current is not None:
+            context = min(context, window_plus_current)
+        return float(context)
+
+    def _estimate_prefill_perf_from_batch(
+        self: Scheduler,
+        batch: Optional[ScheduleBatch],
+        num_tokens: int,
+        num_seqs: int,
     ) -> Tuple[float, float, float]:
         tokens = max(0, int(num_tokens))
         if tokens == 0:
             return 0.0, 0.0, 0.0
 
-        # Causal prefill token-context product.
-        context_product = tokens * (tokens + 1) / 2.0
-        flops = (
-            tokens * self._linear_flops_per_token
-            + self._attn_dot_flops_coeff * context_product
+        items = self._mfu_prefill_items(batch, tokens, num_seqs)
+        active_seqs = len(items)
+        enable_kv_mirror = (
+            self._mfu_enable_welm_kv_mirror_opt and len(self._mfu_kv_mirror_layers) > 0
         )
+        first_mirror_layer = (
+            min(self._mfu_kv_mirror_layers) if enable_kv_mirror else None
+        )
+
+        flops = tokens * self._mfu_num_layers * self._mfu_attn_kv_flops
+        for layer_idx in range(self._mfu_num_layers):
+            window = self._mfu_sliding_windows[layer_idx]
+            full_context_sum = sum(
+                self._mfu_prefill_context_sum(prefix_len, extend_len, window)
+                for prefix_len, extend_len in items
+            )
+
+            q_rows = tokens
+            context_sum = full_context_sum
+            if first_mirror_layer is not None and layer_idx > first_mirror_layer:
+                q_rows = active_seqs
+                context_sum = sum(
+                    self._mfu_last_context(prefix_len, extend_len, window)
+                    for prefix_len, extend_len in items
+                )
+            flops += q_rows * self._mfu_q_o_gate_flops
+            flops += context_sum * self._mfu_attn_ctx_flops
+
+            mlp_rows = tokens
+            if first_mirror_layer is not None and layer_idx >= first_mirror_layer:
+                mlp_rows = active_seqs
+            flops += mlp_rows * self._mfu_mlp_flops
+
+        flops += active_seqs * self._mfu_lm_head_flops
 
         read_bytes = (
             tokens * self._weight_read_bytes_per_token
@@ -444,6 +739,11 @@ class SchedulerMetricsMixin:
         )
         return flops, read_bytes, write_bytes
 
+    def _estimate_prefill_perf(
+        self: Scheduler, num_tokens: int
+    ) -> Tuple[float, float, float]:
+        return self._estimate_prefill_perf_from_batch(None, num_tokens, 1)
+
     def _estimate_decode_perf(
         self: Scheduler, batch: ScheduleBatch, num_tokens: int
     ) -> Tuple[float, float, float]:
@@ -451,16 +751,31 @@ class SchedulerMetricsMixin:
         if tokens == 0:
             return 0.0, 0.0, 0.0
 
-        total_context = float(batch.seq_lens_cpu.sum().item())
-        flops = (
-            tokens * self._linear_flops_per_token
-            + self._attn_dot_flops_coeff * total_context
+        seq_lens = self._mfu_to_int_list(getattr(batch, "seq_lens_cpu", None)) or [
+            1
+        ] * tokens
+        context_scale = tokens / len(seq_lens) if seq_lens else 0.0
+        flops = tokens * (
+            self._mfu_linear_flops_per_layer * self._mfu_num_layers
+            + self._mfu_lm_head_flops
         )
+        context_by_layer = 0.0
+        for layer_idx in range(self._mfu_num_layers):
+            window = self._mfu_sliding_windows[layer_idx]
+            layer_context = 0.0
+            for seq_len in seq_lens:
+                layer_context += (
+                    min(seq_len, window) if window is not None else float(seq_len)
+                )
+            layer_context *= context_scale
+            context_by_layer += layer_context
+            flops += self._mfu_attn_ctx_flops * layer_context
+
         read_bytes = (
             tokens * self._weight_read_bytes_per_token
             + tokens * self._qkv_act_bytes_per_token
             + tokens * self._decode_q_read_bytes_per_token
-            + total_context * self._kv_cache_bytes_per_token
+            + context_by_layer * self._kv_cache_bytes_per_token_per_layer
         )
         write_bytes = (
             tokens * self._kv_cache_bytes_per_token
@@ -533,7 +848,9 @@ class SchedulerMetricsMixin:
         msg += f"input throughput (token/s): {self.last_input_throughput:.2f}"
 
         if self.enable_mfu_metrics and gap_latency > 0:
-            flops, _, _ = self._estimate_prefill_perf(prefill_stats.log_input_tokens)
+            flops, _, _ = self._estimate_prefill_perf_from_batch(
+                batch, prefill_stats.log_input_tokens, prefill_stats.num_new_seqs
+            )
             tflops_per_s = flops / gap_latency / 1e12
             msg += f", est. prefill TFLOPS/s (per GPU): {tflops_per_s:.2f}"
 
@@ -552,8 +869,8 @@ class SchedulerMetricsMixin:
                 dp_cooperation_info=dp_cooperation_info,
             )
             if self.enable_mfu_metrics:
-                flops, read_bytes, write_bytes = self._estimate_prefill_perf(
-                    prefill_stats.log_input_tokens
+                flops, read_bytes, write_bytes = self._estimate_prefill_perf_from_batch(
+                    batch, prefill_stats.log_input_tokens, prefill_stats.num_new_seqs
                 )
                 self.metrics_collector.increment_estimated_perf(
                     num_flops_per_gpu=flops,
@@ -618,26 +935,29 @@ class SchedulerMetricsMixin:
     ):
         batch = running_batch or self.running_batch
 
+        decode_tokens = batch.batch_size() + num_correct_drafts
+        mfu_perf = None
+        if self.enable_mfu_metrics:
+            mfu_perf = self._estimate_decode_perf(batch, decode_tokens)
+            flops, read_bytes, write_bytes = mfu_perf
+            self._mfu_log_flops += flops
+            self._mfu_log_read_bytes += read_bytes
+            self._mfu_log_write_bytes += write_bytes
+
         # Every-iteration work: realtime token counting + status logger
         if self.current_scheduler_metrics_enabled:
-            decode_tokens = batch.batch_size() + num_correct_drafts
             self.metrics_collector.increment_realtime_tokens(
                 # TODO unify this w/ the bumping logic in `Scheduler.num_generated_tokens` accumulator
                 decode_tokens=decode_tokens,
                 dp_cooperation_info=batch.dp_cooperation_info,
             )
             if self.enable_mfu_metrics:
-                flops, read_bytes, write_bytes = self._estimate_decode_perf(
-                    batch, decode_tokens
-                )
+                flops, read_bytes, write_bytes = mfu_perf
                 self.metrics_collector.increment_estimated_perf(
                     num_flops_per_gpu=flops,
                     num_read_bytes_per_gpu=read_bytes,
                     num_write_bytes_per_gpu=write_bytes,
                 )
-                self._mfu_log_flops += flops
-                self._mfu_log_read_bytes += read_bytes
-                self._mfu_log_write_bytes += write_bytes
 
             if x := self.scheduler_status_logger:
                 x.maybe_dump(batch, self.waiting_queue)
