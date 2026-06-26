@@ -3,11 +3,13 @@ from __future__ import annotations
 import bisect
 import contextlib
 from dataclasses import dataclass
+from functools import partial
 from typing import TYPE_CHECKING, Callable, Optional
 
 import torch
 import torch.nn.functional as F
 
+from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH, GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
     get_attention_cp_size,
@@ -35,12 +37,14 @@ from sglang.srt.models.welm_perf_opt import get_welm_oe_hash_config
 from sglang.srt.speculative.eagle_info import EagleDraftInput
 from sglang.srt.speculative.welmv4_mtp_sampling import welm_mtp_deterministic_uniforms
 from sglang.srt.utils import (
+    get_bool_env_var,
     require_attn_tp_gather,
     require_gathered_buffer,
     require_mlp_sync,
     require_mlp_tp_gather,
 )
 from sglang.srt.utils.common import fast_topk, is_cuda, is_musa
+from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 _is_cuda = is_cuda()
 _is_musa = is_musa()
@@ -50,6 +54,7 @@ if _is_cuda or _is_musa:
 
 if TYPE_CHECKING:
     from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker
+
 
 @dataclass
 class WelmMTPDraftProposalInputBuffers(ForwardInputBuffers):
@@ -218,9 +223,7 @@ class WelmMTPDraftProposalCudaGraphRunner:
                 - 1
             )
             custom_last_cache_loc = torch.zeros((self.max_bs,), dtype=torch.int64)
-            if hasattr(
-                self.model_runner.model_config.hf_config, "draft_vocab_size"
-            ):
+            if hasattr(self.model_runner.model_config.hf_config, "draft_vocab_size"):
                 vocab_size = self.model_runner.model_config.hf_config.draft_vocab_size
             elif hasattr(self.model_runner.model_config.hf_config, "hot_vocab_size"):
                 vocab_size = self.model_runner.model_config.hf_config.hot_vocab_size
@@ -322,17 +325,26 @@ class WelmMTPDraftProposalCudaGraphRunner:
             self.welm_mtp_mirror_padding_index = self.max_num_token
             self.welm_mtp_mirror_kv_len = self.max_num_token + 1
             self.welm_mtp_mirror_kv_states = {}
-            for layer_idx, kv_size in self._welmv4_mtp_mirror_kv_specs():
-                self.welm_mtp_mirror_kv_states[layer_idx] = (
-                    torch.zeros(
-                        (self.welm_mtp_mirror_kv_len, kv_size),
-                        dtype=self.model_runner.dtype,
-                    ),
-                    torch.zeros(
-                        (self.welm_mtp_mirror_kv_len, kv_size),
-                        dtype=self.model_runner.dtype,
-                    ),
-                )
+            # These mirror-KV scratch buffers hold a copy of the target's KV
+            # for the draft proposal graph. Tag them GPU_MEMORY_TYPE_KV_CACHE
+            # so release_memory_occupation / pause(GPU_MEMORY_TYPE_KV_CACHE)
+            # can release them alongside the draft's own KV pool. Stale data
+            # after resume is harmless: _copy_welmv4_mtp_mirror_kv_states
+            # refreshes them before graph.replay() on the next replay.
+            with self.model_runner.memory_saver_adapter.region(
+                GPU_MEMORY_TYPE_KV_CACHE
+            ):
+                for layer_idx, kv_size in self._welmv4_mtp_mirror_kv_specs():
+                    self.welm_mtp_mirror_kv_states[layer_idx] = (
+                        torch.zeros(
+                            (self.welm_mtp_mirror_kv_len, kv_size),
+                            dtype=self.model_runner.dtype,
+                        ),
+                        torch.zeros(
+                            (self.welm_mtp_mirror_kv_len, kv_size),
+                            dtype=self.model_runner.dtype,
+                        ),
+                    )
 
         seq_lens_cpu = torch.full(
             (self.max_bs,), self.seq_len_fill_value, dtype=torch.int32
@@ -400,9 +412,7 @@ class WelmMTPDraftProposalCudaGraphRunner:
             return capture_bs
 
         num_max_requests = self.model_runner.req_to_token_pool.size
-        num_max_requests = (
-            (num_max_requests + mul_base - 1) // mul_base * mul_base
-        )
+        num_max_requests = (num_max_requests + mul_base - 1) // mul_base * mul_base
         candidates = list(capture_bs)
         if num_max_requests >= mul_base and not any(
             bs % mul_base == 0 for bs in candidates
@@ -456,9 +466,7 @@ class WelmMTPDraftProposalCudaGraphRunner:
             forward_batch.spec_info, "mirrored_kv_indices", None
         )
         required_kv_len = (
-            int(forward_batch.input_ids.numel())
-            if mirrored_kv_indices is None
-            else 0
+            int(forward_batch.input_ids.numel()) if mirrored_kv_indices is None else 0
         )
         if mirrored_kv_indices is not None and mirrored_kv_indices.numel() > 0:
             required_kv_len = int(mirrored_kv_indices.max().item()) + 1
@@ -647,9 +655,7 @@ class WelmMTPDraftProposalCudaGraphRunner:
                             cached_hash[:, src_start:src_end]
                         )
 
-                real_last = (
-                    dst_end - 1 if real_len > 0 else dst_start + padded_len - 1
-                )
+                real_last = dst_end - 1 if real_len > 0 else dst_start + padded_len - 1
                 real_last_indices.append(real_last)
                 if pad_len > 0 and real_len > 0:
                     pad_start = dst_end
@@ -787,7 +793,9 @@ class WelmMTPDraftProposalCudaGraphRunner:
         req_pool_indices = buffers.req_pool_indices[:bs].to(
             device=req_to_token.device, dtype=torch.long
         )
-        seq_lens = buffers.seq_lens[:bs].to(device=req_to_token.device, dtype=torch.long)
+        seq_lens = buffers.seq_lens[:bs].to(
+            device=req_to_token.device, dtype=torch.long
+        )
         if raw_bs < bs:
             seq_lens = seq_lens.clone()
             seq_lens[raw_bs:bs].zero_()
@@ -810,9 +818,7 @@ class WelmMTPDraftProposalCudaGraphRunner:
             .reshape(self.speculative_num_steps, bs * self.topk)
             .contiguous()
         )
-        buffers.welm_mtp_branch_step_cache_locs[
-            :, : bs * self.topk
-        ].copy_(branch_step)
+        buffers.welm_mtp_branch_step_cache_locs[:, : bs * self.topk].copy_(branch_step)
 
     def _init_tree_draft_attn_graph_metadata_capture(
         self,
@@ -1035,7 +1041,22 @@ class WelmMTPDraftProposalCudaGraphRunner:
             run_once_fn()
 
     def _capture_graph(self, graph, pool, stream, run_once_fn):
-        with torch.cuda.graph(graph, pool=pool, stream=stream):
+        # Mirror CudaGraphRunner._capture_graph: tag the captured graph's
+        # private memory pool with GPU_MEMORY_TYPE_CUDA_GRAPH when
+        # torch_memory_saver is enabled (enable_memory_saver and
+        # SGLANG_MEMORY_SAVER_CUDA_GRAPH), so release_memory_occupation /
+        # pause(GPU_MEMORY_TYPE_CUDA_GRAPH) can release it. Otherwise fall
+        # back to torch.cuda.graph (previous behavior).
+        memory_saver_adapter = TorchMemorySaverAdapter.create(
+            enable=self.model_runner.server_args.enable_memory_saver
+            and get_bool_env_var("SGLANG_MEMORY_SAVER_CUDA_GRAPH")
+        )
+        graph_ctx = (
+            partial(memory_saver_adapter.cuda_graph, tag=GPU_MEMORY_TYPE_CUDA_GRAPH)
+            if memory_saver_adapter.enabled
+            else torch.cuda.graph
+        )
+        with graph_ctx(cuda_graph=graph, pool=pool, stream=stream):
             out = run_once_fn()
         return out
 
@@ -1053,9 +1074,7 @@ class WelmMTPDraftProposalCudaGraphRunner:
     def capture(self):
         CudaGraphRunner.capture(self)
 
-    def capture_one_batch_size(
-        self, bs: int, forward: Callable, stream_idx: int = 0
-    ):
+    def capture_one_batch_size(self, bs: int, forward: Callable, stream_idx: int = 0):
         buffers = self.buffers
         graph = self._create_graph()
         stream = self.stream
@@ -1172,9 +1191,9 @@ class WelmMTPDraftProposalCudaGraphRunner:
         )
         if buffers.welm_mtp_oe_hash_out is not None:
             oe_work_history_size = num_tokens if self.topk == 1 else bs
-            forward_batch.welm_oe_decode_hashed_inputs = (
-                buffers.welm_mtp_oe_hash_out[:, :num_tokens]
-            )
+            forward_batch.welm_oe_decode_hashed_inputs = buffers.welm_mtp_oe_hash_out[
+                :, :num_tokens
+            ]
             forward_batch.welm_mtp_oe_work_history = [
                 buffers.welm_mtp_oe_work_history_a[:oe_work_history_size],
                 buffers.welm_mtp_oe_work_history_b[:oe_work_history_size],
@@ -1197,9 +1216,9 @@ class WelmMTPDraftProposalCudaGraphRunner:
             forward_batch.welm_mtp_oe_hash_out_batch_major = (
                 buffers.welm_mtp_oe_hash_out_batch_major[:num_tokens]
             )
-            forward_batch.welm_mtp_draft_input_ids = (
-                buffers.welm_mtp_draft_input_ids[:, :num_tokens]
-            )
+            forward_batch.welm_mtp_draft_input_ids = buffers.welm_mtp_draft_input_ids[
+                :, :num_tokens
+            ]
         if self.topk > 1:
             forward_batch.welm_mtp_branch_step_cache_locs = (
                 buffers.welm_mtp_branch_step_cache_locs[:, : bs * self.topk]
@@ -1393,9 +1412,7 @@ class WelmMTPDraftProposalCudaGraphRunner:
             buffers.welm_mtp_query_hash_inputs[:, :raw_bs].copy_(
                 first_query_hashed_inputs
             )
-            buffers.welm_mtp_oe_entry_history[:raw_bs].copy_(
-                first_query_history_state
-            )
+            buffers.welm_mtp_oe_entry_history[:raw_bs].copy_(first_query_history_state)
 
         if self.require_gathered_buffer:
             buffers.global_num_tokens_gpu.fill_(graph_num_tokens)
@@ -1405,13 +1422,12 @@ class WelmMTPDraftProposalCudaGraphRunner:
         replay_forward_batch.spec_info.extend_seq_lens_cpu = list(
             self.extend_seq_lens_cpu[:bs]
         )
-        replay_forward_batch.spec_info.extend_seq_lens_tensor = (
-            buffers.extend_seq_lens[:bs]
-        )
-        replay_forward_batch.seq_lens_sum = (
-            forward_batch.seq_lens_sum
-            + (bs - raw_bs) * int(self.seq_len_fill_value)
-        )
+        replay_forward_batch.spec_info.extend_seq_lens_tensor = buffers.extend_seq_lens[
+            :bs
+        ]
+        replay_forward_batch.seq_lens_sum = forward_batch.seq_lens_sum + (
+            bs - raw_bs
+        ) * int(self.seq_len_fill_value)
         self.draft_extend_attn_backend.init_forward_metadata_replay_cuda_graph(
             bs=bs,
             req_pool_indices=buffers.req_pool_indices,
@@ -1453,9 +1469,7 @@ class WelmMTPDraftProposalCudaGraphRunner:
             None if draft_probs is None else draft_probs[:raw_bs].clone()
         )
         spec_info.welm_mtp_draft_topk_indices = (
-            None
-            if draft_topk_indices is None
-            else draft_topk_indices[:raw_bs].clone()
+            None if draft_topk_indices is None else draft_topk_indices[:raw_bs].clone()
         )
         spec_info.welm_mtp_draft_topk_values = (
             None if draft_topk_values is None else draft_topk_values[:raw_bs].clone()
