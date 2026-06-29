@@ -560,6 +560,7 @@ class ServerArgs:
     attn_cp_mode: str = "none"
     attn_cp_kv_chunk_size: int = 1024
     attn_cp_decode_cuda_graph_max_seq_len: int = 0
+    attn_cp_decode_fused_q_fa: bool = False
     moe_dp_size: int = 1
 
     # Multi-node distributed serving
@@ -5365,6 +5366,15 @@ class ServerArgs:
                 "CUDA graph capture/replay. 0 auto-selects per CUDA graph batch "
                 "bucket from the KV cache capacity. Requests longer than the "
                 "selected cap fall back to eager decode."
+            ),
+        )
+        parser.add_argument(
+            "--attn-cp-decode-fused-q-fa",
+            action="store_true",
+            help=(
+                "Enable the experimental CP2 sharded-KV decode Triton fused "
+                "Q exchange + local FA path. Logprob-returning batches still "
+                "fall back to the exact FA3 path."
             ),
         )
         parser.add_argument(

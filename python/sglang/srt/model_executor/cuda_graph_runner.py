@@ -1273,6 +1273,12 @@ class CudaGraphRunner:
         # Disable for token embedding overrides (dynamic per-request)
         if forward_batch.replace_embeds is not None:
             return False
+        stream_idx = get_current_stream_idx() if self.enable_pdmux else None
+        attn_backend = (
+            self.model_runner.decode_attn_backend_group[stream_idx]
+            if stream_idx is not None
+            else self.attn_backend
+        )
         if self.require_mlp_tp_gather:
             cuda_graph_bs = (
                 max(forward_batch.global_num_tokens_cpu) // self.num_tokens_per_bs
@@ -1307,8 +1313,28 @@ class CudaGraphRunner:
             else:
                 seq_len_bucket = self._select_seq_len_fill_value_for_bs(graph_bs)
 
+        if (
+            forward_batch.return_logprob
+            and getattr(attn_backend, "enable_attn_cp_decode_cp2_fused_q_fa", False)
+            and not getattr(
+                attn_backend,
+                "attn_cp_decode_cp2_fused_q_fa_allow_logprob",
+                False,
+            )
+        ):
+            fused_min_seq_cap = getattr(
+                attn_backend,
+                "attn_cp_decode_cp2_fused_q_fa_min_seq_cap",
+                0,
+            )
+            # The graph capture batch does not request logprobs. Only bypass a
+            # captured graph when the selected graph bucket could have captured
+            # the experimental fused branch; short buckets captured the exact
+            # FA3 fallback and should keep using the existing graph path.
+            if seq_len_bucket is not None and seq_len_bucket >= fused_min_seq_cap:
+                return False
+
         variant_label = self._resolve_lora_variant(forward_batch)
-        stream_idx = get_current_stream_idx() if self.enable_pdmux else None
         graph_key = (
             self._make_graph_key(
                 graph_bs,

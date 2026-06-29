@@ -12,9 +12,13 @@ import triton.language as tl
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.distributed import get_sharded_kv_cp_group
 from sglang.srt.layers.attention.attncp_fused_ops import (
+    attncp_cp2_fused_q_fa_decode,
+    attncp_cp2_fused_q_fa_max_splits,
+    attncp_cp2_fused_q_fa_supports_shape,
     attncp_cp2_merge_local_head_slice,
     attncp_cp2_merge_local_remote_head_slice,
     attncp_cp2_pack_local_head_slice,
+    attncp_sharded_kv_local_cap,
 )
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.radix_attention import AttentionType
@@ -58,11 +62,15 @@ _ATTNCP_EXPERIMENTAL_DECODE_LOCAL_MERGE_SWA_ENV = (
 _ATTNCP_EXPERIMENTAL_DECODE_CP2_Q_P2P_ENV = (
     "SGLANG_ATTNCP_EXPERIMENTAL_DECODE_CP2_Q_P2P"
 )
+_ATTNCP_EXPERIMENTAL_DECODE_CP2_FUSED_Q_FA_ALLOW_LOGPROB_ENV = (
+    "SGLANG_ATTNCP_EXPERIMENTAL_DECODE_CP2_FUSED_Q_FA_ALLOW_LOGPROB"
+)
 _ATTNCP_EXPERIMENTAL_DECODE_CP2_OLSE_P2P_ENV = (
     "SGLANG_ATTNCP_EXPERIMENTAL_DECODE_CP2_OLSE_P2P"
 )
 _ATTNCP_DECODE_CP2_FUSED_MERGE_ENV = "SGLANG_ATTNCP_DECODE_CP2_FUSED_MERGE"
 _ATTNCP_DEBUG_METADATA_CHECKS_ENV = "SGLANG_ATTNCP_DEBUG_METADATA_CHECKS"
+_ATTNCP_DECODE_CP2_FUSED_Q_FA_MIN_SEQ_CAP = 16384
 
 
 def _env_flag_enabled(name: str, default: bool) -> bool:
@@ -149,6 +157,7 @@ class FlashAttentionMetadata:
     cp_local_page_table: torch.Tensor = None
     cp_swa_local_cache_seqlens_int32: torch.Tensor = None
     cp_swa_local_page_table: torch.Tensor = None
+    requires_exact_logprob: bool = False
 
     @dataclass
     class LocalAttentionMetadata:
@@ -214,6 +223,7 @@ class FlashAttentionBackend(AttentionBackend):
         self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
         self.skip_prefill = skip_prefill
         self.attn_cp_size = model_runner.attn_cp_size
+        self.attn_cp_kv_chunk_size = model_runner.server_args.attn_cp_kv_chunk_size
         self.is_attn_cp_sharded_kv = (
             self.attn_cp_size > 1
             and model_runner.server_args.attn_cp_mode == "sharded-kv"
@@ -230,16 +240,36 @@ class FlashAttentionBackend(AttentionBackend):
                 _ATTNCP_EXPERIMENTAL_DECODE_LOCAL_MERGE_SWA_ENV, default=True
             )
         )
+        attn_cp_decode_fused_q_fa_requested = bool(
+            getattr(
+                model_runner.server_args,
+                "attn_cp_decode_fused_q_fa",
+                False,
+            )
+        )
         self.enable_attn_cp_decode_cp2_q_p2p = (
             self.enable_attn_cp_decode_local_merge
             and _env_flag_enabled(
-                _ATTNCP_EXPERIMENTAL_DECODE_CP2_Q_P2P_ENV, default=False
+                _ATTNCP_EXPERIMENTAL_DECODE_CP2_Q_P2P_ENV,
+                default=attn_cp_decode_fused_q_fa_requested,
             )
+        )
+        self.enable_attn_cp_decode_cp2_fused_q_fa = (
+            self.enable_attn_cp_decode_local_merge
+            and attn_cp_decode_fused_q_fa_requested
+        )
+        self.attn_cp_decode_cp2_fused_q_fa_min_seq_cap = (
+            _ATTNCP_DECODE_CP2_FUSED_Q_FA_MIN_SEQ_CAP
+        )
+        self.attn_cp_decode_cp2_fused_q_fa_allow_logprob = _env_flag_enabled(
+            _ATTNCP_EXPERIMENTAL_DECODE_CP2_FUSED_Q_FA_ALLOW_LOGPROB_ENV,
+            default=False,
         )
         self.enable_attn_cp_decode_cp2_olse_p2p = (
             self.enable_attn_cp_decode_local_merge
             and _env_flag_enabled(
-                _ATTNCP_EXPERIMENTAL_DECODE_CP2_OLSE_P2P_ENV, default=False
+                _ATTNCP_EXPERIMENTAL_DECODE_CP2_OLSE_P2P_ENV,
+                default=attn_cp_decode_fused_q_fa_requested,
             )
         )
         self.enable_attn_cp_decode_cp2_fused_merge = (
@@ -472,6 +502,19 @@ class FlashAttentionBackend(AttentionBackend):
         # dense K/V tensors above. Page table just indexes that range row-major.
         return full_k, full_v, dense_page_table
 
+    @staticmethod
+    def _attncp_forward_batch_requires_exact_logprob(
+        forward_batch: Optional[ForwardBatch],
+    ) -> bool:
+        if forward_batch is None:
+            return False
+        return bool(getattr(forward_batch, "return_logprob", False))
+
+    def _attncp_current_batch_requires_exact_logprob(self) -> bool:
+        return self._attncp_forward_batch_requires_exact_logprob(
+            getattr(self, "_replay_forward_batch", None)
+        )
+
     def _get_attncp_dense_gather_static_tensors(
         self,
         batch_size: int,
@@ -608,6 +651,16 @@ class FlashAttentionBackend(AttentionBackend):
             self.attncp_dense_window_static_tensors[key] = cached
         return cached
 
+    def _attncp_local_kv_cap(self, max_seq_len: int) -> int:
+        """Upper-bound local CP-owned KV tokens for a global sequence cap."""
+        cp_group = get_sharded_kv_cp_group()
+        return attncp_sharded_kv_local_cap(
+            max_seq_len,
+            cp_rank=cp_group.rank_in_group,
+            cp_size=cp_group.world_size,
+            chunk_size=self.attn_cp_kv_chunk_size,
+        )
+
     def _set_sharded_kv_decode_metadata(
         self,
         metadata: FlashAttentionMetadata,
@@ -625,15 +678,21 @@ class FlashAttentionBackend(AttentionBackend):
 
         slots = page_table.to(dtype=torch.int32)
         max_seq_len = slots.shape[1]
+        local_page_table_cap = self._attncp_local_kv_cap(max_seq_len)
         if out_page_table is None:
-            local_page_table = torch.empty_like(slots)
+            local_page_table = torch.empty(
+                slots.shape[0],
+                local_page_table_cap,
+                dtype=slots.dtype,
+                device=slots.device,
+            )
         else:
-            if out_page_table.shape[1] < max_seq_len:
+            if out_page_table.shape[1] < local_page_table_cap:
                 raise RuntimeError(
                     "CP sharded-KV decode local page table buffer is too small: "
-                    f"{out_page_table.shape[1]} < {max_seq_len}"
+                    f"{out_page_table.shape[1]} < {local_page_table_cap}"
                 )
-            local_page_table = out_page_table
+            local_page_table = out_page_table[:, :local_page_table_cap]
         local_page_table.zero_()
 
         logical_pos = torch.arange(max_seq_len, device=slots.device).unsqueeze(0)
@@ -789,8 +848,7 @@ class FlashAttentionBackend(AttentionBackend):
         )
 
     def _init_attn_cp_local_merge_cuda_graph_state(self, max_bs: int) -> None:
-        cp_group = get_sharded_kv_cp_group()
-        cp_world_size = cp_group.world_size
+        cp_world_size = self.attn_cp_size
         local_q_heads = self.num_attention_heads
         full_q_heads = local_q_heads * cp_world_size
         head_dim = self.head_dim
@@ -865,9 +923,32 @@ class FlashAttentionBackend(AttentionBackend):
             ),
         }
 
-        if self.enable_attn_cp_decode_cp2_q_p2p:
+        if (
+            self.enable_attn_cp_decode_cp2_q_p2p
+            or self.enable_attn_cp_decode_cp2_fused_q_fa
+        ):
             local_merge_workspace["q_peer"] = torch.empty(
                 max_bs, local_q_heads, head_dim, dtype=dtype, device=device
+            )
+
+        if self.enable_attn_cp_decode_cp2_fused_q_fa:
+            max_splits = attncp_cp2_fused_q_fa_max_splits(
+                self.cuda_graph_max_seq_len
+            )
+            local_merge_workspace["fused_q_fa_split_o"] = torch.empty(
+                max_splits,
+                max_bs,
+                full_q_heads,
+                head_dim,
+                dtype=dtype,
+                device=device,
+            )
+            local_merge_workspace["fused_q_fa_split_lse"] = torch.empty(
+                max_splits,
+                max_bs,
+                full_q_heads,
+                dtype=torch.float32,
+                device=device,
             )
 
         if self.enable_attn_cp_decode_cp2_olse_p2p:
@@ -912,6 +993,139 @@ class FlashAttentionBackend(AttentionBackend):
         else:
             raise RuntimeError(f"Unexpected FA LSE shape: {tuple(lse.shape)}")
         return out
+
+    def _attncp_exchange_cp2_q_peer(
+        self,
+        q_local: torch.Tensor,
+        bufs: dict[str, torch.Tensor],
+        batch_size: int,
+        local_q_heads: int,
+    ) -> Optional[torch.Tensor]:
+        cp_group = get_sharded_kv_cp_group()
+        if cp_group.world_size != 2:
+            return None
+        if "q_peer" not in bufs or not q_local.is_contiguous():
+            return None
+
+        cp_rank = cp_group.rank_in_group
+        peer_rank = 1 - cp_rank
+        q_peer = bufs["q_peer"][:batch_size, :local_q_heads, :]
+        if self.enable_attn_cp_decode_cp2_q_p2p:
+            pynccl_comm = cp_group.pynccl_comm
+            if pynccl_comm is None or pynccl_comm.disabled:
+                return None
+            with pynccl_comm.change_state(enable=True):
+                pynccl_comm.group_start()
+                pynccl_comm.recv(q_peer, peer_rank)
+                pynccl_comm.send(q_local, peer_rank)
+                pynccl_comm.group_end()
+            return q_peer
+
+        q_gather = bufs.get("q_gather")
+        if q_gather is None:
+            return None
+        head_dim = q_local.shape[2]
+        q_gather = q_gather[: cp_group.world_size * batch_size]
+        cp_group.all_gather_into_tensor(q_gather, q_local.contiguous())
+        q_view = q_gather.view(
+            cp_group.world_size, batch_size, local_q_heads, head_dim
+        )
+        q_peer.copy_(q_view[peer_rank])
+        return q_peer
+
+    def _attncp_try_fused_q_fa_decode(
+        self,
+        q_local: torch.Tensor,
+        bufs: dict[str, torch.Tensor],
+        layer: RadixAttention,
+        metadata: FlashAttentionMetadata,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        *,
+        batch_size: int,
+        local_q_heads: int,
+        head_dim: int,
+        local_page_table: torch.Tensor,
+        local_cache_seqlens: torch.Tensor,
+        attn_window_size: tuple[int, int],
+        causal: bool,
+        local_kwargs: dict,
+    ) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
+        """Try the experimental Triton provider for CP2 local attention.
+
+        This is the replacement boundary for decode-side Q exchange plus local
+        attention over the resident KV shard. The implementation below is a
+        KV-stationary Triton path and does not require rebuilding sgl-kernel.
+        """
+        seq_cap = int(local_page_table.shape[1]) * int(self.page_size)
+
+        if not self.enable_attn_cp_decode_cp2_fused_q_fa:
+            return None
+        if (
+            getattr(metadata, "requires_exact_logprob", False)
+            and not self.attn_cp_decode_cp2_fused_q_fa_allow_logprob
+        ):
+            return None
+        cp_group = get_sharded_kv_cp_group()
+        if cp_group.world_size != 2:
+            return None
+        if self.page_size != 1 or layer.v_head_dim != layer.head_dim:
+            return None
+        if not attncp_cp2_fused_q_fa_supports_shape(
+            local_q_heads,
+            int(key_cache.shape[2]),
+            cp_world_size=cp_group.world_size,
+        ):
+            return None
+        if metadata.max_seq_len_q != 1:
+            return None
+        if seq_cap < self.attn_cp_decode_cp2_fused_q_fa_min_seq_cap:
+            return None
+        window_left = attn_window_size[0] if attn_window_size is not None else -1
+        window_right = attn_window_size[1] if attn_window_size is not None else -1
+        if window_right not in (-1, 0):
+            return None
+        if not causal:
+            return None
+        if any(key != "sinks" for key in local_kwargs):
+            return None
+        if (
+            not key_cache.is_contiguous()
+            or not value_cache.is_contiguous()
+            or not local_cache_seqlens.is_contiguous()
+        ):
+            return None
+
+        q_peer = self._attncp_exchange_cp2_q_peer(
+            q_local, bufs, batch_size, local_q_heads
+        )
+        if q_peer is None:
+            return None
+
+        full_q_heads = local_q_heads * cp_group.world_size
+        local_o_full = bufs["local_o_full"][:batch_size, :full_q_heads, :]
+        local_lse_full = bufs["local_lse_full"][:batch_size, :full_q_heads]
+
+        attncp_cp2_fused_q_fa_decode(
+            q_local,
+            q_peer,
+            key_cache,
+            value_cache,
+            local_page_table,
+            local_cache_seqlens,
+            local_o_full,
+            local_lse_full,
+            cp_rank=cp_group.rank_in_group,
+            softmax_scale=layer.scaling,
+            softcap=layer.logit_cap,
+            window_left=window_left,
+            sinks=local_kwargs.get("sinks"),
+            page_size=self.page_size,
+            split_o=bufs.get("fused_q_fa_split_o"),
+            split_lse=bufs.get("fused_q_fa_split_lse"),
+            max_splits=bufs["fused_q_fa_split_o"].shape[0],
+        )
+        return local_o_full, local_lse_full
 
     def _attncp_gather_full_q(
         self,
@@ -1225,13 +1439,6 @@ class FlashAttentionBackend(AttentionBackend):
         local_q_heads = q_local.shape[1]
         head_dim = q_local.shape[2]
         full_q_heads = local_q_heads * cp_world_size
-        q_full = self._attncp_gather_full_q(
-            q_local,
-            bufs,
-            batch_size,
-            local_q_heads,
-            head_dim,
-        )
 
         sinks_gather = None
         sinks_gather_f32 = None
@@ -1247,32 +1454,60 @@ class FlashAttentionBackend(AttentionBackend):
                 local_kwargs["sinks"] = sinks_gather[:full_q_heads]
             else:
                 local_kwargs["sinks"] = bufs["sinks_disabled_full"][:full_q_heads]
+
         local_o_full = bufs["local_o_full"][:batch_size, :full_q_heads, :]
-        result = flash_attn_with_kvcache(
-            q=q_full,
-            k_cache=key_cache,
-            v_cache=value_cache,
-            page_table=local_page_table,
-            cache_seqlens=local_cache_seqlens,
-            cu_seqlens_q=metadata.cu_seqlens_q,
-            max_seqlen_q=metadata.max_seq_len_q,
-            softmax_scale=layer.scaling,
+        local_lse_full = bufs["local_lse_full"][:batch_size, :full_q_heads]
+        fused_result = self._attncp_try_fused_q_fa_decode(
+            q_local,
+            bufs,
+            layer,
+            metadata,
+            key_cache,
+            value_cache,
+            batch_size=batch_size,
+            local_q_heads=local_q_heads,
+            head_dim=head_dim,
+            local_page_table=local_page_table,
+            local_cache_seqlens=local_cache_seqlens,
+            attn_window_size=attn_window_size,
             causal=causal,
-            window_size=attn_window_size,
-            softcap=layer.logit_cap,
-            num_splits=self.num_splits,
-            ver=self.fa_impl_ver,
-            return_softmax_lse=True,
-            out=local_o_full,
-            **local_kwargs,
+            local_kwargs=local_kwargs,
         )
-        local_o, local_lse = result[:2]
-        local_lse = self._copy_fa_lse(
-            bufs["local_lse_full"],
-            local_lse,
-            batch_size,
-            full_q_heads,
-        )
+        if fused_result is None:
+            q_full = self._attncp_gather_full_q(
+                q_local,
+                bufs,
+                batch_size,
+                local_q_heads,
+                head_dim,
+            )
+            result = flash_attn_with_kvcache(
+                q=q_full,
+                k_cache=key_cache,
+                v_cache=value_cache,
+                page_table=local_page_table,
+                cache_seqlens=local_cache_seqlens,
+                cu_seqlens_q=metadata.cu_seqlens_q,
+                max_seqlen_q=metadata.max_seq_len_q,
+                softmax_scale=layer.scaling,
+                causal=causal,
+                window_size=attn_window_size,
+                softcap=layer.logit_cap,
+                num_splits=self.num_splits,
+                ver=self.fa_impl_ver,
+                return_softmax_lse=True,
+                out=local_o_full,
+                **local_kwargs,
+            )
+            local_o, local_lse = result[:2]
+            local_lse = self._copy_fa_lse(
+                local_lse_full,
+                local_lse,
+                batch_size,
+                full_q_heads,
+            )
+        else:
+            local_o, local_lse = fused_result
         empty_lse = (
             sinks_gather_f32[:full_q_heads]
             if sinks_gather is not None and cp_group.rank_in_group == 0
@@ -1289,7 +1524,7 @@ class FlashAttentionBackend(AttentionBackend):
         cp2_exchange = self._attncp_exchange_cp2_local_head_slice(
             bufs,
             local_o_full,
-            bufs["local_lse_full"][:batch_size, :full_q_heads],
+            local_lse_full,
             batch_size,
             local_q_heads,
             head_dim,
@@ -1298,12 +1533,7 @@ class FlashAttentionBackend(AttentionBackend):
             cp_group.all_gather_coalesced(
                 [
                     (o_gather, local_o_full.contiguous()),
-                    (
-                        lse_gather,
-                        bufs["local_lse_full"][
-                            :batch_size, :full_q_heads
-                        ].contiguous(),
-                    ),
+                    (lse_gather, local_lse_full.contiguous()),
                 ]
             )
         if cp2_exchange is None:
@@ -1315,7 +1545,7 @@ class FlashAttentionBackend(AttentionBackend):
             merged_o = self._attncp_merge_cp2_local_head_slice(
                 bufs,
                 local_o_full,
-                bufs["local_lse_full"][:batch_size, :full_q_heads],
+                local_lse_full,
                 remote_o,
                 remote_lse,
                 batch_size,
@@ -1724,6 +1954,9 @@ class FlashAttentionBackend(AttentionBackend):
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Initialize forward metadata hence all layers in the forward pass can reuse it."""
         metadata = FlashAttentionMetadata()
+        metadata.requires_exact_logprob = (
+            self._attncp_forward_batch_requires_exact_logprob(forward_batch)
+        )
         seqlens_in_batch = forward_batch.seq_lens
         batch_size = forward_batch.batch_size
         device = seqlens_in_batch.device
@@ -3675,9 +3908,13 @@ class FlashAttentionBackend(AttentionBackend):
     ):
         """Initialize forward metadata for capturing CUDA graph."""
         metadata = FlashAttentionMetadata()
+        metadata.requires_exact_logprob = (
+            self._attncp_current_batch_requires_exact_logprob()
+        )
 
         # metadata_expand is needed for Spec Decoding when top k > 1
         metadata_expand = FlashAttentionMetadata()
+        metadata_expand.requires_exact_logprob = metadata.requires_exact_logprob
 
         device = seq_lens.device
         if forward_mode.is_decode_or_idle():
@@ -4348,6 +4585,12 @@ class FlashAttentionBackend(AttentionBackend):
                 ),
             ]
             metadata.page_table[:, : metadata.max_seq_len_k].copy_(page_table)
+
+        requires_exact_logprob = self._attncp_current_batch_requires_exact_logprob()
+        if metadata is not None:
+            metadata.requires_exact_logprob = requires_exact_logprob
+        if metadata_expand is not None:
+            metadata_expand.requires_exact_logprob = requires_exact_logprob
 
         self.forward_metadata = metadata
         self.forward_metadata_spec_decode_expand = metadata_expand
