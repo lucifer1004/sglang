@@ -1,4 +1,0 @@
-interface:
-  display_name: "SGLang MTP Decode Benchmark"
-  short_description: "Compare MTP and no-MTP decode TPOT"
-  default_prompt: "Use $sglang-mtp-decode-benchmark to compare MTP versus no-MTP decode TPOT for this SGLang model."

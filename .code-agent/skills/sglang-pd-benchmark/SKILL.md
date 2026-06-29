@@ -46,6 +46,7 @@ number = 200
 min_tokens = max_tokens = 100
 temperature = 0.7
 prefix_length = 0
+tokenize_prompt = true
 extra_args = {"ignore_eos":true,"bootstrap_host":"2.2.2.2","bootstrap_room":0}
 CacheHit = None
 MTP配置 = none
@@ -211,9 +212,12 @@ evalscope perf \
   --max-tokens 100 \
   --min-tokens 100 \
   --prefix-length 0 \
+  --tokenize-prompt \
   --temperature 0.7 \
   --extra-args '{"ignore_eos":true,"bootstrap_host":"2.2.2.2","bootstrap_room":0}'
 ```
+
+Always use `--tokenize-prompt` for formal prefill and decode benchmark runs. This makes EvalScope send tokenized prompts/input IDs, avoids counting server-side tokenizer cost in TTFT, and keeps prompt length exact. Without it, random text prompts can tokenize to lengths different from `PROMPT_LEN` and make TTFT/input throughput incomparable.
 
 Use `curl --noproxy '*'` for local health checks and cache operations.
 
