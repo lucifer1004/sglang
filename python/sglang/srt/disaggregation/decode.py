@@ -62,6 +62,7 @@ from sglang.srt.mem_cache.common import (
     page_align_floor,
     release_kv_cache,
 )
+from sglang.srt.mem_cache.cp_sharded_allocator import CPShardedKVPoolAllocator
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.memory_pool import (
     HybridReqToTokenPool,
@@ -612,9 +613,15 @@ class DecodePreallocQueue:
         if all(decode_req.waiting_for_input for decode_req in self.queue):
             return
 
-        polls = poll_and_all_reduce(
-            [decode_req.kv_receiver for decode_req in self.queue], self.gloo_group
-        )
+        if all(
+            _is_fake_transfer(decode_req.req, self.scheduler.server_args)
+            for decode_req in self.queue
+        ):
+            polls = [decode_req.kv_receiver.poll() for decode_req in self.queue]
+        else:
+            polls = poll_and_all_reduce(
+                [decode_req.kv_receiver for decode_req in self.queue], self.gloo_group
+            )
 
         for i, (decode_req, poll) in enumerate(zip(self.queue, polls)):
             if rids_to_check is not None and decode_req.req.rid not in rids_to_check:
@@ -907,80 +914,84 @@ class DecodePreallocQueue:
                 swa_allocatable_tokens -= swa_required
             decode_req.req.cache_protected_len = prefix_len
 
-            if self.scheduler.enable_hisparse:
-                # Must cast to int32 for ZMQ serialization -- from_zmq reads np.int32.
-                kv_indices = (
-                    dst_kv_indices[: origin_input_len - prefix_len]
-                    .cpu()
-                    .numpy()
-                    .astype(np.int32)
-                )
-                page_size = 1  # host pool page_size
+            if _is_fake_transfer(decode_req.req, self.scheduler.server_args):
+                page_indices = np.empty((0,), dtype=np.int32)
+                state_indices = []
             else:
-                # Only send delta indices (beyond prefix) to prefill.
-                kv_indices = (
-                    self.req_to_token_pool.req_to_token[decode_req.req.req_pool_idx][
-                        prefix_len:origin_input_len
-                    ]
-                    .cpu()
-                    .numpy()
-                )
-                page_size = self.token_to_kv_pool_allocator.page_size
-
-            seq_len = len(decode_req.req.origin_input_ids)
-
-            def _mamba_payload():
-                return [
-                    self.req_to_token_pool.req_index_to_mamba_index_mapping[
-                        decode_req.req.req_pool_idx
-                    ]
-                    .cpu()
-                    .numpy()
-                ]
-
-            def _swa_payload():
-                window_size = self.scheduler.sliding_window_size
-                window_start = max(0, seq_len - window_size)
-                window_start = page_align_floor(window_start, page_size)
-                window_kv_indices_full = self.req_to_token_pool.req_to_token[
-                    decode_req.req.req_pool_idx, window_start:seq_len
-                ]
-                window_kv_indices_swa = (
-                    self.token_to_kv_pool_allocator.translate_loc_from_full_to_swa(
-                        window_kv_indices_full
+                if self.scheduler.enable_hisparse:
+                    # Must cast to int32 for ZMQ serialization -- from_zmq reads np.int32.
+                    kv_indices = (
+                        dst_kv_indices[: origin_input_len - prefix_len]
+                        .cpu()
+                        .numpy()
+                        .astype(np.int32)
                     )
-                )
-                return kv_to_page_indices(
-                    window_kv_indices_swa.cpu().numpy(), page_size
-                )
-
-            def _nsa_payload():
-                kv_indices_full = self.req_to_token_pool.req_to_token[
-                    decode_req.req.req_pool_idx, :seq_len
-                ]
-                # Indexer lives on device pool; always use device page_size
-                device_page_size = self.token_to_kv_pool.page_size
-                return kv_to_page_indices(
-                    kv_indices_full.cpu().numpy(), device_page_size
-                )
-
-            state_types = self.kv_manager.kv_args.state_types
-            state_indices: Optional[List] = []
-            for st in state_types:
-                if st == StateType.MAMBA:
-                    state_indices.append(_mamba_payload())
-                elif st == StateType.SWA:
-                    state_indices.append(_swa_payload())
-                elif st == StateType.NSA:
-                    state_indices.append(_nsa_payload())
+                    page_size = 1  # host pool page_size
                 else:
-                    state_indices.append(None)
+                    # Only send delta indices (beyond prefix) to prefill.
+                    kv_indices = (
+                        self.req_to_token_pool.req_to_token[decode_req.req.req_pool_idx][
+                            prefix_len:origin_input_len
+                        ]
+                        .cpu()
+                        .numpy()
+                    )
+                    page_size = self.token_to_kv_pool_allocator.page_size
+
+                seq_len = len(decode_req.req.origin_input_ids)
+
+                def _mamba_payload():
+                    return [
+                        self.req_to_token_pool.req_index_to_mamba_index_mapping[
+                            decode_req.req.req_pool_idx
+                        ]
+                        .cpu()
+                        .numpy()
+                    ]
+
+                def _swa_payload():
+                    window_size = self.scheduler.sliding_window_size
+                    window_start = max(0, seq_len - window_size)
+                    window_start = page_align_floor(window_start, page_size)
+                    window_kv_indices_full = self.req_to_token_pool.req_to_token[
+                        decode_req.req.req_pool_idx, window_start:seq_len
+                    ]
+                    window_kv_indices_swa = (
+                        self.token_to_kv_pool_allocator.translate_loc_from_full_to_swa(
+                            window_kv_indices_full
+                        )
+                    )
+                    return kv_to_page_indices(
+                        window_kv_indices_swa.cpu().numpy(), page_size
+                    )
+
+                def _nsa_payload():
+                    kv_indices_full = self.req_to_token_pool.req_to_token[
+                        decode_req.req.req_pool_idx, :seq_len
+                    ]
+                    # Indexer lives on device pool; always use device page_size
+                    device_page_size = self.token_to_kv_pool.page_size
+                    return kv_to_page_indices(
+                        kv_indices_full.cpu().numpy(), device_page_size
+                    )
+
+                state_types = self.kv_manager.kv_args.state_types
+                state_indices = []
+                for st in state_types:
+                    if st == StateType.MAMBA:
+                        state_indices.append(_mamba_payload())
+                    elif st == StateType.SWA:
+                        state_indices.append(_swa_payload())
+                    elif st == StateType.NSA:
+                        state_indices.append(_nsa_payload())
+                    else:
+                        state_indices.append(None)
+                page_indices = kv_to_page_indices(kv_indices, page_size)
 
             decode_req.metadata_buffer_index = (
                 self.req_to_metadata_buffer_idx_allocator.alloc()
             )
             assert decode_req.metadata_buffer_index is not None
-            page_indices = kv_to_page_indices(kv_indices, page_size)
             decode_req.kv_receiver.send_metadata(
                 page_indices,
                 decode_req.metadata_buffer_index,
@@ -1276,10 +1287,23 @@ class DecodePreallocQueue:
             kv_loc = self.token_to_kv_pool_allocator.alloc(delta_len)
         else:
             device = self.token_to_kv_pool_allocator.device
+            is_cp_sharded_paged = isinstance(
+                self.token_to_kv_pool_allocator, CPShardedKVPoolAllocator
+            )
+
+            def device_i64_scalar(value: int) -> torch.Tensor:
+                out = torch.empty((1,), dtype=torch.int64, device=device)
+                out.fill_(int(value))
+                return out
+
             last_loc = (
                 prefix_indices[-1:].to(dtype=torch.int64, device=device)
                 if prefix_len > 0
-                else torch.tensor([-1], dtype=torch.int64, device=device)
+                else (
+                    torch.tensor([-1], dtype=torch.int64)
+                    if is_cp_sharded_paged
+                    else device_i64_scalar(-1)
+                )
             )
             if self._uses_swa_tail_prealloc() and prefix_len == 0:
                 # Tail-only SWA allocation: only valid when prefix_len == 0.
@@ -1287,9 +1311,9 @@ class DecodePreallocQueue:
                 # alloc_extend which allocates SWA at full page count; the
                 # SWA budget in that case may slightly under-estimate.
                 kv_loc = self.token_to_kv_pool_allocator.alloc_extend_swa_tail(
-                    prefix_lens=torch.tensor([0], dtype=torch.int64, device=device),
+                    prefix_lens=device_i64_scalar(0),
                     prefix_lens_cpu=torch.tensor([0], dtype=torch.int64),
-                    seq_lens=torch.tensor([fill_len], dtype=torch.int64, device=device),
+                    seq_lens=device_i64_scalar(fill_len),
                     seq_lens_cpu=torch.tensor([fill_len], dtype=torch.int64),
                     last_loc=last_loc,
                     extend_num_tokens=fill_len,
@@ -1297,11 +1321,9 @@ class DecodePreallocQueue:
                 )
             else:
                 kv_loc = self.token_to_kv_pool_allocator.alloc_extend(
-                    prefix_lens=torch.tensor(
-                        [prefix_len], dtype=torch.int64, device=device
-                    ),
+                    prefix_lens=device_i64_scalar(prefix_len),
                     prefix_lens_cpu=torch.tensor([prefix_len], dtype=torch.int64),
-                    seq_lens=torch.tensor([fill_len], dtype=torch.int64, device=device),
+                    seq_lens=device_i64_scalar(fill_len),
                     seq_lens_cpu=torch.tensor([fill_len], dtype=torch.int64),
                     last_loc=last_loc,
                     extend_num_tokens=delta_len,
@@ -1483,7 +1505,12 @@ class DecodeTransferQueue:
         if not self.queue:
             return []
 
-        if self.enable_staging:
+        if all(
+            _is_fake_transfer(decode_req.req, self.scheduler.server_args)
+            for decode_req in self.queue
+        ):
+            polls = [decode_req.kv_receiver.poll() for decode_req in self.queue]
+        elif self.enable_staging:
             polls = self._poll_with_staging()
         else:
             polls = poll_and_all_reduce(

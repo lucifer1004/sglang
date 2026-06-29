@@ -158,6 +158,7 @@ class FlashAttentionMetadata:
     cp_swa_local_cache_seqlens_int32: torch.Tensor = None
     cp_swa_local_page_table: torch.Tensor = None
     requires_exact_logprob: bool = False
+    has_empty_cp_shard: bool = False
 
     @dataclass
     class LocalAttentionMetadata:
@@ -468,26 +469,57 @@ class FlashAttentionBackend(AttentionBackend):
         value_cache: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Reconstruct a temporary dense full-KV table from sharded KV slots."""
-        if self.page_size != 1:
-            raise RuntimeError("CP sharded-KV gathered attention requires page_size=1")
         if page_table is None:
             raise RuntimeError("CP sharded-KV gathered attention missing page_table")
 
         slots = page_table.to(dtype=torch.long)
         batch_size = slots.shape[0]
-        max_seq_len = slots.shape[1]
-        logical_pos, dense_page_table = self._get_attncp_dense_gather_static_tensors(
-            batch_size, max_seq_len, slots.device
+        if self.page_size == 1:
+            max_seq_len = slots.shape[1]
+            logical_pos, dense_page_table = (
+                self._get_attncp_dense_gather_static_tensors(
+                    batch_size, max_seq_len, slots.device
+                )
+            )
+            valid_by_len = logical_pos < cache_seqlens.unsqueeze(1)
+            local_valid = valid_by_len & slots.ne(0)
+            safe_slots = torch.where(local_valid, slots, torch.zeros_like(slots))
+
+            if self.enable_attn_cp_zero_dummy_slot:
+                key_cache[0].zero_()
+                value_cache[0].zero_()
+            local_k = key_cache[safe_slots][:, :, 0].contiguous()
+            local_v = value_cache[safe_slots][:, :, 0].contiguous()
+            if not self.enable_attn_cp_zero_dummy_slot:
+                local_mask = local_valid.unsqueeze(-1).unsqueeze(-1)
+                local_k = local_k * local_mask.to(dtype=local_k.dtype)
+                local_v = local_v * local_mask.to(dtype=local_v.dtype)
+
+            cp_group = get_sharded_kv_cp_group()
+            full_k, full_v = cp_group.all_reduce_coalesced([local_k, local_v])
+            return full_k.contiguous(), full_v.contiguous(), dense_page_table
+
+        max_pages = slots.shape[1]
+        page_starts = (
+            torch.arange(max_pages, device=slots.device, dtype=torch.long)
+            .view(1, max_pages, 1)
+            .mul_(self.page_size)
         )
-        valid_by_len = logical_pos < cache_seqlens.unsqueeze(1)
-        local_valid = valid_by_len & slots.ne(0)
-        safe_slots = torch.where(local_valid, slots, torch.zeros_like(slots))
+        offsets_in_page = torch.arange(
+            self.page_size, device=slots.device, dtype=torch.long
+        ).view(1, 1, self.page_size)
+        logical_pos = page_starts + offsets_in_page
+        page_slots = slots.unsqueeze(-1).expand(batch_size, max_pages, self.page_size)
+        valid_by_len = logical_pos < cache_seqlens.to(torch.long).view(batch_size, 1, 1)
+        local_valid = valid_by_len & page_slots.ne(0)
+        safe_slots = torch.where(local_valid, page_slots, torch.zeros_like(page_slots))
 
         if self.enable_attn_cp_zero_dummy_slot:
             key_cache[0].zero_()
             value_cache[0].zero_()
-        local_k = key_cache[safe_slots][:, :, 0].contiguous()
-        local_v = value_cache[safe_slots][:, :, 0].contiguous()
+        expanded_offsets = offsets_in_page.expand(batch_size, max_pages, -1)
+        local_k = key_cache[safe_slots, expanded_offsets].contiguous()
+        local_v = value_cache[safe_slots, expanded_offsets].contiguous()
         if not self.enable_attn_cp_zero_dummy_slot:
             local_mask = local_valid.unsqueeze(-1).unsqueeze(-1)
             local_k = local_k * local_mask.to(dtype=local_k.dtype)
@@ -498,8 +530,13 @@ class FlashAttentionBackend(AttentionBackend):
         full_k = full_k.contiguous()
         full_v = full_v.contiguous()
 
-        # Each batch row maps to a contiguous [bs, max_seq_len) slice of the
-        # dense K/V tensors above. Page table just indexes that range row-major.
+        dense_page_table = torch.arange(
+            batch_size * max_pages, dtype=torch.int32, device=slots.device
+        ).view(batch_size, max_pages)
+
+        # Each batch row maps to a contiguous [bs, max_pages) slice of the
+        # dense K/V pages above. Keeping the original page size avoids changing
+        # FA3 scheduling and numerics in the correctness fallback.
         return full_k, full_v, dense_page_table
 
     @staticmethod
@@ -513,6 +550,42 @@ class FlashAttentionBackend(AttentionBackend):
     def _attncp_current_batch_requires_exact_logprob(self) -> bool:
         return self._attncp_forward_batch_requires_exact_logprob(
             getattr(self, "_replay_forward_batch", None)
+        )
+
+    @staticmethod
+    def _attncp_seq_lens_has_empty_cp_shard(
+        seq_lens_cpu,
+        cp_world_size: int,
+        cp_kv_chunk_size: int,
+    ) -> bool:
+        cp_world_size = int(cp_world_size or 0)
+        cp_kv_chunk_size = int(cp_kv_chunk_size or 0)
+        if cp_world_size <= 1 or cp_kv_chunk_size <= 0 or seq_lens_cpu is None:
+            return False
+
+        threshold = (cp_world_size - 1) * cp_kv_chunk_size
+        if threshold <= 0:
+            return False
+
+        if isinstance(seq_lens_cpu, torch.Tensor):
+            if seq_lens_cpu.numel() == 0:
+                return False
+            return bool((seq_lens_cpu.to(torch.long) <= threshold).any().item())
+
+        try:
+            return any(int(seq_len) <= threshold for seq_len in seq_lens_cpu)
+        except TypeError:
+            return int(seq_lens_cpu) <= threshold
+
+    def attncp_forward_batch_has_empty_cp_shard(
+        self, forward_batch: Optional[ForwardBatch]
+    ) -> bool:
+        if not self.is_attn_cp_sharded_kv or forward_batch is None:
+            return False
+        return self._attncp_seq_lens_has_empty_cp_shard(
+            getattr(forward_batch, "seq_lens_cpu", None),
+            self.attn_cp_size,
+            self.attn_cp_kv_chunk_size,
         )
 
     def _get_attncp_dense_gather_static_tensors(
@@ -546,13 +619,12 @@ class FlashAttentionBackend(AttentionBackend):
         window_left: int,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Reconstruct compact K/V while preserving full logical positions."""
-        if self.page_size != 1:
-            raise RuntimeError("CP sharded-KV gathered attention requires page_size=1")
         if page_table is None:
             raise RuntimeError("CP sharded-KV gathered attention missing page_table")
 
         slots = page_table.to(dtype=torch.long)
-        batch_size, max_seq_len = slots.shape
+        batch_size, max_pages = slots.shape
+        max_seq_len = max_pages * self.page_size
         window_tokens = int(window_left) + 1
         if window_tokens <= 0 or window_tokens >= max_seq_len:
             full_k, full_v, dense_page_table = self._gather_sharded_kv_dense(
@@ -575,8 +647,10 @@ class FlashAttentionBackend(AttentionBackend):
         start = torch.clamp(cache_seqlens.to(torch.long) - window_tokens, min=0)
         cols = start.unsqueeze(1) + offsets
         valid = cols < cache_seqlens.to(torch.long).unsqueeze(1)
-        safe_cols = torch.where(valid, cols, torch.zeros_like(cols))
-        window_slots = slots[row_indices, safe_cols]
+        page_cols = torch.div(cols, self.page_size, rounding_mode="floor")
+        safe_page_cols = torch.where(valid, page_cols, torch.zeros_like(page_cols))
+        offsets_in_page = cols - page_cols * self.page_size
+        window_slots = slots[row_indices, safe_page_cols]
         local_valid = valid & window_slots.ne(0)
         safe_slots = torch.where(
             local_valid, window_slots, torch.zeros_like(window_slots)
@@ -585,8 +659,8 @@ class FlashAttentionBackend(AttentionBackend):
         if self.enable_attn_cp_zero_dummy_slot:
             key_cache[0].zero_()
             value_cache[0].zero_()
-        local_k_window = key_cache[safe_slots][:, :, 0].contiguous()
-        local_v_window = value_cache[safe_slots][:, :, 0].contiguous()
+        local_k_window = key_cache[safe_slots, offsets_in_page].contiguous()
+        local_v_window = value_cache[safe_slots, offsets_in_page].contiguous()
         if not self.enable_attn_cp_zero_dummy_slot:
             local_mask = local_valid.unsqueeze(-1).unsqueeze(-1)
             local_k_window = local_k_window * local_mask.to(dtype=local_k_window.dtype)
@@ -671,14 +745,16 @@ class FlashAttentionBackend(AttentionBackend):
         out_cache_seqlens: Optional[torch.Tensor] = None,
     ) -> None:
         """Compact the local CP-owned KV slots for sharded-KV decode."""
-        if self.page_size != 1:
-            raise RuntimeError("CP sharded-KV decode requires page_size=1")
         if page_table is None:
             raise RuntimeError("CP sharded-KV decode missing page_table")
 
         slots = page_table.to(dtype=torch.int32)
-        max_seq_len = slots.shape[1]
-        local_page_table_cap = self._attncp_local_kv_cap(max_seq_len)
+        max_pages = slots.shape[1]
+        max_seq_len = max_pages * self.page_size
+        local_token_cap = self._attncp_local_kv_cap(max_seq_len)
+        local_page_table_cap = max(
+            1, (local_token_cap + self.page_size - 1) // self.page_size
+        )
         if out_page_table is None:
             local_page_table = torch.empty(
                 slots.shape[0],
@@ -695,18 +771,31 @@ class FlashAttentionBackend(AttentionBackend):
             local_page_table = out_page_table[:, :local_page_table_cap]
         local_page_table.zero_()
 
-        logical_pos = torch.arange(max_seq_len, device=slots.device).unsqueeze(0)
-        local_valid = (logical_pos < cache_seqlens.unsqueeze(1)) & slots.ne(0)
-        local_cache_seqlens = local_valid.sum(dim=1, dtype=torch.int32)
+        page_starts = (
+            torch.arange(max_pages, device=slots.device, dtype=torch.long).unsqueeze(0)
+            * self.page_size
+        )
+        cache_lens = cache_seqlens.to(torch.long).unsqueeze(1)
+        page_token_counts = torch.clamp(
+            cache_lens - page_starts, min=0, max=self.page_size
+        ).to(torch.int32)
+        local_valid_pages = page_token_counts.gt(0) & slots.ne(0)
+        local_cache_seqlens = torch.where(
+            local_valid_pages,
+            page_token_counts,
+            torch.zeros_like(page_token_counts),
+        ).sum(dim=1, dtype=torch.int32)
 
-        if max_seq_len > 0:
-            compact_cols = torch.cumsum(local_valid.to(torch.int32), dim=1) - 1
+        if max_pages > 0:
+            compact_cols = torch.cumsum(local_valid_pages.to(torch.int32), dim=1) - 1
             scatter_cols = torch.where(
-                local_valid,
+                local_valid_pages,
                 compact_cols,
                 torch.zeros_like(compact_cols),
             ).to(torch.long)
-            scatter_slots = torch.where(local_valid, slots, torch.zeros_like(slots))
+            scatter_slots = torch.where(
+                local_valid_pages, slots, torch.zeros_like(slots)
+            )
             local_page_table.scatter_reduce_(
                 dim=1,
                 index=scatter_cols,
@@ -744,7 +833,9 @@ class FlashAttentionBackend(AttentionBackend):
         if window_tokens is None:
             return
         if self.page_size != 1:
-            raise RuntimeError("CP sharded-KV SWA decode requires page_size=1")
+            metadata.cp_swa_local_cache_seqlens_int32 = None
+            metadata.cp_swa_local_page_table = None
+            return
         if page_table is None:
             raise RuntimeError("CP sharded-KV SWA decode missing page_table")
 
@@ -847,7 +938,9 @@ class FlashAttentionBackend(AttentionBackend):
             ][:bs],
         )
 
-    def _init_attn_cp_local_merge_cuda_graph_state(self, max_bs: int) -> None:
+    def _build_attn_cp_local_merge_workspace(
+        self, max_bs: int
+    ) -> dict[str, torch.Tensor]:
         cp_world_size = self.attn_cp_size
         local_q_heads = self.num_attention_heads
         full_q_heads = local_q_heads * cp_world_size
@@ -969,9 +1062,16 @@ class FlashAttentionBackend(AttentionBackend):
                 }
             )
 
-        self.decode_cuda_graph_metadata["attncp_local_merge"] = local_merge_workspace
+        return local_merge_workspace
 
-    def _attncp_local_merge_workspace(self) -> Optional[dict[str, torch.Tensor]]:
+    def _init_attn_cp_local_merge_cuda_graph_state(self, max_bs: int) -> None:
+        self.decode_cuda_graph_metadata["attncp_local_merge"] = (
+            self._build_attn_cp_local_merge_workspace(max_bs)
+        )
+
+    def _attncp_local_merge_workspace(
+        self,
+    ) -> Optional[dict[str, torch.Tensor]]:
         return self.decode_cuda_graph_metadata.get("attncp_local_merge")
 
     @staticmethod
@@ -993,6 +1093,18 @@ class FlashAttentionBackend(AttentionBackend):
         else:
             raise RuntimeError(f"Unexpected FA LSE shape: {tuple(lse.shape)}")
         return out
+
+    @classmethod
+    def _normalize_fa_lse(
+        cls,
+        lse: torch.Tensor,
+        batch_size: int,
+        num_heads: int,
+    ) -> torch.Tensor:
+        out = torch.empty(
+            (batch_size, num_heads), dtype=torch.float32, device=lse.device
+        )
+        return cls._copy_fa_lse(out, lse, batch_size, num_heads)
 
     def _attncp_exchange_cp2_q_peer(
         self,
@@ -1600,15 +1712,22 @@ class FlashAttentionBackend(AttentionBackend):
             )
             dense_cache_seqlens = cache_seqlens
 
+        dense_page_size = self.page_size if dense_k.dim() == 5 else 1
+        if dense_page_size != self.page_size:
+            # Some translated fallbacks, such as compact SWA windows, expose
+            # temporary K/V as page_size=1. Scheduler metadata precomputed for
+            # the original paged cache is not valid for that page table.
+            scheduler_metadata = None
+
         dense_kwargs = dict(kwargs)
         dense_kwargs.pop("ver", None)
         o = flash_attn_with_kvcache(
             q=q_local,
             k_cache=dense_k.view(
-                -1, 1, layer.tp_k_head_num, layer.head_dim
+                -1, dense_page_size, layer.tp_k_head_num, layer.head_dim
             ).contiguous(),
             v_cache=dense_v.view(
-                -1, 1, layer.tp_v_head_num, layer.v_head_dim
+                -1, dense_page_size, layer.tp_v_head_num, layer.v_head_dim
             ).contiguous(),
             page_table=dense_page_table,
             cache_seqlens=dense_cache_seqlens,
@@ -1715,7 +1834,9 @@ class FlashAttentionBackend(AttentionBackend):
         )
         local_o, local_lse = result[:2]
 
-        local_lse = local_lse.T.contiguous()
+        local_lse = self._normalize_fa_lse(
+            local_lse, q_for_attn.shape[0], q_for_attn.shape[1]
+        )
         empty_local_kv = local_cache_seqlens.to(torch.long).eq(0)
         if empty_local_kv.any():
             local_o = torch.where(
@@ -1793,6 +1914,22 @@ class FlashAttentionBackend(AttentionBackend):
         # full-KV FA pass for WeLM. Keep it behind an explicit experiment flag.
         window_left = window_size[0] if window_size is not None else -1
         is_swa_window = 0 <= window_left < self.max_context_len
+        if is_swa_window and self.page_size != 1:
+            return self._flash_attn_sharded_kv_dense(
+                q_local,
+                layer,
+                metadata.page_table if page_table is None else page_table,
+                cache_seqlens,
+                key_cache,
+                value_cache,
+                metadata.cu_seqlens_q,
+                metadata.max_seq_len_q,
+                window_size=window_size,
+                causal=causal,
+                kwargs=kwargs,
+                out=out,
+                scheduler_metadata=scheduler_metadata,
+            )
         if is_swa_window and not self.enable_attn_cp_decode_local_merge_swa:
             return self._flash_attn_sharded_kv_dense(
                 q_local,
@@ -1813,6 +1950,13 @@ class FlashAttentionBackend(AttentionBackend):
         local_page_table = metadata.cp_local_page_table
         local_cache_seqlens = metadata.cp_local_cache_seqlens_int32
         local_window_size = window_size
+        # Local merge is a numerically different decomposition from a single
+        # full-KV FA pass. When a sequence has not yet reached every CP shard,
+        # at least one rank contributes an empty softmax state; this is the most
+        # fragile case for greedy token-level parity. The condition is computed
+        # from CPU sequence lengths while building metadata so layer execution
+        # stays CUDA-graph friendly.
+        has_empty_cp_shard = bool(getattr(metadata, "has_empty_cp_shard", False))
         if (
             self.enable_attn_cp_decode_local_merge_swa
             and is_swa_window
@@ -1832,16 +1976,20 @@ class FlashAttentionBackend(AttentionBackend):
         )
         use_local_merge = (
             self.enable_attn_cp_decode_local_merge
+            and not has_empty_cp_shard
             and can_use_local_merge
             and local_page_table is not None
             and (page_table is None or page_table is metadata.page_table)
+            and not getattr(metadata, "requires_exact_logprob", False)
         )
         if is_swa_window and local_window_size == (-1, -1):
             use_local_merge = (
                 self.enable_attn_cp_decode_local_merge
                 and self.enable_attn_cp_decode_local_merge_swa
+                and not has_empty_cp_shard
                 and local_page_table is not None
                 and local_cache_seqlens is not None
+                and not getattr(metadata, "requires_exact_logprob", False)
             )
         if use_local_merge:
             return self._flash_attn_sharded_kv_local_merge(
@@ -1956,6 +2104,9 @@ class FlashAttentionBackend(AttentionBackend):
         metadata = FlashAttentionMetadata()
         metadata.requires_exact_logprob = (
             self._attncp_forward_batch_requires_exact_logprob(forward_batch)
+        )
+        metadata.has_empty_cp_shard = self.attncp_forward_batch_has_empty_cp_shard(
+            forward_batch
         )
         seqlens_in_batch = forward_batch.seq_lens
         batch_size = forward_batch.batch_size

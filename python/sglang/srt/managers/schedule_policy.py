@@ -47,7 +47,10 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
     zero_match_result,
 )
-from sglang.srt.mem_cache.cp_sharded_allocator import unwrap_cp_sharded_allocator
+from sglang.srt.mem_cache.cp_sharded_allocator import (
+    CPShardedKVPoolAllocator,
+    unwrap_cp_sharded_allocator,
+)
 from sglang.srt.mem_cache.hisparse_memory_pool import (
     DeepSeekV4HiSparseTokenToKVPoolAllocator,
 )
@@ -83,6 +86,9 @@ IN_BATCH_PREFIX_CACHING_DEPRIORITIZE_THRESHOLD = int(
 
 
 IGNORE_EOS_RESERVE_TOKENS = 1
+ATTN_CP_LONG_CONTEXT_MIN_TRIGGER_TOKENS = 65536
+ATTN_CP_LONG_CONTEXT_TRIGGER_CHUNK_FACTOR = 8
+ATTN_CP_LONG_CONTEXT_RESERVE_CHUNK_FACTOR = 16
 
 
 def match_prefix_for_req(
@@ -470,6 +476,14 @@ class PrefillAdder:
         self.is_hybrid_ssm_cache = self.tree_cache.supports_mamba()
 
         self.rem_swa_token_offset = 0
+        self.cp_sharded_allocator = (
+            self.token_to_kv_pool_allocator
+            if isinstance(self.token_to_kv_pool_allocator, CPShardedKVPoolAllocator)
+            else None
+        )
+        self.cp_sharded_local_token_offset = 0
+        self.cp_sharded_available_and_evictable_override: Optional[int] = None
+        self.cp_sharded_physical_available_override: Optional[int] = None
 
         self.priority_scheduling_preemption_threshold = (
             priority_scheduling_preemption_threshold
@@ -504,24 +518,85 @@ class PrefillAdder:
             * self.new_token_ratio
         )
 
-    @property
-    def rem_total_tokens(self):
+    @staticmethod
+    def _len_or_zero(value) -> int:
+        return 0 if value is None else len(value)
+
+    def _cp_sharded_req_len(self, req: Req) -> int:
+        return max(
+            self._len_or_zero(getattr(req, "origin_input_ids", None))
+            + self._len_or_zero(getattr(req, "output_ids", None)),
+            self._len_or_zero(getattr(req, "prefix_indices", None))
+            + int(getattr(req, "extend_input_len", 0) or 0),
+        )
+
+    def _cp_sharded_long_context_threshold(self) -> int:
+        chunk_size = int(self.rem_chunk_tokens or 0)
+        return max(
+            ATTN_CP_LONG_CONTEXT_MIN_TRIGGER_TOKENS,
+            chunk_size * ATTN_CP_LONG_CONTEXT_TRIGGER_CHUNK_FACTOR,
+        )
+
+    def _cp_sharded_has_long_context(self, candidate_req: Optional[Req] = None) -> bool:
+        if self.cp_sharded_allocator is None:
+            return False
+
+        threshold = self._cp_sharded_long_context_threshold()
+        if (
+            candidate_req is not None
+            and self._cp_sharded_req_len(candidate_req) >= threshold
+        ):
+            return True
+
+        reqs = list(self.can_run_list)
+        if self.running_batch is not None:
+            reqs.extend(self.running_batch.reqs)
+        return any(self._cp_sharded_req_len(req) >= threshold for req in reqs)
+
+    def _cp_sharded_admission_reserve_tokens(
+        self, candidate_req: Optional[Req] = None
+    ) -> int:
+        if not self._cp_sharded_has_long_context(candidate_req):
+            return 0
+        chunk_size = int(self.rem_chunk_tokens or self.page_size or 1)
+        return (
+            chunk_size
+            * ATTN_CP_LONG_CONTEXT_RESERVE_CHUNK_FACTOR
+            * self.cp_sharded_allocator.cp_size
+        )
+
+    def _available_and_evictable_tokens(self) -> int:
+        if (
+            self.cp_sharded_allocator is not None
+            and self.cp_sharded_available_and_evictable_override is not None
+        ):
+            return self.cp_sharded_available_and_evictable_override
+
         if self.is_hybrid_swa:
-            available_and_evictable = (
+            return (
                 self.token_to_kv_pool_allocator.full_available_size()
                 + self.tree_cache.full_evictable_size()
             )
         elif self.is_hybrid_ssm_cache:
-            available_and_evictable = (
+            return (
                 self.token_to_kv_pool_allocator.available_size()
                 + self.tree_cache.full_evictable_size()
             )
-        else:
-            available_and_evictable = (
-                self.token_to_kv_pool_allocator.available_size()
-                + self.tree_cache.evictable_size()
-            )
-        return available_and_evictable - self.rem_total_token_offset
+        return (
+            self.token_to_kv_pool_allocator.available_size()
+            + self.tree_cache.evictable_size()
+        )
+
+    def _rem_total_tokens(self, candidate_req: Optional[Req] = None) -> int:
+        return (
+            self._available_and_evictable_tokens()
+            - self.rem_total_token_offset
+            - self._cp_sharded_admission_reserve_tokens(candidate_req)
+        )
+
+    @property
+    def rem_total_tokens(self):
+        return self._rem_total_tokens()
 
     @property
     def rem_swa_tokens(self):
@@ -533,23 +608,30 @@ class PrefillAdder:
 
     @property
     def cur_rem_tokens(self):
-        if self.is_hybrid_swa:
-            available_and_evictable = (
-                self.token_to_kv_pool_allocator.full_available_size()
-                + self.tree_cache.full_evictable_size()
-            )
-        elif self.is_hybrid_ssm_cache:
-            available_and_evictable = (
-                self.token_to_kv_pool_allocator.available_size()
-                + self.tree_cache.full_evictable_size()
-            )
-        else:
-            available_and_evictable = (
-                self.token_to_kv_pool_allocator.available_size()
-                + self.tree_cache.evictable_size()
-            )
+        return (
+            self._available_and_evictable_tokens()
+            - self.cur_rem_token_offset
+            - self._cp_sharded_admission_reserve_tokens()
+        )
 
-        return available_and_evictable - self.cur_rem_token_offset
+    def _cp_sharded_extend_local_budget(self, start_pos: int, extend_len: int) -> int:
+        if self.cp_sharded_allocator is None:
+            return 0
+        return self.cp_sharded_allocator.max_local_alloc_size_for_range(
+            start_pos, self.ceil_paged_tokens(extend_len)
+        )
+
+    def _cp_sharded_can_allocate_extend(self, start_pos: int, extend_len: int) -> bool:
+        if self.cp_sharded_allocator is None:
+            return True
+        needed = self._cp_sharded_extend_local_budget(start_pos, extend_len)
+        physical_available = (
+            self.cp_sharded_physical_available_override
+            if self.cp_sharded_physical_available_override is not None
+            else self.cp_sharded_allocator.physical_available_size()
+        )
+        available = physical_available - self.cp_sharded_local_token_offset
+        return needed <= available
 
     def _swa_budget_for_req(self, extend_input_len: int) -> int:
         """SWA pool budget per request. Only valid when is_hybrid_swa is True.
@@ -591,7 +673,12 @@ class PrefillAdder:
         return AddReqResult.CONTINUE
 
     def _update_prefill_budget(
-        self, prefix_len: int, extend_input_len: int, max_new_tokens: int
+        self,
+        prefix_len: int,
+        extend_input_len: int,
+        max_new_tokens: int,
+        *,
+        cp_start_pos: Optional[int] = None,
     ):
         # TODO(lsyin): check this workaround logic, which only ensures the prefill will not out of memory, and may be too conservative
         extend_input_len = self.ceil_paged_tokens(extend_input_len)
@@ -601,6 +688,11 @@ class PrefillAdder:
         self.rem_total_token_offset += extend_input_len + max_new_tokens + page_overhead
         self.cur_rem_token_offset += extend_input_len + page_overhead
         self.rem_input_tokens -= extend_input_len
+        if self.cp_sharded_allocator is not None:
+            start_pos = prefix_len if cp_start_pos is None else cp_start_pos
+            self.cp_sharded_local_token_offset += self._cp_sharded_extend_local_budget(
+                start_pos, extend_input_len
+            )
 
         if self.is_hybrid_swa:
             self.rem_swa_token_offset += self._swa_budget_for_req(extend_input_len)
@@ -678,22 +770,30 @@ class PrefillAdder:
         if self.dllm_config is not None:
             _rem_tokens = self._get_dllm_remain_tokens()
         else:
-            _rem_tokens = min(self.rem_chunk_tokens, int(self.rem_total_tokens))
+            _rem_tokens = min(
+                self.rem_chunk_tokens, int(self._rem_total_tokens(candidate_req=req))
+            )
             if self.is_hybrid_swa:
                 # alloc_extend needs extend_num_tokens + page_size per request,
                 # so reserve one page here to avoid OOM
                 _rem_tokens = min(
                     _rem_tokens, int(self.rem_swa_tokens) - self.page_size
                 )
-            # The chunked_req must be added to the list; otherwise, it will cause a memory leak.
-            # Therefore, in certain cases where _rem_tokens <= 0, it should be replaced with rem_chunk_tokens.
             if _rem_tokens <= 0:
-                if self.is_hybrid_swa:
+                if self.is_hybrid_swa or self.cp_sharded_allocator is not None:
                     return req
+                # Preserve the legacy non-SWA fallback: a previously admitted
+                # chunked request should keep making progress after its prior
+                # chunk has been released.
                 _rem_tokens = self.rem_chunk_tokens
 
         truncated = req.extend_input_len > _rem_tokens
-        req.set_extend_input_len(min(req.extend_input_len, _rem_tokens))
+        new_extend_len = min(req.extend_input_len, _rem_tokens)
+        start_pos = len(req.prefix_indices)
+        if not self._cp_sharded_can_allocate_extend(start_pos, new_extend_len):
+            return req
+
+        req.set_extend_input_len(new_extend_len)
         req.fill_ids = req.fill_ids[: len(req.prefix_indices) + req.extend_input_len]
         self.can_run_list.append(req)
         self._update_prefill_budget(
@@ -704,6 +804,7 @@ class PrefillAdder:
                 if not truncated
                 else 0
             ),
+            cp_start_pos=start_pos,
         )
 
         # Return if chunked prefill not finished
@@ -728,7 +829,10 @@ class PrefillAdder:
 
     def add_one_req_ignore_eos(self, req: Req):
         paged_input = self.ceil_paged_tokens(req.extend_input_len)
-        if paged_input > min(self.cur_rem_tokens, self.rem_total_tokens):
+        if paged_input > min(self.cur_rem_tokens, self._rem_total_tokens(req)):
+            return AddReqResult.NO_TOKEN
+        start_pos = self._len_or_zero(getattr(req, "prefix_indices", None))
+        if not self._cp_sharded_can_allocate_extend(start_pos, req.extend_input_len):
             return AddReqResult.NO_TOKEN
         if self.is_hybrid_swa:
             if self._swa_budget_for_req(req.extend_input_len) > self.rem_swa_tokens:
@@ -805,6 +909,7 @@ class PrefillAdder:
                 0,
                 req.extend_input_len,
                 min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS),
+                cp_start_pos=start_pos,
             )
         else:
             if self.rem_chunk_tokens <= 0:
@@ -817,7 +922,7 @@ class PrefillAdder:
             req.fill_ids = req.fill_ids[:trunc_len]
             self.can_run_list.append(req)
             self.new_chunked_req = req
-            self._update_prefill_budget(0, trunc_len, 0)
+            self._update_prefill_budget(0, trunc_len, 0, cp_start_pos=start_pos)
 
         return self.budget_state()
 
@@ -864,7 +969,7 @@ class PrefillAdder:
         real_input_tokens = self.ceil_paged_tokens(real_input_tokens)
         prefix_len = len(req.prefix_indices)
 
-        if total_tokens >= self.rem_total_tokens:
+        if total_tokens >= self._rem_total_tokens(req):
             return AddReqResult.NO_TOKEN
 
         if self.is_hybrid_swa:
@@ -877,7 +982,7 @@ class PrefillAdder:
 
         with self._lock_node(req.last_node):
             # self.rem_total_tokens may decrease after the lock acquisition
-            if total_tokens >= self.rem_total_tokens:
+            if total_tokens >= self._rem_total_tokens(req):
                 return AddReqResult.NO_TOKEN
 
             if self.is_hybrid_swa:
@@ -915,6 +1020,9 @@ class PrefillAdder:
                 self._req_inc_lock_ref(req)
             elif self.rem_chunk_tokens is None or input_tokens <= self.rem_chunk_tokens:
                 # Non-chunked prefill
+                if not self._cp_sharded_can_allocate_extend(prefix_len, input_tokens):
+                    return AddReqResult.NO_TOKEN
+
                 self.can_run_list.append(req)
 
                 self._req_inc_lock_ref(req)
@@ -925,6 +1033,7 @@ class PrefillAdder:
                         req.sampling_params.max_new_tokens,
                         CLIP_MAX_NEW_TOKENS,
                     ),
+                    cp_start_pos=prefix_len,
                 )
             else:
                 # Make sure at least one page is available
@@ -952,6 +1061,9 @@ class PrefillAdder:
                     return AddReqResult.OTHER
 
                 # Chunked prefill
+                if not self._cp_sharded_can_allocate_extend(prefix_len, trunc_len):
+                    return AddReqResult.NO_TOKEN
+
                 req.set_extend_input_len(trunc_len)
                 req.fill_ids = req.fill_ids[: len(req.prefix_indices) + trunc_len]
 
@@ -959,7 +1071,9 @@ class PrefillAdder:
                 self.new_chunked_req = req
 
                 self._req_inc_lock_ref(req)
-                self._update_prefill_budget(prefix_len, trunc_len, 0)
+                self._update_prefill_budget(
+                    prefix_len, trunc_len, 0, cp_start_pos=prefix_len
+                )
 
         return self.budget_state()
 

@@ -147,16 +147,35 @@ class TestShardedKvContextParallelArgs(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "--attn-cp-mode sharded-kv"):
             server_args._handle_context_parallelism()
 
-    def test_sharded_kv_requires_page_size_one(self):
+    def test_sharded_kv_allows_page_size_dividing_chunk_size(self):
         server_args = ServerArgs(
             model_path="dummy",
             tp_size=8,
             attn_cp_size=4,
             attn_cp_mode="sharded-kv",
             page_size=16,
+            attention_backend="fa3",
         )
+        server_args.model_config = self._fake_mha_config()
+        server_args._handle_page_size()
+        server_args._handle_context_parallelism()
 
-        with self.assertRaisesRegex(ValueError, "--page-size 1"):
+        self.assertEqual(server_args.page_size, 16)
+
+    def test_sharded_kv_requires_chunk_size_divisible_by_page_size(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            tp_size=8,
+            attn_cp_size=4,
+            attn_cp_mode="sharded-kv",
+            attn_cp_kv_chunk_size=1024,
+            page_size=96,
+            attention_backend="fa3",
+        )
+        server_args.model_config = self._fake_mha_config()
+        server_args._handle_page_size()
+
+        with self.assertRaisesRegex(ValueError, "divisible by --page-size"):
             server_args._handle_context_parallelism()
 
     def test_sharded_kv_requires_positive_chunk_size(self):

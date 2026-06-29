@@ -2,12 +2,16 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import torch
+
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefResult,
     IncLockRefResult,
 )
+from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
+from sglang.srt.mem_cache.cp_sharded_allocator import CPShardedKVPoolAllocator
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
@@ -34,6 +38,7 @@ class TestPrefillAdder(CustomTestCase):
         tree_cache.swa_evictable_size.return_value = swa_evictable_size
         tree_cache.evictable_size.return_value = evictable_size
         tree_cache.disable = False
+        tree_cache.supports_mamba.return_value = False
         tree_cache.inc_lock_ref.return_value = IncLockRefResult()
         tree_cache.dec_lock_ref.return_value = DecLockRefResult()
         return tree_cache
@@ -543,6 +548,97 @@ class TestPrefillAdder(CustomTestCase):
         self.assertIsNone(result)
         req.set_extend_input_len.assert_called_once_with(200)
         self.assertIn(req, adder.can_run_list)
+
+    def _create_cp_sharded_allocator(self, *, physical_size=1000, logical_size=2000):
+        base = TokenToKVPoolAllocator(
+            size=physical_size,
+            dtype=torch.float32,
+            device="cpu",
+            kvcache=None,
+            need_sort=False,
+        )
+        return CPShardedKVPoolAllocator(
+            base,
+            cp_rank=0,
+            cp_size=2,
+            cp_kv_chunk_size=4,
+            logical_size=logical_size,
+        )
+
+    def _create_prefill_req(self, *, input_len, extend_len, max_new_tokens=0):
+        req = self.create_mock_req(
+            f"req_{input_len}_{extend_len}",
+            priority=0,
+            max_new_tokens=max_new_tokens,
+        )
+        req.origin_input_ids = [0] * input_len
+        req.output_ids = []
+        req.extend_input_len = extend_len
+        req.host_hit_length = 0
+        req.prefix_indices = []
+        req.fill_ids = list(range(extend_len))
+        req.last_node = MagicMock()
+        req.sampling_params.ignore_eos = False
+        req.set_extend_input_len = MagicMock(
+            side_effect=lambda value: setattr(req, "extend_input_len", value)
+        )
+        return req
+
+    def test_attncp_long_context_reserve_only_activates_for_long_requests(self):
+        allocator = self._create_cp_sharded_allocator()
+        long_running_req = self._create_prefill_req(input_len=70000, extend_len=0)
+        short_running_req = self._create_prefill_req(input_len=32768, extend_len=0)
+
+        short_adder = self.create_adder(
+            self.create_running_batch([short_running_req]),
+            token_to_kv_pool_allocator=allocator,
+            rem_chunk_tokens=8,
+        )
+        self.assertEqual(short_adder.rem_total_tokens, 2000)
+
+        long_adder = self.create_adder(
+            self.create_running_batch([long_running_req]),
+            token_to_kv_pool_allocator=allocator,
+            rem_chunk_tokens=8,
+        )
+        # reserve = rem_chunk_tokens * 16 * cp_size
+        self.assertEqual(long_adder.rem_total_tokens, 2000 - 8 * 16 * 2)
+
+    def test_attncp_long_context_candidate_is_throttled_before_near_oom(self):
+        allocator = self._create_cp_sharded_allocator(
+            physical_size=130, logical_size=260
+        )
+        adder = self.create_adder(
+            self.create_running_batch(),
+            token_to_kv_pool_allocator=allocator,
+            rem_chunk_tokens=8,
+        )
+        long_req = self._create_prefill_req(input_len=70000, extend_len=8)
+
+        result = adder.add_one_req(
+            long_req, has_chunked_req=False, truncation_align_size=None
+        )
+
+        self.assertEqual(result, AddReqResult.NO_TOKEN)
+        self.assertEqual(len(adder.can_run_list), 0)
+
+    def test_attncp_short_context_is_not_throttled_by_long_context_reserve(self):
+        allocator = self._create_cp_sharded_allocator(
+            physical_size=130, logical_size=260
+        )
+        adder = self.create_adder(
+            self.create_running_batch(),
+            token_to_kv_pool_allocator=allocator,
+            rem_chunk_tokens=8,
+        )
+        short_req = self._create_prefill_req(input_len=32768, extend_len=8)
+
+        result = adder.add_one_req(
+            short_req, has_chunked_req=False, truncation_align_size=None
+        )
+
+        self.assertEqual(result, AddReqResult.OTHER)
+        self.assertEqual(adder.can_run_list, [short_req])
 
 
 if __name__ == "__main__":

@@ -3140,9 +3140,10 @@ class ServerArgs:
                 "--attn-cp-mode sharded-kv currently supports only single-DP "
                 "serving with --data-parallel-size 1 and DP attention disabled"
             )
-        if self.page_size != 1:
+        if self.attn_cp_kv_chunk_size % self.page_size != 0:
             raise ValueError(
-                "--attn-cp-mode sharded-kv currently requires --page-size 1"
+                "--attn-cp-mode sharded-kv requires "
+                "--attn-cp-kv-chunk-size divisible by --page-size"
             )
         if self.kv_cache_dtype != "auto":
             raise ValueError(

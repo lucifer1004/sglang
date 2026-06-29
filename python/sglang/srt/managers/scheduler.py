@@ -1745,6 +1745,16 @@ class Scheduler(
             and last_batch_is_extend
         )
 
+        # Sharded-KV AttnCP keeps decode-decode overlap, but serializes prefill
+        # boundaries so long chunked prefills cannot pull CP/TP ranks into
+        # different scheduler phases.
+        attn_cp_sharded_kv_prefill_boundary = (
+            self.attn_cp_size > 1
+            and self.server_args.attn_cp_mode == "sharded-kv"
+            and len(self.result_queue) > 0
+            and (batch_is_extend or last_batch_is_extend)
+        )
+
         # We do not support overlap + spec + grammar yet,
         # so we need to turn off overlap for this batch.
         # TODO(lsyin): support overlap + spec + grammar
@@ -1756,7 +1766,11 @@ class Scheduler(
             and len(self.result_queue) > 0
         )
 
-        return disable_overlap_for_batch or need_grammar_sync
+        return (
+            disable_overlap_for_batch
+            or need_grammar_sync
+            or attn_cp_sharded_kv_prefill_boundary
+        )
 
     def recv_limit_reached(self, num_recv_reqs: int) -> bool:
         if self.max_recv_per_poll < 0:
@@ -3197,6 +3211,7 @@ class Scheduler(
             dllm_config=self.dllm_config,
             waiting_queue_len=len(self.waiting_queue),
         )
+        self._sync_cp_sharded_prefill_admission_budget(adder)
 
         if self.chunked_req is not None:
             self.chunked_req.init_next_round_input()
@@ -3372,6 +3387,30 @@ class Scheduler(
             new_batch.decoding_reqs = None
 
         return new_batch
+
+    def _sync_cp_sharded_prefill_admission_budget(self, adder: PrefillAdder) -> None:
+        if (
+            self.attn_cp_size <= 1
+            or self.server_args.attn_cp_mode != "sharded-kv"
+            or adder.cp_sharded_allocator is None
+            or self.tp_size <= 1
+        ):
+            return
+
+        budgets = torch.tensor(
+            [
+                int(adder._available_and_evictable_tokens()),
+                int(adder.cp_sharded_allocator.physical_available_size()),
+            ],
+            dtype=torch.int64,
+        )
+        torch.distributed.all_reduce(
+            budgets,
+            op=torch.distributed.ReduceOp.MIN,
+            group=self.tp_cpu_group,
+        )
+        adder.cp_sharded_available_and_evictable_override = int(budgets[0].item())
+        adder.cp_sharded_physical_available_override = int(budgets[1].item())
 
     def _can_schedule_lora_req(
         self, req: Req, running_loras: set[Optional[str]]

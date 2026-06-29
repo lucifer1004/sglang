@@ -1196,34 +1196,74 @@ class CudaGraphRunner:
         )
 
         page_size = max(1, int(getattr(self.attn_backend, "page_size", 1) or 1))
+        is_attn_cp_sharded_kv = bool(
+            getattr(self.attn_backend, "is_attn_cp_sharded_kv", False)
+        )
         values: Dict[int, List[int]] = {}
         prev_bs = 0
+        # AttnCP sharded-KV selects a CUDA graph by max(seq_lens), while KV
+        # residency is constrained by sum(seq_lens). Long-context eval batches
+        # can therefore be highly skewed. Capture the extra long buckets only
+        # for that backend; other modes keep the standard bucket plan.
+        skew_bucket_max_bs = 64
         for bs in sorted(int(x) for x in self.capture_bs):
             bs_int = max(1, int(bs))
             min_real_bs = bs_int if self.disable_padding else prev_bs + 1
+            skew_real_bs = max(1, (min_real_bs + 1) // 2)
             if max_total_num_tokens > 0 and not getattr(
                 self.attn_backend, "cuda_graph_max_seq_len_is_explicit", False
             ):
                 cap = min(max_seq_cap, max_total_num_tokens // max(1, min_real_bs))
+                skew_cap = min(
+                    max_seq_cap,
+                    max_total_num_tokens // max(1, skew_real_bs),
+                )
             else:
                 cap = max_seq_cap
-            cap = self._align_seq_len_bucket(max(1, cap), page_size)
+                skew_cap = max_seq_cap
+            cap = self._align_seq_len_bucket(max(1, cap), page_size, max_seq_cap)
+            skew_cap = self._align_seq_len_bucket(
+                max(1, skew_cap), page_size, max_seq_cap
+            )
             buckets = [min(default_small_bucket, cap)]
             while buckets[-1] * 2 < cap:
                 buckets.append(buckets[-1] * 2)
             if buckets[-1] != cap:
                 buckets.append(cap)
+            use_attncp_skew_buckets = (
+                is_attn_cp_sharded_kv and bs_int <= skew_bucket_max_bs
+            )
+            if use_attncp_skew_buckets and skew_cap > cap:
+                buckets.append(skew_cap)
+            if use_attncp_skew_buckets:
+                long_cap = max_seq_cap
+                next_bucket = max(buckets)
+                while next_bucket * 2 < long_cap:
+                    next_bucket *= 2
+                    buckets.append(next_bucket)
+                if long_cap > max(buckets):
+                    buckets.append(long_cap)
             values[bs_int] = sorted(
-                {self._align_seq_len_bucket(max(1, x), page_size) for x in buckets}
+                {
+                    self._align_seq_len_bucket(max(1, x), page_size, max_seq_cap)
+                    for x in buckets
+                }
             )
             prev_bs = bs_int
         return values
 
     @staticmethod
-    def _align_seq_len_bucket(seq_len: int, page_size: int) -> int:
+    def _align_seq_len_bucket(
+        seq_len: int, page_size: int, max_seq_cap: Optional[int] = None
+    ) -> int:
         if page_size <= 1:
             return int(seq_len)
-        return max(1, (int(seq_len) // page_size) * page_size)
+        aligned = max(
+            1, ((int(seq_len) + page_size - 1) // page_size) * page_size
+        )
+        if max_seq_cap is not None:
+            aligned = min(aligned, int(max_seq_cap))
+        return aligned
 
     def _seq_len_fill_values_for_bs(self, bs: int) -> List[int]:
         return self.seq_len_fill_values_by_bs.get(int(bs), [self.seq_len_fill_value])
@@ -1313,26 +1353,10 @@ class CudaGraphRunner:
             else:
                 seq_len_bucket = self._select_seq_len_fill_value_for_bs(graph_bs)
 
-        if (
-            forward_batch.return_logprob
-            and getattr(attn_backend, "enable_attn_cp_decode_cp2_fused_q_fa", False)
-            and not getattr(
-                attn_backend,
-                "attn_cp_decode_cp2_fused_q_fa_allow_logprob",
-                False,
-            )
+        if forward_batch.return_logprob and getattr(
+            attn_backend, "is_attn_cp_sharded_kv", False
         ):
-            fused_min_seq_cap = getattr(
-                attn_backend,
-                "attn_cp_decode_cp2_fused_q_fa_min_seq_cap",
-                0,
-            )
-            # The graph capture batch does not request logprobs. Only bypass a
-            # captured graph when the selected graph bucket could have captured
-            # the experimental fused branch; short buckets captured the exact
-            # FA3 fallback and should keep using the existing graph path.
-            if seq_len_bucket is not None and seq_len_bucket >= fused_min_seq_cap:
-                return False
+            return False
 
         variant_label = self._resolve_lora_variant(forward_batch)
         graph_key = (
