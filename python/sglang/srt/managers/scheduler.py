@@ -217,6 +217,9 @@ from sglang.srt.server_args import PortArgs, ServerArgs, get_global_server_args
 from sglang.srt.session.session_controller import SessionController
 from sglang.srt.session.streaming_session import StreamingSession
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.speculative.spec_utils import (
+    make_welmv4_mtp_kv_mirror_state_buffers,
+)
 from sglang.srt.utils import (
     DynamicGradMode,
     broadcast_pyobj,
@@ -1061,16 +1064,53 @@ class Scheduler(
         if self.draft_worker is None or self.spec_algorithm.is_ngram():
             return None, None
 
-        if self.spec_algorithm.supports_spec_v2() and self.enable_overlap:
-            if self.server_args.enable_multi_layer_eagle:
-                draft_runner = self.draft_worker.draft_worker.draft_runner_list[0]
-            else:
-                draft_runner = self.draft_worker.draft_worker.draft_runner
+        draft_runner = self._get_draft_model_runner()
+        if draft_runner is not None:
             return draft_runner.token_to_kv_pool, draft_runner.model_config
 
         return (
             self.draft_worker.model_runner.token_to_kv_pool,
             self.draft_worker.model_config,
+        )
+
+    def _get_draft_model_runner(self):
+        if self.draft_worker is None or self.spec_algorithm.is_ngram():
+            return None
+
+        if self.spec_algorithm.supports_spec_v2() and self.enable_overlap:
+            if self.server_args.enable_multi_layer_eagle:
+                return self.draft_worker.draft_worker.draft_runner_list[0]
+            return self.draft_worker.draft_worker.draft_runner
+
+        return getattr(self.draft_worker, "model_runner", None)
+
+    def _init_welm_mtp_kv_mirror_state_buffers(self) -> None:
+        self.welm_mtp_kv_mirror_state_buffers = None
+        if not self.server_args.enable_welm_kv_mirror_opt:
+            return
+
+        draft_runner = self._get_draft_model_runner()
+        if draft_runner is None:
+            return
+
+        token_to_kv_pool = self.token_to_kv_pool_allocator.get_kvcache()
+        max_rows = token_to_kv_pool.size + getattr(token_to_kv_pool, "page_size", 1)
+        buffers = make_welmv4_mtp_kv_mirror_state_buffers(draft_runner, max_rows)
+        self.welm_mtp_kv_mirror_state_buffers = buffers or None
+
+        inner_draft_worker = getattr(self.draft_worker, "draft_worker", None)
+        if inner_draft_worker is not None:
+            inner_draft_worker.welm_mtp_kv_mirror_state_buffers = (
+                self.welm_mtp_kv_mirror_state_buffers
+            )
+
+        logger.info(
+            "WeLM MTP mirror state buffers for PD: %s",
+            (
+                sorted(self.welm_mtp_kv_mirror_state_buffers)
+                if self.welm_mtp_kv_mirror_state_buffers
+                else []
+            ),
         )
 
     def _maybe_register_hicache_draft(self) -> None:
@@ -1274,6 +1314,7 @@ class Scheduler(
 
         # todo: should we fix this when enabling mtp or it doesn't matter since we only enable mtp in decode node thus we don't transfer draft kvs between P and D?
         draft_token_to_kv_pool, model_config = self._get_draft_kv_pool()
+        self._init_welm_mtp_kv_mirror_state_buffers()
         # Default to the target model_config so the MetadataBuffers branches
         # below can always access it; overridden by the draft model_config
         # when this node runs a spec module.
@@ -1317,6 +1358,7 @@ class Scheduler(
                 req_to_token_pool=self.req_to_token_pool,
                 token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
                 draft_token_to_kv_pool=draft_token_to_kv_pool,
+                welm_mtp_kv_mirror_state_buffers=self.welm_mtp_kv_mirror_state_buffers,
                 req_to_metadata_buffer_idx_allocator=self.req_to_metadata_buffer_idx_allocator,
                 metadata_buffers=self.disagg_metadata_buffers,
                 scheduler=self,
@@ -1360,6 +1402,7 @@ class Scheduler(
             self.disagg_prefill_bootstrap_queue = PrefillBootstrapQueue(
                 token_to_kv_pool=self.token_to_kv_pool_allocator.get_kvcache(),
                 draft_token_to_kv_pool=draft_token_to_kv_pool,
+                welm_mtp_kv_mirror_state_buffers=self.welm_mtp_kv_mirror_state_buffers,
                 req_to_metadata_buffer_idx_allocator=self.req_to_metadata_buffer_idx_allocator,
                 metadata_buffers=self.disagg_metadata_buffers,
                 tp_rank=self.tp_rank,

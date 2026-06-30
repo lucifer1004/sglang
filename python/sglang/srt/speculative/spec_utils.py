@@ -78,7 +78,7 @@ def mark_welmv4_mtp_draft_decode(forward_batch, model_runner) -> None:
 WELMV4_KV_MIRROR_STATES_KEY = "welm_kv_mirror_states"
 
 
-def _get_welmv4_mtp_mirror_imitated_layers(model_runner) -> List[int]:
+def _get_welmv4_mtp_mirror_layers(model_runner) -> List[int]:
     hf_config = getattr(getattr(model_runner, "model_config", None), "hf_config", None)
     num_hidden_layers = getattr(hf_config, "num_hidden_layers", 0)
     num_nextn_predict_layers = getattr(hf_config, "num_nextn_predict_layers", 0)
@@ -92,7 +92,7 @@ def _get_welmv4_mtp_mirror_imitated_layers(model_runner) -> List[int]:
             num_hidden_layers <= mirror < num_hidden_layers + num_nextn_predict_layers
             and 0 <= imitated < num_hidden_layers
         ):
-            layers.append(imitated)
+            layers.append(mirror)
     return layers
 
 
@@ -125,7 +125,7 @@ def make_welmv4_mtp_kv_mirror_state_buffers(
     buffers = {}
     dtype = model_runner.model_config.dtype
     device = model_runner.device
-    for layer_idx in _get_welmv4_mtp_mirror_imitated_layers(model_runner):
+    for layer_idx in _get_welmv4_mtp_mirror_layers(model_runner):
         buffers[f"{layer_idx}.k"] = torch.zeros(
             (max_rows, tensor_size), dtype=dtype, device=device
         )
@@ -135,9 +135,24 @@ def make_welmv4_mtp_kv_mirror_state_buffers(
     return buffers
 
 
+def get_welmv4_mtp_kv_mirror_state_buf_infos(
+    buffers: Optional[Dict[str, torch.Tensor]],
+) -> Tuple[List[int], List[int], List[int]]:
+    if not buffers:
+        return [], [], []
+
+    ordered_buffers = [buffers[key] for key in sorted(buffers)]
+    return (
+        [tensor.data_ptr() for tensor in ordered_buffers],
+        [tensor.nbytes for tensor in ordered_buffers],
+        [tensor[0].nbytes for tensor in ordered_buffers],
+    )
+
+
 def build_welmv4_mtp_model_specific_states(
     buffers: Optional[Dict[str, torch.Tensor]],
-    rows: int,
+    rows: Optional[int] = None,
+    indices: Optional[torch.Tensor] = None,
 ) -> Optional[Dict[str, Dict[int, Tuple[torch.Tensor, torch.Tensor]]]]:
     if not buffers:
         return None
@@ -146,7 +161,18 @@ def build_welmv4_mtp_model_specific_states(
     for key, tensor in buffers.items():
         layer_idx, suffix = key.split(".", 1)
         pair = kv_mirror_states.setdefault(int(layer_idx), [None, None])
-        pair[0 if suffix == "k" else 1] = tensor[:rows]
+        if indices is None:
+            if rows is None:
+                raise ValueError(
+                    "rows is required when building WeLM MTP mirror states "
+                    "without explicit indices."
+                )
+            state_tensor = tensor[:rows]
+        else:
+            state_tensor = tensor.index_select(
+                0, indices.to(device=tensor.device, dtype=torch.long)
+            )
+        pair[0 if suffix == "k" else 1] = state_tensor
 
     kv_mirror_states = {
         layer_idx: (k, v)
@@ -161,32 +187,59 @@ def build_welmv4_mtp_model_specific_states(
 def copy_welmv4_mtp_kv_mirror_states_to_buffers(
     dst_buffers: Optional[Dict[str, torch.Tensor]],
     model_specific_states,
-    rows: int,
+    rows: Optional[int] = None,
+    indices: Optional[torch.Tensor] = None,
 ) -> None:
     if not dst_buffers:
         return
 
-    for buffer in dst_buffers.values():
-        if buffer.shape[0] > rows:
-            buffer[rows:].zero_()
+    if indices is None:
+        if rows is None:
+            raise ValueError(
+                "rows is required when copying WeLM MTP mirror states without "
+                "explicit indices."
+            )
+        dst_indices = None
+        copy_rows = int(rows)
+    else:
+        dst_indices = indices.to(dtype=torch.long)
+        copy_rows = int(dst_indices.numel())
+
+    if dst_indices is None:
+        for buffer in dst_buffers.values():
+            if buffer.shape[0] > copy_rows:
+                buffer[copy_rows:].zero_()
+
+    def zero_dst(dst: torch.Tensor) -> None:
+        if dst_indices is None:
+            dst[:copy_rows].zero_()
+        else:
+            dst.index_fill_(0, dst_indices.to(device=dst.device), 0)
+
+    def copy_dst(dst: torch.Tensor, src: torch.Tensor) -> None:
+        src = src[:copy_rows].to(device=dst.device, dtype=dst.dtype)
+        if dst_indices is None:
+            dst[:copy_rows].copy_(src)
+        else:
+            dst.index_copy_(0, dst_indices.to(device=dst.device), src)
 
     kv_mirror_states = (model_specific_states or {}).get(WELMV4_KV_MIRROR_STATES_KEY)
     if not isinstance(kv_mirror_states, dict):
         for buffer in dst_buffers.values():
-            buffer[:rows].zero_()
+            zero_dst(buffer)
         return
 
     for key, dst in dst_buffers.items():
         layer_idx, suffix = key.split(".", 1)
         tensors = kv_mirror_states.get(int(layer_idx))
         if not tensors:
-            dst[:rows].zero_()
+            zero_dst(dst)
             continue
         src = tensors[0 if suffix == "k" else 1]
         if not isinstance(src, torch.Tensor):
-            dst[:rows].zero_()
+            zero_dst(dst)
             continue
-        dst[:rows].copy_(src[:rows])
+        copy_dst(dst, src)
 
 
 def slice_welmv4_mtp_kv_mirror_states(model_specific_states, indices=None):
@@ -1021,5 +1074,3 @@ def get_last_loc_large_page_size_large_top_k(
         extend_lens,
         last_page_lens,
     )
-
-

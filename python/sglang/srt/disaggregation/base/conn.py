@@ -18,6 +18,7 @@ class StateType(str, enum.Enum):
     MAMBA = "mamba"
     SWA = "swa"
     NSA = "nsa"
+    WELM_MTP_MIRROR = "welm_mtp_mirror"
 
 
 @dataclasses.dataclass

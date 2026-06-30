@@ -960,7 +960,7 @@ class MoriKVManager(CommonKVManager):
             return self._send_mamba_state(
                 peer_info, src_state_indices, dst_state_indices
             )
-        elif state_type in ("swa", "nsa"):
+        elif state_type in ("swa", "nsa", "welm_mtp_mirror"):
             return self._send_swa_nsa_state(
                 peer_info, src_state_indices, dst_state_indices, state_type
             )

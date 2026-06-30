@@ -5,7 +5,7 @@ import random
 from collections import deque
 from contextlib import nullcontext
 from enum import Enum
-from typing import TYPE_CHECKING, List, Literal, Optional, Tuple, Type, overload
+from typing import TYPE_CHECKING, Dict, List, Literal, Optional, Tuple, Type, overload
 
 import numpy as np
 import torch
@@ -555,6 +555,7 @@ def setup_state_kv_args(
     draft_token_to_kv_pool=None,
     total_kv_layers: int = None,
     req_to_token_pool=None,
+    welm_mtp_kv_mirror_state_buffers: Optional[Dict[str, torch.Tensor]] = None,
 ) -> None:
     """Populate ``kv_args`` state-buffer fields from the given pool.
     Shared by prefill and decode bootstrap paths so the state_type dispatch
@@ -564,6 +565,9 @@ def setup_state_kv_args(
     from sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMLATokenToKVPool
     from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
     from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, NSATokenToKVPool
+    from sglang.srt.speculative.spec_utils import (
+        get_welmv4_mtp_kv_mirror_state_buf_infos,
+    )
 
     kv_args.state_types = []
     kv_args.state_data_ptrs = []
@@ -610,6 +614,18 @@ def setup_state_kv_args(
                 append_state_component(
                     kv_args, StateType.NSA, data_ptrs, data_lens, item_lens
                 )
+
+    data_ptrs, data_lens, item_lens = get_welmv4_mtp_kv_mirror_state_buf_infos(
+        welm_mtp_kv_mirror_state_buffers
+    )
+    if data_ptrs:
+        append_state_component(
+            kv_args,
+            StateType.WELM_MTP_MIRROR,
+            data_ptrs,
+            data_lens,
+            item_lens,
+        )
 
     if (
         StateType.MAMBA not in kv_args.state_types

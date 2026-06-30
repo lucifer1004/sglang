@@ -20,6 +20,13 @@ if TYPE_CHECKING:
 
 class ScheduleBatchDisaggregationDecodeMixin:
 
+    def _is_welm_mtp_pd_decode_prebuilt(self: ScheduleBatch, server_args: ServerArgs):
+        return (
+            server_args.disaggregation_mode == "decode"
+            and server_args.enable_welm_kv_mirror_opt
+            and self.spec_algorithm.is_eagle()
+        )
+
     def prepare_for_prebuilt(self: ScheduleBatch):
         """
         Prepare a prebuilt extend by populate metadata
@@ -95,6 +102,29 @@ class ScheduleBatchDisaggregationDecodeMixin:
         self.extend_input_logprob_token_ids = extend_input_logprob_token_ids
         self.multimodal_inputs = [r.multimodal_inputs for r in reqs]
 
+        from sglang.srt.server_args import get_global_server_args
+
+        server_args = get_global_server_args()
+        if self._is_welm_mtp_pd_decode_prebuilt(server_args):
+            from sglang.srt.managers.schedule_batch import OverEncodingContext
+            from sglang.srt.models.welm_perf_opt import (
+                get_welm_oe_hash_config,
+                should_use_welm_oe_hash_kernel,
+            )
+
+            if should_use_welm_oe_hash_kernel(self.model_config):
+                oe_grams, _ = get_welm_oe_hash_config(self.model_config)
+                if not oe_grams:
+                    raise RuntimeError(
+                        "WeLM OE requires oe_grams for the CUDA hash kernel."
+                    )
+                self.oe_context = OverEncodingContext.from_extend_hash_kernel(
+                    reqs,
+                    self.prefix_lens,
+                    max(oe_grams) - 1,
+                    legacy_history_width=max(oe_grams),
+                )
+
         # Build sampling info
         self.sampling_info = SamplingBatchInfo.from_schedule_batch(
             self,
@@ -134,37 +164,56 @@ class ScheduleBatchDisaggregationDecodeMixin:
 
         # Simulate the eagle run.
         if self.spec_algorithm.is_eagle():
-            num_states = server_args.speculative_eagle_topk
+            is_welm_mtp_pd_decode = self._is_welm_mtp_pd_decode_prebuilt(server_args)
+            num_states = (
+                server_args.speculative_num_steps
+                if is_welm_mtp_pd_decode and server_args.speculative_eagle_topk == 1
+                else server_args.speculative_eagle_topk
+            )
             if server_args.enable_multi_layer_eagle:
                 num_states *= server_args.speculative_num_steps
-            topk_p = torch.stack(
-                [
-                    torch.as_tensor(
-                        req.output_topk_p[:num_states],
-                        device=self.device,
-                        dtype=torch.float32,
-                    )
-                    for req in self.reqs
-                ],
-                dim=0,
-            )
-            topk_index = torch.stack(
-                [
-                    torch.as_tensor(
-                        req.output_topk_index[:num_states],
-                        device=self.device,
-                        dtype=torch.int64,
-                    )
-                    for req in self.reqs
-                ],
-                dim=0,
-            )
 
             hidden_states_list = [req.hidden_states_tensor for req in self.reqs]
             hidden_states = torch.stack(hidden_states_list, dim=0).to(self.device)
 
             # local import to avoid circular import
             from sglang.srt.speculative.eagle_info import EagleDraftInput
+
+            if is_welm_mtp_pd_decode:
+                topk_index = (
+                    self.output_ids.to(dtype=torch.int64)
+                    .view(-1, 1)
+                    .expand(-1, num_states)
+                    .contiguous()
+                )
+                topk_p = torch.ones(
+                    (len(self.reqs), num_states),
+                    device=self.device,
+                    dtype=torch.float32,
+                )
+            else:
+                topk_p = torch.stack(
+                    [
+                        torch.as_tensor(
+                            req.output_topk_p[:num_states],
+                            device=self.device,
+                            dtype=torch.float32,
+                        )
+                        for req in self.reqs
+                    ],
+                    dim=0,
+                )
+                topk_index = torch.stack(
+                    [
+                        torch.as_tensor(
+                            req.output_topk_index[:num_states],
+                            device=self.device,
+                            dtype=torch.int64,
+                        )
+                        for req in self.reqs
+                    ],
+                    dim=0,
+                )
 
             spec_info = EagleDraftInput(
                 topk_p=topk_p,
@@ -173,7 +222,17 @@ class ScheduleBatchDisaggregationDecodeMixin:
                 bonus_tokens=self.output_ids,
                 new_seq_lens=self.seq_lens,
             )
-            spec_info.prepare_for_extend(self)
+            if is_welm_mtp_pd_decode:
+                spec_info.welm_mtp_deferred_prefill_draft = True
+                spec_info.welm_mtp_deferred_prefill_draft_mask = torch.ones(
+                    (len(self.reqs),),
+                    dtype=torch.bool,
+                    device=self.device,
+                )
+                spec_info.num_tokens_per_req = 1
+                spec_info.num_tokens_for_logprob_per_req = 1
+            else:
+                spec_info.prepare_for_extend(self)
             spec_info.capture_hidden_mode = CaptureHiddenMode.LAST
             if self.enable_overlap:
                 spec_info.future_indices = future_map.alloc_future_indices(

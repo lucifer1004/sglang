@@ -72,6 +72,8 @@ from sglang.srt.speculative.eagle_utils import (
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
     assign_req_to_token_pool_func,
+    build_welmv4_mtp_model_specific_states,
+    copy_welmv4_mtp_kv_mirror_states_to_buffers,
     draft_tp_context,
     generate_token_bitmask,
     load_token_map,
@@ -257,6 +259,7 @@ class EagleDraftWorker(BaseDraftWorker):
         self.welmv4_mtp_draft_fixed_top_p = _parse_optional_float_env(
             _WELM_MTP_DRAFT_FIXED_TOP_P_ENV
         )
+        self.welm_mtp_kv_mirror_state_buffers = None
         if (
             self.welmv4_mtp_draft_fixed_temperature is not None
             and self.welmv4_mtp_draft_fixed_temperature <= 0
@@ -2319,6 +2322,142 @@ class EagleDraftWorker(BaseDraftWorker):
             device=next_token_ids.device,
         )
 
+    def _copy_welmv4_mtp_pd_prefill_mirror_states(
+        self,
+        batch: ModelWorkerBatch,
+        model_specific_states,
+    ) -> None:
+        if not self.server_args.enable_welm_kv_mirror_opt:
+            return
+        buffers = getattr(self, "welm_mtp_kv_mirror_state_buffers", None)
+        if not buffers:
+            return
+        out_cache_loc = getattr(batch, "out_cache_loc", None)
+        if out_cache_loc is None or int(out_cache_loc.numel()) == 0:
+            return
+        copy_welmv4_mtp_kv_mirror_states_to_buffers(
+            buffers,
+            model_specific_states,
+            indices=out_cache_loc,
+        )
+
+    def _build_welmv4_mtp_pd_prefill_mirror_states(
+        self,
+        batch: ModelWorkerBatch,
+    ):
+        if not self.server_args.enable_welm_kv_mirror_opt:
+            return None
+        buffers = getattr(self, "welm_mtp_kv_mirror_state_buffers", None)
+        if not buffers:
+            return None
+        out_cache_loc = getattr(batch, "out_cache_loc", None)
+        if out_cache_loc is None or int(out_cache_loc.numel()) == 0:
+            return None
+        return build_welmv4_mtp_model_specific_states(
+            buffers,
+            indices=out_cache_loc,
+        )
+
+    def _materialize_welmv4_mtp_deferred_prefill_draft(
+        self,
+        model_worker_batch: ModelWorkerBatch,
+        draft_input: EagleDraftInput,
+    ) -> None:
+        deferred_mask = getattr(
+            draft_input, "welm_mtp_deferred_prefill_draft_mask", None
+        )
+        if deferred_mask is not None and (
+            deferred_mask.numel() == 0 or not bool(deferred_mask.all().item())
+        ):
+            raise RuntimeError(
+                "Mixed WeLM MTP deferred prefill rows reached draft(); PD decode "
+                "currently isolates deferred prebuilt batches before running them."
+            )
+
+        if model_worker_batch.extend_seq_lens is None:
+            raise RuntimeError(
+                "WeLM MTP PD decode bootstrap requires prebuilt extend_seq_lens."
+            )
+        if model_worker_batch.extend_prefix_lens is None:
+            raise RuntimeError(
+                "WeLM MTP PD decode bootstrap requires prebuilt extend_prefix_lens."
+            )
+
+        model_specific_states = self._build_welmv4_mtp_pd_prefill_mirror_states(
+            model_worker_batch
+        )
+        if self.server_args.enable_welm_kv_mirror_opt and model_specific_states is None:
+            raise RuntimeError(
+                "WeLM MTP PD decode bootstrap is missing mirrored KV states."
+            )
+
+        original_attrs = {
+            name: getattr(model_worker_batch, name, None)
+            for name in (
+                "forward_mode",
+                "is_extend_in_batch",
+                "capture_hidden_mode",
+                "input_ids",
+            )
+        }
+        original_model_specific_states = draft_input.model_specific_states
+        first_query_hashed_inputs = None
+        first_query_history_state = None
+        use_oe_hash_kernel = self._should_use_welmv4_mtp_oe_hash_kernel()
+        try:
+            model_worker_batch.forward_mode = ForwardMode.EXTEND
+            model_worker_batch.is_extend_in_batch = False
+            model_worker_batch.capture_hidden_mode = CaptureHiddenMode.LAST
+            model_worker_batch.input_ids = model_worker_batch.input_ids.to(
+                dtype=torch.int64
+            )
+            draft_input.model_specific_states = model_specific_states
+
+            forward_batch = ForwardBatch.init_new(model_worker_batch, self.draft_runner)
+            forward_batch.return_logprob = False
+            if use_oe_hash_kernel and model_worker_batch.oe_context is not None:
+                self._prepare_welmv4_mtp_segment_hash_inputs_from_prefixes(
+                    forward_batch
+                )
+            if use_oe_hash_kernel:
+                entry_history_state = self._init_welmv4_mtp_oe_history_from_extend(
+                    forward_batch,
+                    first_token_ids=None,
+                )
+                if entry_history_state is None:
+                    raise RuntimeError(
+                        "WeLMV4 MTP PD decode bootstrap is missing entry OE "
+                        "history for the first query."
+                    )
+                (
+                    first_query_hashed_inputs,
+                    first_query_history_state,
+                    first_query_verify_history_state,
+                ) = self._compute_welmv4_mtp_first_query_hash_from_entry_history(
+                    forward_batch,
+                    draft_input.bonus_tokens,
+                    entry_history_state,
+                )
+                draft_input.welm_mtp_oe_history_state = (
+                    first_query_verify_history_state
+                )
+
+            self._run_welmv4_mtp_merged_extend_draft(
+                forward_batch,
+                draft_input.bonus_tokens,
+                skip_attn_backend_init=False,
+                first_query_hashed_inputs=first_query_hashed_inputs,
+                first_query_history_state=first_query_history_state,
+                draft_path="pd_decode_prefill",
+            )
+        finally:
+            for name, value in original_attrs.items():
+                setattr(model_worker_batch, name, value)
+            draft_input.model_specific_states = original_model_specific_states
+
+        draft_input.welm_mtp_deferred_prefill_draft = False
+        draft_input.welm_mtp_deferred_prefill_draft_mask = None
+
     def _run_welmv4_mtp_merged_extend_draft(
         self,
         forward_batch: ForwardBatch,
@@ -3066,10 +3205,12 @@ class EagleDraftWorker(BaseDraftWorker):
             and not model_worker_batch.forward_mode.is_idle()
             and self._has_welmv4_mtp_deferred_prefill_rows(draft_input)
         ):
-            raise RuntimeError(
-                "Deferred WeLM MTP prefill draft input reached draft(); "
-                "the final prefill chunk should replace it with a "
-                "merged_extend_draft proposal before decode."
+            self._materialize_welmv4_mtp_deferred_prefill_draft(
+                model_worker_batch,
+                draft_input,
+            )
+            use_welmv4_mtp_draft_proposal = self._has_welmv4_mtp_draft_proposal(
+                draft_input
             )
         if (
             is_welmv4_mtp
@@ -4160,9 +4301,19 @@ class EAGLEWorkerV2(BaseSpecWorker):
             or model_worker_batch.is_extend_in_batch
         ):
             # Target prefill
-            model_worker_batch.capture_hidden_mode = CaptureHiddenMode.FULL
+            is_welmv4_mtp = self.draft_worker._is_welmv4_mtp_draft_model()
+            defer_welmv4_mtp_pd_prefill = (
+                self.server_args.disaggregation_mode == "prefill"
+                and self.server_args.enable_welm_kv_mirror_opt
+                and is_welmv4_mtp
+            )
+            model_worker_batch.capture_hidden_mode = (
+                CaptureHiddenMode.LAST
+                if defer_welmv4_mtp_pd_prefill
+                else CaptureHiddenMode.FULL
+            )
             if (
-                self.draft_worker._is_welmv4_mtp_draft_model()
+                is_welmv4_mtp
                 and self.topk > 1
                 and model_worker_batch.out_cache_loc is not None
             ):
@@ -4172,6 +4323,29 @@ class EAGLEWorkerV2(BaseSpecWorker):
             batch_output = self.target_worker.forward_batch_generation(
                 model_worker_batch
             )
+
+            if defer_welmv4_mtp_pd_prefill:
+                self.draft_worker._copy_welmv4_mtp_pd_prefill_mirror_states(
+                    model_worker_batch,
+                    batch_output.logits_output.model_specific_states,
+                )
+                next_draft_input = EagleDraftInput(
+                    hidden_states=batch_output.logits_output.hidden_states,
+                    bonus_tokens=batch_output.next_token_ids,
+                    new_seq_lens=model_worker_batch.seq_lens,
+                    num_tokens_per_req=1,
+                    num_tokens_for_logprob_per_req=1,
+                )
+                self.draft_worker._prepare_welmv4_mtp_deferred_prefill_draft_input(
+                    next_draft_input,
+                    model_worker_batch,
+                    batch_output.logits_output.hidden_states,
+                    batch_output.next_token_ids,
+                )
+                next_draft_input.capture_hidden_mode = CaptureHiddenMode.LAST
+                model_worker_batch.spec_info = next_draft_input
+                batch_output.next_draft_input = next_draft_input
+                return batch_output
 
             # Draft prefill
             model_worker_batch.capture_hidden_mode = CaptureHiddenMode.LAST

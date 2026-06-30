@@ -3109,7 +3109,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self, seq_lens_cpu_cache: Optional[torch.Tensor] = None
     ) -> ModelWorkerBatch:
         scale = self._get_scale_seq_factor()
-        if self.forward_mode.is_decode_or_idle() and scale <= 1:
+        if (
+            self.forward_mode.is_decode_or_idle()
+            and scale <= 1
+            and not getattr(self.spec_info, "welm_mtp_deferred_prefill_draft", False)
+        ):
             extend_seq_lens = extend_prefix_lens = extend_logprob_start_lens = None
             welm_kv_mirror_last_q_indices = None
             welm_kv_mirror_active_batch_indices = None

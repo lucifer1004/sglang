@@ -268,6 +268,7 @@ class DecodePreallocQueue:
         req_to_token_pool: ReqToTokenPool,
         token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
         draft_token_to_kv_pool: Optional[KVCache],
+        welm_mtp_kv_mirror_state_buffers: Optional[Dict[str, torch.Tensor]],
         req_to_metadata_buffer_idx_allocator: ReqToMetadataIdxAllocator,
         metadata_buffers: MetadataBuffers,
         scheduler: Scheduler,
@@ -288,6 +289,7 @@ class DecodePreallocQueue:
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
         self.token_to_kv_pool = token_to_kv_pool_allocator.get_kvcache()
         self.draft_token_to_kv_pool = draft_token_to_kv_pool
+        self.welm_mtp_kv_mirror_state_buffers = welm_mtp_kv_mirror_state_buffers
         self.is_mla_backend = is_mla_backend(self.token_to_kv_pool)
         self.metadata_buffers = metadata_buffers
         self.req_to_metadata_buffer_idx_allocator = req_to_metadata_buffer_idx_allocator
@@ -418,6 +420,7 @@ class DecodePreallocQueue:
             self.draft_token_to_kv_pool,
             total_kv_layers=self.scheduler.model_config.num_hidden_layers,
             req_to_token_pool=getattr(self, "req_to_token_pool", None),
+            welm_mtp_kv_mirror_state_buffers=self.welm_mtp_kv_mirror_state_buffers,
         )
 
         kv_args.ib_device = self.scheduler.server_args.disaggregation_ib_device
@@ -975,6 +978,11 @@ class DecodePreallocQueue:
                         kv_indices_full.cpu().numpy(), device_page_size
                     )
 
+                def _welm_mtp_mirror_payload():
+                    return self.req_to_token_pool.req_to_token[
+                        decode_req.req.req_pool_idx, :seq_len
+                    ].cpu().numpy()
+
                 state_types = self.kv_manager.kv_args.state_types
                 state_indices = []
                 for st in state_types:
@@ -984,6 +992,8 @@ class DecodePreallocQueue:
                         state_indices.append(_swa_payload())
                     elif st == StateType.NSA:
                         state_indices.append(_nsa_payload())
+                    elif st == StateType.WELM_MTP_MIRROR:
+                        state_indices.append(_welm_mtp_mirror_payload())
                     else:
                         state_indices.append(None)
                 page_indices = kv_to_page_indices(kv_indices, page_size)
@@ -1594,6 +1604,20 @@ class DecodeTransferQueue:
 
 
 class SchedulerDisaggregationDecodeMixin:
+    def _should_isolate_welm_mtp_prebuilt(self: Scheduler) -> bool:
+        if not (
+            self.server_args.enable_welm_kv_mirror_opt
+            and self.spec_algorithm.is_eagle()
+        ):
+            return False
+        inner_draft_worker = getattr(
+            getattr(self, "draft_worker", None), "draft_worker", None
+        )
+        is_welm_mtp = getattr(
+            inner_draft_worker, "_is_welmv4_mtp_draft_model", lambda: False
+        )
+        return bool(is_welm_mtp())
+
     @torch.no_grad()
     def event_loop_normal_disagg_decode(self: Scheduler):
         """A normal scheduler loop for decode worker in disaggregation mode."""
@@ -1675,7 +1699,13 @@ class SchedulerDisaggregationDecodeMixin:
     ) -> Optional[ScheduleBatch]:
         """Process prebuilt batch and schedule the next decode batch."""
         # Process pending prebuilt batch: output processing + filter + merge
-        new_prebuilt_batch = self.get_new_prebuilt_batch()
+        if (
+            self._should_isolate_welm_mtp_prebuilt()
+            and not self.running_batch.is_empty()
+        ):
+            new_prebuilt_batch = None
+        else:
+            new_prebuilt_batch = self.get_new_prebuilt_batch()
         if new_prebuilt_batch:
             assert self.chunked_req is None
             self.process_batch_result_prebuilt(new_prebuilt_batch)
