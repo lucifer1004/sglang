@@ -524,11 +524,16 @@ class SchedulerDisaggregationPrefillMixin:
                 req.output_ids.append(next_token_id)
                 maybe_cache_unfinished_req(req, self.tree_cache)
                 self.disagg_prefill_inflight_queue.append(req)
-                if self.spec_algorithm.is_eagle() and batch.spec_info is not None:
-                    req.output_topk_p = batch.spec_info.topk_p[i]
-                    req.output_topk_index = batch.spec_info.topk_index[i]
+                spec_info = (
+                    result.next_draft_input
+                    if result.next_draft_input is not None
+                    else batch.spec_info
+                )
+                if self.spec_algorithm.is_eagle() and spec_info is not None:
+                    req.output_topk_p = spec_info.topk_p[i]
+                    req.output_topk_index = spec_info.topk_index[i]
                     req.hidden_states_tensor = (
-                        batch.spec_info.hidden_states[i].cpu().clone()
+                        spec_info.hidden_states[i].cpu().clone()
                     )
                 else:
                     req.hidden_states_tensor = None
