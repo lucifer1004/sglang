@@ -175,6 +175,7 @@ from sglang.srt.utils.json_response import (
     orjson_response,
 )
 from sglang.srt.utils.request_trace import (
+    close_request_trace_recording,
     configure_request_trace_recording,
     trace_http_request,
 )
@@ -409,7 +410,12 @@ async def lifespan(fast_api_app: FastAPI):
     try:
         yield
     finally:
-        warmup_thread.join()
+        try:
+            close_request_trace_recording()
+        except Exception:
+            logger.exception("Failed to close request trace recording")
+        finally:
+            warmup_thread.join()
 
 
 # Fast API

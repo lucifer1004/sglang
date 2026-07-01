@@ -122,6 +122,7 @@ from sglang.srt.utils.request_logger import RequestLogger
 from sglang.srt.utils.request_trace import (
     add_generation_output_ids,
     add_generation_prompt_ids,
+    close_request_trace_recording,
     current_request_trace,
     request_trace_enabled,
 )
@@ -1054,6 +1055,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 need_wait_for_mm_inputs=obj.need_wait_for_mm_inputs,
                 num_items_assigned=obj.num_items_assigned,
                 multi_item_delimiter_indices=obj.multi_item_delimiter_indices,
+                request_trace_input_ids_from_body=obj.input_ids is not None,
             )
         elif isinstance(obj, EmbeddingReqInput):
             # Resolve unresolved embed overrides now that input_ids are available
@@ -1326,6 +1328,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             trace=trace,
             generation_rid=tokenized_obj.rid,
             prompt_token_ids=tokenized_obj.input_ids,
+            prompt_token_ids_from_request_body=(
+                tokenized_obj.request_trace_input_ids_from_body
+            ),
         )
 
     def _record_request_trace_output_ids(
@@ -1334,8 +1339,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         out: Dict[Any, Any],
         is_stream: bool,
         finished: bool,
+        output_ids: Optional[List[int]] = None,
     ) -> None:
-        if not request_trace_enabled() or not isinstance(obj, GenerateReqInput):
+        if (
+            not finished
+            or not request_trace_enabled()
+            or not isinstance(obj, GenerateReqInput)
+        ):
             return
         trace = current_request_trace.get(None)
         if trace is None:
@@ -1344,9 +1354,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         add_generation_output_ids(
             trace=trace,
             generation_rid=obj.rid,
-            output_ids=out.get("output_ids"),
+            output_ids=output_ids if output_ids is not None else out.get("output_ids"),
             meta_info=out.get("meta_info"),
-            is_delta=is_stream and self.server_args.incremental_streaming_output,
+            is_delta=False,
             finished=finished,
         )
 
@@ -1507,13 +1517,21 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     )
                     if abort_out is not None:
                         self._record_request_trace_output_ids(
-                            obj, abort_out, is_stream, finished=True
+                            obj,
+                            abort_out,
+                            is_stream,
+                            finished=True,
+                            output_ids=state.output_ids if incremental_stream else None,
                         )
                         yield abort_out
                         break
 
                 self._record_request_trace_output_ids(
-                    obj, out, is_stream, finished=True
+                    obj,
+                    out,
+                    is_stream,
+                    finished=True,
+                    output_ids=state.output_ids if incremental_stream else None,
                 )
                 yield out
                 break
@@ -1525,9 +1543,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     out["meta_info"][
                         "response_sent_to_client_ts"
                     ] = state.time_stats.get_response_sent_to_client_realtime()
-                self._record_request_trace_output_ids(
-                    obj, out, is_stream, finished=False
-                )
                 yield out
             else:
                 if (
@@ -2532,6 +2547,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             await asyncio.sleep(5)
 
         # Drain requests
+        should_close_request_trace = True
         while True:
             remain_num_req = len(self.rid_to_state)
             remaining_rids = list(self.rid_to_state.keys())
@@ -2542,6 +2558,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     "Signal SIGTERM received while health check failed. Force exiting."
                 )
                 self.dump_requests_before_crash()
+                should_close_request_trace = False
                 self.force_exit_handler()
                 break
 
@@ -2550,6 +2567,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 logger.error(
                     "Signal SIGTERM received while force shutdown flag set. Force exiting."
                 )
+                should_close_request_trace = False
                 self.force_exit_handler()
                 break
 
@@ -2561,6 +2579,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             else:
                 self.dump_requests_before_crash()
                 break
+
+        if should_close_request_trace:
+            try:
+                close_request_trace_recording()
+            except Exception:
+                logger.exception("Failed to close request trace recording")
 
         kill_process_tree(os.getpid(), include_parent=True)
         sys.exit(0)

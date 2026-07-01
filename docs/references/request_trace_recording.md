@@ -30,6 +30,14 @@ python -m sglang.launch_server \
 - `--request-trace-max-bytes`：单个压缩 JSONL 文件达到该大小后轮转，默认 `1073741824`。
 - `--request-trace-backup-count`：每个进程保留的轮转文件数量，默认 `5`。
 
+性能相关环境变量：
+
+- `SGLANG_REQUEST_TRACE_ASYNC_WORKER_NUM`：并行序列化/压缩进程数，默认 `8`。序列化/压缩完成后会把结果发送给独立 writer 进程落盘。
+- `SGLANG_REQUEST_TRACE_ASYNC_WRITER_QUEUE_MAXSIZE`：writer 进程输入队列最大深度，默认 `SGLANG_REQUEST_TRACE_ASYNC_WORKER_NUM * 2`。队列满时序列化/压缩进程会阻塞等待，不会丢记录。
+- `SGLANG_REQUEST_TRACE_PROCESS_MAX_INFLIGHT`：最多提交到进程池的未完成任务数，默认 `SGLANG_REQUEST_TRACE_ASYNC_WORKER_NUM * 4`。达到上限时请求路径会阻塞等待，不会丢记录。
+- `SGLANG_REQUEST_TRACE_PROCESS_START_METHOD`：multiprocessing start method，默认 `spawn`。
+- `SGLANG_REQUEST_TRACE_GZIP_COMPRESSLEVEL`：gzip 压缩级别，范围 `0` 到 `9`，默认 `1`。
+
 文件名格式：
 
 ```text

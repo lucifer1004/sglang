@@ -808,6 +808,10 @@ class TokenizedGenerateReqInput(BaseReq):
     # Whether to disallow logging for this request (e.g. due to ZDR)
     no_logs: bool = False
 
+    # Whether input_ids came directly from the request body. Request tracing can
+    # recover those ids from the preserved HTTP body without copying them again.
+    request_trace_input_ids_from_body: bool = False
+
     # (Internal) Whether to return bytes for image generation
     return_bytes: bool = False
 

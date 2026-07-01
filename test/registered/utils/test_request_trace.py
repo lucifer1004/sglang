@@ -1,14 +1,19 @@
 import gzip
 import json
+import multiprocessing as mp
+import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from sglang.srt.utils.request_trace import (
     RequestTraceState,
+    _DeferredJsonBody,
     add_generation_output_ids,
     add_generation_prompt_ids,
     configure_request_trace_recording,
+    flush_request_trace,
     write_request_trace,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -17,7 +22,19 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=30, suite="stage-a-test-cpu", nightly=True)
 
 
+_TEST_PROCESS_START_METHOD = (
+    "fork" if "fork" in mp.get_all_start_methods() else "spawn"
+)
+
+
 class TestRequestTrace(CustomTestCase):
+    def setUp(self):
+        self._env_patch = patch.dict(
+            os.environ,
+            {"SGLANG_REQUEST_TRACE_PROCESS_START_METHOD": _TEST_PROCESS_START_METHOD},
+        )
+        self._env_patch.start()
+
     def tearDown(self):
         configure_request_trace_recording(
             record_dir=None,
@@ -26,6 +43,7 @@ class TestRequestTrace(CustomTestCase):
             model_path=None,
             tokenizer_path=None,
         )
+        self._env_patch.stop()
 
     def test_generation_token_ids_support_delta_and_cumulative(self):
         trace = _make_trace()
@@ -90,12 +108,14 @@ class TestRequestTrace(CustomTestCase):
                 finished=True,
             )
             write_request_trace(trace)
+            flush_request_trace()
 
             lines = _read_record_lines(tmpdir)
             self.assertEqual(len(lines), 1)
             self.assertEqual(lines[0]["schema_version"], 1)
             self.assertEqual(lines[0]["request_id"], "req-1")
             self.assertEqual(lines[0]["http_response"], {"text": "hello"})
+            self.assertEqual(lines[0]["generations"][0]["prompt_token_ids"], [1])
             self.assertEqual(lines[0]["generations"][0]["output_token_ids"], [2])
             self.assertEqual(lines[0]["model_path"], "model")
             self.assertEqual(lines[0]["tokenizer_path"], "tokenizer")
@@ -128,6 +148,7 @@ class TestRequestTrace(CustomTestCase):
                     finished=True,
                 )
                 write_request_trace(trace)
+            flush_request_trace()
 
             paths = _record_paths(tmpdir)
             self.assertEqual(len(paths), 3)
@@ -135,6 +156,102 @@ class TestRequestTrace(CustomTestCase):
             lines = _read_record_lines(tmpdir)
             request_ids = {line["request_id"] for line in lines}
             self.assertEqual(request_ids, {"req-2", "req-3", "req-4"})
+
+    def test_deferred_http_body_is_written_as_original_json(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            configure_request_trace_recording(
+                record_dir=tmpdir,
+                max_bytes=1 << 20,
+                backup_count=1,
+                model_path="model",
+                tokenizer_path="tokenizer",
+            )
+            trace = _make_trace()
+            trace.http_request["body"] = _DeferredJsonBody(
+                json.dumps({"input_ids": [1, 2, 3], "no_logs": False}).encode()
+            )
+            write_request_trace(trace)
+            flush_request_trace()
+
+            lines = _read_record_lines(tmpdir)
+            self.assertEqual(lines[0]["http_request"]["body"]["input_ids"], [1, 2, 3])
+            self.assertFalse(lines[0]["http_request"]["body"]["no_logs"])
+
+    def test_prompt_token_ids_fallback_to_request_body_without_main_process_fragment(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            configure_request_trace_recording(
+                record_dir=tmpdir,
+                max_bytes=1 << 20,
+                backup_count=1,
+                model_path="model",
+                tokenizer_path="tokenizer",
+            )
+            trace = _make_trace()
+            trace.endpoint = "/v1/completions"
+            trace.http_request["body"] = _DeferredJsonBody(
+                json.dumps({"prompt": [1, 2, 3], "max_tokens": 1}).encode()
+            )
+            add_generation_prompt_ids(
+                trace=trace,
+                generation_rid="rid-1",
+                prompt_token_ids=[100, 200, 300],
+                prompt_token_ids_from_request_body=True,
+            )
+            self.assertIsNone(trace.generations["rid-1"].prompt_token_ids)
+            add_generation_output_ids(
+                trace=trace,
+                generation_rid="rid-1",
+                output_ids=[4],
+                meta_info={"finish_reason": {"type": "stop"}},
+                is_delta=False,
+                finished=True,
+            )
+            write_request_trace(trace)
+            flush_request_trace()
+
+            lines = _read_record_lines(tmpdir)
+            self.assertEqual(lines[0]["generations"][0]["prompt_token_ids"], [1, 2, 3])
+
+    def test_process_writer_preserves_all_records_with_bounded_inflight(self):
+        env = {
+            "SGLANG_REQUEST_TRACE_ASYNC_WORKER_NUM": "2",
+            "SGLANG_REQUEST_TRACE_ASYNC_WRITER_QUEUE_MAXSIZE": "1",
+            "SGLANG_REQUEST_TRACE_PROCESS_MAX_INFLIGHT": "2",
+        }
+        with tempfile.TemporaryDirectory() as tmpdir, patch.dict(os.environ, env):
+            configure_request_trace_recording(
+                record_dir=tmpdir,
+                max_bytes=1 << 20,
+                backup_count=1,
+                model_path="model",
+                tokenizer_path="tokenizer",
+            )
+
+            for index in range(20):
+                trace = _make_trace(request_id=f"req-{index}")
+                add_generation_prompt_ids(
+                    trace=trace,
+                    generation_rid=f"rid-{index}",
+                    prompt_token_ids=[index],
+                )
+                add_generation_output_ids(
+                    trace=trace,
+                    generation_rid=f"rid-{index}",
+                    output_ids=[index],
+                    meta_info={"finish_reason": {"type": "stop"}},
+                    is_delta=False,
+                    finished=True,
+                )
+                write_request_trace(trace)
+            flush_request_trace()
+
+            lines = _read_record_lines(tmpdir)
+            self.assertEqual(
+                [line["request_id"] for line in lines],
+                [f"req-{index}" for index in range(20)],
+            )
 
 
 def _make_trace(request_id: str = "req-1"):
