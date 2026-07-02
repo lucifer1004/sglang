@@ -56,6 +56,12 @@ from sglang.srt.mem_cache.common import (
     release_kv_cache,
 )
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+from sglang.srt.mem_cache.hicache_storage import (
+    hicache_gib_per_s,
+    hicache_timing_enabled,
+    log_hicache_timing,
+    request_timing_fields,
+)
 from sglang.srt.observability.req_time_stats import set_schedule_time_batch
 
 if TYPE_CHECKING:
@@ -522,6 +528,29 @@ class SchedulerDisaggregationPrefillMixin:
 
                 # There is no output_ids for prefill
                 req.output_ids.append(next_token_id)
+                forward_start = (
+                    req.time_stats.last_forward_entry_time
+                    or req.time_stats.forward_entry_time
+                )
+                if hicache_timing_enabled():
+                    log_hicache_timing(
+                        logger,
+                        "pd_prefill_forward",
+                        **request_timing_fields(
+                            req,
+                            start=forward_start,
+                            end=req.time_stats.prefill_finished_time,
+                            role="prefill",
+                            stage="forward",
+                            tp_rank=getattr(self, "tp_rank", None),
+                            pp_rank=getattr(self, "pp_rank", None),
+                            batch_size=len(batch.reqs),
+                            forward_mode=str(batch.forward_mode),
+                            can_run_cuda_graph=getattr(
+                                result, "can_run_cuda_graph", None
+                            ),
+                        ),
+                    )
                 maybe_cache_unfinished_req(req, self.tree_cache)
                 self.disagg_prefill_inflight_queue.append(req)
                 spec_info = (
@@ -687,9 +716,54 @@ class SchedulerDisaggregationPrefillMixin:
             kv_mgr = getattr(req.disagg_kv_sender, "kv_mgr", None)
             if kv_mgr and getattr(kv_mgr, "is_dummy_cp_rank", False):
                 continue
+            transfer_metric = req.disagg_kv_sender.get_transfer_metric()
             metrics = req.time_stats.compute_and_observe_kv_transfer_metrics(
-                req.disagg_kv_sender.get_transfer_metric()
+                transfer_metric
             )
+            if hicache_timing_enabled():
+                transfer_total_bytes = getattr(
+                    transfer_metric, "transfer_total_bytes", None
+                )
+                transfer_latency_s = getattr(
+                    transfer_metric, "transfer_latency_s", None
+                )
+                timing_elapsed_s = (
+                    req.time_stats.prefill_kv_transfer_finish_time
+                    - req.time_stats.prefill_transfer_queue_entry_time
+                    if req.time_stats.prefill_transfer_queue_entry_time > 0
+                    and req.time_stats.prefill_kv_transfer_finish_time
+                    >= req.time_stats.prefill_transfer_queue_entry_time
+                    else None
+                )
+                transfer_gib_per_s = None
+                if transfer_total_bytes is not None:
+                    transfer_gib_per_s = hicache_gib_per_s(
+                        transfer_total_bytes,
+                        transfer_latency_s or timing_elapsed_s or 0,
+                    )
+                log_hicache_timing(
+                    logger,
+                    "pd_prefill_kv_transfer",
+                    **request_timing_fields(
+                        req,
+                        start=req.time_stats.prefill_transfer_queue_entry_time,
+                        end=req.time_stats.prefill_kv_transfer_finish_time,
+                        role="prefill",
+                        stage="kv_transfer_to_decode",
+                        tp_rank=getattr(self, "tp_rank", None),
+                        pp_rank=getattr(self, "pp_rank", None),
+                        transfer_total_bytes=transfer_total_bytes,
+                        transfer_latency_ms=(
+                            transfer_latency_s * 1000
+                            if transfer_latency_s is not None
+                            else None
+                        ),
+                        transfer_gib_per_s=transfer_gib_per_s,
+                        transfer_speed_gb_s=(
+                            metrics.get("speed_gb_s") if metrics is not None else None
+                        ),
+                    ),
+                )
             if metrics:
                 # Update last-value for REST API
                 if "latency_ms" in metrics:

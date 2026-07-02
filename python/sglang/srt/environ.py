@@ -596,6 +596,27 @@ class Envs:
     SGLANG_OPT_SWA_RADIX_CACHE_COMPACT = EnvBool(False)
     SGLANG_OPT_SWA_SPLIT_LEAF_ON_INSERT = EnvBool(False)
     SGLANG_OPT_SWA_RELEASE_LEAF_LOCK_AFTER_WINDOW = EnvBool(False)
+    # SWA HiCache L3 storage. When True, SWAComponent will emit
+    # BACKUP_STORAGE / PREFETCH transfers so the SWA window-tail KV is
+    # persisted to / fetched from L3 (mooncake / hf3fs / etc) alongside
+    # the Full KV main channel. Default OFF — opt in per deployment to
+    # control L3 bandwidth/storage cost (SWA payload is comparable to
+    # Full KV, so enabling roughly doubles L3 traffic).
+    SGLANG_HICACHE_SWA_STORAGE_ENABLE = EnvBool(False)
+    # SWA L3 write reduction knobs. These are independent and only take
+    # effect when SGLANG_HICACHE_SWA_STORAGE_ENABLE is enabled.
+    # - TAIL_TRIM keeps at most the node-local trailing window pages.
+    # - BOUNDED_BFS skips an entire node when no descendant leaf can use it
+    #   within the SWA trailing window.
+    SGLANG_HICACHE_SWA_STORAGE_TAIL_TRIM_ENABLE = EnvBool(True)
+    SGLANG_HICACHE_SWA_STORAGE_BOUNDED_BFS_ENABLE = EnvBool(False)
+    # Decode-side analogue: when True, DecodeKVCacheOffloadManager mirrors
+    # both the Full and SWA sub-pools to host on each offload step and
+    # backs each up to L3 independently, so cross-node session reuse can
+    # see the SWA window-tail of decode-generated output tokens. Default
+    # OFF — without this flag, decode offload still raises on SWAKVPool
+    # (legacy behavior preserved).
+    SGLANG_HICACHE_SWA_DECODE_STORAGE_ENABLE = EnvBool(False)
 
     # DeepGemm Mega MoE
     SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE = EnvBool(False)

@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import json
 import logging
+import os
 import threading
 import time
+from queue import Queue
 from typing import TYPE_CHECKING, Any, Callable, List, Optional
 
 import torch
@@ -26,6 +29,9 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolName,
     PoolTransfer,
     PoolTransferResult,
+    hicache_gib_per_s,
+    hicache_timing_enabled,
+    log_hicache_timing,
 )
 from sglang.srt.mem_cache.memory_pool_host import PoolEntry
 from sglang.srt.utils import get_device_module
@@ -171,6 +177,7 @@ class HybridCacheController(BaseHiCacheController):
         enable_storage_metrics: bool = False,
     ):
         startup_storage_backend = storage_backend
+        self.extra_host_mem_release_queues: dict[PoolName, Queue] = {}
         super().__init__(
             token_to_kv_pool_allocator=token_to_kv_pool_allocator,
             mem_pool_host=mem_pool_host,
@@ -204,6 +211,10 @@ class HybridCacheController(BaseHiCacheController):
                 host_pools=getattr(mem_pool_host, "entries", None),
             )
 
+    def _start_storage_threads(self):
+        super()._start_storage_threads()
+        self._init_extra_host_mem_release_queues()
+
     def attach_storage_backend(
         self,
         storage_backend: str,
@@ -222,10 +233,133 @@ class HybridCacheController(BaseHiCacheController):
         for entry in host_pools or []:
             self.storage_backend.register_mem_host_pool_v2(entry.host_pool, entry.name)
 
+    @staticmethod
+    def parse_storage_backend_extra_config(
+        storage_backend_extra_config: Optional[str],
+    ) -> tuple[dict, int, float, float, bool]:
+        extra_config = {}
+        if storage_backend_extra_config:
+            if storage_backend_extra_config.startswith("@"):
+                path = storage_backend_extra_config[1:]
+                ext = os.path.splitext(path)[1].lower()
+                with open(path, "rb" if ext == ".toml" else "r") as f:
+                    if ext == ".json":
+                        extra_config = json.load(f)
+                    elif ext == ".toml":
+                        import tomllib
+
+                        extra_config = tomllib.load(f)
+                    elif ext in (".yaml", ".yml"):
+                        import yaml
+
+                        extra_config = yaml.safe_load(f)
+                    else:
+                        raise ValueError(
+                            f"Unsupported config file {path} (config format: {ext})"
+                        )
+            else:
+                extra_config = json.loads(storage_backend_extra_config)
+
+        prefetch_threshold = extra_config.pop("prefetch_threshold", 256)
+        prefetch_timeout_base = extra_config.pop("prefetch_timeout_base", 1)
+        prefetch_timeout_per_ki_token = extra_config.pop(
+            "prefetch_timeout_per_ki_token", 0.25
+        )
+        hicache_storage_pass_prefix_keys = extra_config.pop(
+            "hicache_storage_pass_prefix_keys", False
+        )
+
+        if not isinstance(prefetch_threshold, int):
+            raise ValueError(
+                f"prefetch_threshold must be int, got {type(prefetch_threshold).__name__}"
+            )
+        if not isinstance(prefetch_timeout_base, (int, float)):
+            raise ValueError(
+                f"prefetch_timeout_base must be number, got {type(prefetch_timeout_base).__name__}"
+            )
+        if not isinstance(prefetch_timeout_per_ki_token, (int, float)):
+            raise ValueError(
+                "prefetch_timeout_per_ki_token must be number, got "
+                f"{type(prefetch_timeout_per_ki_token).__name__}"
+            )
+        if not isinstance(hicache_storage_pass_prefix_keys, bool):
+            raise ValueError(
+                "hicache_storage_pass_prefix_keys must be bool, got "
+                f"{type(hicache_storage_pass_prefix_keys).__name__}"
+            )
+
+        return (
+            extra_config,
+            prefetch_threshold,
+            float(prefetch_timeout_base),
+            float(prefetch_timeout_per_ki_token),
+            hicache_storage_pass_prefix_keys,
+        )
+
+    def clear_storage_backend(self) -> bool:
+        if not self.enable_storage:
+            logger.warning("Hierarchical cache storage backend is not enabled.")
+            return False
+        if not hasattr(self.storage_backend, "clear"):
+            logger.warning(
+                "Storage backend %s does not support clear operation.",
+                type(self.storage_backend).__name__,
+            )
+            return False
+        self.storage_backend.clear()
+        return True
+
+    def _init_extra_host_mem_release_queues(self) -> None:
+        self.extra_host_mem_release_queues = {}
+        entries = getattr(self.mem_pool_host, "entries", None) or []
+        anchor_entry = getattr(self.mem_pool_host, "anchor_entry", None)
+        for entry in entries:
+            if entry is anchor_entry or entry.is_primary_index_anchor:
+                continue
+            self.extra_host_mem_release_queues[entry.name] = Queue()
+
+    def _append_host_mem_release_pages(
+        self, release_queue: Queue, host_indices: torch.Tensor, page_size: int
+    ) -> None:
+        if host_indices.numel() == 0:
+            return
+        for page in host_indices.split(page_size):
+            release_queue.put(page)
+
+    def append_host_mem_release(
+        self,
+        host_indices: Optional[torch.Tensor] = None,
+        extra_pools: Optional[list[PoolTransfer]] = None,
+    ):
+        if host_indices is not None:
+            self._append_host_mem_release_pages(
+                self.host_mem_release_queue,
+                host_indices,
+                self.mem_pool_host.page_size,
+            )
+        for transfer in extra_pools or []:
+            if transfer.host_indices is None or transfer.host_indices.numel() == 0:
+                continue
+            entry = self.mem_pool_host.entry_map.get(transfer.name)
+            if (
+                entry is None
+                or entry.is_primary_index_anchor
+                or transfer.indices_from_pool is not None
+            ):
+                continue
+            release_queue = self.extra_host_mem_release_queues.get(transfer.name)
+            if release_queue is None:
+                continue
+            self._append_host_mem_release_pages(
+                release_queue, transfer.host_indices, entry.host_pool.page_size
+            )
+
     def reset(self):
         super().reset()
         if self.enable_storage:
             self.host_mem_release_queue.queue.clear()
+            for release_queue in self.extra_host_mem_release_queues.values():
+                release_queue.queue.clear()
             self.prefetch_tokens_occupied = 0
 
     def write(
@@ -343,8 +477,12 @@ class HybridCacheController(BaseHiCacheController):
         self.load_queue.clear()
         producer_event = self.layer_done_counter.events[producer_id]
         producer_event.start_event.record()
+        timing_start_event = self._new_hicache_timing_event()
+        timing_finish_event = self._new_hicache_timing_event()
         with device_module.stream(self.load_stream):
             producer_event.start_event.wait(self.load_stream)
+            if timing_start_event is not None:
+                timing_start_event.record()
             for i in range(self.layer_num):
                 self.mem_pool_host.load_to_device_per_layer(
                     self.mem_pool_device,
@@ -355,6 +493,8 @@ class HybridCacheController(BaseHiCacheController):
                     pool_transfers=resolved_pool_transfers,
                 )
                 producer_event.complete(i)
+            if timing_finish_event is not None:
+                timing_finish_event.record()
             self._record_transfer_indices_on_stream(
                 self.load_stream,
                 host_indices,
@@ -368,6 +508,14 @@ class HybridCacheController(BaseHiCacheController):
                 op.node_ids,
             )
         )
+        if timing_start_event is not None and timing_finish_event is not None:
+            self._log_load_timing_async(
+                timing_start_event,
+                timing_finish_event,
+                self._load_timing_fields(
+                    host_indices, op.node_ids, resolved_pool_transfers
+                ),
+            )
         return producer_id
 
     def _record_transfer_indices_on_stream(
@@ -458,6 +606,115 @@ class HybridCacheController(BaseHiCacheController):
             kv_hit_pages * self.page_size,
         )
 
+    def _pool_transfer_host_pool(self, transfer: PoolTransfer):
+        entry = getattr(self.mem_pool_host, "entry_map", {}).get(transfer.name)
+        if entry is not None:
+            return entry.host_pool
+        return getattr(self.storage_backend, "registered_pools", {}).get(transfer.name)
+
+    def _pool_transfer_requested_pages(self, transfer: PoolTransfer) -> int:
+        host_pool = self._pool_transfer_host_pool(transfer)
+        page_size = int(getattr(host_pool, "page_size", self.page_size) or 1)
+        if transfer.keys:
+            return len(transfer.keys)
+        if transfer.host_indices is not None:
+            return int(transfer.host_indices.numel()) // page_size
+        return 0
+
+    def _pool_transfer_bytes_for_pages(
+        self, transfer: PoolTransfer, pages: int
+    ) -> tuple[int, int]:
+        host_pool = self._pool_transfer_host_pool(transfer)
+        page_size = int(getattr(host_pool, "page_size", self.page_size) or 1)
+        size_per_token = int(getattr(host_pool, "size_per_token", 0) or 0)
+        tokens = pages * page_size
+        return tokens, tokens * size_per_token
+
+    def _pool_transfer_load_pages(self, transfer: PoolTransfer) -> int:
+        host_pool = self._pool_transfer_host_pool(transfer)
+        page_size = int(getattr(host_pool, "page_size", self.page_size) or 1)
+        if transfer.host_indices is not None:
+            return int(transfer.host_indices.numel()) // page_size
+        if transfer.device_indices is not None:
+            return int(transfer.device_indices.numel()) // page_size
+        return 0
+
+    def _load_timing_fields(
+        self,
+        host_indices: torch.Tensor,
+        node_ids: Optional[list[int]] = None,
+        pool_transfers: Optional[list[PoolTransfer]] = None,
+    ) -> dict:
+        fields = super()._load_timing_fields(host_indices, node_ids, pool_transfers)
+        extra_bytes = 0
+        extra_pool_pages = {}
+        extra_pool_tokens = {}
+        extra_pool_breakdown = {}
+        for transfer in pool_transfers or []:
+            pool_name = str(transfer.name)
+            pages = self._pool_transfer_load_pages(transfer)
+            tokens, num_bytes = self._pool_transfer_bytes_for_pages(transfer, pages)
+            extra_pool_pages[pool_name] = pages
+            extra_pool_tokens[pool_name] = tokens
+            extra_pool_breakdown[pool_name] = {
+                "pages": pages,
+                "tokens": tokens,
+                "bytes": num_bytes,
+                "hit_policy": str(transfer.hit_policy),
+            }
+            extra_bytes += num_bytes
+        fields.update(
+            {
+                "extra_pool_bytes": extra_bytes,
+                "extra_pool_pages": extra_pool_pages,
+                "extra_pool_tokens": extra_pool_tokens,
+                "extra_pool_breakdown": extra_pool_breakdown,
+                "total_bytes": int(fields.get("kv_bytes") or 0)
+                + int(fields.get("draft_bytes") or 0)
+                + extra_bytes,
+            }
+        )
+        return fields
+
+    def _extra_pool_success_pages(
+        self, operation: PrefetchOperation, transfer: PoolTransfer
+    ) -> int:
+        pages_by_pool = operation.pool_storage_result.extra_pool_hit_pages
+        return int(
+            pages_by_pool.get(transfer.name, pages_by_pool.get(str(transfer.name), 0))
+            or 0
+        )
+
+    def _prefetch_timing_fields(self, operation) -> dict:
+        fields = super()._prefetch_timing_fields(operation)
+        extra_pool_pages = {}
+        extra_pool_tokens = {}
+        extra_pool_breakdown = {}
+        extra_bytes = 0
+        for transfer in operation.pool_transfers or []:
+            pool_name = str(transfer.name)
+            pages = self._extra_pool_success_pages(operation, transfer)
+            tokens, num_bytes = self._pool_transfer_bytes_for_pages(transfer, pages)
+            extra_pool_pages[pool_name] = pages
+            extra_pool_tokens[pool_name] = tokens
+            extra_pool_breakdown[pool_name] = {
+                "pages": pages,
+                "tokens": tokens,
+                "bytes": num_bytes,
+                "hit_policy": str(transfer.hit_policy),
+            }
+            extra_bytes += num_bytes
+        fields.update(
+            {
+                "extra_pool_bytes": extra_bytes,
+                "extra_pool_pages": extra_pool_pages,
+                "extra_pool_tokens": extra_pool_tokens,
+                "extra_pool_breakdown": extra_pool_breakdown,
+                "total_bytes": int(fields.get("kv_bytes") or 0) + extra_bytes,
+            }
+        )
+        return fields
+
     def move_hybrid_indices(
         self, operation: CacheOperation
     ) -> tuple[torch.Tensor, torch.Tensor, Optional[list[PoolTransfer]]]:
@@ -490,8 +747,62 @@ class HybridCacheController(BaseHiCacheController):
         # Transfer extra pools
         if operation.pool_transfers and not operation.is_terminated():
             self._resolve_sidecar_derived_pool_transfers(operation)
-            results = self.storage_backend.batch_get_v2(operation.pool_transfers)
+            if hicache_timing_enabled():
+                requested_breakdown = {}
+                requested_bytes = 0
+                for transfer in operation.pool_transfers:
+                    pages = self._pool_transfer_requested_pages(transfer)
+                    tokens, num_bytes = self._pool_transfer_bytes_for_pages(
+                        transfer, pages
+                    )
+                    pool_name = str(transfer.name)
+                    requested_breakdown[pool_name] = {
+                        "pages": pages,
+                        "tokens": tokens,
+                        "bytes": num_bytes,
+                        "hit_policy": str(transfer.hit_policy),
+                    }
+                    requested_bytes += num_bytes
+                start_time = time.perf_counter()
+                results = self.storage_backend.batch_get_v2(operation.pool_transfers)
+                elapsed_s = time.perf_counter() - start_time
+            else:
+                requested_breakdown = None
+                requested_bytes = 0
+                results = self.storage_backend.batch_get_v2(operation.pool_transfers)
             operation.pool_storage_result.update_extra_pool_hit_pages(results)
+            if requested_breakdown is not None:
+                transferred_bytes = 0
+                transferred_breakdown = {}
+                for transfer in operation.pool_transfers:
+                    pool_name = str(transfer.name)
+                    pages = int(
+                        sum(results.get(transfer.name, results.get(pool_name, [])))
+                    )
+                    tokens, num_bytes = self._pool_transfer_bytes_for_pages(
+                        transfer, pages
+                    )
+                    transferred_breakdown[pool_name] = {
+                        "pages": pages,
+                        "tokens": tokens,
+                        "bytes": num_bytes,
+                        "hit_policy": str(transfer.hit_policy),
+                    }
+                    transferred_bytes += num_bytes
+                log_hicache_timing(
+                    logger,
+                    "hicache_prefetch_extra_pools",
+                    request_id=operation.request_id,
+                    operation_id=operation.id,
+                    storage_backend=self.storage_backend_type,
+                    page_size=self.page_size,
+                    requested_bytes=requested_bytes,
+                    transferred_bytes=transferred_bytes,
+                    elapsed_ms=elapsed_s * 1000.0,
+                    gib_per_s=hicache_gib_per_s(transferred_bytes, elapsed_s),
+                    requested_breakdown=requested_breakdown,
+                    transferred_breakdown=transferred_breakdown,
+                )
 
         # Transfer kv pools
         super()._page_transfer(operation)

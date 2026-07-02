@@ -2230,8 +2230,27 @@ def get_rope(
 
 
 class Qwen2MoeAttention(nn.Module):
+    @staticmethod
+    def _normalize_sliding_window_size(config: PretrainedConfig, window) -> int:
+        if window is None:
+            return -1
+        window = int(window)
+        if window <= 0:
+            return -1
+
+        candidates = [
+            getattr(config, "context_len", None),
+            getattr(config, "sliding_window", None),
+            getattr(config, "max_position_embeddings", None),
+        ]
+        valid = [int(x) for x in candidates if x is not None and int(x) > 0]
+        if valid and window >= min(valid):
+            return -1
+        return window
+
     def __init__(
         self,
+        config: PretrainedConfig,
         hidden_size: int,
         num_heads: int,
         num_kv_heads: int,
@@ -2334,9 +2353,9 @@ class Qwen2MoeAttention(nn.Module):
             flush=True,
         )
         if len(sliding_window_size_layerwise) > self.config_layer_idx:
-            self.sliding_window_size = sliding_window_size_layerwise[
-                self.config_layer_idx
-            ]
+            self.sliding_window_size = self._normalize_sliding_window_size(
+                config, sliding_window_size_layerwise[self.config_layer_idx]
+            )
         else:
             self.sliding_window_size = -1
         print(
@@ -2867,6 +2886,7 @@ class Qwen2MoeDecoderLayer(nn.Module):
         config_layer_id = layer_id + total_layer_num if is_nextn else layer_id
 
         self.self_attn = Qwen2MoeAttention(
+            config=config,
             hidden_size=self.hidden_size,
             num_heads=config.num_attention_heads,
             num_kv_heads=config.num_key_value_heads,
@@ -3619,6 +3639,18 @@ class WeLMV4MoeForCausalLM(nn.Module):
         self.logits_processor = LogitsProcessor(config)
         # For EAGLE3 support
         self.capture_aux_hidden_states = False
+
+    def get_attention_sliding_window_size(self):
+        windows = getattr(self.config, "sliding_window_size_layerwise", []) or []
+        swa_windows = [
+            normalized
+            for normalized in (
+                Qwen2MoeAttention._normalize_sliding_window_size(self.config, window)
+                for window in windows
+            )
+            if normalized > 0
+        ]
+        return min(swa_windows) if swa_windows else None
 
     @torch.no_grad()
     def forward(

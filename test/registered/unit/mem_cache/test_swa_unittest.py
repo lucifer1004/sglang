@@ -13,10 +13,15 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 )
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.common import available_and_evictable_str
+from sglang.srt.mem_cache.hicache_storage import PoolHitPolicy, PoolName
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool, SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
+from sglang.srt.mem_cache.unified_cache_components.tree_component import (
+    CacheTransferPhase,
+    ComponentType,
+)
 from sglang.srt.utils import get_device
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
@@ -243,6 +248,614 @@ class TestSWA(unittest.TestCase):
         alloc.free_swa(index)
         result = alloc.translate_loc_from_full_to_swa(index)
         print(result)
+
+    def _build_swa_pool_alloc(self, size=16, size_swa=16, page_size=1):
+        head_num = 8
+        head_dim = 128
+        num_layers = 48
+        global_interval = 4
+        dtype = torch.bfloat16
+        device = get_device()
+        full_attention_layer_ids = [i for i in range(0, num_layers, global_interval)]
+        full_attention_layer_ids_set = set(full_attention_layer_ids)
+        swa_attention_layer_ids = [
+            i for i in range(num_layers) if i not in full_attention_layer_ids_set
+        ]
+        pool = SWAKVPool(
+            size=size,
+            size_swa=size_swa,
+            page_size=page_size,
+            dtype=dtype,
+            head_num=head_num,
+            head_dim=head_dim,
+            swa_attention_layer_ids=swa_attention_layer_ids,
+            full_attention_layer_ids=full_attention_layer_ids,
+            enable_kvcache_transpose=False,
+            device=device,
+        )
+        alloc = SWATokenToKVPoolAllocator(
+            size=size,
+            size_swa=size_swa,
+            page_size=page_size,
+            dtype=dtype,
+            device=device,
+            kvcache=pool,
+            need_sort=False,
+        )
+        return alloc
+
+    def test_swa_backup_pending_no_pending_frees_immediately(self):
+        """Default (no pending refcount) ``free_swa`` is a fast direct free.
+
+        Backwards-compatibility check: any code path that frees SWA slots
+        without going through add_backup_pending must continue to free
+        immediately, with available_size restored on the same call.
+        """
+        alloc = self._build_swa_pool_alloc()
+        before = alloc.swa_available_size()
+        idx = alloc.alloc(1)
+        self.assertLess(alloc.swa_available_size(), before)
+        alloc.free_swa(idx)
+        self.assertEqual(alloc.swa_available_size(), before)
+        self.assertEqual(len(alloc._deferred_swa_free), 0)
+
+    def test_swa_backup_pending_defers_then_frees_on_dec(self):
+        """``free_swa`` defers physical free for slots with pending refcount.
+
+        Lifecycle the offload manager will rely on:
+          add_backup_pending(swa_loc)   # offload starts D->H
+          ... (D->H copy in flight)
+          free_swa(full_loc)            # _evict_swa fires before backup done
+          ... slot is on _deferred_swa_free, NOT freed yet
+          dec_backup_pending(swa_loc)   # backup completes
+          ... slot now freed, available_size restored
+        """
+        alloc = self._build_swa_pool_alloc()
+        before = alloc.swa_available_size()
+        full_idx = alloc.alloc(1)
+        swa_idx = alloc.translate_loc_from_full_to_swa(full_idx)
+        self.assertGreater(int(swa_idx[0].item()), 0)
+
+        # Mark backup in-flight on the SWA slot.
+        alloc.add_backup_pending(swa_idx)
+        self.assertEqual(int(alloc.backup_pending_ref[swa_idx][0].item()), 1)
+
+        # Eviction tries to free the full slot — SWA side must defer.
+        post_alloc_avail = alloc.swa_available_size()
+        alloc.free_swa(full_idx)
+        self.assertEqual(
+            alloc.swa_available_size(),
+            post_alloc_avail,
+            "free_swa must defer when backup_pending_ref > 0",
+        )
+        self.assertEqual(len(alloc._deferred_swa_free), 1)
+        self.assertEqual(alloc._deferred_swa_free[0], int(swa_idx[0].item()))
+
+        # Backup completes — slot now flushed to free list.
+        alloc.dec_backup_pending(swa_idx)
+        self.assertEqual(alloc.swa_available_size(), before)
+        self.assertEqual(len(alloc._deferred_swa_free), 0)
+        self.assertEqual(int(alloc.backup_pending_ref[swa_idx][0].item()), 0)
+
+    def test_swa_backup_pending_refcount_supports_overlapping_backups(self):
+        """Refcount semantics: same slot can be added/dec'd multiple times.
+
+        If two concurrent backup operations target the same slot
+        (D->H followed by H->L3, both keep a refcount), free_swa must
+        wait until the LAST dec_backup_pending."""
+        alloc = self._build_swa_pool_alloc()
+        before = alloc.swa_available_size()
+        full_idx = alloc.alloc(1)
+        swa_idx = alloc.translate_loc_from_full_to_swa(full_idx)
+
+        alloc.add_backup_pending(swa_idx)
+        alloc.add_backup_pending(swa_idx)  # second concurrent backup
+        self.assertEqual(int(alloc.backup_pending_ref[swa_idx][0].item()), 2)
+
+        alloc.free_swa(full_idx)
+        post_first_dec = alloc.swa_available_size()
+
+        alloc.dec_backup_pending(swa_idx)
+        # Refcount still > 0 — slot must NOT be freed yet.
+        self.assertEqual(
+            alloc.swa_available_size(),
+            post_first_dec,
+            "free deferred until refcount reaches 0",
+        )
+        self.assertEqual(int(alloc.backup_pending_ref[swa_idx][0].item()), 1)
+
+        alloc.dec_backup_pending(swa_idx)
+        self.assertEqual(alloc.swa_available_size(), before)
+
+    def test_swa_backup_pending_zero_indices_noop(self):
+        """SWA index 0 is the 'no pair' sentinel — must never be tracked."""
+        alloc = self._build_swa_pool_alloc()
+        zero = torch.tensor([0], dtype=torch.int64, device=alloc.device)
+        # No-op: no exception, no refcount change.
+        alloc.add_backup_pending(zero)
+        alloc.dec_backup_pending(zero)
+        self.assertEqual(int(alloc.backup_pending_ref[0].item()), 0)
+
+    def test_swa_backup_pending_dec_underflow_clamps_not_asserts(self):
+        """``dec_backup_pending`` must not assert on underflow.
+
+        Abort/restart paths can decrement without a matching add (e.g. the
+        request was cancelled before alloc_decode populated the SWA pair).
+        The pool clamps the refcount back to 0 and logs, so a single
+        dropped pair doesn't take the scheduler down.
+        """
+        alloc = self._build_swa_pool_alloc()
+        full_idx = alloc.alloc(1)
+        swa_idx = alloc.translate_loc_from_full_to_swa(full_idx)
+        self.assertEqual(int(alloc.backup_pending_ref[swa_idx][0].item()), 0)
+
+        # Decrement without a matching add — must not raise.
+        alloc.dec_backup_pending(swa_idx)
+        # Refcount clamped to 0, slot remains usable.
+        self.assertEqual(int(alloc.backup_pending_ref[swa_idx][0].item()), 0)
+        self.assertEqual(len(alloc._deferred_swa_free), 0)
+
+    def test_swa_trim_to_trailing_window(self):
+        """`_trim_swa_to_trailing_window` slices host_value + hash list to
+        the last `n_window_pages` pages.
+
+        A radix node carries one hash per page in `hash_value` and one
+        host slot per token in `host_value` (page_size tokens per page).
+        BACKUP_STORAGE only needs the trailing window because PREFETCH
+        will never read older pages back. The trim must produce a
+        consistent (host_value, hash_value) pair where lengths satisfy
+        `len(host_value) == len(hash_value) * page_size`.
+        """
+        from sglang.srt.mem_cache.unified_cache_components.swa_component import (
+            _trim_swa_to_trailing_window,
+        )
+        page_size = 64
+        # Long node: 6 pages of hash + 6*64 host slots
+        host = torch.arange(6 * page_size)
+        hashes = [f"h{i}" for i in range(6)]
+
+        # Window = 2 → keep last 2 pages.
+        trimmed_host, trimmed_keys = _trim_swa_to_trailing_window(
+            host, hashes, n_window_pages=2, page_size=page_size
+        )
+        self.assertEqual(trimmed_keys, ["h4", "h5"])
+        self.assertEqual(len(trimmed_host), 2 * page_size)
+        # Verify slice semantics: trimmed_host should match host[-128:].
+        self.assertTrue(torch.equal(trimmed_host, host[-2 * page_size:]))
+
+        # Window >= total → no trim, returns full list (defensive).
+        full_host, full_keys = _trim_swa_to_trailing_window(
+            host, hashes, n_window_pages=10, page_size=page_size
+        )
+        self.assertEqual(full_keys, hashes)
+        self.assertTrue(torch.equal(full_host, host))
+
+        # Single-page node + window=2 → keep the single page (n_keep=1).
+        small_host = torch.arange(page_size)
+        small_hashes = ["solo"]
+        sh, sk = _trim_swa_to_trailing_window(
+            small_host, small_hashes, n_window_pages=2, page_size=page_size
+        )
+        self.assertEqual(sk, ["solo"])
+        self.assertEqual(len(sh), page_size)
+
+    def test_swa_bounded_bfs_descendant_leaf_window(self):
+        """Bounded BFS keeps only nodes whose descendant leaf can terminate
+        within the trailing SWA window.
+
+        With a 2-page window and a one-page chain A->B->C->D, only C and D
+        can contribute SWA KV to the trailing window of the D prefix. A and B
+        are too old and may be skipped by the optional bounded-BFS optimizer.
+        """
+        from sglang.srt.mem_cache.unified_cache_components.swa_component import (
+            _swa_node_has_descendant_leaf_within_window,
+        )
+
+        page_size = 1
+
+        class _Node:
+            def __init__(self, name, children=()):
+                self.key = [name]
+                self.hash_value = [name]
+                self.children = {child.key[0]: child for child in children}
+
+        d = _Node("D")
+        c = _Node("C", [d])
+        b = _Node("B", [c])
+        a = _Node("A", [b])
+
+        self.assertFalse(
+            _swa_node_has_descendant_leaf_within_window(
+                a, n_window_pages=2, page_size=page_size
+            )
+        )
+        self.assertFalse(
+            _swa_node_has_descendant_leaf_within_window(
+                b, n_window_pages=2, page_size=page_size
+            )
+        )
+        self.assertTrue(
+            _swa_node_has_descendant_leaf_within_window(
+                c, n_window_pages=2, page_size=page_size
+            )
+        )
+        self.assertTrue(
+            _swa_node_has_descendant_leaf_within_window(
+                d, n_window_pages=2, page_size=page_size
+            )
+        )
+
+        # Branching is conservative: if any descendant leaf is close enough,
+        # keep the node so short-prefix traffic can still hit SWA L3.
+        short_leaf = _Node("S")
+        branched = _Node("A2", [b, short_leaf])
+        self.assertTrue(
+            _swa_node_has_descendant_leaf_within_window(
+                branched, n_window_pages=2, page_size=page_size
+            )
+        )
+
+    def test_swa_storage_tail_trim_and_bounded_bfs_flags_are_orthogonal(self):
+        """SWA L3 write-reduction knobs can be enabled independently.
+
+        Tail trim changes how many pages a kept node writes. Bounded BFS
+        decides whether to skip the node entirely based on descendant-leaf
+        distance. The two decisions are independent.
+        """
+        from sglang.srt.mem_cache.unified_cache_components.swa_component import (
+            SWAComponent,
+        )
+
+        page_size = 4
+
+        class _Cache:
+            page_size = 4
+
+        class _CD:
+            def __init__(self, host_value):
+                self.host_value = host_value
+                self.value = None
+
+        class _Node:
+            def __init__(self, name, pages, children=()):
+                self.key = list(range(pages * page_size))
+                self.hash_value = [f"{name}{i}" for i in range(pages)]
+                self.children = {child.hash_value[0]: child for child in children}
+                self.component_data = {
+                    ComponentType.SWA: _CD(torch.arange(pages * page_size))
+                }
+
+        leaf = _Node("L", pages=1)
+        node = _Node("N", pages=3, children=[leaf])
+
+        comp = SWAComponent.__new__(SWAComponent)
+        comp.component_type = ComponentType.SWA
+        comp.cache = _Cache()
+        comp.sliding_window_size = 2 * page_size
+        comp._swa_kv_pool_host = object()
+
+        def build(*, tail_trim: bool, bounded_bfs: bool, target=node):
+            with envs.SGLANG_HICACHE_SWA_STORAGE_ENABLE.override(True):
+                with envs.SGLANG_HICACHE_SWA_STORAGE_TAIL_TRIM_ENABLE.override(
+                    tail_trim
+                ):
+                    with envs.SGLANG_HICACHE_SWA_STORAGE_BOUNDED_BFS_ENABLE.override(
+                        bounded_bfs
+                    ):
+                        return comp.build_hicache_transfers(
+                            target, CacheTransferPhase.BACKUP_STORAGE
+                        )
+
+        # No optimization: all node pages are emitted.
+        transfers = build(tail_trim=False, bounded_bfs=False)
+        self.assertEqual(transfers[0].name, PoolName.SWA)
+        self.assertEqual(transfers[0].hit_policy, PoolHitPolicy.TRAILING_PAGES)
+        self.assertEqual(transfers[0].keys, ["N0", "N1", "N2"])
+        self.assertEqual(transfers[0].host_indices.tolist(), list(range(12)))
+
+        # Tail trim only: keep the node, but write only its trailing window
+        # plus one guard page for page-aligned replay prefixes.
+        transfers = build(tail_trim=True, bounded_bfs=False)
+        self.assertEqual(transfers[0].keys, ["N0", "N1", "N2"])
+        self.assertEqual(transfers[0].host_indices.tolist(), list(range(12)))
+
+        # Bounded BFS only: the node is kept because its child leaf is within
+        # the 2-page window; with tail trim off it still writes all pages.
+        transfers = build(tail_trim=False, bounded_bfs=True)
+        self.assertEqual(transfers[0].keys, ["N0", "N1", "N2"])
+        self.assertEqual(transfers[0].host_indices.tolist(), list(range(12)))
+
+        # Both on: bounded BFS keeps this node, tail trim then trims it.
+        transfers = build(tail_trim=True, bounded_bfs=True)
+        self.assertEqual(transfers[0].keys, ["N0", "N1", "N2"])
+        self.assertEqual(transfers[0].host_indices.tolist(), list(range(12)))
+
+        # A node whose nearest descendant leaf is a full window away is skipped
+        # only when bounded BFS is enabled.
+        deep_leaf = _Node("D", pages=1)
+        mid = _Node("M", pages=1, children=[deep_leaf])
+        old = _Node("O", pages=1, children=[mid])
+        self.assertIsNotNone(build(tail_trim=True, bounded_bfs=False, target=old))
+        self.assertIsNone(build(tail_trim=True, bounded_bfs=True, target=old))
+
+    def test_swa_storage_keys_align_to_partial_host_pages_when_trim_off(self):
+        """A prefetch-loaded host node may cover only the trailing pages.
+
+        Disabling tail trim should not pair that partial host_value with the
+        full node hash list; storage writes still need one key per host page.
+        """
+        from sglang.srt.mem_cache.unified_cache_components.swa_component import (
+            SWAComponent,
+        )
+
+        page_size = 4
+
+        class _Cache:
+            page_size = 4
+
+        class _CD:
+            value = None
+
+            def __init__(self):
+                # Two host pages loaded for a four-page node.
+                self.host_value = torch.arange(2 * page_size)
+
+        class _Node:
+            key = list(range(4 * page_size))
+            hash_value = ["h0", "h1", "h2", "h3"]
+            children = {}
+            component_data = {ComponentType.SWA: _CD()}
+
+        comp = SWAComponent.__new__(SWAComponent)
+        comp.component_type = ComponentType.SWA
+        comp.cache = _Cache()
+        comp.sliding_window_size = 4 * page_size
+        comp._swa_kv_pool_host = object()
+
+        with envs.SGLANG_HICACHE_SWA_STORAGE_ENABLE.override(True):
+            with envs.SGLANG_HICACHE_SWA_STORAGE_TAIL_TRIM_ENABLE.override(False):
+                with envs.SGLANG_HICACHE_SWA_STORAGE_BOUNDED_BFS_ENABLE.override(
+                    False
+                ):
+                    transfers = comp.build_hicache_transfers(
+                        _Node, CacheTransferPhase.BACKUP_STORAGE
+                    )
+
+        xfer = transfers[0]
+        self.assertEqual(xfer.keys, ["h2", "h3"])
+        self.assertEqual(int(xfer.host_indices.numel()), 2 * page_size)
+
+    def test_swa_storage_key_alignment_keeps_partial_page(self):
+        """A sub-page SWA host_value still maps to the trailing page key."""
+        from sglang.srt.mem_cache.unified_cache_components.swa_component import (
+            _align_swa_keys_to_host_pages,
+        )
+
+        host = torch.arange(3)
+        aligned_host, keys = _align_swa_keys_to_host_pages(
+            host, ["h0", "h1"], page_size=4
+        )
+        self.assertEqual(keys, ["h1"])
+        self.assertTrue(torch.equal(aligned_host, host))
+
+    def test_swa_trailing_host_value_split_keeps_tail_alignment(self):
+        """Splitting a PREFETCH-loaded SWA host node must preserve tail offsets."""
+        from sglang.srt.mem_cache.unified_cache_components.swa_component import (
+            _split_swa_trailing_device_value_on_node_split,
+            _split_swa_trailing_host_value_on_node_split,
+        )
+
+        # Full coverage behaves like an ordinary tensor split.
+        host = torch.arange(12)
+        parent_host, child_host = _split_swa_trailing_host_value_on_node_split(
+            host, old_node_len=12, split_len=5
+        )
+        self.assertEqual(parent_host.tolist(), list(range(5)))
+        self.assertEqual(child_host.tolist(), list(range(5, 12)))
+
+        # Tail-only host coverage for old [0, 12) with host covering [8, 12).
+        # Split at 5: parent [0, 5) has no SWA host data; child [5, 12)
+        # carries the full tail coverage.
+        host = torch.arange(100, 104)
+        parent_host, child_host = _split_swa_trailing_host_value_on_node_split(
+            host, old_node_len=12, split_len=5
+        )
+        self.assertIsNone(parent_host)
+        self.assertEqual(child_host.tolist(), [100, 101, 102, 103])
+
+        # Split inside the covered suffix. Parent gets the covered overlap
+        # [8, 10), child gets [10, 12).
+        parent_host, child_host = _split_swa_trailing_host_value_on_node_split(
+            host, old_node_len=12, split_len=10
+        )
+        self.assertEqual(parent_host.tolist(), [100, 101])
+        self.assertEqual(child_host.tolist(), [102, 103])
+
+        # Split after the covered suffix gives all SWA host data to parent.
+        parent_host, child_host = _split_swa_trailing_host_value_on_node_split(
+            host, old_node_len=12, split_len=12
+        )
+        self.assertEqual(parent_host.tolist(), [100, 101, 102, 103])
+        self.assertIsNone(child_host)
+
+        # Device values restored from L3 use the same tail-alignment rule.
+        parent_value, child_value = _split_swa_trailing_device_value_on_node_split(
+            torch.arange(200, 204), old_node_len=12, split_len=10
+        )
+        self.assertEqual(parent_value.tolist(), [200, 201])
+        self.assertEqual(child_value.tolist(), [202, 203])
+
+    def test_swa_redistribute_split_preserves_partial_host_tail(self):
+        """Node split must not attach tail-only SWA host data to old prefixes."""
+        from sglang.srt.mem_cache.unified_cache_components.swa_component import (
+            SWAComponent,
+        )
+        from sglang.srt.mem_cache.unified_cache_components.tree_component import (
+            ComponentData,
+        )
+
+        class _LRU:
+            def __init__(self):
+                self.nodes = set()
+
+            def in_list(self, node):
+                return node.id in self.nodes
+
+            def insert_mru(self, node):
+                self.nodes.add(node.id)
+
+            def remove_node(self, node):
+                self.nodes.remove(node.id)
+
+        class _Cache:
+            def __init__(self, lru):
+                self.host_lru_lists = {ComponentType.SWA: lru}
+
+        class _Node:
+            def __init__(self, node_id, key_len):
+                self.id = node_id
+                self.key = list(range(key_len))
+                self.component_data = [ComponentData() for _ in range(3)]
+
+        def run_split(split_len, child_len, host_values):
+            lru = _LRU()
+            comp = SWAComponent.__new__(SWAComponent)
+            comp.cache = _Cache(lru)
+            comp.component_type = ComponentType.SWA
+            parent = _Node(1, split_len)
+            child = _Node(2, child_len)
+            child.component_data[ComponentType.SWA].host_value = torch.tensor(
+                host_values
+            )
+            child.component_data[ComponentType.SWA].metadata["uuid"] = "u"
+            lru.insert_mru(child)
+            comp.redistribute_on_node_split(parent, child)
+            return parent, child, lru
+
+        # Old node length 12, SWA host covers old [8, 12), split at 5.
+        # Parent [0, 5) must not receive tail KV.
+        parent, child, lru = run_split(5, 7, [100, 101, 102, 103])
+        self.assertIsNone(parent.component_data[ComponentType.SWA].host_value)
+        self.assertEqual(
+            child.component_data[ComponentType.SWA].host_value.tolist(),
+            [100, 101, 102, 103],
+        )
+        self.assertFalse(lru.in_list(parent))
+        self.assertTrue(lru.in_list(child))
+
+        # Split inside the covered suffix: parent gets [8, 10), child [10, 12).
+        parent, child, lru = run_split(10, 2, [100, 101, 102, 103])
+        self.assertEqual(
+            parent.component_data[ComponentType.SWA].host_value.tolist(), [100, 101]
+        )
+        self.assertEqual(
+            child.component_data[ComponentType.SWA].host_value.tolist(), [102, 103]
+        )
+        self.assertTrue(lru.in_list(parent))
+        self.assertTrue(lru.in_list(child))
+
+    def test_swa_validator_counts_host_value_for_partial_trailing_coverage(self):
+        """SWA validator must count host_value length, not node.key length.
+
+        After PREFETCH from L3, a single multi-page node can hold a
+        host_value that covers only the trailing window — not the full
+        node key. The validator must therefore add `len(host_value)` to
+        its in-window accumulator, not `len(node.key)`. Counting the
+        full key length would over-claim coverage and let SWA layer
+        attention read positions whose KV is missing.
+        """
+        from sglang.srt.mem_cache.unified_cache_components.swa_component import (
+            SWAComponent,
+        )
+        from sglang.srt.mem_cache.unified_cache_components.tree_component import (
+            ComponentType,
+        )
+
+        # Minimal stand-in: a closure capturing only the fields the
+        # validator actually reads (sliding_window_size, component_type,
+        # node.component_data[ct].{value,host_value}, node.key).
+        page_size = 64
+        sliding_window_size = 128
+
+        class _NodeStub:
+            def __init__(self, key_len, host_value_len, has_device_value=False):
+                self.key = list(range(key_len))
+                cd = type(
+                    "_CD",
+                    (),
+                    {
+                        "value": (
+                            torch.arange(host_value_len)
+                            if has_device_value
+                            else None
+                        ),
+                        "host_value": (
+                            torch.arange(host_value_len)
+                            if host_value_len > 0
+                            else None
+                        ),
+                    },
+                )()
+                self.component_data = {ComponentType.SWA: cd}
+
+        # Make a fake SWAComponent — bypass __init__ since it pulls in
+        # full UnifiedRadixCache / allocator state we don't need here.
+        comp = SWAComponent.__new__(SWAComponent)
+        comp.sliding_window_size = sliding_window_size
+        comp.component_type = ComponentType.SWA
+
+        # Case 1: host-only node, host_value covers full window → match.
+        validator = comp.create_match_validator(match_device_only=False)
+        node_full_window = _NodeStub(
+            key_len=384, host_value_len=128, has_device_value=False
+        )
+        self.assertTrue(validator(node_full_window))
+
+        # Case 2: host-only node, host_value < window → must NOT match
+        # (under-coverage would corrupt SWA-layer attention).
+        validator = comp.create_match_validator(match_device_only=False)
+        node_partial = _NodeStub(
+            key_len=384, host_value_len=64, has_device_value=False
+        )
+        self.assertFalse(validator(node_partial))
+
+        # Case 3: short host-only prefix is valid when host_value covers the
+        # whole prefix, even though it is shorter than sliding_window_size.
+        validator = comp.create_match_validator(match_device_only=False)
+        node_short_full = _NodeStub(
+            key_len=64, host_value_len=64, has_device_value=False
+        )
+        self.assertTrue(validator(node_short_full))
+
+        validator = comp.create_match_validator(match_device_only=False)
+        node_short_partial = _NodeStub(
+            key_len=64, host_value_len=32, has_device_value=False
+        )
+        self.assertFalse(validator(node_short_partial))
+
+        # Case 4: device-resident node uses len(node.key) (full coverage).
+        validator = comp.create_match_validator(match_device_only=False)
+        node_device = _NodeStub(
+            key_len=128, host_value_len=128, has_device_value=True
+        )
+        self.assertTrue(validator(node_device))
+
+        # Case 5: matching is cumulative along the radix path. A missing old
+        # node can become irrelevant once later nodes cover the full trailing
+        # sliding window, but not before.
+        validator = comp.create_match_validator(match_device_only=False)
+        node_missing_old = _NodeStub(
+            key_len=64, host_value_len=0, has_device_value=False
+        )
+        node_new_tail_1 = _NodeStub(
+            key_len=64, host_value_len=64, has_device_value=False
+        )
+        node_new_tail_2 = _NodeStub(
+            key_len=64, host_value_len=64, has_device_value=False
+        )
+        self.assertFalse(validator(node_missing_old))
+        self.assertFalse(validator(node_new_tail_1))
+        self.assertTrue(validator(node_new_tail_2))
 
     def test_swa_radix_cache_1(self):
         # args

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import logging
 import os
+import json
+import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from enum import Enum
@@ -15,6 +17,80 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool_host import HostKVCache
 
 logger = logging.getLogger(__name__)
+
+
+def hicache_timing_enabled() -> bool:
+    return os.getenv("SGLANG_HICACHE_TIMING_LOG", "").lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+def hicache_gib_per_s(num_bytes: int, elapsed_s: float) -> Optional[float]:
+    if num_bytes <= 0 or elapsed_s <= 0:
+        return None
+    return num_bytes / (1024**3) / elapsed_s
+
+
+def log_hicache_timing(log: logging.Logger, event: str, **fields) -> None:
+    if not hicache_timing_enabled():
+        return
+    payload = {"event": event, "time_unix": time.time(), **fields}
+    log.info("HICACHE_TIMING %s", json.dumps(payload, sort_keys=True, default=str))
+
+
+def _perf_counter_to_unix(ts: Optional[float]) -> Optional[float]:
+    if ts is None or ts <= 0:
+        return None
+    return ts + (time.time() - time.perf_counter())
+
+
+def _safe_len(value: Any) -> Optional[int]:
+    if value is None:
+        return None
+    try:
+        return len(value)
+    except TypeError:
+        return None
+
+
+def request_timing_fields(
+    req: Any,
+    *,
+    start: Optional[float],
+    end: Optional[float],
+    role: str,
+    stage: str,
+    **fields,
+) -> dict[str, Any]:
+    elapsed_ms = None
+    if start is not None and end is not None and start > 0 and end >= start:
+        elapsed_ms = (end - start) * 1000
+
+    payload = {
+        "request_id": getattr(req, "rid", None),
+        "role": role,
+        "stage": stage,
+        "elapsed_ms": elapsed_ms,
+        "start_perf_counter": start,
+        "end_perf_counter": end,
+        "start_time_unix": _perf_counter_to_unix(start),
+        "end_time_unix": _perf_counter_to_unix(end),
+        "origin_input_len": _safe_len(getattr(req, "origin_input_ids", None)),
+        "fill_len": _safe_len(getattr(req, "fill_ids", None)),
+        "output_len": _safe_len(getattr(req, "output_ids", None)),
+        "extend_input_len": getattr(req, "extend_input_len", None),
+        "seqlen": getattr(req, "seqlen", None),
+        "cached_tokens": getattr(req, "cached_tokens", None),
+        "cached_tokens_device": getattr(req, "cached_tokens_device", None),
+        "cached_tokens_host": getattr(req, "cached_tokens_host", None),
+        "cached_tokens_storage": getattr(req, "cached_tokens_storage", None),
+        "bootstrap_room": getattr(req, "bootstrap_room", None),
+        **fields,
+    }
+    return {key: value for key, value in payload.items() if value is not None}
 
 
 @dataclass

@@ -1379,11 +1379,7 @@ class Req(ReqDllmMixin):
             )
             self.logprob_start_len = -1
 
-        # NOTE: the matched length is at most 1 less than the input length to enable logprob computation
-        max_prefix_len = input_len - 1
-        if self.return_logprob and self.logprob_start_len >= 0:
-            max_prefix_len = min(max_prefix_len, self.logprob_start_len)
-        max_prefix_len = max(max_prefix_len, 0)
+        max_prefix_len = self._compute_max_prefix_len(input_len)
         token_ids = self.fill_ids[:max_prefix_len]
 
         # Disable prefix caching when embed overrides are present: same token IDs
@@ -1447,6 +1443,13 @@ class Req(ReqDllmMixin):
         self.set_extend_input_len(
             len(self.fill_ids) - len(self.prefix_indices) // self._scale_seq_factor
         )
+
+    def _compute_max_prefix_len(self, input_len: int) -> int:
+        # The matched length is at most 1 less than the input length to enable logprob computation.
+        max_prefix_len = input_len - 1
+        if self.return_logprob and self.logprob_start_len >= 0:
+            max_prefix_len = min(max_prefix_len, self.logprob_start_len)
+        return max(max_prefix_len, 0)
 
     # Based on https://github.com/vllm-project/vllm/blob/7a64d24aad69e4d2548aa0bf528d9fe63428ab01/vllm/transformers_utils/detokenizer.py#L194-L313
     def init_incremental_detokenize(self):
@@ -2138,21 +2141,23 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             list(chain.from_iterable(input_ids)), dtype=torch.int64, pin_memory=_pin
         ).to(self.device, non_blocking=True)
 
-        oe_grams, _ = get_welm_oe_hash_config(self.model_config)
-        if not oe_grams:
-            raise RuntimeError("WeLM OE requires oe_grams for the CUDA hash kernel.")
-        if torch.device(self.device).type != "cuda":
-            raise RuntimeError("WeLM OE requires the CUDA hash kernel.")
-        if not should_use_welm_oe_hash_kernel(self.model_config):
-            raise RuntimeError(
-                "WeLM OE CUDA hash kernel is not supported by this model config."
+        self.oe_context = None
+        if get_global_server_args().prepare_n_gram_inputs:
+            oe_grams, _ = get_welm_oe_hash_config(self.model_config)
+            if not oe_grams:
+                raise RuntimeError("WeLM OE requires oe_grams for the CUDA hash kernel.")
+            if torch.device(self.device).type != "cuda":
+                raise RuntimeError("WeLM OE requires the CUDA hash kernel.")
+            if not should_use_welm_oe_hash_kernel(self.model_config):
+                raise RuntimeError(
+                    "WeLM OE CUDA hash kernel is not supported by this model config."
+                )
+            self.oe_context = OverEncodingContext.from_extend_hash_kernel(
+                reqs,
+                logical_prefix_lens,
+                max(oe_grams) - 1,
+                legacy_history_width=max(oe_grams),
             )
-        self.oe_context = OverEncodingContext.from_extend_hash_kernel(
-            reqs,
-            logical_prefix_lens,
-            max(oe_grams) - 1,
-            legacy_history_width=max(oe_grams),
-        )
         seq_lens_tensor = torch.tensor(
             expanded_seq_lens, dtype=torch.int64, pin_memory=_pin
         ).to(self.device, non_blocking=True)
@@ -2827,21 +2832,23 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             )
         )
 
-        oe_grams, _ = get_welm_oe_hash_config(self.model_config)
-        if not oe_grams:
-            raise RuntimeError("WeLM OE requires oe_grams for the CUDA hash kernel.")
-        if torch.device(self.device).type != "cuda":
-            raise RuntimeError("WeLM OE requires the CUDA hash kernel.")
-        if not should_use_welm_oe_hash_kernel(self.model_config):
-            raise RuntimeError(
-                "WeLM OE CUDA hash kernel is not supported by this model config."
+        self.oe_context = None
+        if get_global_server_args().prepare_n_gram_inputs:
+            oe_grams, _ = get_welm_oe_hash_config(self.model_config)
+            if not oe_grams:
+                raise RuntimeError("WeLM OE requires oe_grams for the CUDA hash kernel.")
+            if torch.device(self.device).type != "cuda":
+                raise RuntimeError("WeLM OE requires the CUDA hash kernel.")
+            if not should_use_welm_oe_hash_kernel(self.model_config):
+                raise RuntimeError(
+                    "WeLM OE CUDA hash kernel is not supported by this model config."
+                )
+            self.oe_context = OverEncodingContext.from_decode_hash_kernel(
+                self.reqs,
+                self.enable_overlap,
+                max(oe_grams) - 1,
+                legacy_history_width=max(oe_grams),
             )
-        self.oe_context = OverEncodingContext.from_decode_hash_kernel(
-            self.reqs,
-            self.enable_overlap,
-            max(oe_grams) - 1,
-            legacy_history_width=max(oe_grams),
-        )
 
         if self.model_config.is_encoder_decoder:
             self.prepare_encoder_info_decode()

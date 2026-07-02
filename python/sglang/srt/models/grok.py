@@ -146,7 +146,6 @@ class Grok1MoE(nn.Module):
             top_k=top_k,
             layer_id=self.layer_id,
             renormalize=False,
-            layer_id=layer_id,
             custom_routing_function=None if _is_npu else custom_routing_function,
         )
 

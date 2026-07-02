@@ -19,6 +19,9 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolName,
     PoolTransfer,
     PoolTransferResult,
+    hicache_gib_per_s,
+    hicache_timing_enabled,
+    log_hicache_timing,
 )
 from sglang.srt.mem_cache.memory_pool_host import HostKVCache, HostTensorAllocator
 from sglang.srt.observability.metrics_collector import StorageMetrics
@@ -475,6 +478,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                     self.mha_suffix = [f"{rank}" for rank in target_ranks]
 
             self.registered_pools = {}
+            self.registered_buffer_ranges: List[Tuple[int, int]] = []
 
             self.gb_per_page = None
             self.prefetch_pgs = []
@@ -488,6 +492,30 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         except Exception as exc:
             logger.error("An error occurred while loading the configuration: %s", exc)
             raise
+
+    def _register_buffer_once(self, buffer: torch.Tensor):
+        ptr = buffer.data_ptr()
+        size = buffer.numel() * buffer.element_size()
+        end = ptr + size
+        for registered_ptr, registered_size in self.registered_buffer_ranges:
+            registered_end = registered_ptr + registered_size
+            if ptr >= registered_ptr and end <= registered_end:
+                logger.debug(
+                    "Skipping Mooncake buffer registration for already registered "
+                    "range ptr=%s size=%s.",
+                    ptr,
+                    size,
+                )
+                return
+            if ptr < registered_end and end > registered_ptr:
+                raise RuntimeError(
+                    "Mooncake buffer registration overlaps a previously registered "
+                    f"range: ptr={ptr}, size={size}, registered_ptr={registered_ptr}, "
+                    f"registered_size={registered_size}"
+                )
+
+        super().register_buffer(buffer)
+        self.registered_buffer_ranges.append((ptr, size))
 
     def check_server(self):
         master_server_ip = self.config.master_server_address.split(":")[0]
@@ -558,7 +586,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         ], "mooncake store storage backend only support page first, page first direct, page head and  page_first_kv_split layout"
         buffer = self.mem_pool_host.kv_buffer
         try:
-            super().register_buffer(buffer)
+            self._register_buffer_once(buffer)
         except TypeError as err:
             logger.error("Failed to register buffer to Mooncake Store: %s", err)
             raise TypeError("Mooncake Store Register Buffer Error.") from err
@@ -579,7 +607,22 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         # The storage backend only depends on this accessor, not concrete fields.
         buf_list = host_pool.get_hybrid_pool_buffer()
         for buf in buf_list:
-            super().register_buffer(buf)
+            self._register_buffer_once(buf)
+
+    def _get_mha_pool_suffixes(self, pool_name: PoolName) -> List[str]:
+        if self.storage_config.should_split_heads:
+            return [
+                suffix
+                for rank_suffix in self.mha_suffix
+                for suffix in (
+                    f"_{rank_suffix}_{pool_name}_k",
+                    f"_{rank_suffix}_{pool_name}_v",
+                )
+            ]
+        return [
+            f"_{self.mha_suffix}_{pool_name}_k",
+            f"_{self.mha_suffix}_{pool_name}_v",
+        ]
 
     def _tag_keys(self, keys: List[str]) -> List[str]:
         if self.extra_backend_tag is None:
@@ -592,6 +635,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         # A logical "page" may map to multiple physical objects in storage.
         # - INDEXER: one key per page
         # - MAMBA  : one temporal key + N conv keys per page
+        # - SWA    : one key per page (per-token KV, layer-stacked, no sub-objects)
         # key_multiplier records how many component keys are generated per page.
         name = transfer.name
         suffixes = []
@@ -605,6 +649,12 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             suffixes = [f"{base_suffix}_temporal"] + [
                 f"{base_suffix}_conv_{i}" for i in range(conv_num)
             ]
+        elif name == PoolName.SWA:
+            suffixes = (
+                [f"_{self.mla_suffix}_{PoolName.SWA}_k"]
+                if self.is_mla_backend
+                else self._get_mha_pool_suffixes(PoolName.SWA)
+            )
         key_multiplier = len(suffixes)
         component_keys = [
             f"{page_key}{suffix}" for page_key in page_keys for suffix in suffixes
@@ -617,8 +667,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         pool_transfers: Optional[List[PoolTransfer]] = None,
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> PoolTransferResult:
-        qkeys = self._tag_keys(keys)
-        kv_pages = self.batch_exists(qkeys, extra_info)
+        kv_pages = self.batch_exists(keys, extra_info)
 
         hit_count: dict = {PoolName.KV: kv_pages} if kv_pages else {}
         final_pages = kv_pages
@@ -627,8 +676,9 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             if final_pages == 0:
                 break
             component_keys, key_multiplier = self._get_hybrid_page_component_keys(
-                qkeys, transfer
+                keys, transfer
             )
+            component_keys = self._tag_keys(component_keys)
             ex = self._batch_exist(component_keys)
             if key_multiplier > 0:
                 page_exists = [
@@ -673,28 +723,85 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             assert len(keys) > 0
             assert len(keys) == len(host_indices) // page_size
 
-            ptr_list, element_size_list = host_pool.get_page_buffer_meta(host_indices)
+            if (
+                transfer.name == PoolName.SWA
+                and not self.is_mla_backend
+                and self.storage_config.should_split_heads
+            ):
+                ptr_list, element_size_list = (
+                    host_pool.get_split_heads_page_buffer_meta(
+                        host_indices, self.split_factor
+                    )
+                )
+            else:
+                ptr_list, element_size_list = host_pool.get_page_buffer_meta(
+                    host_indices
+                )
             key_strs, key_multiplier = self._get_hybrid_page_component_keys(
                 keys, transfer
             )
             key_strs = self._tag_keys(key_strs)
+            if len(key_strs) != len(ptr_list) or len(ptr_list) != len(
+                element_size_list
+            ):
+                raise RuntimeError(
+                    f"Mooncake v2 transfer metadata mismatch for {transfer.name}: "
+                    f"{len(key_strs)=}, {len(ptr_list)=}, {len(element_size_list)=}"
+                )
 
             if is_set:
                 exist_result = self._batch_exist(key_strs)
                 io_results = [0 if state == 1 else -1 for state in exist_result]
                 missing_idx = [i for i, state in enumerate(exist_result) if state != 1]
                 if missing_idx:
+                    put_sizes = [element_size_list[i] for i in missing_idx]
+                    timing_enabled = hicache_timing_enabled()
+                    start_time = time.perf_counter() if timing_enabled else None
                     put_results = self._put_batch_zero_copy_impl(
                         [key_strs[i] for i in missing_idx],
                         [ptr_list[i] for i in missing_idx],
-                        [element_size_list[i] for i in missing_idx],
+                        put_sizes,
                     )
+                    if timing_enabled:
+                        elapsed_s = time.perf_counter() - start_time
+                        self._log_zero_copy_timing(
+                            event="mooncake_batch_put",
+                            interface="v2",
+                            pool_name=transfer.name,
+                            logical_pages=len(keys),
+                            object_count=len(missing_idx),
+                            requested_bytes=sum(put_sizes),
+                            transferred_bytes=sum(
+                                size
+                                for size, res in zip(put_sizes, put_results)
+                                if res == 0
+                            ),
+                            elapsed_s=elapsed_s,
+                            results=put_results,
+                            key_multiplier=key_multiplier,
+                        )
                     for i, res in zip(missing_idx, put_results):
                         io_results[i] = res
             else:
+                timing_enabled = hicache_timing_enabled()
+                start_time = time.perf_counter() if timing_enabled else None
                 io_results = self._get_batch_zero_copy_impl(
                     key_strs, ptr_list, element_size_list
                 )
+                if timing_enabled:
+                    elapsed_s = time.perf_counter() - start_time
+                    self._log_zero_copy_timing(
+                        event="mooncake_batch_get",
+                        interface="v2",
+                        pool_name=transfer.name,
+                        logical_pages=len(keys),
+                        object_count=len(key_strs),
+                        requested_bytes=sum(element_size_list),
+                        transferred_bytes=sum(res for res in io_results if res > 0),
+                        elapsed_s=elapsed_s,
+                        results=io_results,
+                        key_multiplier=key_multiplier,
+                    )
             results[transfer.name] = self._batch_postprocess(
                 io_results, is_set_operate=is_set, key_multiplier=key_multiplier
             )
@@ -798,16 +905,31 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
 
         key_strs, buffer_ptrs, buffer_sizes = self._batch_preprocess(keys, host_indices)
 
-        start_time = time.perf_counter()
+        timing_enabled = hicache_timing_enabled()
+        measure_time = timing_enabled or self.enable_storage_metrics
+        start_time = time.perf_counter() if measure_time else None
         get_results = self._get_batch_zero_copy_impl(
             key_strs, buffer_ptrs, buffer_sizes
         )
-        end_time = time.perf_counter()
+        end_time = time.perf_counter() if measure_time else None
+        elapsed_s = end_time - start_time if measure_time else None
+        if timing_enabled:
+            self._log_zero_copy_timing(
+                event="mooncake_batch_get",
+                interface="v1",
+                pool_name=PoolName.KV,
+                logical_pages=len(keys),
+                object_count=len(key_strs),
+                requested_bytes=sum(buffer_sizes),
+                transferred_bytes=sum(res for res in get_results if res > 0),
+                elapsed_s=elapsed_s,
+                results=get_results,
+            )
 
         if self.enable_storage_metrics:
             self.prefetch_pgs.append(len(keys))
             self.prefetch_bandwidth.append(
-                len(keys) / (end_time - start_time) * self.gb_per_page
+                len(keys) / elapsed_s * self.gb_per_page
             )
 
         return self._batch_postprocess(get_results, is_set_operate=False)
@@ -840,16 +962,35 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
 
         # Only set non-existing keys to storage
         if len(set_keys) > 0:
-            start_time = time.perf_counter()
+            timing_enabled = hicache_timing_enabled()
+            measure_time = timing_enabled or self.enable_storage_metrics
+            start_time = time.perf_counter() if measure_time else None
             put_results = self._put_batch_zero_copy_impl(
                 set_keys, set_buffer_ptrs, set_buffer_sizes
             )
-            end_time = time.perf_counter()
+            end_time = time.perf_counter() if measure_time else None
+            elapsed_s = end_time - start_time if measure_time else None
+            if timing_enabled:
+                self._log_zero_copy_timing(
+                    event="mooncake_batch_put",
+                    interface="v1",
+                    pool_name=PoolName.KV,
+                    logical_pages=len(keys),
+                    object_count=len(set_keys),
+                    requested_bytes=sum(set_buffer_sizes),
+                    transferred_bytes=sum(
+                        size
+                        for size, res in zip(set_buffer_sizes, put_results)
+                        if res == 0
+                    ),
+                    elapsed_s=elapsed_s,
+                    results=put_results,
+                )
 
             if self.enable_storage_metrics:
                 self.backup_pgs.append(len(set_keys))
                 self.backup_bandwidth.append(
-                    len(set_keys) / (end_time - start_time) * self.gb_per_page
+                    len(set_keys) / elapsed_s * self.gb_per_page
                 )
 
             for i in range(len(set_indices)):
@@ -954,11 +1095,26 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         if len(keys) == 0:
             return 0
 
-        start_time = time.perf_counter()
+        timing_enabled = hicache_timing_enabled()
+        measure_time = timing_enabled or self.enable_storage_metrics
+        start_time = time.perf_counter() if measure_time else None
         get_result = self._get_batch_zero_copy_impl(
             keys, target_locations, target_sizes
         )
-        end_time = time.perf_counter()
+        end_time = time.perf_counter() if measure_time else None
+        elapsed_s = end_time - start_time if measure_time else None
+        if timing_enabled:
+            self._log_zero_copy_timing(
+                event="mooncake_batch_get",
+                interface="legacy",
+                pool_name=PoolName.KV,
+                logical_pages=len(keys),
+                object_count=len(keys),
+                requested_bytes=sum(target_sizes),
+                transferred_bytes=sum(res for res in get_result if res > 0),
+                elapsed_s=elapsed_s,
+                results=get_result,
+            )
 
         if self.is_mla_backend:
             key_multiplier = 1
@@ -968,7 +1124,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         if self.enable_storage_metrics:
             self.prefetch_pgs.append(len(keys))
             self.prefetch_bandwidth.append(
-                len(keys) / (end_time - start_time) * self.gb_per_page
+                len(keys) / elapsed_s * self.gb_per_page
             )
 
         for i in range(len(keys)):
@@ -1026,6 +1182,45 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         self, key_strs: List[str], buffer_ptrs: List[int], buffer_sizes: List[int]
     ) -> List[int]:
         return self.store.batch_get_into(key_strs, buffer_ptrs, buffer_sizes)
+
+    def _log_zero_copy_timing(
+        self,
+        event: str,
+        interface: str,
+        pool_name: PoolName,
+        logical_pages: int,
+        object_count: int,
+        requested_bytes: int,
+        transferred_bytes: int,
+        elapsed_s: float,
+        results: List[int],
+        key_multiplier: Optional[int] = None,
+    ) -> None:
+        if not hicache_timing_enabled():
+            return
+        if event == "mooncake_batch_put":
+            success_objects = sum(1 for res in results if res == 0)
+        else:
+            success_objects = sum(1 for res in results if res > 0)
+        failed_objects = len(results) - success_objects
+        log_hicache_timing(
+            logger,
+            event,
+            backend="mooncake",
+            interface=interface,
+            pool=str(pool_name),
+            logical_pages=logical_pages,
+            object_count=object_count,
+            key_multiplier=key_multiplier,
+            requested_bytes=requested_bytes,
+            transferred_bytes=transferred_bytes,
+            elapsed_ms=elapsed_s * 1000.0,
+            gib_per_s=hicache_gib_per_s(transferred_bytes, elapsed_s),
+            success_objects=success_objects,
+            failed_objects=failed_objects,
+            protocol=getattr(self.config, "protocol", None),
+            device_name=getattr(self.config, "device_name", None),
+        )
 
     def _batch_exist(self, key_strs: List[str]) -> List[int]:
         return self.store.batch_is_exist(key_strs)

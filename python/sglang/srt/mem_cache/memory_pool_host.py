@@ -394,6 +394,9 @@ class MHATokenToKVPoolHost(HostKVCache):
     def v_buffer(self):
         return self.kv_buffer[1]
 
+    def get_hybrid_pool_buffer(self):
+        return [self.kv_buffer]
+
     def load_to_device_per_layer(
         self,
         device_pool,
@@ -1143,6 +1146,14 @@ class MLATokenToKVPoolHost(HostKVCache):
             )
         else:
             raise ValueError(f"Unsupported layout: {self.layout}")
+
+    def get_hybrid_pool_buffer(self):
+        if self.layout == "page_first_kv_split":
+            buffers = [self.k_buffer, self.v_buffer]
+            if self.index_k_buffer is not None:
+                buffers.append(self.index_k_buffer)
+            return buffers
+        return [self.kv_buffer]
 
     def get_page_buffer_meta(self, indices):
         """ "

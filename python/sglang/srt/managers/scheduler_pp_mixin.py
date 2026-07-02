@@ -514,7 +514,7 @@ class SchedulerPPMixin:
                 + len(self.disagg_decode_prealloc_queue.queue)
             )
             if self.server_args.disaggregation_decode_enable_offload_kvcache:
-                queue_size += len(self.decode_offload_manager.ongoing_offload)
+                queue_size += self.decode_offload_manager.pending_work_count()
 
             if server_is_idle and queue_size == 0:
                 self.on_idle()

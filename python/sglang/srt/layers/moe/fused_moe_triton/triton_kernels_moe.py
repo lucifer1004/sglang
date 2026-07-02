@@ -80,6 +80,7 @@ def triton_kernel_moe_forward(
         a1_scale=a1_scale,
         a2_scale=a2_scale,
         block_shape=block_shape,
+        swiglu_clamp_limit=moe_runner_config.swiglu_clamp_limit,
     )
 
 
@@ -103,6 +104,7 @@ def triton_kernel_fused_experts(
     a1_scale: Optional[torch.Tensor] = None,
     a2_scale: Optional[torch.Tensor] = None,
     block_shape: Optional[list[int]] = None,
+    swiglu_clamp_limit: Optional[float] = None,
 ) -> torch.Tensor:
 
     assert use_fp8_w8a8 is False, "use_fp8_w8a8 is not supported"
@@ -113,6 +115,9 @@ def triton_kernel_fused_experts(
     assert a1_scale is None, "a1_scale is not supported"
     assert a2_scale is None, "a2_scale is not supported"
     assert block_shape is None, "block_shape is not supported"
+    assert (
+        swiglu_clamp_limit is None
+    ), "swiglu_clamp_limit is not supported by triton_kernel_fused_experts"
 
     # type check
     assert hidden_states.dtype == torch.bfloat16, "hidden_states must be bfloat16"
@@ -224,6 +229,7 @@ def triton_kernel_moe_with_bias_forward(
         block_shape=block_shape,
         gemm1_alpha=moe_runner_config.gemm1_alpha,
         gemm1_clamp_limit=moe_runner_config.gemm1_clamp_limit,
+        swiglu_clamp_limit=moe_runner_config.swiglu_clamp_limit,
     )
 
 
@@ -252,6 +258,7 @@ def triton_kernel_fused_experts_with_bias(
     block_shape: Optional[list[int]] = None,
     gemm1_alpha: Optional[float] = None,
     gemm1_clamp_limit: Optional[float] = None,
+    swiglu_clamp_limit: Optional[float] = None,
 ) -> torch.Tensor:
     assert use_fp8_w8a8 is False, "use_fp8_w8a8 is not supported"
     assert per_channel_quant is False, "per_channel_quant is not supported"
@@ -288,6 +295,10 @@ def triton_kernel_fused_experts_with_bias(
     if global_num_experts == -1:
         global_num_experts = E
 
+    activation_limit = gemm1_clamp_limit
+    if activation_limit is None:
+        activation_limit = swiglu_clamp_limit
+
     # TODO maybe completely remove this branch
     if w1.dtype == torch.bfloat16:
         device = "cuda"
@@ -300,7 +311,7 @@ def triton_kernel_fused_experts_with_bias(
 
     act = FusedActivation(
         FnSpecs("swiglu", swiglu_fn, ("alpha", "limit"), reduction_n=2),
-        (gemm1_alpha, gemm1_clamp_limit),
+        (gemm1_alpha, activation_limit),
     )
 
     intermediate_cache = torch.empty(

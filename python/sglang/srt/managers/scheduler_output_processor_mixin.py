@@ -20,6 +20,11 @@ from sglang.srt.managers.schedule_batch import (
     ScheduleBatch,
 )
 from sglang.srt.mem_cache.common import maybe_cache_unfinished_req, release_kv_cache
+from sglang.srt.mem_cache.hicache_storage import (
+    hicache_timing_enabled,
+    log_hicache_timing,
+    request_timing_fields,
+)
 from sglang.srt.server_args import MIS_DELIMITER_TOKEN_ID, get_global_server_args
 from sglang.srt.state_capturer.indexer_topk import (
     get_global_indexer_capturer,
@@ -95,6 +100,22 @@ class SchedulerOutputProcessorMixin:
             self.token_to_kv_pool_allocator.free_group_begin()
         for req in batch.reqs:
             req.time_stats.set_decode_prebuilt_finish_time()
+            if hicache_timing_enabled():
+                log_hicache_timing(
+                    logger,
+                    "pd_decode_prebuilt",
+                    **request_timing_fields(
+                        req,
+                        start=req.time_stats.forward_entry_time,
+                        end=req.time_stats.decode_prebuilt_finish_time,
+                        role="decode",
+                        stage="prebuilt",
+                        tp_rank=getattr(self, "tp_rank", None),
+                        pp_rank=getattr(self, "pp_rank", None),
+                        batch_size=len(batch.reqs),
+                        forward_mode=str(batch.forward_mode),
+                    ),
+                )
             req.check_finished()
             if req.finished():
                 req.time_stats.set_quick_finish_time()
@@ -217,9 +238,7 @@ class SchedulerOutputProcessorMixin:
                     None,
                 )
                 if mtp_prefill_branch_cache_locs is not None:
-                    self.token_to_kv_pool_allocator.free(
-                        mtp_prefill_branch_cache_locs
-                    )
+                    self.token_to_kv_pool_allocator.free(mtp_prefill_branch_cache_locs)
                     result.next_draft_input.welm_mtp_prefill_branch_cache_locs = None
 
             # Move next_token_ids and logprobs to cpu
@@ -553,6 +572,25 @@ class SchedulerOutputProcessorMixin:
             if is_spec_v1:
                 self._mamba_prefix_cache_update(req, batch, result, i)
                 req.time_stats.set_last_decode_finish_time()
+                if hicache_timing_enabled():
+                    log_hicache_timing(
+                        logger,
+                        "pd_decode_forward",
+                        **request_timing_fields(
+                            req,
+                            start=(
+                                req.time_stats.last_forward_entry_time
+                                or req.time_stats.forward_entry_time
+                            ),
+                            end=req.time_stats.last_decode_finish_time,
+                            role="decode",
+                            stage="forward",
+                            tp_rank=getattr(self, "tp_rank", None),
+                            pp_rank=getattr(self, "pp_rank", None),
+                            batch_size=len(batch.reqs),
+                            forward_mode=str(batch.forward_mode),
+                        ),
+                    )
                 self._handle_finished_req(req, i, logits_output)
                 if req.return_hidden_states and logits_output.hidden_states is not None:
                     req.hidden_states.append(
@@ -576,6 +614,25 @@ class SchedulerOutputProcessorMixin:
             # Update Mamba last track seqlen
             self._mamba_prefix_cache_update(req, batch, result, i)
             req.time_stats.set_last_decode_finish_time()
+            if hicache_timing_enabled():
+                log_hicache_timing(
+                    logger,
+                    "pd_decode_forward",
+                    **request_timing_fields(
+                        req,
+                        start=(
+                            req.time_stats.last_forward_entry_time
+                            or req.time_stats.forward_entry_time
+                        ),
+                        end=req.time_stats.last_decode_finish_time,
+                        role="decode",
+                        stage="forward",
+                        tp_rank=getattr(self, "tp_rank", None),
+                        pp_rank=getattr(self, "pp_rank", None),
+                        batch_size=len(batch.reqs),
+                        forward_mode=str(batch.forward_mode),
+                    ),
+                )
             req.check_finished(new_accepted_len)
 
             self._handle_finished_req(req, i, logits_output)

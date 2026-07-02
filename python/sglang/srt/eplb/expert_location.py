@@ -93,8 +93,11 @@ class ExpertLocationMetadata:
 
         num_physical_experts = common["num_physical_experts"]
         model_config_for_expert_location = common["model_config_for_expert_location"]
-        num_layers = model_config_for_expert_location.num_layers + getattr(
-            model_config, "num_nextn_predict_layers", 0
+        num_nextn_predict_layers = (
+            getattr(model_config, "num_nextn_predict_layers", 0) or 0
+        )
+        num_layers = (
+            model_config_for_expert_location.num_layers + num_nextn_predict_layers
         )
         num_logical_experts = model_config_for_expert_location.num_logical_experts
 

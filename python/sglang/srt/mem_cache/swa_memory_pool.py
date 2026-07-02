@@ -93,6 +93,8 @@ class SWAKVPool(BaseSWAKVPool):
         for swa_layer_id, global_layer_id in enumerate(swa_attention_layer_ids):
             self.layers_mapping[global_layer_id] = (swa_layer_id, True)
         self.full_to_swa_index_mapping: Optional[torch.Tensor] = None
+        self._cached_swa_loc: Optional[torch.Tensor] = None
+        self._cached_loc_key: Optional[Tuple[int, int, int]] = None
 
         k_size, v_size = self.get_kv_size_bytes()
         self.mem_usage = (k_size + v_size) / GB
@@ -102,6 +104,11 @@ class SWAKVPool(BaseSWAKVPool):
 
     def register_mapping(self, full_to_swa_index_mapping: torch.Tensor):
         self.full_to_swa_index_mapping = full_to_swa_index_mapping
+        self.invalidate_loc_cache()
+
+    def invalidate_loc_cache(self) -> None:
+        self._cached_swa_loc = None
+        self._cached_loc_key = None
 
     def register_layer_transfer_counter(self, layer_transfer_counter):
         # Wait happens at this wrapper. Inner pools must not wait again.
@@ -167,7 +174,13 @@ class SWAKVPool(BaseSWAKVPool):
 
         # Note: kv_indices could have -1 values (from alloc_extend), which will be mapped to -1
         # since the last item of full_to_swa_index_mapping is -1.
-        return self.full_to_swa_index_mapping[kv_indices].to(torch.int32)
+        loc_key = (kv_indices.data_ptr(), kv_indices.numel(), kv_indices._version)
+        if loc_key != self._cached_loc_key:
+            self._cached_swa_loc = self.full_to_swa_index_mapping[kv_indices].to(
+                torch.int32
+            )
+            self._cached_loc_key = loc_key
+        return self._cached_swa_loc
 
     def set_kv_buffer(
         self,
@@ -590,8 +603,20 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.is_not_in_free_group = True
         self.free_group = []
 
-        self.clear()
+        # Backup-pending refcount on SWA slots: when an SWA slot is being
+        # backed up (D->H or H->L3), free_swa must defer the actual physical
+        # free so the backup reads consistent bytes. Indexed by SWA slot id;
+        # slot 0 is the "no-pair" sentinel and is never tracked.
+        # See add_backup_pending / dec_backup_pending / free_swa below.
+        self.backup_pending_ref = torch.zeros(
+            size_swa + 1, dtype=torch.int32, device=device
+        )
+        # Slots whose physical free was deferred because backup_pending_ref > 0.
+        # Drained whenever dec_backup_pending() drops a refcount to 0.
+        self._deferred_swa_free: list[int] = []
+
         self._kvcache = kvcache
+        self.clear()
         self._kvcache.register_mapping(self.full_to_swa_index_mapping)
 
     def available_size(self):
@@ -651,6 +676,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             )
         else:
             self.full_to_swa_index_mapping[alloc_full_indices] = alloc_swa_indices
+        self._kvcache.invalidate_loc_cache()
         return alloc_full_indices
 
     def alloc_extend(
@@ -701,6 +727,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             )
         else:
             self.full_to_swa_index_mapping[alloc_full_indices] = alloc_swa_indices
+        self._kvcache.invalidate_loc_cache()
 
         return alloc_full_indices
 
@@ -769,6 +796,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         )
         if swa_tail_len < extend_num_tokens:
             self.full_to_swa_index_mapping[alloc_full_indices[:-swa_tail_len]] = 0
+        self._kvcache.invalidate_loc_cache()
         return alloc_full_indices
 
     def alloc_decode(
@@ -796,6 +824,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             )
         else:
             self.full_to_swa_index_mapping[alloc_full_indices] = alloc_swa_indices
+        self._kvcache.invalidate_loc_cache()
 
         return alloc_full_indices
 
@@ -830,12 +859,76 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             )
         else:
             self.full_to_swa_index_mapping[full_indices] = swa_indices
+        self._kvcache.invalidate_loc_cache()
 
     def free_swa(self, free_index: torch.Tensor):
+        self._kvcache.invalidate_loc_cache()
         swa_indices = self.full_to_swa_index_mapping[free_index]
         swa_indices = swa_indices[swa_indices > 0]
-        self.swa_attn_allocator.free(swa_indices)
+        if swa_indices.numel() > 0:
+            # Slots with backup_pending_ref > 0 are still being read by an
+            # in-flight backup; physical free must wait until the backup
+            # callback drops their refcount in dec_backup_pending().
+            pending_mask = self.backup_pending_ref[swa_indices] > 0
+            if bool(pending_mask.any().item()):
+                immediate = swa_indices[~pending_mask]
+                deferred = swa_indices[pending_mask]
+                if immediate.numel() > 0:
+                    self.swa_attn_allocator.free(immediate)
+                self._deferred_swa_free.extend(deferred.tolist())
+            else:
+                self.swa_attn_allocator.free(swa_indices)
         self.full_to_swa_index_mapping[free_index] = 0
+
+    def add_backup_pending(self, swa_indices: torch.Tensor) -> None:
+        """Mark SWA slots as having an in-flight backup.
+
+        While a slot's refcount is > 0, ``free_swa`` will defer its
+        physical free. Pair with ``dec_backup_pending`` on backup completion.
+        """
+        if swa_indices.numel() == 0:
+            return
+        valid = swa_indices[swa_indices > 0]
+        if valid.numel() > 0:
+            self.backup_pending_ref[valid] += 1
+
+    def dec_backup_pending(self, swa_indices: torch.Tensor) -> None:
+        """Mark backup completion and drain any newly freeable deferred slots.
+
+        Underflow can occur on abort/restart paths where the matching
+        ``add_backup_pending`` was skipped (e.g., the request was cancelled
+        before alloc_decode populated the pair). We log and clamp instead of
+        asserting so a single dropped pair doesn't take the process down.
+        """
+        if swa_indices.numel() == 0:
+            return
+        valid = swa_indices[swa_indices > 0]
+        if valid.numel() > 0:
+            self.backup_pending_ref[valid] -= 1
+            negative_mask = self.backup_pending_ref[valid] < 0
+            if bool(negative_mask.any().item()):
+                bad = valid[negative_mask]
+                logger.error(
+                    "backup_pending_ref underflow on %d swa slots — clamping to 0",
+                    bad.numel(),
+                )
+                self.backup_pending_ref[bad] = 0
+        self._drain_deferred_swa_free()
+
+    def _drain_deferred_swa_free(self) -> None:
+        """Free any deferred SWA slots whose backup_pending_ref has reached 0."""
+        if not self._deferred_swa_free:
+            return
+        idx = torch.tensor(
+            self._deferred_swa_free, dtype=torch.int64, device=self.device
+        )
+        ready_mask = self.backup_pending_ref[idx] == 0
+        if not bool(ready_mask.any().item()):
+            return
+        ready = idx[ready_mask]
+        self.swa_attn_allocator.free(ready)
+        still_pending = idx[~ready_mask]
+        self._deferred_swa_free = still_pending.tolist()
 
     def backup_state(self):
         return [
@@ -853,8 +946,13 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.full_attn_allocator.clear()
         # Note: the last item is -1, we don't clear it, see the comment in __init__
         self.full_to_swa_index_mapping[:-1].fill_(0)
+        self._kvcache.invalidate_loc_cache()
         self.is_not_in_free_group = True
         self.free_group = []
+        # Reset backup-pending state — any in-flight backups are abandoned.
+        if hasattr(self, "backup_pending_ref"):
+            self.backup_pending_ref.zero_()
+            self._deferred_swa_free = []
 
     def get_cpu_copy(self, indices, mamba_indices=None):
         return self._kvcache.get_cpu_copy(indices, mamba_indices=mamba_indices)

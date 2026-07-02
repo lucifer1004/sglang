@@ -15,6 +15,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
     EvictParams,
     EvictResult,
+    IncLockRefResult,
     InitLoadBackParams,
     InsertParams,
     MatchPrefixParams,
@@ -22,7 +23,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 )
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.common import available_and_evictable_str
-from sglang.srt.mem_cache.hicache_storage import PoolName
+from sglang.srt.mem_cache.hicache_storage import PoolHitPolicy, PoolName, PoolTransfer
 from sglang.srt.mem_cache.memory_pool import (
     HybridLinearKVPool,
     HybridReqToTokenPool,
@@ -2014,6 +2015,85 @@ class UnifiedRadixCacheSuite:
         self.assertFalse(tree.host_lru_lists[ComponentType.SWA].in_list(node))
         self.assertNotIn(node, tree.evictable_host_leaves)
 
+    def test_hicache_swa_host_lock_detaches_and_restores_host_lru(self):
+        if not self.cfg.has_swa:
+            self.skipTest("requires SWA")
+
+        tree, allocator, req_to_token_pool = build_fixture(self.cfg)
+        seq = self._make_seq(1, 2)
+        self._insert(tree, allocator, req_to_token_pool, seq)
+        node = tree.match_prefix(MatchPrefixParams(key=RadixKey(seq))).last_device_node
+        self._simulate_backup(tree, node)
+
+        cd = node.component_data[ComponentType.SWA]
+        self.assertIsNotNone(cd.value)
+        old_swa = cd.value
+        cd.value = None
+        tree.lru_lists[ComponentType.SWA].remove_node(node)
+        tree.component_evictable_size_[ComponentType.SWA] -= len(old_swa)
+
+        host_lru = tree.host_lru_lists[ComponentType.SWA]
+        host_lru.insert_mru(node)
+        self.assertTrue(host_lru.in_list(node))
+
+        lock_params = tree.inc_host_lock_ref(node).to_dec_params()
+        self.assertGreater(cd.host_lock_ref, 0)
+        self.assertFalse(host_lru.in_list(node))
+        host_lru.insert_mru(node)
+        self.assertIsNone(host_lru.get_lru_no_lock())
+        host_lru.remove_node(node)
+
+        tree.dec_host_lock_ref(node, lock_params)
+        self.assertEqual(cd.host_lock_ref, 0)
+        self.assertTrue(host_lru.in_list(node))
+        tree.sanity_check()
+
+    def test_hicache_swa_host_lock_survives_node_split(self):
+        if not self.cfg.has_swa or self.cfg.has_mamba:
+            self.skipTest("requires SWA-only path")
+
+        tree, allocator, req_to_token_pool = build_fixture(self.cfg)
+        seq = self._make_seq(1, 2)
+        self._insert(tree, allocator, req_to_token_pool, seq)
+        node = tree.match_prefix(MatchPrefixParams(key=RadixKey(seq))).last_device_node
+        self._simulate_backup(tree, node)
+
+        cd = node.component_data[ComponentType.SWA]
+        old_swa = cd.value
+        self.assertIsNotNone(old_swa)
+        cd.value = None
+        tree.lru_lists[ComponentType.SWA].remove_node(node)
+        tree.component_evictable_size_[ComponentType.SWA] -= len(old_swa)
+
+        host_lru = tree.host_lru_lists[ComponentType.SWA]
+        host_lru.insert_mru(node)
+
+        swa_comp = tree.components[ComponentType.SWA]
+        lock_params = swa_comp.acquire_component_lock(
+            node, IncLockRefResult(), lock_host=True
+        ).to_dec_params()
+        self.assertGreater(cd.host_lock_ref, 0)
+        self.assertFalse(host_lru.in_list(node))
+
+        new_parent = tree._split_node(node.key, node, self.cfg.page_size)
+        locked_nodes = [
+            n
+            for n in (new_parent, node)
+            if n.component_data[ComponentType.SWA].host_value is not None
+        ]
+        self.assertGreater(len(locked_nodes), 0)
+        for locked_node in locked_nodes:
+            locked_cd = locked_node.component_data[ComponentType.SWA]
+            self.assertGreater(locked_cd.host_lock_ref, 0)
+            self.assertFalse(host_lru.in_list(locked_node))
+
+        swa_comp.release_component_lock(node, lock_params, lock_host=True)
+        for locked_node in locked_nodes:
+            locked_cd = locked_node.component_data[ComponentType.SWA]
+            self.assertEqual(locked_cd.host_lock_ref, 0)
+            self.assertTrue(host_lru.in_list(locked_node))
+        tree.sanity_check()
+
     def _swa_finalize_setup(self):
         """Build a SWA chain long enough to fill at least the window
         plus one extra page, and host-back every node so we can flip
@@ -2297,6 +2377,299 @@ class UnifiedRadixCacheSuite:
         tree.dec_lock_ref(leaf, load_back_lock.to_dec_params())
         tree.dec_lock_ref(leaf, request_lock.to_dec_params())
         self.assertEqual(cd.lock_ref, 0)
+
+    def test_hicache_swa_load_back_uses_full_pool_capacity(self):
+        """load_back should gate Full KV load on Full pool capacity only."""
+        if not self.cfg.has_swa:
+            self.skipTest("requires SWA")
+        if self.cfg.has_mamba:
+            self.skipTest("SWA-only path")
+        if self.cfg.page_size > 1:
+            self.skipTest("page_size==1 for direct swa_attn_allocator access")
+
+        tree, allocator, req_to_token_pool = self._build_hicache_fixture()
+
+        sw = self.cfg.sliding_window_size
+        kv_tokens = sw + 2
+        chain = self._build_chain_pages(tree, allocator, req_to_token_pool, kv_tokens)
+        if len(chain) < kv_tokens:
+            self.skipTest("chain too short")
+        leaf = chain[-1]
+
+        self._backup_tree(tree)
+        result = tree.evict(EvictParams(num_tokens=kv_tokens))
+        self.assertGreaterEqual(result.num_tokens_evicted, kv_tokens)
+        self.assertIsNone(leaf.component_data[ComponentType.FULL].value)
+
+        kv_xfer = tree.components[ComponentType.FULL].build_hicache_transfers(
+            leaf, CacheTransferPhase.LOAD_BACK
+        )[0]
+        self.assertEqual(int(kv_xfer.host_indices.numel()), kv_tokens)
+
+        swa_xfer = tree.components[ComponentType.SWA].build_hicache_transfers(
+            leaf, CacheTransferPhase.LOAD_BACK
+        )[0]
+        self.assertEqual(int(swa_xfer.host_indices.numel()), sw)
+
+        # Leave tree-owned SWA available for controller-side SWA eviction.
+        unrelated_seq = self._make_seq(100_000, sw)
+        self._insert(tree, allocator, req_to_token_pool, unrelated_seq)
+        self.assertGreaterEqual(tree.swa_evictable_size(), sw)
+
+        # Make raw SWA availability smaller than both load-back transfers.
+        target_swa_avail = sw - 1
+        swa_avail = allocator.swa_attn_allocator.available_size()
+        self.assertGreaterEqual(swa_avail, target_swa_avail)
+        if swa_avail > target_swa_avail:
+            external_swa = allocator.swa_attn_allocator.alloc(
+                swa_avail - target_swa_avail
+            )
+            self.assertIsNotNone(external_swa)
+
+        self.assertGreaterEqual(
+            allocator.full_attn_allocator.available_size(),
+            int(kv_xfer.host_indices.numel()),
+        )
+        self.assertLess(
+            allocator.swa_attn_allocator.available_size(),
+            int(kv_xfer.host_indices.numel()),
+        )
+        self.assertLess(
+            allocator.swa_attn_allocator.available_size(),
+            int(swa_xfer.host_indices.numel()),
+        )
+
+        with mock.patch.object(tree, "evict", wraps=tree.evict) as evict_mock:
+            self.assertTrue(tree.load_back(leaf))
+
+        # Full pre-eviction must not be triggered by SWA pool pressure.
+        full_pre_evict_calls = [
+            call
+            for call in evict_mock.call_args_list
+            if call.args and call.args[0].num_tokens > 0
+        ]
+        self.assertEqual(full_pre_evict_calls, [])
+
+        # SWA shortage is handled by the controller through SWA-only eviction.
+        self.assertTrue(
+            any(
+                call.args
+                and call.args[0].num_tokens == 0
+                and call.args[0].swa_num_tokens > 0
+                for call in evict_mock.call_args_list
+            )
+        )
+
+        self._finish_pending_loads(tree)
+        self.assertIsNotNone(leaf.component_data[ComponentType.FULL].value)
+        self._release_ongoing_load_back_locks(tree)
+        tree.sanity_check()
+
+    def test_hicache_swa_backup_storage_disabled_returns_none(self):
+        """With SGLANG_HICACHE_SWA_STORAGE_ENABLE off, BACKUP_STORAGE is a no-op.
+
+        Even when a node is fully backed up to host (so cd.host_value and
+        node.hash_value are both populated), the SWA component must return
+        None for the BACKUP_STORAGE phase. This keeps SWA L3 strictly
+        opt-in: turning on `--hicache-storage-backend` for Full KV must
+        not implicitly enable SWA L3 traffic.
+        """
+        if not self.cfg.has_swa or self.cfg.has_mamba:
+            self.skipTest("SWA-only path")
+        tree, allocator, req_to_token_pool = self._build_hicache_fixture()
+        chain = self._build_chain_pages(tree, allocator, req_to_token_pool, 2)
+        if not chain:
+            self.skipTest("chain too short")
+        leaf = chain[-1]
+        self._backup_node(tree, leaf)
+
+        with envs.SGLANG_HICACHE_SWA_STORAGE_ENABLE.override(False):
+            transfers = tree.components[ComponentType.SWA].build_hicache_transfers(
+                leaf, CacheTransferPhase.BACKUP_STORAGE
+            )
+        self.assertIsNone(transfers)
+
+    def test_hicache_swa_backup_storage_emits_transfer(self):
+        """With env on, BACKUP_STORAGE returns a TRAILING_PAGES transfer.
+
+        The transfer carries the node's host SWA indices and the per-page
+        hashes — these are the keys mooncake will use to persist the page
+        contents. Trailing-page semantics let the storage layer match the
+        same prefix on prefetch even when only the window-tail pages are
+        present.
+        """
+        if not self.cfg.has_swa or self.cfg.has_mamba:
+            self.skipTest("SWA-only path")
+        tree, allocator, req_to_token_pool = self._build_hicache_fixture()
+        chain = self._build_chain_pages(tree, allocator, req_to_token_pool, 2)
+        if not chain:
+            self.skipTest("chain too short")
+        leaf = chain[-1]
+        self._backup_node(tree, leaf)
+        cd = leaf.component_data[ComponentType.SWA]
+        if cd.host_value is None or not leaf.hash_value:
+            self.skipTest("SWA host_value not populated by fixture")
+
+        with envs.SGLANG_HICACHE_SWA_STORAGE_ENABLE.override(True):
+            transfers = tree.components[ComponentType.SWA].build_hicache_transfers(
+                leaf, CacheTransferPhase.BACKUP_STORAGE
+            )
+        self.assertIsNotNone(transfers)
+        self.assertEqual(len(transfers), 1)
+        xfer = transfers[0]
+        self.assertEqual(xfer.name, PoolName.SWA)
+        self.assertEqual(xfer.hit_policy, PoolHitPolicy.TRAILING_PAGES)
+        self.assertEqual(list(xfer.keys), list(leaf.hash_value))
+        self.assertEqual(int(xfer.host_indices.numel()), int(cd.host_value.numel()))
+        self.assertTrue(torch.equal(xfer.host_indices, cd.host_value))
+
+    def test_hicache_swa_backup_storage_no_host_value_returns_none(self):
+        """Nodes whose SWA host data was already evicted must not re-emit a
+        backup transfer — there is nothing to persist, and emitting one
+        would mooncake-write zero or stale slot bytes."""
+        if not self.cfg.has_swa or self.cfg.has_mamba:
+            self.skipTest("SWA-only path")
+        tree, allocator, req_to_token_pool = self._build_hicache_fixture()
+        chain = self._build_chain_pages(tree, allocator, req_to_token_pool, 2)
+        if not chain:
+            self.skipTest("chain too short")
+        leaf = chain[-1]
+        # Do NOT backup — host_value stays None.
+        self.assertIsNone(leaf.component_data[ComponentType.SWA].host_value)
+
+        with envs.SGLANG_HICACHE_SWA_STORAGE_ENABLE.override(True):
+            transfers = tree.components[ComponentType.SWA].build_hicache_transfers(
+                leaf, CacheTransferPhase.BACKUP_STORAGE
+            )
+        self.assertIsNone(transfers)
+
+    def test_hicache_swa_prefetch_disabled_returns_none(self):
+        """PREFETCH phase is gated by the same env flag as BACKUP_STORAGE."""
+        if not self.cfg.has_swa or self.cfg.has_mamba:
+            self.skipTest("SWA-only path")
+        tree, allocator, req_to_token_pool = self._build_hicache_fixture()
+        chain = self._build_chain_pages(tree, allocator, req_to_token_pool, 2)
+        if not chain:
+            self.skipTest("chain too short")
+
+        with envs.SGLANG_HICACHE_SWA_STORAGE_ENABLE.override(False):
+            transfers = tree.components[ComponentType.SWA].build_hicache_transfers(
+                tree.root_node,
+                CacheTransferPhase.PREFETCH,
+                prefetch_tokens=self.cfg.sliding_window_size,
+            )
+        self.assertIsNone(transfers)
+
+    def test_hicache_swa_prefetch_emits_transfer(self):
+        """With env on, PREFETCH allocates host slots for the trailing-window
+        pages and returns a TRAILING_PAGES transfer with placeholder keys.
+
+        - host_indices length matches min(prefetch_tokens, sliding_window) rounded down to a page multiple
+        - keys count matches the number of pages
+        - hit_policy is TRAILING_PAGES (only the trailing N pages must hit)
+        """
+        if not self.cfg.has_swa or self.cfg.has_mamba:
+            self.skipTest("SWA-only path")
+        tree, allocator, req_to_token_pool = self._build_hicache_fixture()
+        page_size = self.cfg.page_size
+        sw = self.cfg.sliding_window_size
+        if sw // page_size < 1:
+            self.skipTest("sliding_window smaller than one page — no prefetch unit")
+
+        # Ask to prefetch 4 windows worth so the cap to sliding_window kicks in.
+        prefetch_tokens = sw * 4
+        with envs.SGLANG_HICACHE_SWA_STORAGE_ENABLE.override(True):
+            transfers = tree.components[ComponentType.SWA].build_hicache_transfers(
+                tree.root_node,
+                CacheTransferPhase.PREFETCH,
+                prefetch_tokens=prefetch_tokens,
+            )
+        # Empty list signals alloc failure; None signals not-applicable. We
+        # require an actual transfer here.
+        self.assertIsNotNone(transfers)
+        self.assertNotEqual(transfers, [])
+        self.assertEqual(len(transfers), 1)
+        xfer = transfers[0]
+        self.assertEqual(xfer.name, PoolName.SWA)
+        self.assertEqual(xfer.hit_policy, PoolHitPolicy.TRAILING_PAGES)
+
+        expected_pages = sw // page_size
+        expected_tokens = expected_pages * page_size
+        self.assertEqual(int(xfer.host_indices.numel()), expected_tokens)
+        self.assertEqual(len(xfer.keys), expected_pages)
+        self.assertTrue(all(k == "__placeholder__" for k in xfer.keys))
+
+        # Release the host slots to keep the fixture clean.
+        host_pool = tree.components[ComponentType.SWA]._swa_kv_pool_host
+        host_pool.free(xfer.host_indices)
+
+    def test_hicache_swa_load_back_splits_partial_tail_node(self):
+        """L3-restored SWA tail must become its own radix node before LOAD_BACK.
+
+        PREFETCH can attach only the trailing SWA page to a multi-page Full host
+        node. LOAD_BACK must split at that tail boundary before restoring SWA to
+        device; otherwise the restored device value would look like it covers
+        the whole Full node.
+        """
+        if not self.cfg.has_swa or self.cfg.has_mamba:
+            self.skipTest("SWA-only path")
+        if self.cfg.page_size != 4 or self.cfg.sliding_window_size != 4:
+            self.skipTest("single-page SWA tail scenario")
+
+        tree, allocator, req_to_token_pool = build_fixture(self.cfg)
+        page_size = self.cfg.page_size
+        seq = self._make_seq(1, 3)
+        self._insert(tree, allocator, req_to_token_pool, seq)
+
+        match = tree.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
+        node = match.last_device_node
+        self.assertEqual(len(node.key), 3 * page_size)
+        old_full = node.component_data[ComponentType.FULL].value.clone()
+        old_swa = node.component_data[ComponentType.SWA].value
+        self.assertIsNotNone(old_swa)
+        tail_host = old_swa[-page_size:].clone()
+
+        # Simulate prefetch-created host state: Full covers the whole node,
+        # SWA covers only the trailing page.
+        allocator.free_swa(old_full)
+        node.component_data[ComponentType.FULL].host_value = old_full.clone()
+        node.component_data[ComponentType.SWA].host_value = tail_host
+        node.component_data[ComponentType.SWA].value = None
+        tree.lru_lists[ComponentType.SWA].remove_node(node)
+        tree.host_lru_lists[ComponentType.SWA].insert_mru(node)
+        tree.component_evictable_size_[ComponentType.SWA] -= len(old_swa)
+
+        new_swa = allocator.swa_attn_allocator.alloc(page_size)
+        self.assertIsNotNone(new_swa)
+        transfer = PoolTransfer(
+            name=PoolName.SWA,
+            host_indices=node.component_data[ComponentType.SWA].host_value,
+            device_indices=new_swa,
+            nodes_to_load=[node],
+        )
+
+        tree.components[ComponentType.SWA].commit_hicache_transfer(
+            node, CacheTransferPhase.LOAD_BACK, transfers=[transfer]
+        )
+
+        prefix = next(iter(tree.root_node.children.values()))
+        tail = next(iter(prefix.children.values()))
+        self.assertEqual(len(prefix.key), 2 * page_size)
+        self.assertEqual(len(tail.key), page_size)
+        self.assertIsNone(prefix.component_data[ComponentType.SWA].value)
+        self.assertIsNone(prefix.component_data[ComponentType.SWA].host_value)
+        self.assertEqual(
+            tail.component_data[ComponentType.SWA].value.tolist(), new_swa.tolist()
+        )
+        self.assertEqual(
+            allocator.translate_loc_from_full_to_swa(
+                tail.component_data[ComponentType.FULL].value
+            ).tolist(),
+            new_swa.tolist(),
+        )
+        self.assertTrue(tree.lru_lists[ComponentType.SWA].in_list(tail))
+        self.assertFalse(tree.host_lru_lists[ComponentType.SWA].in_list(tail))
+        tree.sanity_check()
 
     def test_hicache_full_temp_lock_skips_evicted_anchor_and_mirrors_on_release(
         self,

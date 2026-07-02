@@ -64,6 +64,11 @@ from sglang.srt.mem_cache.common import (
 )
 from sglang.srt.mem_cache.cp_sharded_allocator import CPShardedKVPoolAllocator
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+from sglang.srt.mem_cache.hicache_storage import (
+    hicache_timing_enabled,
+    log_hicache_timing,
+    request_timing_fields,
+)
 from sglang.srt.mem_cache.memory_pool import (
     HybridReqToTokenPool,
     KVCache,
@@ -917,6 +922,7 @@ class DecodePreallocQueue:
                 swa_allocatable_tokens -= swa_required
             decode_req.req.cache_protected_len = prefix_len
 
+            page_size = self.token_to_kv_pool_allocator.page_size
             if _is_fake_transfer(decode_req.req, self.scheduler.server_args):
                 page_indices = np.empty((0,), dtype=np.int32)
                 state_indices = []
@@ -939,7 +945,6 @@ class DecodePreallocQueue:
                         .cpu()
                         .numpy()
                     )
-                    page_size = self.token_to_kv_pool_allocator.page_size
 
                 seq_len = len(decode_req.req.origin_input_ids)
 
@@ -1019,6 +1024,24 @@ class DecodePreallocQueue:
             preallocated_reqs.append(decode_req)
             indices_to_remove.add(i)
             decode_req.req.time_stats.set_decode_transfer_queue_entry_time()
+            if hicache_timing_enabled():
+                log_hicache_timing(
+                    logger,
+                    "pd_decode_prealloc",
+                    **request_timing_fields(
+                        decode_req.req,
+                        start=decode_req.req.time_stats.decode_prealloc_queue_entry_time,
+                        end=decode_req.req.time_stats.decode_transfer_queue_entry_time,
+                        role="decode",
+                        stage="prealloc",
+                        tp_rank=getattr(self, "tp_rank", None),
+                        pp_rank=getattr(self, "pp_rank", None),
+                        prefix_len=prefix_len,
+                        page_size=page_size,
+                        page_count=len(page_indices),
+                        metadata_buffer_index=decode_req.metadata_buffer_index,
+                    ),
+                )
 
         self.queue = [
             entry for i, entry in enumerate(self.queue) if i not in indices_to_remove
@@ -1493,6 +1516,20 @@ class DecodeTransferQueue:
         decode_req.kv_receiver.clear()
         decode_req.kv_receiver = None
         decode_req.req.time_stats.set_wait_queue_entry_time()
+        if hicache_timing_enabled():
+            log_hicache_timing(
+                logger,
+                "pd_decode_kv_arrival",
+                **request_timing_fields(
+                    decode_req.req,
+                    start=decode_req.req.time_stats.decode_transfer_queue_entry_time,
+                    end=decode_req.req.time_stats.wait_queue_entry_time,
+                    role="decode",
+                    stage="kv_arrival",
+                    tp_rank=getattr(self, "tp_rank", None),
+                    metadata_buffer_index=idx,
+                ),
+            )
         return True
 
     def _poll_with_staging(self) -> list:

@@ -24,6 +24,9 @@ import torch
 from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorageConfig,
     HiCacheStorageExtraInfo,
+    hicache_timing_enabled,
+    hicache_gib_per_s,
+    log_hicache_timing,
 )
 
 if TYPE_CHECKING:
@@ -491,6 +494,7 @@ class HiCacheController:
         self.storage_config = self._generate_storage_config(
             model_name, storage_backend_extra_config
         )
+        storage_batch_size = self._resolve_storage_batch_size()
         # for MLA models, only one rank needs to backup the KV cache
         self.backup_skip = (
             self.storage_config.is_mla_model
@@ -514,7 +518,7 @@ class HiCacheController:
                 0, int(0.8 * (self.mem_pool_host.size - self.mem_pool_device.size))
             )
             # granularity of batch storage IO operations, in number of pages
-            self.storage_batch_size = 128
+            self.storage_batch_size = storage_batch_size
             # tracking the number of tokens locked in prefetching, updated by the main scheduler thread
             self.prefetch_tokens_occupied = 0
 
@@ -561,6 +565,22 @@ class HiCacheController:
             self.page_get_func = self._generic_page_get
             self.page_set_func = self._generic_page_set
             raise
+
+    def _resolve_storage_batch_size(self) -> int:
+        extra_config = self.storage_config.extra_config or {}
+        raw_value = extra_config.pop("storage_batch_size", 128)
+        try:
+            storage_batch_size = int(raw_value)
+        except (TypeError, ValueError) as e:
+            raise ValueError(
+                f"Invalid storage_batch_size in storage extra config: {raw_value!r}"
+            ) from e
+        if storage_batch_size <= 0:
+            raise ValueError(
+                f"storage_batch_size must be positive, got {storage_batch_size}"
+            )
+        logger.info("HiCache storage batch size: %d pages", storage_batch_size)
+        return storage_batch_size
 
     def detach_storage_backend(self):
         """Detach (disable) storage backend at runtime.
@@ -792,9 +812,13 @@ class HiCacheController:
         self.load_queue.clear()
         producer_event = self.layer_done_counter.events[producer_id]
         producer_event.start_event.record()
+        timing_start_event = self._new_hicache_timing_event()
+        timing_finish_event = self._new_hicache_timing_event()
 
         with device_module.stream(self.load_stream):
             producer_event.start_event.wait(self.load_stream)
+            if timing_start_event is not None:
+                timing_start_event.record()
             for i in range(self.layer_num):
                 self.mem_pool_host.load_to_device_per_layer(
                     self.mem_pool_device,
@@ -812,6 +836,8 @@ class HiCacheController:
                         self.io_backend,
                     )
                 producer_event.complete(i)
+            if timing_finish_event is not None:
+                timing_finish_event.record()
             # NOTE: We must save the host indices and device indices here,
             # this is because we need to guarantee that these tensors are
             # still alive when the load stream is executing.
@@ -827,7 +853,73 @@ class HiCacheController:
                 node_ids=op.node_ids,
             )
         )
+        if timing_start_event is not None and timing_finish_event is not None:
+            self._log_load_timing_async(
+                timing_start_event,
+                timing_finish_event,
+                self._load_timing_fields(host_indices, op.node_ids),
+            )
         return producer_id
+
+    def _new_hicache_timing_event(self):
+        if not hicache_timing_enabled():
+            return None
+        try:
+            return device_module.Event(enable_timing=True)
+        except TypeError:
+            return None
+
+    def _load_timing_fields(
+        self,
+        host_indices: torch.Tensor,
+        node_ids: Optional[List[int]] = None,
+        pool_transfers: Optional[list] = None,
+    ) -> dict:
+        kv_tokens = int(host_indices.numel())
+        kv_bytes = kv_tokens * int(
+            getattr(self.mem_pool_host, "size_per_token", 0) or 0
+        )
+        draft_bytes = 0
+        if self.has_draft and self.mem_pool_host_draft is not None:
+            draft_bytes = kv_tokens * int(
+                getattr(self.mem_pool_host_draft, "size_per_token", 0) or 0
+            )
+        return {
+            "io_backend": self.io_backend,
+            "kv_tokens": kv_tokens,
+            "kv_bytes": kv_bytes,
+            "draft_bytes": draft_bytes,
+            "extra_pool_bytes": 0,
+            "extra_pool_breakdown": {},
+            "total_bytes": kv_bytes + draft_bytes,
+            "node_count": len(node_ids or []),
+        }
+
+    def _log_load_timing_async(
+        self,
+        start_event,
+        finish_event,
+        fields: dict,
+    ) -> None:
+        if start_event is None or finish_event is None:
+            return
+
+        def _log_when_ready():
+            try:
+                finish_event.synchronize()
+                elapsed_ms = float(start_event.elapsed_time(finish_event))
+                total_bytes = int(fields.get("total_bytes") or 0)
+                log_hicache_timing(
+                    logger,
+                    "hicache_load_to_device",
+                    elapsed_ms=elapsed_ms,
+                    gib_per_s=hicache_gib_per_s(total_bytes, elapsed_ms / 1000.0),
+                    **fields,
+                )
+            except Exception:
+                logger.exception("Failed to log HiCache host-to-device timing.")
+
+        threading.Thread(target=_log_when_ready, daemon=True).start()
 
     def evict_device(self, device_indices: torch.Tensor) -> int:
         self.mem_pool_device_allocator.free(device_indices)
@@ -948,6 +1040,49 @@ class HiCacheController:
             if prefix_keys and len(prefix_keys) > 0:
                 prefix_keys += batch_hashes
 
+    def _prefetch_timing_fields(self, operation) -> dict:
+        completed_tokens = int(operation.completed_tokens)
+        kv_bytes = completed_tokens * int(
+            getattr(self.mem_pool_host, "size_per_token", 0) or 0
+        )
+        return {
+            "kv_completed_tokens": completed_tokens,
+            "kv_pages": completed_tokens // self.page_size if self.page_size else 0,
+            "kv_bytes": kv_bytes,
+            "extra_pool_bytes": 0,
+            "extra_pool_pages": {},
+            "extra_pool_tokens": {},
+            "extra_pool_breakdown": {},
+            "total_bytes": kv_bytes,
+        }
+
+    def _log_prefetch_timing(
+        self,
+        operation,
+        transfer_elapsed_s: float,
+    ) -> None:
+        if not hicache_timing_enabled():
+            return
+        fields = self._prefetch_timing_fields(operation)
+        total_bytes = int(fields.get("total_bytes") or 0)
+        request_elapsed_s = time.monotonic() - operation.start_time
+        log_hicache_timing(
+            logger,
+            "hicache_prefetch_request",
+            request_id=operation.request_id,
+            operation_id=operation.id,
+            storage_backend=self.storage_backend_type,
+            requested_tokens=len(operation.token_ids),
+            hash_pages=len(operation.hash_value),
+            page_size=self.page_size,
+            transfer_elapsed_ms=transfer_elapsed_s * 1000.0,
+            request_e2e_ms=request_elapsed_s * 1000.0,
+            transfer_gib_per_s=hicache_gib_per_s(total_bytes, transfer_elapsed_s),
+            request_e2e_gib_per_s=hicache_gib_per_s(total_bytes, request_elapsed_s),
+            terminated=operation.is_terminated(),
+            **fields,
+        )
+
     def prefetch_io_aux_func(self):
         """
         Auxiliary function conducting IO operations for prefetching.
@@ -957,7 +1092,17 @@ class HiCacheController:
                 operation = self.prefetch_buffer.get(block=True, timeout=1)
                 if operation is None:
                     continue
+                timing_enabled = hicache_timing_enabled()
+                transfer_start = time.perf_counter() if timing_enabled else None
                 self._page_transfer(operation)
+                if timing_enabled:
+                    try:
+                        self._log_prefetch_timing(
+                            operation,
+                            transfer_elapsed_s=time.perf_counter() - transfer_start,
+                        )
+                    except Exception:
+                        logger.exception("Failed to log HiCache prefetch timing.")
                 # operation terminated by controller, release pre-allocated memory
                 self.append_host_mem_release(
                     operation.host_indices[operation.completed_tokens :]

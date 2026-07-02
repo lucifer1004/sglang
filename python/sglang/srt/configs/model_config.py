@@ -43,6 +43,11 @@ MIMO_V2_MODEL_ARCHS = (
     "MiMoV2ForCausalLM",
     "MiMoV2FlashForCausalLM",
 )
+
+WELMV4_MODEL_ARCHS = (
+    "WeLMV4MoeForCausalLM",
+    "WeLMV4MoeForCausalLMNextN",
+)
 MIMO_V2_MULTIMODAL_ARCHS = ("MiMoV2ForCausalLM",)
 
 
@@ -499,6 +504,15 @@ class ModelConfig:
             is_hybrid_swa_model(self.hf_config.architectures)
             and not self.disable_hybrid_swa_memory
         )
+        if self.is_hybrid_swa and any(
+            arch in WELMV4_MODEL_ARCHS for arch in self.hf_config.architectures
+        ):
+            swa_layer_ids, _ = get_hybrid_layer_ids(
+                self.hf_config.architectures,
+                self.hf_text_config,
+                context_len=self.context_len,
+            )
+            self.is_hybrid_swa = bool(swa_layer_ids)
 
         if self.is_hybrid_swa:
             logger.info(f"Hybrid swa model: {self.hf_config.architectures=}")
@@ -513,6 +527,7 @@ class ModelConfig:
                     get_hybrid_layer_ids(
                         self.hf_config.architectures,
                         self.hf_text_config,
+                        context_len=self.context_len,
                     )
                 )
 
@@ -1677,13 +1692,71 @@ def is_hybrid_swa_model(model_architectures: List[str]):
         "Gemma4ForCausalLM",
         "Gemma4ForConditionalGeneration",
         "LagunaForCausalLM",
+        *WELMV4_MODEL_ARCHS,
     }
     return any(arch in hybrid_swa_archs for arch in model_architectures)
+
+
+def _get_welmv4_swa_full_window_limit(
+    hf_text_config: PretrainedConfig,
+    context_len: Optional[int],
+) -> Optional[int]:
+    candidates = [
+        context_len,
+        getattr(hf_text_config, "sliding_window", None),
+        getattr(hf_text_config, "max_position_embeddings", None),
+    ]
+    valid = [int(x) for x in candidates if x is not None and int(x) > 0]
+    return min(valid) if valid else None
+
+
+def _is_welmv4_swa_window(window: Optional[int], full_window_limit: Optional[int]):
+    if window is None:
+        return False
+    window = int(window)
+    if window <= 0:
+        return False
+    return full_window_limit is None or window < full_window_limit
+
+
+def _get_welmv4_hybrid_layer_ids(
+    model_architectures: List[str],
+    hf_text_config: PretrainedConfig,
+    context_len: Optional[int],
+):
+    windows = getattr(hf_text_config, "sliding_window_size_layerwise", []) or []
+    full_window_limit = _get_welmv4_swa_full_window_limit(
+        hf_text_config, context_len
+    )
+    num_target_layers = getattr(
+        hf_text_config,
+        "num_target_hidden_layers",
+        getattr(hf_text_config, "num_hidden_layers", 0),
+    )
+
+    if "WeLMV4MoeForCausalLMNextN" in model_architectures:
+        num_layers = getattr(hf_text_config, "num_nextn_predict_layers", 1)
+        offset = num_target_layers
+    else:
+        num_layers = getattr(hf_text_config, "num_hidden_layers", 0)
+        offset = 0
+
+    swa_attention_layer_ids = []
+    full_attention_layer_ids = []
+    for layer_id in range(num_layers):
+        window_idx = offset + layer_id
+        window = windows[window_idx] if window_idx < len(windows) else None
+        if _is_welmv4_swa_window(window, full_window_limit):
+            swa_attention_layer_ids.append(layer_id)
+        else:
+            full_attention_layer_ids.append(layer_id)
+    return swa_attention_layer_ids, full_attention_layer_ids
 
 
 def get_hybrid_layer_ids(
     model_architectures: List[str],
     hf_text_config: PretrainedConfig,
+    context_len: Optional[int] = None,
 ):
     num_hidden_layers = hf_text_config.num_hidden_layers
     if "Llama4ForConditionalGeneration" in model_architectures:
@@ -1746,6 +1819,12 @@ def get_hybrid_layer_ids(
         full_attention_layer_ids = [
             i for i, x in enumerate(layer_types) if x == "full_attention"
         ]
+    elif any(arch in WELMV4_MODEL_ARCHS for arch in model_architectures):
+        swa_attention_layer_ids, full_attention_layer_ids = (
+            _get_welmv4_hybrid_layer_ids(
+                model_architectures, hf_text_config, context_len
+            )
+        )
     else:
         swa_attention_layer_ids = None
         full_attention_layer_ids = None

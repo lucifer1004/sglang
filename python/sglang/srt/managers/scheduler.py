@@ -2760,8 +2760,11 @@ class Scheduler(
             last_host_node = req.last_host_node
             if last_host_node.backuped or last_host_node is self.tree_cache.root_node:
                 last_hash = last_host_node.get_last_hash_value()
-                matched_len = len(req.prefix_indices) + req.host_hit_length
-                new_input_tokens = req.fill_ids[matched_len:]
+                max_prefix_len = req._compute_max_prefix_len(len(req.fill_ids))
+                matched_len = min(
+                    len(req.prefix_indices) + req.host_hit_length, max_prefix_len
+                )
+                new_input_tokens = req.fill_ids[matched_len:max_prefix_len]
 
                 prefix_keys = (
                     last_host_node.get_prefix_hash_values(last_host_node.parent)
@@ -3912,7 +3915,7 @@ class Scheduler(
                 idle &= len(self.disagg_decode_prealloc_queue.queue) == 0
                 idle &= len(self.disagg_decode_transfer_queue.queue) == 0
                 if self.decode_offload_manager is not None:
-                    idle &= len(self.decode_offload_manager.ongoing_offload) == 0
+                    idle &= not self.decode_offload_manager.has_pending_work()
 
             # HiSparse: staging requests transitioning prefill -> decode
             if self.enable_hisparse:
@@ -3922,11 +3925,9 @@ class Scheduler(
             # destructive operations like attach/detach/flush_cache.
             if self.enable_hierarchical_cache:
                 tc = self.tree_cache
-                idle &= len(tc.ongoing_write_through) == 0
-                idle &= len(tc.ongoing_load_back) == 0
-                if tc.enable_storage:
-                    idle &= len(tc.ongoing_prefetch) == 0
-                    idle &= len(tc.ongoing_backup) == 0
+                if tc.tp_world_size == 1:
+                    tc.poll_storage_work()
+                idle &= not tc.has_pending_storage_work()
 
         return idle
 
