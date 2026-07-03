@@ -193,6 +193,19 @@ def create_trtllm_mha_backend(runner):
     return TRTLLMHAAttnBackend(runner)
 
 
+@register_attention_backend("mk_decode_attention")
+def create_mk_decode_attention_backend(runner):
+    if runner.use_mla_backend:
+        raise ValueError(
+            "mk_decode_attention backend can only be used with non-MLA models."
+        )
+    from sglang.srt.layers.attention.mk_decode_attention_backend import (
+        MkDecodeAttentionBackend,
+    )
+
+    return MkDecodeAttentionBackend(runner)
+
+
 @register_attention_backend("intel_amx")
 def create_intel_amx_backend(runner):
     from sglang.srt.layers.attention.intel_amx_backend import IntelAMXAttnBackend

@@ -54,6 +54,18 @@ class HybridAttnBackend(AttentionBackend):
         backend = self._select_backend(forward_batch.forward_mode)
         backend.init_forward_metadata(forward_batch)
 
+    def _set_child_cuda_graph_attrs(self, backend: AttentionBackend):
+        attrs = {}
+        for name in ("_cuda_graph_seq_len_fill_value", "_replay_forward_batch"):
+            if hasattr(self, name):
+                attrs[name] = getattr(self, name)
+                setattr(backend, name, attrs[name])
+        return attrs
+
+    def _clear_child_cuda_graph_attrs(self, backend: AttentionBackend, attrs):
+        for name in attrs:
+            setattr(backend, name, None)
+
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         self.decode_backend.init_cuda_graph_state(max_bs, max_num_tokens)
         needs_prefill_graph_state = (
@@ -91,15 +103,19 @@ class HybridAttnBackend(AttentionBackend):
         spec_info: Optional[SpecInput],
     ):
         backend = self._select_backend(forward_mode)
-        backend.init_forward_metadata_capture_cuda_graph(
-            bs,
-            num_tokens,
-            req_pool_indices,
-            seq_lens,
-            encoder_lens,
-            forward_mode,
-            spec_info,
-        )
+        attrs = self._set_child_cuda_graph_attrs(backend)
+        try:
+            backend.init_forward_metadata_capture_cuda_graph(
+                bs,
+                num_tokens,
+                req_pool_indices,
+                seq_lens,
+                encoder_lens,
+                forward_mode,
+                spec_info,
+            )
+        finally:
+            self._clear_child_cuda_graph_attrs(backend, attrs)
 
     def init_forward_metadata_replay_cuda_graph(
         self,
@@ -113,19 +129,28 @@ class HybridAttnBackend(AttentionBackend):
         seq_lens_cpu: Optional[torch.Tensor],
     ):
         backend = self._select_backend(forward_mode)
-        backend.init_forward_metadata_replay_cuda_graph(
-            bs,
-            req_pool_indices,
-            seq_lens,
-            seq_lens_sum,
-            encoder_lens,
-            forward_mode,
-            spec_info,
-            seq_lens_cpu,
-        )
+        attrs = self._set_child_cuda_graph_attrs(backend)
+        try:
+            backend.init_forward_metadata_replay_cuda_graph(
+                bs,
+                req_pool_indices,
+                seq_lens,
+                seq_lens_sum,
+                encoder_lens,
+                forward_mode,
+                spec_info,
+                seq_lens_cpu,
+            )
+        finally:
+            self._clear_child_cuda_graph_attrs(backend, attrs)
 
     def get_cuda_graph_seq_len_fill_value(self):
         return self.decode_backend.get_cuda_graph_seq_len_fill_value()
+
+    def on_after_cuda_graph_warmup(self):
+        self.decode_backend.on_after_cuda_graph_warmup()
+        if self.prefill_backend is not self.decode_backend:
+            self.prefill_backend.on_after_cuda_graph_warmup()
 
     def forward(
         self,

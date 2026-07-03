@@ -187,6 +187,7 @@ ATTENTION_BACKEND_CHOICES = [
     "trtllm_mla",
     "tokenspeed_mla",
     "trtllm_mha",
+    "mk_decode_attention",
     "dual_chunk_flash_attn",
     # AMD specific
     "aiter",
@@ -2880,6 +2881,20 @@ class ServerArgs:
             self.attention_backend = "triton"
 
         prefill_backend, decode_backend = self.get_attention_backends()
+        if prefill_backend == "mk_decode_attention":
+            raise ValueError(
+                "mk_decode_attention is decode-only. Use "
+                "--decode-attention-backend mk_decode_attention together with a "
+                "different --prefill-attention-backend."
+            )
+        if decode_backend == "mk_decode_attention":
+            if self.page_size not in (None, 16):
+                logger.warning(
+                    "mk_decode_attention only supports page_size=16, changing "
+                    f"page_size from {self.page_size} to 16."
+                )
+            self.page_size = 16
+
         if self.use_mla_backend() and prefill_backend == "intel_xpu":
             raise ValueError(
                 "intel_xpu backend is only supported on decode for MLA models, please set --decode-attention-backend to intel_xpu and do not set --attention-backend or --prefill-attention-backend to intel_xpu for prefill instead use triton."

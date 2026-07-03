@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 
 import torch
@@ -18,6 +19,10 @@ from sglang.srt.managers.schedule_batch import (
     BaseFinishReason,
     Req,
     ScheduleBatch,
+)
+from sglang.srt.managers.scheduler_decode_profile import (
+    decode_scheduler_profile_enabled,
+    record_decode_scheduler_event,
 )
 from sglang.srt.mem_cache.common import maybe_cache_unfinished_req, release_kv_cache
 from sglang.srt.mem_cache.hicache_storage import (
@@ -504,14 +509,29 @@ class SchedulerOutputProcessorMixin:
         batch: ScheduleBatch,
         result: GenerationBatchResult,
     ):
+        profile_enabled = decode_scheduler_profile_enabled()
+        profile_begin_ns = time.perf_counter_ns() if profile_enabled else 0
+        phase_begin_ns = profile_begin_ns
+        profile_extra: dict[str, object] = {}
+
         if result.copy_done is not None:
             result.copy_done.synchronize()
+        if profile_enabled:
+            now_ns = time.perf_counter_ns()
+            profile_extra["copy_done_wait_ms"] = (
+                now_ns - phase_begin_ns
+            ) / 1.0e6
+            phase_begin_ns = now_ns
         if result.routed_experts_output is not None:
             result.routed_experts_output.finalize()
             result.routed_experts_output = None
         if result.indexer_topk_output is not None:
             result.indexer_topk_output.finalize()
             result.indexer_topk_output = None
+        if profile_enabled:
+            now_ns = time.perf_counter_ns()
+            profile_extra["aux_finalize_ms"] = (now_ns - phase_begin_ns) / 1.0e6
+            phase_begin_ns = now_ns
 
         logits_output, next_token_ids, can_run_cuda_graph = (
             result.logits_output,
@@ -542,6 +562,12 @@ class SchedulerOutputProcessorMixin:
                         v.tolist()
                         for v in logits_output.next_token_token_ids_logprobs_val
                     ]
+        if profile_enabled:
+            now_ns = time.perf_counter_ns()
+            profile_extra["result_to_cpu_objects_ms"] = (
+                now_ns - phase_begin_ns
+            ) / 1.0e6
+            phase_begin_ns = now_ns
         # else: Spec V1 — output_ids, check_finished, grammar, and reasoning tokens
         # are already handled in the verify phase (eagle_info.py / ngram_info.py).
 
@@ -693,7 +719,15 @@ class SchedulerOutputProcessorMixin:
                     self.abort_request(AbortReq(rid=req.rid))
                 req.grammar.finished = req.finished()
 
+        if profile_enabled:
+            now_ns = time.perf_counter_ns()
+            profile_extra["update_reqs_ms"] = (now_ns - phase_begin_ns) / 1.0e6
+            phase_begin_ns = now_ns
         self.stream_output(batch.reqs, batch.return_logprob)
+        if profile_enabled:
+            now_ns = time.perf_counter_ns()
+            profile_extra["stream_output_ms"] = (now_ns - phase_begin_ns) / 1.0e6
+            phase_begin_ns = now_ns
         self.token_to_kv_pool_allocator.free_group_end()
 
         self.forward_ct_decode = (self.forward_ct_decode + 1) % (1 << 30)
@@ -702,6 +736,18 @@ class SchedulerOutputProcessorMixin:
             running_batch=batch,
             num_correct_drafts=result.num_correct_drafts,
         )
+        if profile_enabled:
+            now_ns = time.perf_counter_ns()
+            profile_extra["finalize_stats_ms"] = (now_ns - phase_begin_ns) / 1.0e6
+            profile_extra["can_run_cuda_graph"] = bool(can_run_cuda_graph)
+            profile_extra["num_correct_drafts"] = result.num_correct_drafts
+            record_decode_scheduler_event(
+                "process_batch_result_decode",
+                self,
+                batch=batch,
+                start_ns=profile_begin_ns,
+                extra=profile_extra,
+            )
 
     def _handle_finished_req(
         self: Scheduler, req: Req, i: int, logits_output: LogitsProcessorOutput
@@ -1100,6 +1146,8 @@ class SchedulerOutputProcessorMixin:
         skip_req: Optional[Req] = None,
         is_idle_batch: bool = False,
     ):
+        profile_enabled = decode_scheduler_profile_enabled()
+        profile_begin_ns = time.perf_counter_ns() if profile_enabled else 0
         rids = []
         http_worker_ipcs = []
         finished_reasons: List[BaseFinishReason] = []
@@ -1334,6 +1382,7 @@ class SchedulerOutputProcessorMixin:
 
         # Send to detokenizer
         if reqs or is_idle_batch:
+            send_begin_ns = time.perf_counter_ns() if profile_enabled else 0
             self.send_to_detokenizer.send_output(
                 BatchTokenIDOutput(
                     rids=rids,
@@ -1379,6 +1428,35 @@ class SchedulerOutputProcessorMixin:
                     dp_ranks=dp_ranks,
                 )
             )
+            if profile_enabled:
+                now_ns = time.perf_counter_ns()
+                output_tokens_sent = 0
+                for ids in output_ids:
+                    try:
+                        output_tokens_sent += len(ids)
+                    except TypeError:
+                        pass
+                record_decode_scheduler_event(
+                    "stream_output_generation",
+                    self,
+                    start_ns=profile_begin_ns,
+                    extra={
+                        "reqs_count": len(reqs),
+                        "rids_count": len(rids),
+                        "finished_count": sum(
+                            reason is not None for reason in finished_reasons
+                        ),
+                        "completion_min": min(completion_tokens)
+                        if completion_tokens
+                        else None,
+                        "completion_max": max(completion_tokens)
+                        if completion_tokens
+                        else None,
+                        "output_tokens_sent": output_tokens_sent,
+                        "send_output_ms": (now_ns - send_begin_ns) / 1.0e6,
+                        "is_idle_batch": is_idle_batch,
+                    },
+                )
 
     def stream_output_embedding(self: Scheduler, reqs: List[Req]):
         rids = []
