@@ -218,17 +218,18 @@ class RedisRoutedExpertsStore(RoutedExpertsStore):
         if isinstance(value, dict):
             if "values" not in value:
                 raise TypeError(
-                    "Redis routed experts backend expects sparse payloads to "
+                    "Redis routed experts backend expects dense payloads to "
                     "contain a 'values' tensor."
                 )
             summary = summarize_routed_experts_value(value)
             values_ref = self.put(value["values"])
+            is_dense = value.get("format") == "dense"
             response = {
                 **value,
                 "values": values_ref,
-                "format": "remote_masked_dense",
+                "format": "remote_dense" if is_dense else "remote_masked_dense",
                 "backend": "redis",
-                "schema_version": 2,
+                "schema_version": 3 if is_dense else 2,
                 "remote_summary": summary,
             }
             return response
@@ -409,16 +410,17 @@ class MooncakeRoutedExpertsStore(RoutedExpertsStore):
         if isinstance(value, dict):
             if "values" not in value:
                 raise TypeError(
-                    "Mooncake routed experts backend expects sparse payloads to "
+                    "Mooncake routed experts backend expects dense payloads to "
                     "contain a 'values' tensor."
                 )
             summary = summarize_routed_experts_value(value)
+            is_dense = value.get("format") == "dense"
             response = {
                 **value,
                 "values": self.put(value["values"]),
-                "format": "remote_masked_dense",
+                "format": "remote_dense" if is_dense else "remote_masked_dense",
                 "backend": "mooncake",
-                "schema_version": 2,
+                "schema_version": 3 if is_dense else 2,
                 "remote_summary": summary,
             }
             valid_mask = value.get("valid_mask")

@@ -89,6 +89,31 @@ def test_mooncake_routed_experts_store_puts_raw_tensor_bytes():
     assert replica_num == 2
 
 
+def test_mooncake_routed_experts_store_preserves_dense_payload_format():
+    store = create_routed_experts_store(
+        "mooncake://localhost:17913"
+        "?metadata_server=http://127.0.0.1:18080/metadata"
+        "&master_server=127.0.0.1:15051"
+    )
+    tensor = torch.tensor([[[1, 2]], [[3, 4]]], dtype=torch.int32)
+
+    metadata = store.put(
+        {
+            "schema_version": 3,
+            "format": "dense",
+            "values": tensor,
+            "shape": [2, 1, 2],
+            "missing_value": -1,
+        }
+    )
+
+    assert metadata["schema_version"] == 3
+    assert metadata["format"] == "remote_dense"
+    assert metadata["values"]["format"] == "remote"
+    assert metadata["values"]["shape"] == [2, 1, 2]
+    assert "valid_mask" not in metadata
+
+
 def test_mooncake_routed_experts_store_uses_env_defaults(monkeypatch):
     monkeypatch.setenv("MOONCAKE_LOCAL_HOSTNAME", "env-host:1234")
     monkeypatch.setenv("MOONCAKE_TE_META_DATA_SERVER", "http://metadata/metadata")

@@ -1153,6 +1153,29 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             # remote refs (they were produced by a prior capture run we
             # control, so range/shape are already known).
             return routed_experts
+        if fmt == "dense":
+            values = routed_experts.get("values")
+            if values is None:
+                raise ValueError("dense routed_experts requires a values tensor.")
+            if isinstance(values, str):
+                raw = base64.b64decode(values.encode("utf-8"))
+                values = np.frombuffer(raw, dtype=np.int32).copy()
+                if routed_experts.get("shape") is not None:
+                    values = values.reshape(routed_experts["shape"])
+            values = torch.as_tensor(values, dtype=torch.int32)
+            values._sglang_router_replay_trusted = True
+            return values
+        if fmt == "remote_dense":
+            values_ref = routed_experts.get("values")
+            if not isinstance(values_ref, dict):
+                raise ValueError(
+                    "remote_dense routed_experts requires a remote values reference."
+                )
+            values = self._decode_remote_routed_experts_tensor(values_ref).to(
+                dtype=torch.int32
+            )
+            values._sglang_router_replay_trusted = True
+            return values
         if fmt != "remote_masked_dense":
             raise ValueError(f"Unsupported routed_experts payload format: {fmt!r}")
 

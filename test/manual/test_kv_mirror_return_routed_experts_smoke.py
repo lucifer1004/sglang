@@ -18,7 +18,7 @@ import numpy as np
 import pandas
 import requests
 
-from sglang.srt.layers.moe.routed_experts_capturer import (
+from sglang.srt.state_capturer.routed_experts import (
     extract_routed_experts_from_meta_info,
 )
 from sglang.test.simple_eval_common import format_multichoice_question
@@ -65,9 +65,7 @@ def _decode_routed_experts(response_json, model_path, num_layers, top_k):
     routed_experts = extract_routed_experts_from_meta_info(response_json)
     if isinstance(routed_experts, dict):
         values = routed_experts["values"].reshape(routed_experts["shape"])
-        valid_mask = routed_experts["valid_mask"].reshape(
-            routed_experts["valid_mask_shape"]
-        )
+        valid_mask = np.ones(values.shape[:2], dtype=bool)
         return values, valid_mask.astype(bool)
 
     num_layers, top_k = _infer_routed_experts_shape(model_path, num_layers, top_k)

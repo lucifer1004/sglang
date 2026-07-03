@@ -5,10 +5,9 @@ import numpy as np
 import pytest
 import torch
 
-from sglang.srt.layers.moe.routed_experts_capturer import (
-    _RoutedExpertsCapturerReal,
-    _RoutedExpertsDeviceCache,
-    _RoutedExpertsHostCache,
+from sglang.srt.state_capturer.base import BaseDeviceCache
+from sglang.srt.state_capturer.routed_experts import (
+    RoutedExpertsCapturer,
     encode_routed_experts_payload,
     extract_routed_experts_from_meta_info,
 )
@@ -68,23 +67,19 @@ def make_routed_experts_capturer(num_tokens=32, num_layers=3, top_k=2):
     server_args.chunked_prefill_size = num_tokens
     server_args.dp_size = 1
     set_global_server_args_for_scheduler(server_args)
-    capturer = _RoutedExpertsCapturerReal.__new__(_RoutedExpertsCapturerReal)
+    capturer = RoutedExpertsCapturer.__new__(RoutedExpertsCapturer)
     capturer.num_fused_shared_experts = 0
-    capturer.num_hidden_layers = num_layers
-    capturer.num_experts_per_tok = top_k
-    capturer.host_cache = _RoutedExpertsHostCache(
-        num_tokens=num_tokens,
-        num_hidden_layers=num_layers,
-        num_experts_per_tok=top_k,
+    capturer.topk_size = top_k
+    capturer.host_cache = types.SimpleNamespace(
+        buffer=torch.full((num_tokens, num_layers, top_k), -1, dtype=torch.int32)
     )
-    capturer.device_cache = _RoutedExpertsDeviceCache(
-        max_running_requests=num_tokens,
-        num_hidden_layers=num_layers,
-        num_experts_per_tok=top_k,
-        num_fused_shared_experts=0,
+    capturer.device_cache = BaseDeviceCache(
+        max_batch_size=num_tokens,
+        num_layers=num_layers,
+        topk_size=top_k,
         device="cpu",
+        name="test_routed_experts",
     )
-    capturer._active_forward_batch_id = None
     return capturer
 
 
@@ -234,6 +229,15 @@ def test_tokenizer_resolves_remote_masked_router_replay_payload():
     assert torch.equal(resolved[0, 0], torch.tensor(values[0, 0], dtype=torch.int32))
     assert resolved[1, 1].tolist() == [-1, -1]
     assert resolved[2, 0].tolist() == [-1, -1]
+
+
+def test_tokenizer_rejects_dense_router_replay_payload_without_values():
+    tokenizer_manager = TokenizerManager.__new__(TokenizerManager)
+
+    with pytest.raises(ValueError, match="dense routed_experts requires a values"):
+        TokenizerManager._resolve_router_replay_experts(
+            tokenizer_manager, {"format": "dense", "shape": [1, 2, 2]}
+        )
 
 
 def test_scheduler_forced_decode_tokens_override_after_sampling():
@@ -494,22 +498,24 @@ def test_build_router_replay_decode_batch_uses_explicit_trace_positions():
     assert torch.equal(mask.cpu(), torch.tensor([True]))
 
 
-def test_return_routed_experts_capturer_marks_kv_mirror_missing_layers():
+def test_return_routed_experts_capturer_overwrites_kv_slots_dense():
     capturer = make_routed_experts_capturer(num_tokens=32, num_layers=3, top_k=2)
+    slots = torch.tensor([10, 11, 12, 13, 14, 15], dtype=torch.long)
     forward_batch = types.SimpleNamespace(
-        out_cache_loc=torch.tensor([10, 11, 12, 13, 14, 15], dtype=torch.long),
+        out_cache_loc=slots,
     )
 
     layer0 = torch.tensor(
         [[0, 1], [10, 11], [20, 21], [30, 31], [40, 41], [50, 51]],
         dtype=torch.int32,
     )
-    layer1 = torch.tensor([[100, 101], [200, 201]], dtype=torch.int32)
+    layer1 = layer0 + 100
+    layer2 = layer0 + 200
 
     with set_current_forward_batch(forward_batch):
         capturer.capture(0, layer0)
-        forward_batch.custom_last_index = torch.tensor([2, 5], dtype=torch.long)
         capturer.capture(1, layer1)
+        capturer.capture(2, layer2)
 
     capturer.on_forward_end(
         forward_batch,
@@ -517,22 +523,24 @@ def test_return_routed_experts_capturer_marks_kv_mirror_missing_layers():
         cuda_graph_batch=None,
         no_copy_to_cpu=False,
     )
-    routed = capturer.host_cache.get(forward_batch.out_cache_loc.cpu())
+    expected = torch.stack([layer0, layer1, layer2], dim=1)
+    assert torch.equal(capturer.host_cache.buffer[slots], expected)
 
+    router_rows = slots.numel()
+    req_to_token_pool = types.SimpleNamespace(req_to_token=slots.view(1, router_rows))
+    routed = capturer.get_topk(
+        req_pool_idx=0,
+        seqlen=router_rows + 1,
+        req_to_token_pool=req_to_token_pool,
+    )
+
+    assert routed["schema_version"] == 3
+    assert routed["format"] == "dense"
     assert routed["shape"] == [6, 3, 2]
-    assert routed["valid_mask_shape"] == [6, 3]
-    values = routed["values"]
-    valid_mask = routed["valid_mask"].bool()
-    assert torch.equal(values[:, 0, :], layer0)
-    assert valid_mask[:, 0].all()
-    assert torch.equal(values[[2, 5], 1, :], layer1)
-    assert torch.equal(
-        valid_mask[:, 1],
-        torch.tensor([False, False, True, False, False, True]),
-    )
-    assert torch.equal(
-        values[~valid_mask[:, 1], 1, :], torch.full((4, 2), -1, dtype=torch.int32)
-    )
+    assert routed["missing_value"] == -1
+    assert routed["invalid_cache_locs"] == 0
+    assert "valid_mask" not in routed
+    assert torch.equal(routed["values"], expected)
 
 
 def test_return_routed_experts_overlap_output_keeps_device_values_until_copy():
@@ -552,7 +560,7 @@ def test_return_routed_experts_overlap_output_keeps_device_values_until_copy():
         no_copy_to_cpu=True,
     )
 
-    assert torch.equal(output.routed_experts[:, 0, :], layer0)
+    assert torch.equal(output.topk[:, 0, :], layer0)
     output.copy_to_cpu()
     output.finalize()
     assert torch.equal(
@@ -560,29 +568,22 @@ def test_return_routed_experts_overlap_output_keeps_device_values_until_copy():
     )
 
 
-def test_routed_experts_masked_payload_encoding_round_trip():
+def test_routed_experts_dense_payload_encoding_round_trip():
     payload = {
-        "schema_version": 2,
-        "format": "masked_dense",
+        "schema_version": 3,
+        "format": "dense",
         "values": make_trace(num_tokens=2),
         "shape": [2, 3, 2],
-        "valid_mask": torch.tensor([[1, 0, 1], [1, 1, 0]], dtype=torch.uint8),
-        "valid_mask_shape": [2, 3],
         "missing_value": -1,
     }
 
     encoded = encode_routed_experts_payload(payload)
     assert isinstance(encoded["values"], str)
-    assert isinstance(encoded["valid_mask"], str)
 
     decoded = extract_routed_experts_from_meta_info(
         {"meta_info": {"routed_experts": encoded}}
     )
-    assert decoded["schema_version"] == 2
-    assert decoded["values"].tolist() == payload["values"].numpy().reshape(-1).tolist()
-    assert decoded["valid_mask"].tolist() == payload["valid_mask"].numpy().reshape(
-        -1
-    ).tolist()
+    assert decoded.tolist() == payload["values"].numpy().tolist()
 
 
 def test_build_router_replay_decode_batch_masks_overlap_overrun_after_max_new_tokens():
