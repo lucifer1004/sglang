@@ -1112,25 +1112,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             tensor = tensor.reshape(shape)
         return torch.from_numpy(tensor)
 
-    def _decode_routed_experts_valid_mask(self, payload: Dict[str, Any]) -> torch.Tensor:
-        valid_mask = payload.get("valid_mask")
-        if valid_mask is None:
-            shape = payload.get("valid_mask_shape")
-            if shape is None:
-                shape = payload.get("shape", [])[:2]
-            return torch.ones(shape, dtype=torch.bool)
-
-        if isinstance(valid_mask, dict):
-            mask = self._decode_remote_routed_experts_tensor(valid_mask)
-        elif isinstance(valid_mask, str):
-            raw = base64.b64decode(valid_mask.encode("utf-8"))
-            mask = torch.from_numpy(np.frombuffer(raw, dtype=np.uint8).copy())
-            if payload.get("valid_mask_shape") is not None:
-                mask = mask.reshape(payload["valid_mask_shape"])
-        else:
-            mask = torch.as_tensor(valid_mask)
-        return mask.to(dtype=torch.bool)
-
     def _resolve_router_replay_experts(self, routed_experts):
         if not isinstance(routed_experts, dict):
             return routed_experts
@@ -1176,26 +1157,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             )
             values._sglang_router_replay_trusted = True
             return values
-        if fmt != "remote_masked_dense":
-            raise ValueError(f"Unsupported routed_experts payload format: {fmt!r}")
-
-        values_ref = routed_experts.get("values")
-        if not isinstance(values_ref, dict):
-            raise ValueError(
-                "remote_masked_dense routed_experts requires a remote values reference."
-            )
-        values = self._decode_remote_routed_experts_tensor(values_ref).to(
-            dtype=torch.int32
-        )
-        valid_mask = self._decode_routed_experts_valid_mask(routed_experts)
-        if values.shape[:2] != valid_mask.shape:
-            raise ValueError(
-                "Invalid remote_masked_dense routed_experts shapes: "
-                f"values={tuple(values.shape)}, valid_mask={tuple(valid_mask.shape)}."
-            )
-        values[~valid_mask] = -1
-        values._sglang_router_replay_trusted = True
-        return values
+        raise ValueError(f"Unsupported routed_experts payload format: {fmt!r}")
 
     @staticmethod
     def _resolve_embed_overrides(

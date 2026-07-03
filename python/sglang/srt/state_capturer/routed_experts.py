@@ -262,11 +262,6 @@ def extract_routed_experts_from_meta_info(data):
         payload = dict(routed_experts_payload)
         if "values" in payload:
             payload["values"] = _decode_int32_payload(payload["values"])
-        if isinstance(payload.get("valid_mask"), str):
-            payload["valid_mask"] = np.frombuffer(
-                pybase64.b64decode(payload["valid_mask"].encode("utf-8")),
-                dtype=np.uint8,
-            )
         if payload.get("format") == "dense":
             values = payload["values"]
             if isinstance(values, np.ndarray) and payload.get("shape") is not None:

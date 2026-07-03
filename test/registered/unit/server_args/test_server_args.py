@@ -81,6 +81,33 @@ class TestWelmOeArgs(unittest.TestCase):
             server_args._handle_welm_oe_hash_kernel_args()
 
 
+class TestRouterReplayServerArgs(unittest.TestCase):
+    def test_return_routed_experts_rejects_welm_kv_mirror_opt(self):
+        with self.assertRaisesRegex(
+            ValueError,
+            "--enable-return-routed-experts.*--enable-welm-kv-mirror-opt",
+        ):
+            ServerArgs(
+                model_path="dummy",
+                enable_return_routed_experts=True,
+                enable_welm_kv_mirror_opt=True,
+            )
+
+    def test_return_routed_experts_rejects_kv_mirror_alias(self):
+        with self.assertRaisesRegex(
+            ValueError,
+            "--enable-return-routed-experts.*--enable-welm-kv-mirror-opt",
+        ):
+            prepare_server_args(
+                [
+                    "--model-path",
+                    "dummy",
+                    "--enable-return-routed-experts",
+                    "--enable-kv-mirror",
+                ]
+            )
+
+
 class TestShardedKvContextParallelArgs(unittest.TestCase):
     def _fake_mha_config(self, q_heads=24, kv_heads=2):
         model_config = MagicMock()

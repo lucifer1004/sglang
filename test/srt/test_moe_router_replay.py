@@ -1,7 +1,5 @@
 import types
-import base64
 
-import numpy as np
 import pytest
 import torch
 
@@ -189,12 +187,8 @@ def test_tokenizer_forced_decode_tokens_reject_max_new_tokens_mismatch():
         TokenizerManager._validate_one_request(tokenizer_manager, req, req.input_ids)
 
 
-def test_tokenizer_resolves_remote_masked_router_replay_payload():
+def test_tokenizer_resolves_remote_dense_router_replay_payload():
     values = make_trace(num_tokens=3, num_layers=2, top_k=2).numpy()
-    valid_mask = np.array(
-        [[1, 1], [1, 0], [0, 0]],
-        dtype=np.uint8,
-    )
 
     class Store:
         def get(self, ref):
@@ -204,7 +198,7 @@ def test_tokenizer_resolves_remote_masked_router_replay_payload():
     tokenizer_manager = TokenizerManager.__new__(TokenizerManager)
     tokenizer_manager.routed_experts_store = Store()
     payload = {
-        "format": "remote_masked_dense",
+        "format": "remote_dense",
         "values": {
             "format": "remote",
             "backend": "redis",
@@ -215,8 +209,6 @@ def test_tokenizer_resolves_remote_masked_router_replay_payload():
         },
         "shape": list(values.shape),
         "dtype": "int32",
-        "valid_mask": base64.b64encode(valid_mask.tobytes()).decode("ascii"),
-        "valid_mask_shape": list(valid_mask.shape),
     }
 
     resolved = TokenizerManager._resolve_router_replay_experts(
@@ -227,8 +219,16 @@ def test_tokenizer_resolves_remote_masked_router_replay_payload():
     assert resolved.shape == values.shape
     assert resolved._sglang_router_replay_trusted
     assert torch.equal(resolved[0, 0], torch.tensor(values[0, 0], dtype=torch.int32))
-    assert resolved[1, 1].tolist() == [-1, -1]
-    assert resolved[2, 0].tolist() == [-1, -1]
+    assert torch.equal(resolved, torch.tensor(values, dtype=torch.int32))
+
+
+def test_tokenizer_rejects_remote_masked_router_replay_payload():
+    tokenizer_manager = TokenizerManager.__new__(TokenizerManager)
+
+    with pytest.raises(ValueError, match="Unsupported routed_experts payload format"):
+        TokenizerManager._resolve_router_replay_experts(
+            tokenizer_manager, {"format": "remote_masked_dense", "values": {}}
+        )
 
 
 def test_tokenizer_rejects_dense_router_replay_payload_without_values():

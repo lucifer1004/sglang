@@ -221,15 +221,18 @@ class RedisRoutedExpertsStore(RoutedExpertsStore):
                     "Redis routed experts backend expects dense payloads to "
                     "contain a 'values' tensor."
                 )
+            if value.get("format") != "dense":
+                raise TypeError(
+                    "Redis routed experts backend only accepts dense payloads."
+                )
             summary = summarize_routed_experts_value(value)
             values_ref = self.put(value["values"])
-            is_dense = value.get("format") == "dense"
             response = {
                 **value,
                 "values": values_ref,
-                "format": "remote_dense" if is_dense else "remote_masked_dense",
+                "format": "remote_dense",
                 "backend": "redis",
-                "schema_version": 3 if is_dense else 2,
+                "schema_version": 3,
                 "remote_summary": summary,
             }
             return response
@@ -413,19 +416,19 @@ class MooncakeRoutedExpertsStore(RoutedExpertsStore):
                     "Mooncake routed experts backend expects dense payloads to "
                     "contain a 'values' tensor."
                 )
+            if value.get("format") != "dense":
+                raise TypeError(
+                    "Mooncake routed experts backend only accepts dense payloads."
+                )
             summary = summarize_routed_experts_value(value)
-            is_dense = value.get("format") == "dense"
             response = {
                 **value,
                 "values": self.put(value["values"]),
-                "format": "remote_dense" if is_dense else "remote_masked_dense",
+                "format": "remote_dense",
                 "backend": "mooncake",
-                "schema_version": 3 if is_dense else 2,
+                "schema_version": 3,
                 "remote_summary": summary,
             }
-            valid_mask = value.get("valid_mask")
-            if hasattr(valid_mask, "detach") and hasattr(valid_mask, "numel"):
-                response["valid_mask"] = self.put(valid_mask)
             return response
 
         if not (hasattr(value, "detach") and hasattr(value, "numel")):

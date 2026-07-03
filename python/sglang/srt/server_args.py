@@ -917,6 +917,7 @@ class ServerArgs:
         # Validate --prefill-only-disable-kv-cache args early (before dummy-model
         # short-circuit). The backend check is run later after backends settle.
         self._validate_prefill_only_disable_kv_cache_args()
+        self._validate_return_routed_experts_args()
 
         if self.model_path.lower() in ["none", "dummy"]:
             # Skip for dummy models
@@ -3588,6 +3589,14 @@ class ServerArgs:
             raise ValueError(
                 "--prefill-only-disable-kv-cache is incompatible with --enable-hisparse: "
                 "HiSparse uses a dedicated pool family that is not the no-op MHA pool."
+            )
+
+    def _validate_return_routed_experts_args(self):
+        if self.enable_return_routed_experts and self.enable_welm_kv_mirror_opt:
+            raise ValueError(
+                "--enable-return-routed-experts cannot be used with "
+                "--enable-welm-kv-mirror-opt. WeLM KV mirror optimization skips "
+                "full-layer routed expert capture."
             )
 
     def _handle_prefill_only_disable_kv_cache(self):
