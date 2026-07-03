@@ -1,0 +1,23 @@
+{
+    "metrics": {
+        "accuracy": 0.3361,
+        "empty_predict_count": 0,
+        "judge_parse_failed_count": 0,
+        "sample_count": 854,
+        "score": 0.3361,
+        "subset_metrics": {
+            "math": {
+                "accuracy": 0.3287,
+                "count": 724,
+                "empty_predict_count": 0,
+                "judge_parse_failed_count": 0
+            },
+            "math2": {
+                "accuracy": 0.3769,
+                "count": 130,
+                "empty_predict_count": 0,
+                "judge_parse_failed_count": 0
+            }
+        }
+    }
+}

@@ -1,0 +1,47 @@
+{
+    "metrics": {
+        "accuracy": 0.2917,
+        "empty_predict_count": 0,
+        "judge_parse_failed_count": 0,
+        "sample_count": 600,
+        "score": 0.2917,
+        "subset_metrics": {
+            "Finance": {
+                "accuracy": 0.26,
+                "count": 100,
+                "empty_predict_count": 0,
+                "judge_parse_failed_count": 0
+            },
+            "Health": {
+                "accuracy": 0.26,
+                "count": 100,
+                "empty_predict_count": 0,
+                "judge_parse_failed_count": 0
+            },
+            "Humanities and Social Sciences": {
+                "accuracy": 0.26,
+                "count": 100,
+                "empty_predict_count": 0,
+                "judge_parse_failed_count": 0
+            },
+            "Law": {
+                "accuracy": 0.16,
+                "count": 100,
+                "empty_predict_count": 0,
+                "judge_parse_failed_count": 0
+            },
+            "Science Engineering and Mathematics": {
+                "accuracy": 0.44,
+                "count": 100,
+                "empty_predict_count": 0,
+                "judge_parse_failed_count": 0
+            },
+            "Software Engineering": {
+                "accuracy": 0.37,
+                "count": 100,
+                "empty_predict_count": 0,
+                "judge_parse_failed_count": 0
+            }
+        }
+    }
+}

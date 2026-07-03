@@ -1,0 +1,76 @@
+version: v1
+
+# ============================================================================
+# 5 数据集套餐 —— 与算法老师的 evalsuite 评估流程对齐
+# ============================================================================
+#
+# 用法（顺序串行跑 5 个 task）:
+#   ./bin/new_eval run --config configs/eval.example.5tasks.yaml
+#
+# 每个 task sample 5 条快速 smoke test 测试:
+#   ./bin/new_eval run --config configs/eval.example.5tasks.yaml --sample-num 5
+#
+# new_eval 的多任务调度是【串行】的：jobs 列表里 5 个 job 按顺序跑，
+# 前一个跑完才开始后一个。每个 job 独立产出 runs/<job.name>/output/<type>/。
+#
+# 与 evalsuite 配置的对照:
+#                                   evalsuite tasks/      concurrency  judge style
+#   gary-math               (854)   gary-math.yaml             20      HLE 'correct: yes/no'
+#   aime-2025               ( 30)   aime-2025.yaml             20      open-qa 'CORRECT/INCORRECT'
+#   gpqa-diamond            (198)   gpqa-diamond.yaml          20      mcq 'VERDICT: correct/incorrect/unclear'
+#   aa-lcr                  (100)   aa-lcr.yaml                20      open-qa 'CORRECT/INCORRECT'
+#   aa-omniscience-public   (600)   aa-omniscience-public.yaml 20      4-class A/B/C/D
+#
+# 注意: 当前 new_eval 不支持 evalsuite 的 sample_ratio>1 (pass@N)。
+# 跑全量得到的是 pass@1，分数会比 evalsuite 公布的指标低 1-3pp（数学题更明显）。
+# 想要 pass@N 可后续给 JobConfig 加 sample_repeat 字段。
+# ============================================================================
+
+# ─── target 连接参数（被测模型）─── 5 个 jobs 共享，可在各 job 段覆盖
+defaults:
+  base_url: http://<host>:<port>/v1
+  api_key:  dummy 
+  model:    <模型ID> # 填服务启动时的 model id
+  rtx:      ""
+  output_root: ./runs/<run_name> # <run_name> 改成当前的 eval name
+
+# ─── judge 连接参数（评分模型）─── 与 evalsuite 全局 judge 一致
+judge:
+  base_url: http://welmgateway.production.polaris:30000/v1
+  api_key:  sk-forwelmrouter2026
+  model:    gpt-oss-120b-eval
+  rtx:      wenhanli_eval
+  concurrency: 20 # 评测并发，最好和jobs中的并发对齐
+  max_retries: 5
+
+# ─── 5 个评估任务（顺序执行）───
+jobs:
+  # 1. gary-math (854 题: math 724 + math2 130) — 数学推理
+  - name: suite_gary_math
+    type: gary-math
+    concurrency: 20 # todo: 根据机器实际负载修改。 H20 + 单个 80BA3B-TP4 实例最好不要超过 20
+    rollout_max_retries: 2
+
+  # 2. aime-2025 (30 题) — AIME 数学竞赛, 整数答案
+  - name: suite_aime_2025
+    type: aime-2025
+    concurrency: 20 # todo: 根据机器实际负载修改。 H20 + 单个 80BA3B-TP4 实例最好不要超过 20
+    rollout_max_retries: 2
+
+  # 3. gpqa-diamond (198 题) — 研究生级别 4 选 1 科学问答
+  - name: suite_gpqa_diamond
+    type: gpqa-diamond
+    concurrency: 20 # todo: 根据机器实际负载修改。 H20 + 单个 80BA3B-TP4 实例最好不要超过 20
+    rollout_max_retries: 2
+
+  # 4. aa-lcr (100 题) — 长上下文推理 (单条 context 可能数百 KB)
+  - name: suite_aa_lcr
+    type: aa-lcr
+    concurrency: 20 # todo: 根据机器实际负载修改。 H20 + 单个 80BA3B-TP4 实例最好不要超过 20
+    rollout_max_retries: 2
+
+  # 5. aa-omniscience-public (600 题) — 知识性问答 + 拒答评估, 4 分类 judge
+  - name: suite_aa_omniscience
+    type: aa-omniscience-public
+    concurrency: 20 # todo: 根据机器实际负载修改。 H20 + 单个 80BA3B-TP4 实例最好不要超过 20
+    rollout_max_retries: 2

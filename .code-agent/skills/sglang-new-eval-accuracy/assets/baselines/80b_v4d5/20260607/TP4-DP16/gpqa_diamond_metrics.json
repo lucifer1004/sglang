@@ -1,0 +1,29 @@
+{
+    "metrics": {
+        "accuracy": 0.8687,
+        "empty_predict_count": 0,
+        "judge_parse_failed_count": 0,
+        "sample_count": 198,
+        "score": 0.8687,
+        "subset_metrics": {
+            "Biology": {
+                "accuracy": 0.6842,
+                "count": 19,
+                "empty_predict_count": 0,
+                "judge_parse_failed_count": 0
+            },
+            "Chemistry": {
+                "accuracy": 0.828,
+                "count": 93,
+                "empty_predict_count": 0,
+                "judge_parse_failed_count": 0
+            },
+            "Physics": {
+                "accuracy": 0.9535,
+                "count": 86,
+                "empty_predict_count": 0,
+                "judge_parse_failed_count": 0
+            }
+        }
+    }
+}

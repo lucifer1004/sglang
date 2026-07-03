@@ -1,0 +1,35 @@
+{
+    "metrics": {
+        "accuracy": 0.9333,
+        "empty_predict_count": 0,
+        "judge_parse_failed_count": 0,
+        "sample_count": 30,
+        "score": 0.9333,
+        "subset_metrics": {
+            "Algebra": {
+                "accuracy": 1,
+                "count": 9,
+                "empty_predict_count": 0,
+                "judge_parse_failed_count": 0
+            },
+            "Combinatorics": {
+                "accuracy": 1,
+                "count": 9,
+                "empty_predict_count": 0,
+                "judge_parse_failed_count": 0
+            },
+            "Geometry": {
+                "accuracy": 0.8571,
+                "count": 7,
+                "empty_predict_count": 0,
+                "judge_parse_failed_count": 0
+            },
+            "Number Theory": {
+                "accuracy": 0.8,
+                "count": 5,
+                "empty_predict_count": 0,
+                "judge_parse_failed_count": 0
+            }
+        }
+    }
+}

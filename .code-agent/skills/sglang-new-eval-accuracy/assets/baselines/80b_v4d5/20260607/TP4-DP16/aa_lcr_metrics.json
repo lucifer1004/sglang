@@ -1,0 +1,53 @@
+{
+    "metrics": {
+        "accuracy": 0.69,
+        "empty_predict_count": 0,
+        "judge_parse_failed_count": 0,
+        "sample_count": 100,
+        "score": 0.69,
+        "subset_metrics": {
+            "Academia": {
+                "accuracy": 0.8,
+                "count": 5,
+                "empty_predict_count": 0,
+                "judge_parse_failed_count": 0
+            },
+            "Company_Documents": {
+                "accuracy": 0.6667,
+                "count": 63,
+                "empty_predict_count": 0,
+                "judge_parse_failed_count": 0
+            },
+            "Government_Consultations": {
+                "accuracy": 0.7273,
+                "count": 11,
+                "empty_predict_count": 0,
+                "judge_parse_failed_count": 0
+            },
+            "Industry_Reports": {
+                "accuracy": 0.75,
+                "count": 8,
+                "empty_predict_count": 0,
+                "judge_parse_failed_count": 0
+            },
+            "Legal": {
+                "accuracy": 0.6667,
+                "count": 6,
+                "empty_predict_count": 0,
+                "judge_parse_failed_count": 0
+            },
+            "Marketing": {
+                "accuracy": 0.6667,
+                "count": 6,
+                "empty_predict_count": 0,
+                "judge_parse_failed_count": 0
+            },
+            "Survey_Reports": {
+                "accuracy": 1,
+                "count": 1,
+                "empty_predict_count": 0,
+                "judge_parse_failed_count": 0
+            }
+        }
+    }
+}
