@@ -19,7 +19,7 @@ _logged_hash_kernel_calls: set[str] = set()
 def _log_hash_kernel_call_once(name: str) -> None:
     if name in _logged_hash_kernel_calls:
         return
-    logger.info("Using WeLM OE hash JIT kernel path: %s", name)
+    logger.debug("Using WeLM OE hash JIT kernel path: %s", name)
     _logged_hash_kernel_calls.add(name)
 
 

@@ -45,10 +45,13 @@ from sglang.srt.server_args import (
     set_global_server_args_for_scheduler,
 )
 from sglang.srt.utils import (
+    configure_logger,
     load_audio,
     load_image,
     load_video,
     random_uuid,
+    set_uvicorn_logging_configs,
+    suppress_other_loggers,
 )
 from sglang.srt.utils.network import (
     NetworkAddress,
@@ -1377,6 +1380,8 @@ send_sockets: List[zmq.Socket] = []
 async def run_encoder(
     server_args: ServerArgs, schedule_path, dist_init_method, rank: int
 ):
+    configure_logger(server_args)
+    suppress_other_loggers()
     encoder = MMEncoder(server_args, schedule_path, dist_init_method, rank)
     while True:
         request = await encoder.schedule_socket.recv_pyobj()
@@ -1440,6 +1445,7 @@ def launch_server(server_args: ServerArgs):
             daemon=True,
         ).start()
     encoder = MMEncoder(server_args, dist_init_method=dist_init_method)
+    set_uvicorn_logging_configs(server_args)
     uvicorn.run(app, host=server_args.host, port=server_args.port)
 
 

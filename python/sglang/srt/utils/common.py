@@ -1250,6 +1250,30 @@ def rank0_log(msg: str):
         logger.info(msg)
 
 
+def _parse_debug_modules() -> list[str]:
+    """Parse SGLANG_DEBUG_MODULES env var into a list of logger names.
+
+    Comma-separated, e.g.
+    SGLANG_DEBUG_MODULES="sglang.srt.managers.scheduler,sglang.srt.managers.io_struct"
+    """
+    raw = os.getenv("SGLANG_DEBUG_MODULES", "")
+    if not raw:
+        return []
+    return [name.strip() for name in raw.split(",") if name.strip()]
+
+
+def _apply_debug_modules():
+    """Set DEBUG level on loggers listed in SGLANG_DEBUG_MODULES.
+
+    Applied at the end of configure_logger so per-module DEBUG overrides take
+    precedence over the global log_level. For the HTTP main process, the
+    equivalent override is injected into uvicorn's LOGGING_CONFIG by
+    set_uvicorn_logging_configs (since dictConfig clobbers setLevel on root).
+    """
+    for name in _parse_debug_modules():
+        logging.getLogger(name).setLevel(logging.DEBUG)
+
+
 def configure_logger(server_args, prefix: str = ""):
     if SGLANG_LOGGING_CONFIG_PATH := os.getenv("SGLANG_LOGGING_CONFIG_PATH"):
         if not os.path.exists(SGLANG_LOGGING_CONFIG_PATH):
@@ -1260,26 +1284,31 @@ def configure_logger(server_args, prefix: str = ""):
         with open(SGLANG_LOGGING_CONFIG_PATH, encoding="utf-8") as file:
             custom_config = orjson.loads(file.read())
         logging.config.dictConfig(custom_config)
-        return
-    maybe_ms = ".%(msecs)03d" if envs.SGLANG_LOG_MS.get() else ""
-    format = f"[%(asctime)s{maybe_ms}{prefix}] %(message)s"
-    logging.basicConfig(
-        level=getattr(logging, server_args.log_level.upper()),
-        format=format,
-        datefmt="%Y-%m-%d %H:%M:%S",
-        force=True,
-    )
+    else:
+        maybe_ms = ".%(msecs)03d" if envs.SGLANG_LOG_MS.get() else ""
+        format = f"[%(asctime)s{maybe_ms}{prefix}] %(message)s"
+        logging.basicConfig(
+            level=getattr(logging, server_args.log_level.upper()),
+            format=format,
+            datefmt="%Y-%m-%d %H:%M:%S",
+            force=True,
+        )
 
-    # Suppress noisy httpx/httpcore loggers in every process that calls
-    # configure_logger (main, scheduler, detokenizer). Spawned subprocesses
-    # don't inherit the parent's logger state, so this must run here too.
-    for name in ("httpx", "httpcore"):
-        logging.getLogger(name).setLevel(logging.WARNING)
+        # Suppress noisy httpx/httpcore loggers in every process that calls
+        # configure_logger (main, scheduler, detokenizer). Spawned subprocesses
+        # don't inherit the parent's logger state, so this must run here too.
+        for name in ("httpx", "httpcore"):
+            logging.getLogger(name).setLevel(logging.WARNING)
 
-    if is_flashinfer_available():
-        from flashinfer.jit.core import logger as flashinfer_logger
+        if is_flashinfer_available():
+            from flashinfer.jit.core import logger as flashinfer_logger
 
-        flashinfer_logger.setLevel(logging.ERROR)
+            flashinfer_logger.setLevel(logging.ERROR)
+
+    # Override per-logger DEBUG level from SGLANG_DEBUG_MODULES env var.
+    # Applied last so it takes precedence over the global level above; works
+    # for both the custom dictConfig path and the default basicConfig path.
+    _apply_debug_modules()
 
 
 # source: https://github.com/vllm-project/vllm/blob/93b38bea5dd03e1b140ca997dfaadef86f8f1855/vllm/lora/utils.py#L9
@@ -2514,6 +2543,16 @@ def set_uvicorn_logging_configs(server_args=None):
     LOGGING_CONFIG["formatters"]["access"]["datefmt"] = "%Y-%m-%d %H:%M:%S"
 
     _configure_uvicorn_access_log_filter(LOGGING_CONFIG, server_args)
+
+    # Inject DEBUG level for loggers listed in SGLANG_DEBUG_MODULES. uvicorn
+    # applies LOGGING_CONFIG via dictConfig at startup, which clobbers the root
+    # level set by configure_logger; per-logger entries in the dict survive.
+    for name in _parse_debug_modules():
+        LOGGING_CONFIG["loggers"][name] = {
+            "level": "DEBUG",
+            "handlers": ["default"],
+            "propagate": False,
+        }
 
 
 def _configure_uvicorn_access_log_filter(

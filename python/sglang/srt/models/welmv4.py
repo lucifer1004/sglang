@@ -40,6 +40,7 @@ from sglang.srt.distributed import (
 from sglang.srt.distributed.communication_op import (
     attention_tensor_model_parallel_all_reduce,
 )
+from sglang.srt.environ import Envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.activation import SiluAndMul
@@ -52,10 +53,10 @@ from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
     attn_tp_all_reduce,
     get_attention_dp_size,
-    get_suffix_parallel_rank,
-    get_suffix_parallel_size,
     get_attention_tp_rank,
     get_attention_tp_size,
+    get_suffix_parallel_rank,
+    get_suffix_parallel_size,
     is_dp_attention_enabled,
     is_suffix_parallel_enabled,
     suffix_gather,
@@ -116,7 +117,6 @@ from sglang.srt.utils import (
     make_layers,
     set_weight_attrs,
 )
-from sglang.srt.environ import Envs
 
 logger = logging.getLogger(__name__)
 
@@ -142,8 +142,7 @@ _WELM_GRAPH_DUMP_BUFFERS = {}
 _WELM_GRAPH_DUMP_MISSING = set()
 _WELM_TRUE_ENV_VALUES = {"1", "true", "yes", "on"}
 _WELM_DUMP_ENABLED = (
-    os.getenv("SGLANG_DUMP_ACTIVATIONS", "0").strip().lower()
-    in _WELM_TRUE_ENV_VALUES
+    os.getenv("SGLANG_DUMP_ACTIVATIONS", "0").strip().lower() in _WELM_TRUE_ENV_VALUES
     or os.getenv("SGLANG_WELM_DUMP_ACTIVATIONS", "0").strip().lower()
     in _WELM_TRUE_ENV_VALUES
 )
@@ -194,9 +193,7 @@ def _welm_previous_precision_rmsnorm(norm: RMSNorm, x: torch.Tensor) -> torch.Te
     elif not x.is_contiguous():
         x = x.contiguous()
 
-    out = _sgl_rmsnorm_internal(
-        x, norm.weight.data, norm.variance_epsilon, None, None
-    )
+    out = _sgl_rmsnorm_internal(x, norm.weight.data, norm.variance_epsilon, None, None)
     if needs_reshape:
         out = out.reshape(original_shape)
     return out
@@ -561,11 +558,15 @@ def _welm_needs_input_logprobs(forward_batch: ForwardBatch) -> bool:
 
 
 def _welm_should_contract_kv_mirror(forward_batch: ForwardBatch) -> bool:
-    return forward_batch.enable_welm_kv_mirror_opt and (
-        forward_batch.forward_mode.is_extend_without_speculative()
-        or forward_batch.forward_mode.is_draft_extend(include_v2=True)
-        or getattr(forward_batch, "welm_mtp_merge_kv_fill_draft", False)
-    ) and not _welm_needs_input_logprobs(forward_batch)
+    return (
+        forward_batch.enable_welm_kv_mirror_opt
+        and (
+            forward_batch.forward_mode.is_extend_without_speculative()
+            or forward_batch.forward_mode.is_draft_extend(include_v2=True)
+            or getattr(forward_batch, "welm_mtp_merge_kv_fill_draft", False)
+        )
+        and not _welm_needs_input_logprobs(forward_batch)
+    )
 
 
 def _welm_should_contract_idle_extend_dp_metadata(
@@ -809,13 +810,10 @@ def _welm_update_contracted_dp_metadata(
                 f"candidate_counts={candidate_count_values}."
             )
 
-        force_extend_sum_len = (
-            num_dp_slots > 1
-            and (
-                forward_batch.is_extend_in_batch
-                or forward_batch.forward_mode.is_draft_extend(include_v2=True)
-                or getattr(forward_batch, "welm_mtp_merge_kv_fill_draft", False)
-            )
+        force_extend_sum_len = num_dp_slots > 1 and (
+            forward_batch.is_extend_in_batch
+            or forward_batch.forward_mode.is_draft_extend(include_v2=True)
+            or getattr(forward_batch, "welm_mtp_merge_kv_fill_draft", False)
         )
         if force_extend_sum_len:
             forward_batch.is_extend_in_batch = True
@@ -843,9 +841,7 @@ def _welm_update_contracted_dp_metadata(
                 forward_batch.global_num_tokens_for_logprob_gpu,
                 new_global_num_tokens,
             ):
-                forward_batch.global_num_tokens_for_logprob_cpu = (
-                    new_global_num_tokens
-                )
+                forward_batch.global_num_tokens_for_logprob_cpu = new_global_num_tokens
     elif scale > 1:
         new_global_num_tokens_gpu = forward_batch.global_num_tokens_gpu // scale
         forward_batch.global_num_tokens_gpu.copy_(new_global_num_tokens_gpu)
@@ -964,7 +960,11 @@ def _get_welm_qkv_wna16_args(quant_config, layer, prefix):
     group_size = getattr(weight_quant, "group_size", None)
     qtype = getattr(weight_quant, "type", "int")
     qtype = getattr(qtype, "value", qtype)
-    if num_bits not in (4, 8) or str(qtype).lower().endswith("int") is False or not symmetric:
+    if (
+        num_bits not in (4, 8)
+        or str(qtype).lower().endswith("int") is False
+        or not symmetric
+    ):
         return None
     return int(num_bits), group_size, bool(symmetric)
 
@@ -993,13 +993,18 @@ class _WelmQkvDequantMethod:
         out, n_packed = packed.shape
         in_features = n_packed * pack_factor
 
-        shifts = torch.arange(pack_factor, device=packed.device, dtype=torch.int32) * num_bits
+        shifts = (
+            torch.arange(pack_factor, device=packed.device, dtype=torch.int32)
+            * num_bits
+        )
         codes = (packed.unsqueeze(-1) >> shifts) & mask  # [out, n_packed, pf]
         codes = codes.reshape(out, in_features).to(torch.float32) - offset
 
         scale = layer.weight_scale.data.float()  # [out, in // group_size]
         gs = group_size if group_size and group_size > 0 else in_features
-        deq = (codes.reshape(out, in_features // gs, gs) * scale.unsqueeze(-1)).reshape(out, in_features)
+        deq = (codes.reshape(out, in_features // gs, gs) * scale.unsqueeze(-1)).reshape(
+            out, in_features
+        )
         layer.weight.data = deq.to(layer.weight.dtype)
 
 
@@ -1033,7 +1038,7 @@ class _WelmQkvMarlinMethod:
         pack_factor = 32 // num_bits
 
         packed = layer.weight_packed.data  # [N, K // pack_factor] int32
-        scale = layer.weight_scale.data    # [N, K // group_size]
+        scale = layer.weight_scale.data  # [N, K // group_size]
 
         N, K_packed = packed.shape
         K = K_packed * pack_factor
@@ -1062,7 +1067,11 @@ class _WelmQkvMarlinMethod:
         # param.data keeps the same CUDA memory address across
         # weight-update cycles (critical for CUDA graphs).
         cached_w = getattr(layer, "_marlin_buf_weight_packed", None)
-        if cached_w is not None and cached_w.shape == repacked.shape and cached_w.dtype == repacked.dtype:
+        if (
+            cached_w is not None
+            and cached_w.shape == repacked.shape
+            and cached_w.dtype == repacked.dtype
+        ):
             cached_w.copy_(repacked)
             layer.weight_packed.data = cached_w
         else:
@@ -1079,7 +1088,11 @@ class _WelmQkvMarlinMethod:
         )
 
         cached_s = getattr(layer, "_marlin_buf_weight_scale", None)
-        if cached_s is not None and cached_s.shape == scale_perm.shape and cached_s.dtype == scale_perm.dtype:
+        if (
+            cached_s is not None
+            and cached_s.shape == scale_perm.shape
+            and cached_s.dtype == scale_perm.dtype
+        ):
             cached_s.copy_(scale_perm)
             layer.weight_scale.data = cached_s
         else:
@@ -1101,7 +1114,10 @@ class _WelmQkvMarlinMethod:
     def restore_weights_before_loading(self, layer: nn.Module) -> None:
         """Resize parameters back to their original (pre-Marlin) shapes before loading new weights."""
         if not hasattr(layer, "_original_shapes"):
-            if self.output_size_per_partition is None or self.input_size_per_partition is None:
+            if (
+                self.output_size_per_partition is None
+                or self.input_size_per_partition is None
+            ):
                 return
             N = self.output_size_per_partition
             K = self.input_size_per_partition
@@ -1207,7 +1223,9 @@ class BaseWelmQkvProjection(nn.Module):
             )
             self.weight_packed = nn.Parameter(
                 torch.empty(
-                    self.output_size_per_partition, self.hidden_size // pack_factor, dtype=torch.int32
+                    self.output_size_per_partition,
+                    self.hidden_size // pack_factor,
+                    dtype=torch.int32,
                 ),
                 requires_grad=False,
             )
@@ -1217,8 +1235,14 @@ class BaseWelmQkvProjection(nn.Module):
             )
             # output-dim(0) sharded loaders; reuse the same shard-aware loader
             # (packing/grouping lives on dim 1 / input, untouched by output sharding).
-            set_weight_attrs(self.weight_packed, {"output_dim": 0, "weight_loader": self.weight_loader})
-            set_weight_attrs(self.weight_scale, {"output_dim": 0, "weight_loader": self.weight_loader})
+            set_weight_attrs(
+                self.weight_packed,
+                {"output_dim": 0, "weight_loader": self.weight_loader},
+            )
+            set_weight_attrs(
+                self.weight_scale,
+                {"output_dim": 0, "weight_loader": self.weight_loader},
+            )
 
             # Use Marlin kernel for true W8A16/W4A16 acceleration
             use_marlin = os.environ.get("WELM_QKV_DEQUANT_FALLBACK", "0") != "1"
@@ -1228,7 +1252,8 @@ class BaseWelmQkvProjection(nn.Module):
                 # Placeholder weight for cases that need Q-only slice (NextnMirror)
                 # Will be removed by process_weights_after_loading
                 self.weight = nn.Parameter(
-                    torch.empty(0), requires_grad=False,
+                    torch.empty(0),
+                    requires_grad=False,
                 )
             else:
                 self.weight = nn.Parameter(
@@ -1262,11 +1287,15 @@ class BaseWelmQkvProjection(nn.Module):
         leaf = {"q": "q_proj", "k": "k_proj", "v": "v_proj"}
         out: Dict[str, str] = {}
         for slot in self.shard_layout:
-            m = re.match(r"^[kv]2(?:_(\d+))?$", slot)  # k2 / k2_N / v2 / v2_N -> mirror slot
+            m = re.match(
+                r"^[kv]2(?:_(\d+))?$", slot
+            )  # k2 / k2_N / v2 / v2_N -> mirror slot
             if m is None:
                 tgt = layer_idx  # own layer: q / k1 / v1
             elif m.group(1) is not None:
-                tgt = self.mirror_layer_indices[int(m.group(1))]  # multi-bank k2_N / v2_N
+                tgt = self.mirror_layer_indices[
+                    int(m.group(1))
+                ]  # multi-bank k2_N / v2_N
             else:
                 tgt = self.mirror_layer_idx  # legacy single-bank k2 / v2
             out[slot] = f"model.layers.{tgt}.self_attn.{leaf[slot[0]]}.weight"
@@ -1419,9 +1448,11 @@ class StandardQkvProjection(QKVParallelLinear):
         tp_size: int,
         shard_layout: Tuple[str, ...] = ("q", "k", "v"),
     ) -> None:
-        assert tuple(shard_layout) == ("q", "k", "v"), (
-            f"StandardQkvProjection only supports (q, k, v) layout, got {shard_layout}"
-        )
+        assert tuple(shard_layout) == (
+            "q",
+            "k",
+            "v",
+        ), f"StandardQkvProjection only supports (q, k, v) layout, got {shard_layout}"
         super().__init__(
             hidden_size=hidden_size,
             head_size=head_dim,
@@ -1478,12 +1509,9 @@ class ImitateQkvMultiBankKvProjection(BaseWelmQkvProjection):
                     layerwise and len(layerwise) > mirror_idx and layerwise[mirror_idx]
                 )
                 mirror_extend = (
-                    (
-                        getattr(forward_batch, "enable_kv_mirror", False)
-                        or getattr(forward_batch, "enable_welm_kv_mirror_opt", False)
-                    )
-                    and forward_batch.forward_mode.is_extend_without_speculative()
-                )
+                    getattr(forward_batch, "enable_kv_mirror", False)
+                    or getattr(forward_batch, "enable_welm_kv_mirror_opt", False)
+                ) and forward_batch.forward_mode.is_extend_without_speculative()
                 if not consumer_per_suffix or mirror_extend:
                     kv_dim = mirror_k.shape[-1]
                     mirror_kv = suffix_gather(torch.cat([mirror_k, mirror_v], dim=-1))
@@ -1628,12 +1656,9 @@ class NextnMirrorQProjection(BaseWelmQkvProjection):
             forward_batch.spec_info, "mirrored_kv_indices", None
         )
         if (
-            (
-                forward_batch.forward_mode.is_draft_extend(include_v2=True)
-                or getattr(forward_batch, "welm_mtp_merge_kv_fill_draft", False)
-            )
-            and mirrored_kv_indices is not None
-        ):
+            forward_batch.forward_mode.is_draft_extend(include_v2=True)
+            or getattr(forward_batch, "welm_mtp_merge_kv_fill_draft", False)
+        ) and mirrored_kv_indices is not None:
             if _WELM_MTP_DUMP_ENABLED:
                 _welm_dump_tensor(
                     "model.mtp.0.decoder.0.layer.self_attn.mirrored_kv_indices",
@@ -1912,9 +1937,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         return_components: bool = False,
         skip_component_output: bool = False,
     ) -> torch.Tensor:
-        dump_this_layer = _WELM_DUMP_ENABLED and _welm_should_dump_layer(
-            self.layer_id
-        )
+        dump_this_layer = _WELM_DUMP_ENABLED and _welm_should_dump_layer(self.layer_id)
         if dump_this_layer:
             dump_prefix = f"model.layers.{self.layer_id}.mlp"
         num_tokens, hidden_dim = hidden_states.shape
@@ -2344,13 +2367,12 @@ class Qwen2MoeAttention(nn.Module):
         self.layer_idx = layer_idx
         self.config_layer_idx = layer_idx + total_layer_num if is_nextn else layer_idx
         self.kv_mirror_layer_idx = self.config_layer_idx
-        print(
+        logger.debug(
             "self.layer_idx:{}".format(layer_idx),
             "self.kv_mirror_layers:",
             self.kv_mirror_layers,
             "self.kv_mirror_imitated_layers:",
             self.kv_mirror_imitated_layers,
-            flush=True,
         )
         if len(sliding_window_size_layerwise) > self.config_layer_idx:
             self.sliding_window_size = self._normalize_sliding_window_size(
@@ -2358,11 +2380,10 @@ class Qwen2MoeAttention(nn.Module):
             )
         else:
             self.sliding_window_size = -1
-        print(
+        logger.debug(
             "self.layer_idx:{}".format(layer_idx),
             "self.sliding_window_size:",
             self.sliding_window_size,
-            flush=True,
         )
         if len(enable_attn_sink_layerwise) > self.config_layer_idx:
             self.enable_attention_sink = enable_attn_sink_layerwise[
@@ -2370,11 +2391,10 @@ class Qwen2MoeAttention(nn.Module):
             ]
         else:
             self.enable_attention_sink = False
-        print(
+        logger.debug(
             "self.layer_idx:{}".format(layer_idx),
             "self.enable_attention_sink:",
             self.enable_attention_sink,
-            flush=True,
         )
         if self.enable_attention_sink == True:
             self.attn_sink = nn.Parameter(
@@ -2425,8 +2445,7 @@ class Qwen2MoeAttention(nn.Module):
             tp_rank=attn_tp_rank,
             tp_size=attn_tp_size,
             reduce_results=(
-                not is_dp_attention_enabled()
-                and not self.o_proj_suffix_parallel_reduce
+                not is_dp_attention_enabled() and not self.o_proj_suffix_parallel_reduce
             ),
             prefix=add_prefix("o_proj", prefix),
         )
@@ -2539,9 +2558,7 @@ class Qwen2MoeAttention(nn.Module):
         kv_mirror_states: Dict[int, Tuple[torch.Tensor, torch.Tensor]],
         skip_o_norm: bool = False,
     ) -> torch.Tensor:
-        dump_this_layer = _WELM_DUMP_ENABLED and _welm_should_dump_layer(
-            self.layer_idx
-        )
+        dump_this_layer = _WELM_DUMP_ENABLED and _welm_should_dump_layer(self.layer_idx)
         mtp_dump_attention_io = _WELM_MTP_DUMP_ENABLED and self.is_nextn
         if dump_this_layer:
             if self.is_nextn:
@@ -2549,9 +2566,7 @@ class Qwen2MoeAttention(nn.Module):
             else:
                 dump_prefix = f"model.layers.{self.layer_idx}.self_attn"
         if mtp_dump_attention_io:
-            mtp_dump_prefix = (
-                f"model.mtp.0.decoder.{self.layer_idx}.layer.self_attn"
-            )
+            mtp_dump_prefix = f"model.mtp.0.decoder.{self.layer_idx}.layer.self_attn"
             _welm_dump_tensor(f"{mtp_dump_prefix}.input", hidden_states)
 
         scp_per_suffix = self.suffix_parallel
@@ -2871,7 +2886,7 @@ class Qwen2MoeDecoderLayer(nn.Module):
         self.ppln = getattr(config, "ppln", False)
         o_norm = getattr(config, "o_norm", False)
         self.prenorm_layer_idx = getattr(config, "prenorm_layer_idx", [])
-        print(
+        logger.debug(
             "self.ppln:",
             self.ppln,
             "o_norm:",
@@ -2984,9 +2999,7 @@ class Qwen2MoeDecoderLayer(nn.Module):
         torch.Tensor, torch.Tensor, Dict[int, Tuple[torch.Tensor, torch.Tensor]]
     ]:
         use_previous_precision = welm_use_previous_precision()
-        dump_this_layer = _WELM_DUMP_ENABLED and _welm_should_dump_layer(
-            self.layer_id
-        )
+        dump_this_layer = _WELM_DUMP_ENABLED and _welm_should_dump_layer(self.layer_id)
         if dump_this_layer:
             _welm_dump_tensor(
                 f"model.layers.{self.layer_id}.__input__.0", hidden_states
@@ -3074,9 +3087,7 @@ class Qwen2MoeDecoderLayer(nn.Module):
                 kv_mirror_states=kv_mirror_states,
                 skip_o_norm=use_mmq_norm_after_attn,
             )
-        is_kv_mirror_layer = (
-            self.self_attn.kv_mirror_layer_idx in self.kv_mirror_layers
-        )
+        is_kv_mirror_layer = self.self_attn.kv_mirror_layer_idx in self.kv_mirror_layers
         if (
             _welm_should_contract_idle_extend_dp_metadata(forward_batch)
             and is_kv_mirror_layer
@@ -3192,10 +3203,7 @@ class Qwen2MoeDecoderLayer(nn.Module):
             forward_batch,
             use_reduce_scatter,
             return_components=return_mlp_components,
-            skip_component_output=(
-                can_use_final_components
-                and not dump_this_layer
-            ),
+            skip_component_output=(can_use_final_components and not dump_this_layer),
         )
         experts_output = None
         shared_output = None
@@ -3456,9 +3464,7 @@ class Qwen2MoeModel(nn.Module):
                 scale_seq_embed_tokens_list=getattr(
                     self, "scale_seq_embed_tokens_list", None
                 ),
-                scale_seq_oe_embed_list=getattr(
-                    self, "scale_seq_oe_embed_list", None
-                ),
+                scale_seq_oe_embed_list=getattr(self, "scale_seq_oe_embed_list", None),
                 scale_seq_oe_up_proj_list=getattr(
                     self, "scale_seq_oe_up_proj_list", None
                 ),
@@ -3875,7 +3881,9 @@ class WeLMV4MoeForCausalLM(nn.Module):
                     continue
                 kv_mirror_route[hf_name[: -len(".weight")]] = (module, slot)
 
-        def maybe_load_remote_kv_mirror_weight(name: str, loaded_weight: torch.Tensor) -> bool:
+        def maybe_load_remote_kv_mirror_weight(
+            name: str, loaded_weight: torch.Tensor
+        ) -> bool:
             target = kv_mirror_route.get(name.rpartition(".")[0])
             if target is None:
                 return False
@@ -4081,7 +4089,9 @@ class WeLMV4MoeForCausalLM(nn.Module):
         if is_nextn and is_welm_mtp_nextn:
             missing_projector_steps = expected_nextn_steps - seen_nextn_projector_steps
             missing_decoder_steps = expected_nextn_steps - seen_nextn_decoder_steps
-            if not Envs.WELM_ALLOW_PARTIAL_MTP_LOAD.get() and (missing_projector_steps or missing_decoder_steps):
+            if not Envs.WELM_ALLOW_PARTIAL_MTP_LOAD.get() and (
+                missing_projector_steps or missing_decoder_steps
+            ):
                 raise ValueError(
                     "WeLM MTP checkpoint layout does not match "
                     "num_nextn_predict_layers. "

@@ -53,6 +53,7 @@ from sglang.srt.utils.common import (
     configure_logger,
     kill_itself_when_parent_died,
     maybe_reindex_device_id,
+    suppress_other_loggers,
 )
 from sglang.srt.utils.network import (
     NetworkAddress,
@@ -633,6 +634,7 @@ def run_data_parallel_controller_process(
     parent_process = psutil.Process().parent()
 
     configure_logger(server_args)
+    suppress_other_loggers()
     if server_args.enable_trace:
         process_tracing_init(server_args.otlp_traces_endpoint, "sglang")
         thread_label = "DP Controller"

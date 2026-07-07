@@ -9,6 +9,7 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
+import sglang.srt.models.welmv4 as welmv4_module
 from sglang.srt.distributed import (
     get_pp_group,
     get_tensor_model_parallel_world_size,
@@ -22,7 +23,6 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.models.welm_perf_opt import compute_welm_oe_embedding
-import sglang.srt.models.welmv4 as welmv4_module
 from sglang.srt.models.welmv4 import (
     Qwen2MoeDecoderLayer,
     WelmV4FusedRMSNorm,
@@ -43,7 +43,7 @@ logger = logging.getLogger(__name__)
 
 def _welm_mtp_trace(message: str) -> None:
     if os.environ.get("SGLANG_WELM_MTP_TRACE", "0") == "1":
-        print(f"[WELM_MTP_TRACE pid={os.getpid()}] {message}", flush=True)
+        logger.warning(f"[WELM_MTP_TRACE pid={os.getpid()}] {message}", flush=True)
 
 
 _is_cuda = is_cuda()
@@ -137,9 +137,7 @@ def _start_mtp_dump_pass() -> None:
     _MTP_DUMP_PASS_ACTIVE = not capture_active
     _MTP_GRAPH_DUMP_PASS_ACTIVE = capture_active
     if _MTP_GRAPH_DUMP_PASS_ACTIVE:
-        _MTP_GRAPH_DUMP_CURRENT_PREFIX = (
-            f"graph_step_{_MTP_GRAPH_DUMP_CALL_INDEX:05d}."
-        )
+        _MTP_GRAPH_DUMP_CURRENT_PREFIX = f"graph_step_{_MTP_GRAPH_DUMP_CALL_INDEX:05d}."
         _MTP_GRAPH_DUMP_CALL_INDEX += 1
         _MTP_GRAPH_DUMP_PREV_NAME_PREFIX = (
             welmv4_module._welm_set_graph_dump_name_prefix(
@@ -342,7 +340,10 @@ class WeLMV4ModelNextN(nn.Module):
                 "WeLM MTP requires at least one physical MTP layer, got "
                 f"{self.num_physical_mtp_layers}."
             )
-        if self.num_physical_mtp_layers != 1 and step_idx >= self.num_physical_mtp_layers:
+        if (
+            self.num_physical_mtp_layers != 1
+            and step_idx >= self.num_physical_mtp_layers
+        ):
             raise RuntimeError(
                 "WeLM MTP logical step index is out of physical layer range: "
                 f"{step_idx} vs {self.num_physical_mtp_layers}."
@@ -521,7 +522,9 @@ class WeLMV4ModelNextN(nn.Module):
             query_input_ids,
             query_hidden,
             forward_batch,
-            hashed_inputs=getattr(forward_batch, "welm_mtp_query_oe_hashed_inputs", None),
+            hashed_inputs=getattr(
+                forward_batch, "welm_mtp_query_oe_hashed_inputs", None
+            ),
         )
         hidden_states = hidden_states.clone()
         hidden_states[custom_last_index] = query_hidden.to(hidden_states.dtype)
@@ -753,8 +756,10 @@ class WeLMV4MoeForCausalLMNextN(WeLMV4MoeForCausalLM):
             )
             previous_pruned = None
             if _welm_should_contract_kv_mirror(forward_batch):
-                hidden_states, aux_hidden_states = _welm_prepare_kv_mirror_logits_states(
-                    hidden_states, aux_hidden_states, forward_batch
+                hidden_states, aux_hidden_states = (
+                    _welm_prepare_kv_mirror_logits_states(
+                        hidden_states, aux_hidden_states, forward_batch
+                    )
                 )
                 _welm_update_contracted_dp_metadata(
                     forward_batch,
@@ -799,7 +804,7 @@ class WeLMV4MoeForCausalLMNextN(WeLMV4MoeForCausalLM):
                 _dump_tensor(
                     f"model.mtp.{mtp_step_idx}.logits",
                     logits_output.next_token_logits,
-            )
+                )
             return logits_output
         finally:
             if started_dump:
