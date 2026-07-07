@@ -41,6 +41,12 @@ class FullComponent(TreeComponent):
         # HiCache state: set to host KV pool when HiCache enabled
         self._full_kv_pool_host = None
 
+    def _node_host_ready(self, node: UnifiedTreeNode) -> bool:
+        if node.component_data[self.component_type].host_value is None:
+            return False
+        pending = getattr(self.cache, "ongoing_write_through", None)
+        return pending is None or node.id not in pending
+
     def create_match_validator(
         self, match_device_only: bool = False
     ) -> Callable[[UnifiedTreeNode], bool]:
@@ -51,7 +57,8 @@ class FullComponent(TreeComponent):
 
         # HiCache: evicted + backuped nodes are valid match boundaries.
         return lambda node: (
-            node.component_data[self.component_type].value is not None or node.backuped
+            node.component_data[self.component_type].value is not None
+            or self._node_host_ready(node)
         )
 
     def finalize_match_result(
@@ -65,12 +72,11 @@ class FullComponent(TreeComponent):
         # last_device_node, summing host_value lengths of evicted nodes.
         ct = self.component_type
         kv_host_hit = 0
-        node = result.best_match_node
+        node = result.last_host_node
         root_node = self.cache.root_node
         while node is not result.last_device_node and node is not root_node:
-            full_host = node.component_data[ct].host_value
-            if full_host is not None:
-                kv_host_hit += len(full_host)
+            if self._node_host_ready(node):
+                kv_host_hit += len(node.component_data[ct].host_value)
             node = node.parent
         if kv_host_hit > 0:
             return result._replace(

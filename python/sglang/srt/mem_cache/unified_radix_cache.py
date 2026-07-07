@@ -48,6 +48,7 @@ from sglang.srt.mem_cache.unified_cache_components import (
 from sglang.srt.mem_cache.utils import compute_node_hash_values, split_node_hash_value
 from sglang.srt.observability.metrics_collector import StorageMetricsCollector
 from sglang.srt.session.streaming_session import StreamingSession
+from sglang.srt.utils import get_device_module
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -880,6 +881,121 @@ class UnifiedRadixCache(BasePrefixCache):
         if node.parent is not None:
             self._update_evictable_leaf_sets(node.parent)
 
+    def _restore_host_node_into_fresh_slots(
+        self, node: UnifiedTreeNode, fresh_value: torch.Tensor
+    ) -> bool:
+        """Restore an evicted node from host KV into already allocated slots.
+
+        Prefix matching can hit a host-only node while the current request has
+        recomputed the same tokens into fresh device slots. Reusing the host KV
+        keeps host-hit behavior consistent with device-hit behavior, while
+        preserving the request's req_to_token mapping.
+        """
+        cc = self.cache_controller
+        if cc is None:
+            return False
+
+        ct = BASE_COMPONENT_TYPE
+        cd = node.component_data[ct]
+        host_value = cd.host_value
+        if host_value is None or len(host_value) != len(fresh_value):
+            return False
+
+        if node.id in self.ongoing_write_through:
+            self.writing_check()
+            if node.id in self.ongoing_write_through:
+                return False
+
+        host_indices, device_indices = cc.move_indices(host_value, fresh_value)
+        pool_transfers = self._build_host_sidecar_restores(node, fresh_value)
+        device_module = get_device_module()
+        start_event = device_module.Event()
+        finish_event = device_module.Event()
+        start_event.record()
+        with device_module.stream(cc.load_stream):
+            start_event.wait(cc.load_stream)
+            for layer_id in range(cc.layer_num):
+                cc.mem_pool_host.load_to_device_per_layer(
+                    cc.mem_pool_device,
+                    host_indices,
+                    device_indices,
+                    layer_id,
+                    cc.io_backend,
+                )
+                if pool_transfers:
+                    cc.mem_pool_host.load_to_device_per_layer(
+                        cc.mem_pool_device,
+                        host_indices[:0],
+                        device_indices[:0],
+                        layer_id,
+                        cc.io_backend,
+                        pool_transfers=pool_transfers,
+                    )
+                if (
+                    getattr(cc, "has_draft", False)
+                    and layer_id < cc.mem_pool_host_draft.layer_num
+                ):
+                    cc.mem_pool_host_draft.load_to_device_per_layer(
+                        cc.mem_pool_device_draft,
+                        host_indices,
+                        device_indices,
+                        layer_id,
+                        cc.io_backend,
+                    )
+            finish_event.record()
+            if host_indices.is_cuda:
+                host_indices.record_stream(cc.load_stream)
+            if device_indices.is_cuda:
+                device_indices.record_stream(cc.load_stream)
+            for transfer in pool_transfers:
+                if transfer.host_indices is not None and transfer.host_indices.is_cuda:
+                    transfer.host_indices.record_stream(cc.load_stream)
+                if (
+                    transfer.device_indices is not None
+                    and transfer.device_indices.is_cuda
+                ):
+                    transfer.device_indices.record_stream(cc.load_stream)
+        finish_event.synchronize()
+
+        self._unevict_node_on_insert(node, fresh_value)
+        return True
+
+    def _build_host_sidecar_restores(
+        self, node: UnifiedTreeNode, fresh_value: torch.Tensor
+    ) -> list[PoolTransfer]:
+        cc = self.cache_controller
+        if cc is None or not hasattr(cc.mem_pool_host, "entry_map"):
+            return []
+
+        transfers: list[PoolTransfer] = []
+        if ComponentType.SWA not in self.tree_components:
+            return transfers
+
+        cd = node.component_data[ComponentType.SWA]
+        host_value = cd.host_value
+        if cd.value is not None or host_value is None or len(host_value) == 0:
+            return transfers
+        if len(host_value) > len(fresh_value):
+            return transfers
+
+        translator = getattr(
+            self.token_to_kv_pool_allocator, "translate_loc_from_full_to_swa", None
+        )
+        if translator is None:
+            return transfers
+
+        full_tail = fresh_value[-len(host_value) :]
+        device_value = translator(full_tail).to(torch.int64)
+        host_indices, device_indices = cc.move_indices(host_value, device_value)
+        transfers.append(
+            PoolTransfer(
+                name=PoolName.SWA,
+                host_indices=host_indices,
+                device_indices=device_indices,
+            )
+        )
+        return transfers
+
     def _insert_helper(
         self,
         node: UnifiedTreeNode,
@@ -901,10 +1017,11 @@ class UnifiedRadixCache(BasePrefixCache):
                 node = self._split_node(node.key, node, prefix_len)
 
             if node.evicted:
-                self._unevict_node_on_insert(node, value[:prefix_len])
-                # FULL was restored from the request's fresh KV. Aux
-                # components (e.g. SWA) may still hold tombstones and need
-                # to rebuild their value from the same slice.
+                fresh_value = value[:prefix_len]
+                if not self._restore_host_node_into_fresh_slots(node, fresh_value):
+                    self._unevict_node_on_insert(node, fresh_value)
+                # Aux components (e.g. SWA) may still hold tombstones and need
+                # to rebuild their value from the restored FULL slice.
                 for component in self._components_tuple:
                     if component.component_type == BASE_COMPONENT_TYPE:
                         continue

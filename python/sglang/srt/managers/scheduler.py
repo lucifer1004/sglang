@@ -1687,6 +1687,24 @@ class Scheduler(
             tmp_batch, tmp_result = self.result_queue.popleft()
             self.process_batch_result(tmp_batch, tmp_result)
 
+        def should_process_last_cache_hit_extend_before_schedule():
+            if self.last_batch is None or len(self.result_queue) == 0:
+                return False
+            if self.require_mlp_sync:
+                last_is_extend = self.last_batch.is_extend_in_batch
+            else:
+                last_is_extend = self.last_batch.forward_mode.is_extend()
+            if not last_is_extend:
+                return False
+
+            # Prefix-cache hit prefill result processing may rewrite
+            # req_to_token_pool and radix locks via cache_unfinished_req.
+            # Do it before preparing the next decode batch so decode metadata
+            # cannot observe stale or racing cache mappings.
+            return any(
+                getattr(req, "cached_tokens", 0) > 0 for req in self.last_batch.reqs
+            )
+
         dp_spec_prefill_flag = torch.empty((1,), dtype=torch.int32)
 
         def should_process_last_before_dp_spec_prefill():
@@ -1721,7 +1739,10 @@ class Scheduler(
                 continue
 
             processed_last_before_schedule = False
-            if should_process_last_before_dp_spec_prefill():
+            if should_process_last_cache_hit_extend_before_schedule():
+                pop_and_process()
+                processed_last_before_schedule = True
+            elif should_process_last_before_dp_spec_prefill():
                 # A DP prefill may be local to only one attention-DP rank, but
                 # its MLP-sync collective is global. Finish the previous
                 # speculative decode result on every rank before any rank can
