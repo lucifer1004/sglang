@@ -553,9 +553,10 @@ class SchedulerDisaggregationPrefillMixin:
                     )
                 maybe_cache_unfinished_req(req, self.tree_cache)
                 self.disagg_prefill_inflight_queue.append(req)
+                draft_continuation_state = result.draft_continuation_state
                 spec_info = (
-                    result.next_draft_input
-                    if result.next_draft_input is not None
+                    draft_continuation_state.draft_input
+                    if draft_continuation_state is not None
                     else batch.spec_info
                 )
                 if self.spec_algorithm.is_eagle() and spec_info is not None:

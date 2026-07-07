@@ -374,7 +374,9 @@ class FutureMap:
             intv = future_indices.interval
             self.token_ids_buf[intv] = batch_result.next_token_ids
         else:
-            draft_input: EagleDraftInput = batch_result.next_draft_input
+            draft_continuation_state = batch_result.draft_continuation_state
+            assert draft_continuation_state is not None
+            draft_input: EagleDraftInput = draft_continuation_state.draft_input
             self.store_to_map_for_new_batch(future_indices, draft_input)
 
     def store_to_map_for_new_batch(

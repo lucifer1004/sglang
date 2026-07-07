@@ -38,6 +38,7 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
+from sglang.srt.managers.utils import DraftContinuationState
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.model_executor.forward_batch_info import (
@@ -3815,7 +3816,9 @@ class EagleDraftWorker(BaseDraftWorker):
         self, batch: ModelWorkerBatch, batch_result: GenerationBatchResult
     ):
         is_idle_decode = batch.forward_mode.is_idle()
-        next_draft_input = batch_result.next_draft_input
+        draft_continuation_state = batch_result.draft_continuation_state
+        assert draft_continuation_state is not None
+        next_draft_input = draft_continuation_state.draft_input
         welmv4_mtp_oe_entry_history = getattr(
             getattr(batch, "spec_info", None), "welm_mtp_oe_history_state", None
         )
@@ -4344,7 +4347,9 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 )
                 next_draft_input.capture_hidden_mode = CaptureHiddenMode.LAST
                 model_worker_batch.spec_info = next_draft_input
-                batch_output.next_draft_input = next_draft_input
+                batch_output.draft_continuation_state = DraftContinuationState(
+                    next_draft_input
+                )
                 return batch_output
 
             # Draft prefill
@@ -4356,13 +4361,15 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 speculative_moe_backend_context(),
                 speculative_moe_a2a_backend_context(),
             ):
-                batch_output.next_draft_input = (
-                    self.draft_worker._draft_extend_for_prefill(
-                        model_worker_batch,
-                        batch_output.logits_output.hidden_states,
-                        batch_output.next_token_ids,
-                        batch_output.logits_output.mm_input_embeds,
-                        batch_output.logits_output.model_specific_states,
+                batch_output.draft_continuation_state = (
+                    DraftContinuationState.from_draft_input(
+                        self.draft_worker._draft_extend_for_prefill(
+                            model_worker_batch,
+                            batch_output.logits_output.hidden_states,
+                            batch_output.next_token_ids,
+                            batch_output.logits_output.mm_input_embeds,
+                            batch_output.logits_output.model_specific_states,
+                        )
                     )
                 )
                 return batch_output
@@ -4833,7 +4840,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
             logits_output=logits_output,
             next_token_ids=next_token_ids,
             can_run_cuda_graph=can_run_cuda_graph,
-            next_draft_input=next_draft_input,
+            draft_continuation_state=DraftContinuationState(next_draft_input),
             accept_lens=accept_lens,
             spec_accept_index=accept_index,
             routed_experts_output=forward_batch_output.routed_experts_output,

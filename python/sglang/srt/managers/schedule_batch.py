@@ -1869,7 +1869,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     # Speculative decoding
     spec_algorithm: SpeculativeAlgorithm = None
-    # spec_info: Optional[SpecInput] = None
+    # Local speculative execution state for this batch. In spec-v2 the
+    # scheduler installs GenerationBatchResult.draft_continuation_state.draft_input
+    # here for the next step; it is not a public generation result or PP output.
     spec_info: Optional[SpecInput] = None
 
     # Whether to return hidden states

@@ -27,6 +27,7 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
+from sglang.srt.managers.utils import DraftContinuationState
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
@@ -579,7 +580,9 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
         # ]
         batch_result.next_token_ids = next_token_ids_backup
         # Construct the return values
-        next_draft_input = batch_result.next_draft_input
+        draft_continuation_state = batch_result.draft_continuation_state
+        assert draft_continuation_state is not None
+        next_draft_input = draft_continuation_state.draft_input
         (
             next_draft_input.topk_p,
             next_draft_input.topk_index,
@@ -679,10 +682,14 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
                 if self.draft_worker.chain_mtp_hidden_states
                 else CaptureHiddenMode.LAST
             )
-            batch_output.next_draft_input = self.draft_worker._draft_extend_for_prefill(
-                model_worker_batch,
-                batch_output.logits_output.hidden_states,
-                batch_output.next_token_ids,
+            batch_output.draft_continuation_state = (
+                DraftContinuationState.from_draft_input(
+                    self.draft_worker._draft_extend_for_prefill(
+                        model_worker_batch,
+                        batch_output.logits_output.hidden_states,
+                        batch_output.next_token_ids,
+                    )
+                )
             )
             return batch_output
         else:
@@ -806,7 +813,7 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
             next_token_ids=predict,
             can_run_cuda_graph=can_run_cuda_graph,
             speculative_num_draft_tokens=self.speculative_num_draft_tokens,
-            next_draft_input=next_draft_input,
+            draft_continuation_state=DraftContinuationState(next_draft_input),
             accept_lens=accept_lens,
             routed_experts_output=forward_batch_output.routed_experts_output,
             indexer_topk_output=forward_batch_output.indexer_topk_output,

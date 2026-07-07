@@ -23,6 +23,26 @@ logger = logging.getLogger(__name__)
 
 
 @dataclasses.dataclass
+class DraftContinuationState:
+    """Draft-local state for the next speculative step.
+
+    This is not part of the public generation result or PP output protocol. It
+    may carry draft hidden states, proposal tensors, WeLM MTP OE history, branch
+    cache locations, and other local continuation tensors.
+    """
+
+    draft_input: "EagleDraftInput"
+
+    @classmethod
+    def from_draft_input(
+        cls, draft_input: Optional["EagleDraftInput"]
+    ) -> Optional["DraftContinuationState"]:
+        if draft_input is None:
+            return None
+        return cls(draft_input=draft_input)
+
+
+@dataclasses.dataclass
 class GenerationBatchResult:
     logits_output: Optional[LogitsProcessorOutput] = None
     pp_hidden_states_proxy_tensors: Optional[PPProxyTensors] = None
@@ -47,8 +67,11 @@ class GenerationBatchResult:
     spec_accept_index: Optional[torch.Tensor] = None
     welm_mtp_accepted_draft_token_ids: Optional[torch.Tensor] = None
 
-    # relay path: forward stream -> next step forward
-    next_draft_input: Optional[EagleDraftInput] = None
+    # Draft-worker local relay path: forward stream -> next step forward.
+    # This state must not be serialized as a public generation result or PP
+    # output payload.
+    draft_continuation_state: Optional[DraftContinuationState] = None
+    next_draft_input: dataclasses.InitVar[Optional["EagleDraftInput"]] = None
 
     # Routed experts: pending async D2H for overlap scheduling
     routed_experts_output: Optional[TopkCaptureOutput] = None
@@ -60,6 +83,18 @@ class GenerationBatchResult:
     # Forward pass metrics (FPM) — GPU-accurate timing via CUDA events
     fpm_start_event: Optional[torch.cuda.Event] = None
     fpm_end_event: Optional[torch.cuda.Event] = None
+
+    def __post_init__(self, next_draft_input: Optional["EagleDraftInput"]) -> None:
+        if next_draft_input is None:
+            return
+        if self.draft_continuation_state is None:
+            self.draft_continuation_state = DraftContinuationState(next_draft_input)
+            return
+        if self.draft_continuation_state.draft_input is not next_draft_input:
+            raise ValueError(
+                "GenerationBatchResult received both draft_continuation_state "
+                "and next_draft_input with different draft inputs."
+            )
 
     def copy_to_cpu(self, return_logprob: bool, return_hidden_states: bool = True):
         """Copy tensors to CPU in overlap scheduling.
@@ -126,6 +161,38 @@ class GenerationBatchResult:
             ),
             can_run_cuda_graph=can_run_cuda_graph,
         )
+
+
+def _get_next_draft_input(
+    result: GenerationBatchResult,
+) -> Optional["EagleDraftInput"]:
+    """Compatibility alias for older in-process speculative code.
+
+    New code should use ``draft_continuation_state`` to make the protocol
+    boundary explicit.
+    """
+
+    if result.draft_continuation_state is None:
+        return None
+    return result.draft_continuation_state.draft_input
+
+
+def _set_next_draft_input(
+    result: GenerationBatchResult, draft_input: Optional["EagleDraftInput"]
+) -> None:
+    result.draft_continuation_state = DraftContinuationState.from_draft_input(
+        draft_input
+    )
+
+
+GenerationBatchResult.next_draft_input = property(
+    _get_next_draft_input,
+    _set_next_draft_input,
+    doc=(
+        "Compatibility alias for draft_continuation_state.draft_input; "
+        "not a public generation result field."
+    ),
+)
 
 
 def validate_input_length(

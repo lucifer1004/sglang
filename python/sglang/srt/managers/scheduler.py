@@ -3667,15 +3667,20 @@ class Scheduler(
                 future_indices_or_next_token_ids = -future_indices.indices
 
                 if batch.is_spec_v2:
-                    # FIXME(lsyin): tmp code for spec v2
-                    # We only keep future indices for next draft input
+                    # Spec-v2 keeps draft continuation state local to the
+                    # scheduler/draft worker path. It is not part of the public
+                    # generation result.
+                    draft_continuation_state = (
+                        batch_result.draft_continuation_state
+                    )
+                    assert draft_continuation_state is not None
 
-                    batch.spec_info = batch_result.next_draft_input
+                    batch.spec_info = draft_continuation_state.draft_input
                     batch.spec_info.future_indices = future_indices
 
                     # The future value, usually for next batch preparation
                     # Current implementation strictly synchronizes the seq_lens
-                    batch.seq_lens = batch_result.next_draft_input.new_seq_lens
+                    batch.seq_lens = batch.spec_info.new_seq_lens
             elif self.enable_pdmux and batch.forward_mode.is_split_prefill():
                 batch_result = self.tp_worker.forward_batch_split_prefill(batch)
                 future_indices_or_next_token_ids = batch_result.next_token_ids
