@@ -194,7 +194,12 @@ from sglang.srt.managers.scheduler_update_weights_mixin import (
 )
 from sglang.srt.managers.utils import GenerationBatchResult, validate_input_length
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
-from sglang.srt.mem_cache.common import maybe_cache_unfinished_req, release_kv_cache
+from sglang.srt.mem_cache.common import (
+    evict_from_tree_cache,
+    maybe_cache_unfinished_req,
+    release_kv_cache,
+)
+from sglang.srt.mem_cache.cp_sharded_allocator import CPShardedKVPoolAllocator
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
 from sglang.srt.model_loader.utils import get_resolved_model_impl
@@ -3479,6 +3484,112 @@ class Scheduler(
         adder.cp_sharded_available_and_evictable_override = int(budgets[0].item())
         adder.cp_sharded_physical_available_override = int(budgets[1].item())
 
+    def _sync_cp_sharded_decode_int(self, value: int, op: torch.distributed.ReduceOp):
+        if (
+            self.tp_size <= 1
+            or not torch.distributed.is_available()
+            or not torch.distributed.is_initialized()
+        ):
+            return int(value)
+
+        tensor = torch.tensor([int(value)], dtype=torch.int64)
+        torch.distributed.all_reduce(tensor, op=op, group=self.tp_cpu_group)
+        return int(tensor.item())
+
+    def _use_cp_sharded_decode_mem_check(self, batch: ScheduleBatch) -> bool:
+        return (
+            self.attn_cp_size > 1
+            and self.server_args.attn_cp_mode == "sharded-kv"
+            and isinstance(
+                batch.token_to_kv_pool_allocator, CPShardedKVPoolAllocator
+            )
+            and batch.spec_algorithm.is_none()
+        )
+
+    def _check_decode_mem(
+        self,
+        batch: ScheduleBatch,
+        selected_indices: Optional[List[int]] = None,
+    ) -> bool:
+        if not self._use_cp_sharded_decode_mem_check(batch):
+            return batch.check_decode_mem(selected_indices=selected_indices)
+
+        allocator: CPShardedKVPoolAllocator = batch.token_to_kv_pool_allocator
+        scale = batch._get_scale_seq_factor()
+        requests = (
+            batch.reqs
+            if selected_indices is None
+            else [batch.reqs[i] for i in selected_indices]
+        )
+        needed_local = sum(
+            allocator.local_alloc_size_for_range(req.kv_committed_len, scale)
+            for req in requests
+        )
+        needed_global = self._sync_cp_sharded_decode_int(
+            needed_local, torch.distributed.ReduceOp.MAX
+        )
+
+        logical_needed = batch.new_tokens_required_next_decode(selected_indices)
+        evict_from_tree_cache(
+            batch.tree_cache,
+            max(logical_needed, needed_global * allocator.cp_size),
+        )
+
+        available_local = allocator.physical_available_size()
+        available_global = -self._sync_cp_sharded_decode_int(
+            -available_local, torch.distributed.ReduceOp.MAX
+        )
+        return available_global >= needed_global
+
+    def _retract_mem_snapshot(self) -> Dict[str, int]:
+        allocator = self.token_to_kv_pool_allocator
+        snapshot = {
+            "logical": int(allocator.available_size()),
+            "req": int(self.req_to_token_pool.available_size()),
+        }
+
+        if isinstance(allocator, CPShardedKVPoolAllocator):
+            snapshot.update(
+                {
+                    "cp_rank": int(allocator.cp_rank),
+                    "cp_size": int(allocator.cp_size),
+                    "physical": int(allocator.physical_available_size()),
+                }
+            )
+            base_allocator = allocator.base_allocator
+            if hasattr(base_allocator, "full_available_size"):
+                snapshot["full_physical"] = int(
+                    base_allocator.full_available_size()
+                )
+            if hasattr(base_allocator, "swa_available_size"):
+                snapshot["swa_physical"] = int(base_allocator.swa_available_size())
+
+        return snapshot
+
+    @staticmethod
+    def _format_retract_mem_delta(
+        old_snapshot: Dict[str, int], new_snapshot: Dict[str, int]
+    ) -> str:
+        parts = []
+        for key in (
+            "logical",
+            "physical",
+            "full_physical",
+            "swa_physical",
+            "req",
+        ):
+            if key not in old_snapshot or key not in new_snapshot:
+                continue
+            old_value = old_snapshot[key]
+            new_value = new_snapshot[key]
+            parts.append(f"{key}:{old_value}->{new_value}(+{new_value - old_value})")
+
+        if "cp_rank" in new_snapshot:
+            parts.append(
+                f"cp_rank:{new_snapshot['cp_rank']}/{new_snapshot['cp_size']}"
+            )
+        return ",".join(parts)
+
     def _can_schedule_lora_req(
         self, req: Req, running_loras: set[Optional[str]]
     ) -> bool:
@@ -3521,20 +3632,25 @@ class Scheduler(
         if self.enable_hierarchical_cache:
             self.tree_cache.flush_write_through_acks()
 
+        def check_decode_mem(selected_indices: Optional[List[int]] = None) -> bool:
+            return self._check_decode_mem(batch, selected_indices=selected_indices)
+
         # Check if decode out of memory
-        if (kv_full_retract_flag := not batch.check_decode_mem()) or (
+        if (kv_full_retract_flag := not check_decode_mem()) or (
             TEST_RETRACT and self.forward_ct % TEST_RETRACT_INTERVAL == 0
         ):
             old_available_tokens = self.token_to_kv_pool_allocator.available_size()
+            old_retract_mem_snapshot = self._retract_mem_snapshot()
             old_ratio = self.new_token_ratio
             mamba_pool = getattr(self.tree_cache.req_to_token_pool, "mamba_pool", None)
             old_mamba_available = (
                 mamba_pool.available_size() if mamba_pool is not None else None
             )
             retracted_reqs, new_token_ratio, reqs_to_abort = batch.retract_decode(
-                self.server_args
+                self.server_args, check_decode_mem=check_decode_mem
             )
             new_available_tokens = self.token_to_kv_pool_allocator.available_size()
+            new_retract_mem_snapshot = self._retract_mem_snapshot()
             new_token_gained = new_available_tokens - old_available_tokens
             mamba_num_gained = (
                 mamba_pool.available_size() - old_mamba_available
@@ -3570,6 +3686,9 @@ class Scheduler(
                 else "Testing retraction. "
             )
             msg_details = f"#retracted_reqs: {len(retracted_reqs)}, #new_tokens_gained: {new_token_gained}"
+            msg_details += (
+                f", mem: {self._format_retract_mem_delta(old_retract_mem_snapshot, new_retract_mem_snapshot)}"
+            )
             if mamba_num_gained is not None:
                 msg_details += f", #mamba_num_gained: {mamba_num_gained}"
             if kv_full_retract_flag:

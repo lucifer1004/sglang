@@ -379,10 +379,13 @@ def _attncp_cp2_fused_q_fa_decode_kernel(
     value_cache,
     page_table,
     cache_seqlens,
+    page_start_offsets,
+    page_token_counts,
     sinks,
     out_o,
     out_lse,
     PAGE_TABLE_STRIDE: tl.constexpr,
+    PAGE_TABLE_COLS: tl.constexpr,
     MAX_SEQ_LEN: tl.constexpr,
     NUM_KV_HEADS: tl.constexpr,
     LOCAL_Q_HEADS: tl.constexpr,
@@ -394,6 +397,7 @@ def _attncp_cp2_fused_q_fa_decode_kernel(
     SOFTCAP: tl.constexpr,
     WINDOW_LEFT: tl.constexpr,
     HAS_SINKS: tl.constexpr,
+    HAS_PAGE_MASK: tl.constexpr,
     BLOCK_H: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_D: tl.constexpr,
@@ -457,20 +461,63 @@ def _attncp_cp2_fused_q_fa_decode_kernel(
     if WINDOW_LEFT >= 0:
         window_start = tl.maximum(seq_len - WINDOW_LEFT - 1, 0)
     for start_n in tl.range(0, MAX_SEQ_LEN, BLOCK_N):
-        kv_positions = start_n + token_offsets
-        kv_mask = kv_positions < seq_len
-        if WINDOW_LEFT >= 0:
-            kv_mask = kv_mask & (kv_positions >= window_start)
-        page_indices = tl.load(
-            page_table + batch_idx * PAGE_TABLE_STRIDE + kv_positions // PAGE_SIZE,
-            mask=kv_mask,
-            other=0,
-        )
-        offsets_in_page = kv_positions - (kv_positions // PAGE_SIZE) * PAGE_SIZE
-        kv_base = (
-            ((page_indices * PAGE_SIZE + offsets_in_page) * NUM_KV_HEADS + kv_head_idx)
-            * HEAD_DIM
-        )
+        if PAGE_SIZE == 16:
+            page_offsets = tl.arange(0, BLOCK_N // 16)
+            in_page_offsets = tl.arange(0, 16)
+            page_cols = start_n // 16 + page_offsets
+            page_indices = tl.load(
+                page_table + batch_idx * PAGE_TABLE_STRIDE + page_cols,
+                mask=page_cols < PAGE_TABLE_COLS,
+                other=0,
+            )
+            if HAS_PAGE_MASK:
+                page_starts = tl.load(
+                    page_start_offsets + batch_idx * PAGE_TABLE_STRIDE + page_cols,
+                    mask=page_cols < PAGE_TABLE_COLS,
+                    other=0,
+                )
+                page_counts = tl.load(
+                    page_token_counts + batch_idx * PAGE_TABLE_STRIDE + page_cols,
+                    mask=page_cols < PAGE_TABLE_COLS,
+                    other=0,
+                )
+                physical_positions_2d = (
+                    page_indices[:, None] * 16
+                    + page_starts[:, None]
+                    + in_page_offsets[None, :]
+                )
+                kv_mask_2d = in_page_offsets[None, :] < page_counts[:, None]
+                kv_mask = tl.reshape(kv_mask_2d, (BLOCK_N,))
+            else:
+                page_token_start = page_cols * 16
+                kv_positions_2d = page_token_start[:, None] + in_page_offsets[None, :]
+                kv_positions = tl.reshape(kv_positions_2d, (BLOCK_N,))
+                physical_positions_2d = (
+                    page_indices[:, None] * 16 + in_page_offsets[None, :]
+                )
+                kv_mask = kv_positions < seq_len
+                if WINDOW_LEFT >= 0:
+                    kv_mask = kv_mask & (kv_positions >= window_start)
+            physical_positions = tl.reshape(physical_positions_2d, (BLOCK_N,))
+            kv_base = (physical_positions * NUM_KV_HEADS + kv_head_idx) * HEAD_DIM
+        else:
+            kv_positions = start_n + token_offsets
+            kv_mask = kv_positions < seq_len
+            if WINDOW_LEFT >= 0:
+                kv_mask = kv_mask & (kv_positions >= window_start)
+            page_indices = tl.load(
+                page_table + batch_idx * PAGE_TABLE_STRIDE + kv_positions // PAGE_SIZE,
+                mask=kv_mask,
+                other=0,
+            )
+            offsets_in_page = kv_positions - (kv_positions // PAGE_SIZE) * PAGE_SIZE
+            kv_base = (
+                (
+                    (page_indices * PAGE_SIZE + offsets_in_page) * NUM_KV_HEADS
+                    + kv_head_idx
+                )
+                * HEAD_DIM
+            )
         kv_offsets = kv_base[:, None] + dim_offsets[None, :]
         kv_load_mask = kv_mask[:, None] & dim_mask[None, :]
         # The resident K/V tile is loaded once and reused for every CP Q head
@@ -527,10 +574,13 @@ def _attncp_cp2_fused_q_fa_decode_split_kernel(
     value_cache,
     page_table,
     cache_seqlens,
+    page_start_offsets,
+    page_token_counts,
     sinks,
     split_o,
     split_lse,
     PAGE_TABLE_STRIDE: tl.constexpr,
+    PAGE_TABLE_COLS: tl.constexpr,
     SPLIT_O_STRIDE_SPLIT: tl.constexpr,
     SPLIT_O_STRIDE_BATCH: tl.constexpr,
     SPLIT_O_STRIDE_HEAD: tl.constexpr,
@@ -548,6 +598,7 @@ def _attncp_cp2_fused_q_fa_decode_split_kernel(
     SOFTCAP: tl.constexpr,
     WINDOW_LEFT: tl.constexpr,
     HAS_SINKS: tl.constexpr,
+    HAS_PAGE_MASK: tl.constexpr,
     BLOCK_H: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_D: tl.constexpr,
@@ -617,20 +668,68 @@ def _attncp_cp2_fused_q_fa_decode_split_kernel(
     split_start = split_idx * SPLIT_SIZE
     split_end = split_start + SPLIT_SIZE
     for rel_start in tl.range(0, SPLIT_SIZE, BLOCK_N):
-        kv_positions = split_start + rel_start + token_offsets
-        kv_mask = (kv_positions < seq_len) & (kv_positions < split_end)
-        if WINDOW_LEFT >= 0:
-            kv_mask = kv_mask & (kv_positions >= window_start)
-        page_indices = tl.load(
-            page_table + batch_idx * PAGE_TABLE_STRIDE + kv_positions // PAGE_SIZE,
-            mask=kv_mask,
-            other=0,
-        )
-        offsets_in_page = kv_positions - (kv_positions // PAGE_SIZE) * PAGE_SIZE
-        kv_base = (
-            ((page_indices * PAGE_SIZE + offsets_in_page) * NUM_KV_HEADS + kv_head_idx)
-            * HEAD_DIM
-        )
+        if PAGE_SIZE == 16 and SPLIT_SIZE % 16 == 0:
+            page_offsets = tl.arange(0, BLOCK_N // 16)
+            in_page_offsets = tl.arange(0, 16)
+            page_token_start = split_start + rel_start + page_offsets * 16
+            page_cols = page_token_start // 16
+            page_in_range = page_cols < PAGE_TABLE_COLS
+            page_indices = tl.load(
+                page_table + batch_idx * PAGE_TABLE_STRIDE + page_cols,
+                mask=page_in_range & (page_token_start < split_end),
+                other=0,
+            )
+            if HAS_PAGE_MASK:
+                page_starts = tl.load(
+                    page_start_offsets + batch_idx * PAGE_TABLE_STRIDE + page_cols,
+                    mask=page_in_range & (page_token_start < split_end),
+                    other=0,
+                )
+                page_counts = tl.load(
+                    page_token_counts + batch_idx * PAGE_TABLE_STRIDE + page_cols,
+                    mask=page_in_range & (page_token_start < split_end),
+                    other=0,
+                )
+                physical_positions_2d = (
+                    page_indices[:, None] * 16
+                    + page_starts[:, None]
+                    + in_page_offsets[None, :]
+                )
+                kv_mask_2d = (
+                    (in_page_offsets[None, :] < page_counts[:, None])
+                    & page_in_range[:, None]
+                    & (page_token_start[:, None] < split_end)
+                )
+                kv_mask = tl.reshape(kv_mask_2d, (BLOCK_N,))
+            else:
+                kv_positions_2d = page_token_start[:, None] + in_page_offsets[None, :]
+                kv_positions = tl.reshape(kv_positions_2d, (BLOCK_N,))
+                physical_positions_2d = (
+                    page_indices[:, None] * 16 + in_page_offsets[None, :]
+                )
+                kv_mask = (kv_positions < seq_len) & (kv_positions < split_end)
+                if WINDOW_LEFT >= 0:
+                    kv_mask = kv_mask & (kv_positions >= window_start)
+            physical_positions = tl.reshape(physical_positions_2d, (BLOCK_N,))
+            kv_base = (physical_positions * NUM_KV_HEADS + kv_head_idx) * HEAD_DIM
+        else:
+            kv_positions = split_start + rel_start + token_offsets
+            kv_mask = (kv_positions < seq_len) & (kv_positions < split_end)
+            if WINDOW_LEFT >= 0:
+                kv_mask = kv_mask & (kv_positions >= window_start)
+            page_indices = tl.load(
+                page_table + batch_idx * PAGE_TABLE_STRIDE + kv_positions // PAGE_SIZE,
+                mask=kv_mask,
+                other=0,
+            )
+            offsets_in_page = kv_positions - (kv_positions // PAGE_SIZE) * PAGE_SIZE
+            kv_base = (
+                (
+                    (page_indices * PAGE_SIZE + offsets_in_page) * NUM_KV_HEADS
+                    + kv_head_idx
+                )
+                * HEAD_DIM
+            )
         kv_offsets = kv_base[:, None] + dim_offsets[None, :]
         kv_load_mask = kv_mask[:, None] & dim_mask[None, :]
         # The split owns a disjoint KV range; each loaded K/V tile is shared by
@@ -769,6 +868,8 @@ def attncp_cp2_fused_q_fa_decode(
     window_left: int = -1,
     sinks: torch.Tensor | None = None,
     page_size: int = 1,
+    page_start_offsets: torch.Tensor | None = None,
+    page_token_counts: torch.Tensor | None = None,
     block_n: int = 256,
     split_o: torch.Tensor | None = None,
     split_lse: torch.Tensor | None = None,
@@ -845,6 +946,31 @@ def attncp_cp2_fused_q_fa_decode(
             sinks.numel() == full_q_heads,
             f"sinks must have {full_q_heads} elements, got {sinks.numel()}",
         )
+    has_page_mask = page_start_offsets is not None or page_token_counts is not None
+    if has_page_mask:
+        _check(
+            page_start_offsets is not None and page_token_counts is not None,
+            "page_start_offsets and page_token_counts must be provided together",
+        )
+        _check(
+            page_size == 16,
+            f"masked page metadata is only supported for page_size=16, got {page_size}",
+        )
+        _check(
+            page_start_offsets.is_cuda
+            and page_token_counts.is_cuda
+            and page_start_offsets.is_contiguous()
+            and page_token_counts.is_contiguous(),
+            "masked page metadata must be contiguous CUDA tensors",
+        )
+        _check(
+            page_start_offsets.shape == page_table.shape
+            and page_token_counts.shape == page_table.shape,
+            "masked page metadata must have the same shape as page_table",
+        )
+    else:
+        page_start_offsets = page_table
+        page_token_counts = page_table
 
     if head_dim >= 256:
         block_n = min(int(block_n), 128)
@@ -891,6 +1017,8 @@ def attncp_cp2_fused_q_fa_decode(
             split_size = _FUSED_Q_FA_TARGET_SPLIT_SIZE
         else:
             split_size = triton.cdiv(max_seq_len, num_splits)
+        if has_page_mask:
+            split_size = triton.cdiv(split_size, page_size) * page_size
         # Keep the launch KV-stationary. Splitting by Q head would reload the
         # same local KV shard and break the AttnCP decode bandwidth invariant.
         _attncp_cp2_fused_q_fa_decode_split_kernel[
@@ -902,10 +1030,13 @@ def attncp_cp2_fused_q_fa_decode(
             value_cache,
             page_table,
             cache_seqlens,
+            page_start_offsets,
+            page_token_counts,
             sinks if sinks is not None else out_lse,
             split_o[:num_splits],
             split_lse[:num_splits],
             page_table.stride(0),
+            page_table.shape[1],
             split_o.stride(0),
             split_o.stride(1),
             split_o.stride(2),
@@ -923,6 +1054,7 @@ def attncp_cp2_fused_q_fa_decode(
             float(softcap or 0.0),
             int(window_left),
             sinks is not None,
+            has_page_mask,
             block_h,
             block_n,
             block_d,
@@ -958,10 +1090,13 @@ def attncp_cp2_fused_q_fa_decode(
         value_cache,
         page_table,
         cache_seqlens,
+        page_start_offsets,
+        page_token_counts,
         sinks if sinks is not None else out_lse,
         out_o,
         out_lse,
         page_table.stride(0),
+        page_table.shape[1],
         max_seq_len,
         num_kv_heads,
         local_q_heads,
@@ -973,6 +1108,7 @@ def attncp_cp2_fused_q_fa_decode(
         float(softcap or 0.0),
         int(window_left),
         sinks is not None,
+        has_page_mask,
         block_h,
         block_n,
         block_d,

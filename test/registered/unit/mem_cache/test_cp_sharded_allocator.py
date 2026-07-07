@@ -13,9 +13,46 @@ from sglang.srt.mem_cache.cp_sharded_allocator import (
     filter_dummy_slots,
     get_cp_owner,
 )
+from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
+from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=2, suite="stage-a-test-cpu")
+
+
+class _DummySWAKVPool(BaseSWAKVPool):
+    def __init__(self):
+        self.full_kv_pool = None
+        self.swa_kv_pool = None
+        self.full_to_swa_index_mapping = None
+        self.invalidate_count = 0
+
+    def register_mapping(self, full_to_swa_index_mapping: torch.Tensor) -> None:
+        self.full_to_swa_index_mapping = full_to_swa_index_mapping
+
+    def invalidate_loc_cache(self) -> None:
+        self.invalidate_count += 1
+
+    def translate_loc_from_full_to_swa(self, kv_indices: torch.Tensor) -> torch.Tensor:
+        return self.full_to_swa_index_mapping[kv_indices]
+
+    def set_swa_loc(self, loc: torch.Tensor) -> None:
+        pass
+
+    def get_state_buf_infos(self):
+        return [], [], []
+
+    def get_key_buffer(self, layer_id: int):
+        raise NotImplementedError()
+
+    def get_value_buffer(self, layer_id: int):
+        raise NotImplementedError()
+
+    def get_kv_buffer(self, layer_id: int):
+        raise NotImplementedError()
+
+    def set_kv_buffer(self, layer, loc, cache_k, cache_v) -> None:
+        raise NotImplementedError()
 
 
 class TestCPShardedKVPoolAllocator(unittest.TestCase):
@@ -256,6 +293,39 @@ class TestCPShardedKVPoolAllocator(unittest.TestCase):
         allocator.free_group_end()
 
         self.assertEqual(base.available_size(), 64)
+
+    def test_paged_swa_allocates_and_frees_paired_pages(self):
+        kvcache = _DummySWAKVPool()
+        base = SWATokenToKVPoolAllocator(
+            size=64,
+            size_swa=64,
+            page_size=4,
+            dtype=torch.float32,
+            device="cpu",
+            kvcache=kvcache,
+            need_sort=False,
+        )
+        allocator = CPShardedKVPoolAllocator(
+            base,
+            cp_rank=0,
+            cp_size=2,
+            cp_kv_chunk_size=8,
+        )
+
+        slots = allocator.alloc_for_positions(torch.arange(0, 4, dtype=torch.int64))
+
+        self.assertEqual(slots.tolist(), [4, 5, 6, 7])
+        self.assertEqual(base.full_attn_allocator.available_size(), 60)
+        self.assertEqual(base.swa_attn_allocator.available_size(), 60)
+        self.assertEqual(
+            kvcache.full_to_swa_index_mapping[slots].tolist(), [4, 5, 6, 7]
+        )
+
+        allocator.free(slots)
+
+        self.assertEqual(base.full_attn_allocator.available_size(), 64)
+        self.assertEqual(base.swa_attn_allocator.available_size(), 64)
+        self.assertEqual(kvcache.full_to_swa_index_mapping[slots].tolist(), [0] * 4)
 
     def test_paged_alloc_rejects_unaligned_chunk_size(self):
         base = PagedTokenToKVPoolAllocator(

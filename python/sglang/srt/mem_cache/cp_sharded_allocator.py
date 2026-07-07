@@ -237,20 +237,57 @@ class CPShardedKVPoolAllocator(BaseTokenToKVPoolAllocator):
             return None
         return [int(slot) for slot in local_slots[:: self.page_size].to("cpu").tolist()]
 
-    def _merge_released_pages_without_sort(self):
-        release_pages = self.base_allocator.release_pages
+    @staticmethod
+    def _merge_allocator_released_pages_without_sort(allocator):
+        release_pages = allocator.release_pages
         if release_pages is None or len(release_pages) == 0:
             return
-        self.base_allocator.free_pages = torch.cat(
-            (self.base_allocator.free_pages, release_pages)
-        )
-        self.base_allocator.release_pages = torch.empty(
+        allocator.free_pages = torch.cat((allocator.free_pages, release_pages))
+        allocator.release_pages = torch.empty(
             (0,), dtype=release_pages.dtype, device=release_pages.device
         )
+
+    def _merge_released_pages_without_sort(self):
+        self._merge_allocator_released_pages_without_sort(self.base_allocator)
+
+    def _has_paired_swa_allocator(self) -> bool:
+        return (
+            self.page_size > 1
+            and hasattr(self.base_allocator, "full_attn_allocator")
+            and hasattr(self.base_allocator, "swa_attn_allocator")
+            and hasattr(self.base_allocator, "set_full_to_swa_mapping")
+            and hasattr(self.base_allocator, "full_to_swa_index_mapping")
+        )
+
+    def _alloc_paired_swa_page_slots(self, count: int) -> Optional[torch.Tensor]:
+        full_allocator = self.base_allocator.full_attn_allocator
+        swa_allocator = self.base_allocator.swa_attn_allocator
+        for allocator in (full_allocator, swa_allocator):
+            if allocator.need_sort and int(count) > len(allocator.free_pages):
+                self._merge_allocator_released_pages_without_sort(allocator)
+
+        if int(count) > len(full_allocator.free_pages):
+            return None
+        if int(count) > len(swa_allocator.free_pages):
+            return None
+
+        need_size = int(count) * self.page_size
+        full_slots = full_allocator.alloc(need_size)
+        if full_slots is None:
+            return None
+        swa_slots = swa_allocator.alloc(need_size)
+        if swa_slots is None:
+            full_allocator.free(full_slots)
+            return None
+
+        self.base_allocator.set_full_to_swa_mapping(full_slots, swa_slots)
+        return full_slots
 
     def _alloc_page_slots(self, count: int) -> Optional[torch.Tensor]:
         if count <= 0:
             return torch.empty((0,), dtype=torch.int64, device=self.device)
+        if self._has_paired_swa_allocator():
+            return self._alloc_paired_swa_page_slots(count)
         if (
             self.base_allocator.need_sort
             and int(count) > len(self.base_allocator.free_pages)
@@ -534,6 +571,17 @@ class CPShardedKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
     def _free_base_pages(self, page_indices: torch.Tensor):
         if page_indices.numel() == 0:
+            return
+
+        if self._has_paired_swa_allocator():
+            page_offsets = torch.arange(
+                self.page_size, dtype=torch.int64, device=page_indices.device
+            )
+            full_slots = (
+                page_indices.to(dtype=torch.int64)[:, None] * self.page_size
+                + page_offsets[None, :]
+            ).reshape(-1)
+            self.base_allocator.free(full_slots)
             return
 
         if self.base_allocator.need_sort:

@@ -157,6 +157,8 @@ class FlashAttentionMetadata:
     cp_local_page_table: torch.Tensor = None
     cp_swa_local_cache_seqlens_int32: torch.Tensor = None
     cp_swa_local_page_table: torch.Tensor = None
+    cp_swa_local_page_start_offsets: torch.Tensor = None
+    cp_swa_local_page_token_counts: torch.Tensor = None
     requires_exact_logprob: bool = False
     has_empty_cp_shard: bool = False
 
@@ -827,65 +829,172 @@ class FlashAttentionBackend(AttentionBackend):
         *,
         out_page_table: Optional[torch.Tensor] = None,
         out_cache_seqlens: Optional[torch.Tensor] = None,
+        out_page_start_offsets: Optional[torch.Tensor] = None,
+        out_page_token_counts: Optional[torch.Tensor] = None,
     ) -> None:
         """Compact local CP-owned KV slots inside the global SWA decode window."""
         window_tokens = self._attncp_swa_window_tokens()
         if window_tokens is None:
             return
-        if self.page_size != 1:
-            metadata.cp_swa_local_cache_seqlens_int32 = None
-            metadata.cp_swa_local_page_table = None
-            return
         if page_table is None:
             raise RuntimeError("CP sharded-KV SWA decode missing page_table")
 
         slots = page_table.to(dtype=torch.int32)
-        batch_size, max_seq_len = slots.shape
+        batch_size, table_len = slots.shape
+        if self.page_size == 1:
+            local_page_table_cap = window_tokens
+        else:
+            local_page_table_cap = min(
+                table_len,
+                (window_tokens + 2 * self.page_size - 2) // self.page_size,
+            )
         if out_page_table is None:
             local_page_table = torch.empty(
                 batch_size,
-                window_tokens,
+                local_page_table_cap,
                 dtype=torch.int32,
                 device=slots.device,
             )
         else:
-            if out_page_table.shape[1] < window_tokens:
+            if out_page_table.shape[1] < local_page_table_cap:
                 raise RuntimeError(
                     "CP sharded-KV decode SWA local page table buffer is too small: "
-                    f"{out_page_table.shape[1]} < {window_tokens}"
+                    f"{out_page_table.shape[1]} < {local_page_table_cap}"
                 )
-            local_page_table = out_page_table[:, :window_tokens]
+            local_page_table = out_page_table[:, :local_page_table_cap]
         local_page_table.zero_()
 
-        offsets = torch.arange(window_tokens, device=slots.device).unsqueeze(0)
-        cache_lens_long = cache_seqlens.to(torch.long)
-        start = torch.clamp(cache_lens_long - window_tokens, min=0)
-        cols = start.unsqueeze(1) + offsets
-        valid = cols < cache_lens_long.unsqueeze(1)
-        valid = valid & (cols < max_seq_len)
-        safe_cols = torch.where(valid, cols, torch.zeros_like(cols))
-        row_indices = torch.arange(batch_size, device=slots.device).unsqueeze(1)
-        window_slots = slots[row_indices, safe_cols]
-        local_valid = valid & window_slots.ne(0)
-        local_cache_seqlens = local_valid.sum(dim=1, dtype=torch.int32)
+        if self.page_size == 1:
+            metadata.cp_swa_local_page_start_offsets = None
+            metadata.cp_swa_local_page_token_counts = None
+            offsets = torch.arange(window_tokens, device=slots.device).unsqueeze(0)
+            cache_lens_long = cache_seqlens.to(torch.long)
+            start = torch.clamp(cache_lens_long - window_tokens, min=0)
+            cols = start.unsqueeze(1) + offsets
+            valid = cols < cache_lens_long.unsqueeze(1)
+            valid = valid & (cols < table_len)
+            safe_cols = torch.where(valid, cols, torch.zeros_like(cols))
+            row_indices = torch.arange(batch_size, device=slots.device).unsqueeze(1)
+            window_slots = slots[row_indices, safe_cols]
+            local_valid = valid & window_slots.ne(0)
+            local_cache_seqlens = local_valid.sum(dim=1, dtype=torch.int32)
 
-        if window_tokens > 0:
-            compact_cols = torch.cumsum(local_valid.to(torch.int32), dim=1) - 1
-            scatter_cols = torch.where(
-                local_valid,
-                compact_cols,
-                torch.zeros_like(compact_cols),
-            ).to(torch.long)
-            scatter_slots = torch.where(
-                local_valid, window_slots, torch.zeros_like(window_slots)
+            if window_tokens > 0:
+                compact_cols = torch.cumsum(local_valid.to(torch.int32), dim=1) - 1
+                scatter_cols = torch.where(
+                    local_valid,
+                    compact_cols,
+                    torch.zeros_like(compact_cols),
+                ).to(torch.long)
+                scatter_slots = torch.where(
+                    local_valid, window_slots, torch.zeros_like(window_slots)
+                )
+                local_page_table.scatter_reduce_(
+                    dim=1,
+                    index=scatter_cols,
+                    src=scatter_slots,
+                    reduce="amax",
+                    include_self=True,
+                )
+        else:
+            if out_page_start_offsets is None:
+                local_page_start_offsets = torch.empty_like(local_page_table)
+            else:
+                if out_page_start_offsets.shape[1] < local_page_table_cap:
+                    raise RuntimeError(
+                        "CP sharded-KV decode SWA page-offset buffer is too small: "
+                        f"{out_page_start_offsets.shape[1]} < {local_page_table_cap}"
+                    )
+                local_page_start_offsets = out_page_start_offsets[
+                    :, :local_page_table_cap
+                ]
+            if out_page_token_counts is None:
+                local_page_token_counts = torch.empty_like(local_page_table)
+            else:
+                if out_page_token_counts.shape[1] < local_page_table_cap:
+                    raise RuntimeError(
+                        "CP sharded-KV decode SWA page-count buffer is too small: "
+                        f"{out_page_token_counts.shape[1]} < {local_page_table_cap}"
+                    )
+                local_page_token_counts = out_page_token_counts[
+                    :, :local_page_table_cap
+                ]
+            local_page_start_offsets.zero_()
+            local_page_token_counts.zero_()
+
+            page_offsets = torch.arange(
+                local_page_table_cap, device=slots.device
+            ).unsqueeze(0)
+            cache_lens_long = cache_seqlens.to(torch.long)
+            window_start = torch.clamp(cache_lens_long - window_tokens, min=0)
+            first_page = torch.div(
+                window_start, self.page_size, rounding_mode="floor"
             )
-            local_page_table.scatter_reduce_(
-                dim=1,
-                index=scatter_cols,
-                src=scatter_slots,
-                reduce="amax",
-                include_self=True,
+            page_cols = first_page.unsqueeze(1) + page_offsets
+            valid_page = page_cols < table_len
+            page_token_start = page_cols * self.page_size
+            valid_start = torch.maximum(page_token_start, window_start.unsqueeze(1))
+            valid_end = torch.minimum(
+                page_token_start + self.page_size, cache_lens_long.unsqueeze(1)
             )
+            page_token_counts = torch.clamp(
+                valid_end - valid_start, min=0, max=self.page_size
+            ).to(torch.int32)
+            page_start_offsets = torch.clamp(
+                valid_start - page_token_start, min=0, max=self.page_size - 1
+            ).to(torch.int32)
+            safe_cols = torch.where(valid_page, page_cols, torch.zeros_like(page_cols))
+            row_indices = torch.arange(batch_size, device=slots.device).unsqueeze(1)
+            window_slots = slots[row_indices, safe_cols]
+            local_valid = valid_page & page_token_counts.gt(0) & window_slots.ne(0)
+            valid_counts = torch.where(
+                local_valid, page_token_counts, torch.zeros_like(page_token_counts)
+            )
+            local_cache_seqlens = valid_counts.sum(dim=1, dtype=torch.int32)
+
+            if local_page_table_cap > 0:
+                compact_cols = torch.cumsum(local_valid.to(torch.int32), dim=1) - 1
+                scatter_cols = torch.where(
+                    local_valid,
+                    compact_cols,
+                    torch.zeros_like(compact_cols),
+                ).to(torch.long)
+                scatter_slots = torch.where(
+                    local_valid, window_slots, torch.zeros_like(window_slots)
+                )
+                scatter_offsets = torch.where(
+                    local_valid,
+                    page_start_offsets,
+                    torch.zeros_like(page_start_offsets),
+                )
+                scatter_counts = torch.where(
+                    local_valid,
+                    page_token_counts,
+                    torch.zeros_like(page_token_counts),
+                )
+                local_page_table.scatter_reduce_(
+                    dim=1,
+                    index=scatter_cols,
+                    src=scatter_slots,
+                    reduce="amax",
+                    include_self=True,
+                )
+                local_page_start_offsets.scatter_reduce_(
+                    dim=1,
+                    index=scatter_cols,
+                    src=scatter_offsets,
+                    reduce="amax",
+                    include_self=True,
+                )
+                local_page_token_counts.scatter_reduce_(
+                    dim=1,
+                    index=scatter_cols,
+                    src=scatter_counts,
+                    reduce="amax",
+                    include_self=True,
+                )
+            metadata.cp_swa_local_page_start_offsets = local_page_start_offsets
+            metadata.cp_swa_local_page_token_counts = local_page_token_counts
 
         if out_cache_seqlens is None:
             metadata.cp_swa_local_cache_seqlens_int32 = local_cache_seqlens
@@ -925,17 +1034,24 @@ class FlashAttentionBackend(AttentionBackend):
         local_page_table = (
             page_table if page_table is not None else metadata.swa_page_table
         )
-        local_num_pages = local_page_table.shape[1]
         self._set_sharded_kv_decode_swa_metadata(
             metadata,
             local_page_table,
             metadata.cache_seqlens_int32,
-            out_page_table=self.decode_cuda_graph_metadata["cp_swa_local_page_table"][
-                :bs, :local_num_pages
-            ],
+            out_page_table=self.decode_cuda_graph_metadata["cp_swa_local_page_table"][:bs],
             out_cache_seqlens=self.decode_cuda_graph_metadata[
                 "cp_swa_local_cache_seqlens"
             ][:bs],
+            out_page_start_offsets=self.decode_cuda_graph_metadata.get(
+                "cp_swa_local_page_start_offsets"
+            )[:bs]
+            if "cp_swa_local_page_start_offsets" in self.decode_cuda_graph_metadata
+            else None,
+            out_page_token_counts=self.decode_cuda_graph_metadata.get(
+                "cp_swa_local_page_token_counts"
+            )[:bs]
+            if "cp_swa_local_page_token_counts" in self.decode_cuda_graph_metadata
+            else None,
         )
 
     def _build_attn_cp_local_merge_workspace(
@@ -1159,6 +1275,8 @@ class FlashAttentionBackend(AttentionBackend):
         head_dim: int,
         local_page_table: torch.Tensor,
         local_cache_seqlens: torch.Tensor,
+        local_page_start_offsets: Optional[torch.Tensor],
+        local_page_token_counts: Optional[torch.Tensor],
         attn_window_size: tuple[int, int],
         causal: bool,
         local_kwargs: dict,
@@ -1181,7 +1299,16 @@ class FlashAttentionBackend(AttentionBackend):
         cp_group = get_sharded_kv_cp_group()
         if cp_group.world_size != 2:
             return None
-        if self.page_size != 1 or layer.v_head_dim != layer.head_dim:
+        has_page_mask = (
+            local_page_start_offsets is not None or local_page_token_counts is not None
+        )
+        if self.page_size not in (1, 16) or layer.v_head_dim != layer.head_dim:
+            return None
+        if has_page_mask and (
+            self.page_size != 16
+            or local_page_start_offsets is None
+            or local_page_token_counts is None
+        ):
             return None
         if not attncp_cp2_fused_q_fa_supports_shape(
             local_q_heads,
@@ -1191,7 +1318,13 @@ class FlashAttentionBackend(AttentionBackend):
             return None
         if metadata.max_seq_len_q != 1:
             return None
-        if seq_cap < self.attn_cp_decode_cp2_fused_q_fa_min_seq_cap:
+        # The compact SWA page table is intentionally short. Keep the long-seq
+        # threshold for the normal path, but do not let it force masked SWA
+        # page-size=16 back to the dense fallback.
+        if (
+            not has_page_mask
+            and seq_cap < self.attn_cp_decode_cp2_fused_q_fa_min_seq_cap
+        ):
             return None
         window_left = attn_window_size[0] if attn_window_size is not None else -1
         window_right = attn_window_size[1] if attn_window_size is not None else -1
@@ -1233,6 +1366,8 @@ class FlashAttentionBackend(AttentionBackend):
             window_left=window_left,
             sinks=local_kwargs.get("sinks"),
             page_size=self.page_size,
+            page_start_offsets=local_page_start_offsets,
+            page_token_counts=local_page_token_counts,
             split_o=bufs.get("fused_q_fa_split_o"),
             split_lse=bufs.get("fused_q_fa_split_lse"),
             max_splits=bufs["fused_q_fa_split_o"].shape[0],
@@ -1527,6 +1662,8 @@ class FlashAttentionBackend(AttentionBackend):
         out: Optional[torch.Tensor] = None,
         local_page_table: Optional[torch.Tensor] = None,
         local_cache_seqlens: Optional[torch.Tensor] = None,
+        local_page_start_offsets: Optional[torch.Tensor] = None,
+        local_page_token_counts: Optional[torch.Tensor] = None,
         local_window_size: Optional[tuple[int, int]] = None,
     ) -> Optional[torch.Tensor]:
         bufs = self._attncp_local_merge_workspace()
@@ -1581,11 +1718,18 @@ class FlashAttentionBackend(AttentionBackend):
             head_dim=head_dim,
             local_page_table=local_page_table,
             local_cache_seqlens=local_cache_seqlens,
+            local_page_start_offsets=local_page_start_offsets,
+            local_page_token_counts=local_page_token_counts,
             attn_window_size=attn_window_size,
             causal=causal,
             local_kwargs=local_kwargs,
         )
         if fused_result is None:
+            if (
+                local_page_start_offsets is not None
+                or local_page_token_counts is not None
+            ):
+                return None
             q_full = self._attncp_gather_full_q(
                 q_local,
                 bufs,
@@ -1760,8 +1904,10 @@ class FlashAttentionBackend(AttentionBackend):
         out: Optional[torch.Tensor] = None,
         local_page_table: Optional[torch.Tensor] = None,
         local_cache_seqlens: Optional[torch.Tensor] = None,
+        local_page_start_offsets: Optional[torch.Tensor] = None,
+        local_page_token_counts: Optional[torch.Tensor] = None,
         local_window_size: Optional[tuple[int, int]] = None,
-    ) -> torch.Tensor:
+    ) -> Optional[torch.Tensor]:
         workspace_o = self._flash_attn_sharded_kv_local_merge_workspace(
             q_local,
             layer,
@@ -1774,10 +1920,14 @@ class FlashAttentionBackend(AttentionBackend):
             out=out,
             local_page_table=local_page_table,
             local_cache_seqlens=local_cache_seqlens,
+            local_page_start_offsets=local_page_start_offsets,
+            local_page_token_counts=local_page_token_counts,
             local_window_size=local_window_size,
         )
         if workspace_o is not None:
             return workspace_o
+        if local_page_start_offsets is not None or local_page_token_counts is not None:
+            return None
 
         if local_page_table is None:
             local_page_table = metadata.cp_local_page_table
@@ -1914,22 +2064,6 @@ class FlashAttentionBackend(AttentionBackend):
         # full-KV FA pass for WeLM. Keep it behind an explicit experiment flag.
         window_left = window_size[0] if window_size is not None else -1
         is_swa_window = 0 <= window_left < self.max_context_len
-        if is_swa_window and self.page_size != 1:
-            return self._flash_attn_sharded_kv_dense(
-                q_local,
-                layer,
-                metadata.page_table if page_table is None else page_table,
-                cache_seqlens,
-                key_cache,
-                value_cache,
-                metadata.cu_seqlens_q,
-                metadata.max_seq_len_q,
-                window_size=window_size,
-                causal=causal,
-                kwargs=kwargs,
-                out=out,
-                scheduler_metadata=scheduler_metadata,
-            )
         if is_swa_window and not self.enable_attn_cp_decode_local_merge_swa:
             return self._flash_attn_sharded_kv_dense(
                 q_local,
@@ -1949,6 +2083,8 @@ class FlashAttentionBackend(AttentionBackend):
 
         local_page_table = metadata.cp_local_page_table
         local_cache_seqlens = metadata.cp_local_cache_seqlens_int32
+        local_page_start_offsets = None
+        local_page_token_counts = None
         local_window_size = window_size
         # Local merge is a numerically different decomposition from a single
         # full-KV FA pass. When a sequence has not yet reached every CP shard,
@@ -1964,6 +2100,8 @@ class FlashAttentionBackend(AttentionBackend):
         ):
             local_page_table = metadata.cp_swa_local_page_table
             local_cache_seqlens = metadata.cp_swa_local_cache_seqlens_int32
+            local_page_start_offsets = metadata.cp_swa_local_page_start_offsets
+            local_page_token_counts = metadata.cp_swa_local_page_token_counts
             local_window_size = (-1, -1)
         can_use_local_merge = (
             window_left < 0
@@ -1986,13 +2124,21 @@ class FlashAttentionBackend(AttentionBackend):
             use_local_merge = (
                 self.enable_attn_cp_decode_local_merge
                 and self.enable_attn_cp_decode_local_merge_swa
+                and (
+                    self.page_size == 1
+                    or (
+                        self.enable_attn_cp_decode_cp2_fused_q_fa
+                        and local_page_start_offsets is not None
+                        and local_page_token_counts is not None
+                    )
+                )
                 and not has_empty_cp_shard
                 and local_page_table is not None
                 and local_cache_seqlens is not None
                 and not getattr(metadata, "requires_exact_logprob", False)
             )
         if use_local_merge:
-            return self._flash_attn_sharded_kv_local_merge(
+            local_merge_o = self._flash_attn_sharded_kv_local_merge(
                 q_local,
                 layer,
                 metadata,
@@ -2004,8 +2150,12 @@ class FlashAttentionBackend(AttentionBackend):
                 out=out,
                 local_page_table=local_page_table,
                 local_cache_seqlens=local_cache_seqlens,
+                local_page_start_offsets=local_page_start_offsets,
+                local_page_token_counts=local_page_token_counts,
                 local_window_size=local_window_size,
             )
+            if local_merge_o is not None:
+                return local_merge_o
 
         # Keep the old correctness path for translated page tables such as SWA.
         return self._flash_attn_sharded_kv_dense(
@@ -3776,15 +3926,38 @@ class FlashAttentionBackend(AttentionBackend):
                 self.enable_attn_cp_decode_local_merge_swa
                 and swa_window_tokens is not None
             ):
+                if self.page_size == 1:
+                    swa_local_table_cap = swa_window_tokens
+                else:
+                    swa_local_table_cap = (
+                        swa_window_tokens + 2 * self.page_size - 2
+                    ) // self.page_size
                 self.decode_cuda_graph_metadata["cp_swa_local_cache_seqlens"] = (
                     torch.zeros(max_bs, dtype=torch.int32, device=self.device)
                 )
                 self.decode_cuda_graph_metadata["cp_swa_local_page_table"] = torch.zeros(
                     max_bs,
-                    swa_window_tokens,
+                    swa_local_table_cap,
                     dtype=torch.int32,
                     device=self.device,
                 )
+                if self.page_size != 1:
+                    self.decode_cuda_graph_metadata[
+                        "cp_swa_local_page_start_offsets"
+                    ] = torch.zeros(
+                        max_bs,
+                        swa_local_table_cap,
+                        dtype=torch.int32,
+                        device=self.device,
+                    )
+                    self.decode_cuda_graph_metadata[
+                        "cp_swa_local_page_token_counts"
+                    ] = torch.zeros(
+                        max_bs,
+                        swa_local_table_cap,
+                        dtype=torch.int32,
+                        device=self.device,
+                    )
             self._init_attn_cp_local_merge_cuda_graph_state(max_bs)
 
         # This is used by draft decode's first half of metadata when topk > 1

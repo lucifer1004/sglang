@@ -44,7 +44,18 @@ from enum import Enum, auto
 from functools import lru_cache
 from http import HTTPStatus
 from itertools import chain
-from typing import TYPE_CHECKING, Any, ClassVar, Dict, List, Optional, Set, Tuple, Union
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    ClassVar,
+    Dict,
+    List,
+    Optional,
+    Set,
+    Tuple,
+    Union,
+)
 
 import numpy as np
 import torch
@@ -2654,9 +2665,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         return retracted_reqs
 
     def retract_decode(
-        self, server_args: ServerArgs
+        self,
+        server_args: ServerArgs,
+        check_decode_mem: Optional[
+            Callable[[Optional[List[int]]], bool]
+        ] = None,
     ) -> Tuple[List[Req], float, List[Req]]:
         """Retract the decoding requests when there is not enough memory."""
+        check_decode_mem = check_decode_mem or self.check_decode_mem
         sorted_indices = list(range(len(self.reqs)))
 
         # TODO(lsyin): improve retraction policy for radix cache
@@ -2676,7 +2692,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         retracted_reqs = []
         first_iter = True
         while first_iter or (
-            not self.check_decode_mem(selected_indices=sorted_indices)
+            not check_decode_mem(selected_indices=sorted_indices)
         ):
             if len(sorted_indices) == 1:
                 # Always keep at least one request
@@ -2690,7 +2706,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.release_req(idx, len(sorted_indices), server_args)
 
         reqs_to_abort: List[Req] = []
-        if len(sorted_indices) <= 1 and not self.check_decode_mem(
+        if len(sorted_indices) <= 1 and not check_decode_mem(
             selected_indices=sorted_indices
         ):
             # Even the last remaining request cannot fit in memory.
