@@ -367,6 +367,36 @@ class TestSWA(unittest.TestCase):
         alloc.dec_backup_pending(swa_idx)
         self.assertEqual(alloc.swa_available_size(), before)
 
+    def test_swa_backup_pending_refcount_covers_paged_padding_slots(self):
+        """Paged SWA indices can legally land in the final padding page."""
+        page_size = 16
+        alloc = self._build_swa_pool_alloc(
+            size=32, size_swa=32, page_size=page_size
+        )
+        self.assertEqual(alloc.backup_pending_ref.numel(), 32 + page_size)
+
+        full_idx = alloc.full_attn_allocator.alloc(32)
+        swa_idx = alloc.swa_attn_allocator.alloc(32)
+        self.assertIsNotNone(full_idx)
+        self.assertIsNotNone(swa_idx)
+        alloc.full_to_swa_index_mapping[full_idx] = swa_idx
+
+        tail_full = full_idx[-page_size:]
+        tail_swa = swa_idx[-page_size:]
+        self.assertEqual(int(tail_swa[-1].item()), 32 + page_size - 1)
+
+        alloc.add_backup_pending(tail_swa)
+        self.assertTrue(bool((alloc.backup_pending_ref[tail_swa] == 1).all().item()))
+
+        post_alloc_avail = alloc.swa_available_size()
+        alloc.free_swa(tail_full)
+        self.assertEqual(alloc.swa_available_size(), post_alloc_avail)
+        self.assertEqual(len(alloc._deferred_swa_free), page_size)
+
+        alloc.dec_backup_pending(tail_swa)
+        self.assertEqual(alloc.swa_available_size(), post_alloc_avail + page_size)
+        self.assertEqual(len(alloc._deferred_swa_free), 0)
+
     def test_swa_backup_pending_zero_indices_noop(self):
         """SWA index 0 is the 'no pair' sentinel — must never be tracked."""
         alloc = self._build_swa_pool_alloc()

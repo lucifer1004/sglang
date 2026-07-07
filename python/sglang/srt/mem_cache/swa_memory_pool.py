@@ -606,10 +606,12 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         # Backup-pending refcount on SWA slots: when an SWA slot is being
         # backed up (D->H or H->L3), free_swa must defer the actual physical
         # free so the backup reads consistent bytes. Indexed by SWA slot id;
-        # slot 0 is the "no-pair" sentinel and is never tracked.
+        # slot 0 is the "no-pair" sentinel and is never tracked. Paged
+        # allocators use 1-based page ids, so the last valid slot is
+        # size_swa + page_size - 1.
         # See add_backup_pending / dec_backup_pending / free_swa below.
         self.backup_pending_ref = torch.zeros(
-            size_swa + 1, dtype=torch.int32, device=device
+            size_swa + page_size, dtype=torch.int32, device=device
         )
         # Slots whose physical free was deferred because backup_pending_ref > 0.
         # Drained whenever dec_backup_pending() drops a refcount to 0.
