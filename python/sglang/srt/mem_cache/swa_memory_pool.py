@@ -59,7 +59,7 @@ class SWAKVPool(BaseSWAKVPool):
         self.layer_transfer_counter = None
 
         kwargs["page_size"] = page_size
-        kwargs["enable_memory_saver"] = False
+        kwargs["enable_memory_saver"] = kwargs.get("enable_memory_saver", False)
         kwargs["head_num"] = head_num
         kwargs["head_dim"] = head_dim
         kwargs["device"] = device
@@ -329,7 +329,7 @@ class SuffixKVPool(KVCache):
         self.swa_loc = None
 
         kwargs["page_size"] = 1
-        kwargs["enable_memory_saver"] = False
+        kwargs["enable_memory_saver"] = kwargs.get("enable_memory_saver", False)
         kwargs["head_num"] = head_num
         kwargs["head_dim"] = head_dim
         kwargs["device"] = device
