@@ -93,8 +93,6 @@ class SWAKVPool(BaseSWAKVPool):
         for swa_layer_id, global_layer_id in enumerate(swa_attention_layer_ids):
             self.layers_mapping[global_layer_id] = (swa_layer_id, True)
         self.full_to_swa_index_mapping: Optional[torch.Tensor] = None
-        self._cached_swa_loc: Optional[torch.Tensor] = None
-        self._cached_loc_key: Optional[Tuple[int, int, int]] = None
 
         k_size, v_size = self.get_kv_size_bytes()
         self.mem_usage = (k_size + v_size) / GB
@@ -104,11 +102,6 @@ class SWAKVPool(BaseSWAKVPool):
 
     def register_mapping(self, full_to_swa_index_mapping: torch.Tensor):
         self.full_to_swa_index_mapping = full_to_swa_index_mapping
-        self.invalidate_loc_cache()
-
-    def invalidate_loc_cache(self) -> None:
-        self._cached_swa_loc = None
-        self._cached_loc_key = None
 
     def register_layer_transfer_counter(self, layer_transfer_counter):
         # Wait happens at this wrapper. Inner pools must not wait again.
@@ -174,13 +167,7 @@ class SWAKVPool(BaseSWAKVPool):
 
         # Note: kv_indices could have -1 values (from alloc_extend), which will be mapped to -1
         # since the last item of full_to_swa_index_mapping is -1.
-        loc_key = (kv_indices.data_ptr(), kv_indices.numel(), kv_indices._version)
-        if loc_key != self._cached_loc_key:
-            self._cached_swa_loc = self.full_to_swa_index_mapping[kv_indices].to(
-                torch.int32
-            )
-            self._cached_loc_key = loc_key
-        return self._cached_swa_loc
+        return self.full_to_swa_index_mapping[kv_indices].to(torch.int32)
 
     def set_kv_buffer(
         self,
@@ -678,7 +665,6 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             )
         else:
             self.full_to_swa_index_mapping[alloc_full_indices] = alloc_swa_indices
-        self._kvcache.invalidate_loc_cache()
         return alloc_full_indices
 
     def alloc_extend(
@@ -729,7 +715,6 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             )
         else:
             self.full_to_swa_index_mapping[alloc_full_indices] = alloc_swa_indices
-        self._kvcache.invalidate_loc_cache()
 
         return alloc_full_indices
 
@@ -798,7 +783,6 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         )
         if swa_tail_len < extend_num_tokens:
             self.full_to_swa_index_mapping[alloc_full_indices[:-swa_tail_len]] = 0
-        self._kvcache.invalidate_loc_cache()
         return alloc_full_indices
 
     def alloc_decode(
@@ -826,7 +810,6 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             )
         else:
             self.full_to_swa_index_mapping[alloc_full_indices] = alloc_swa_indices
-        self._kvcache.invalidate_loc_cache()
 
         return alloc_full_indices
 
@@ -861,10 +844,8 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             )
         else:
             self.full_to_swa_index_mapping[full_indices] = swa_indices
-        self._kvcache.invalidate_loc_cache()
 
     def free_swa(self, free_index: torch.Tensor):
-        self._kvcache.invalidate_loc_cache()
         swa_indices = self.full_to_swa_index_mapping[free_index]
         swa_indices = swa_indices[swa_indices > 0]
         if swa_indices.numel() > 0:
@@ -948,7 +929,6 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.full_attn_allocator.clear()
         # Note: the last item is -1, we don't clear it, see the comment in __init__
         self.full_to_swa_index_mapping[:-1].fill_(0)
-        self._kvcache.invalidate_loc_cache()
         self.is_not_in_free_group = True
         self.free_group = []
         # Reset backup-pending state — any in-flight backups are abandoned.

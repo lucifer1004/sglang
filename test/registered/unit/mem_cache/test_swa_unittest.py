@@ -284,6 +284,27 @@ class TestSWA(unittest.TestCase):
         )
         return alloc
 
+    def test_translate_loc_from_full_to_swa_recomputes_mapping(self):
+        alloc = self._build_swa_pool_alloc()
+        device = get_device()
+        full_idx = torch.tensor([1, 2, 3], dtype=torch.int64, device=device)
+
+        alloc.full_to_swa_index_mapping[full_idx] = torch.tensor(
+            [4, 5, 6], dtype=torch.int64, device=device
+        )
+        self.assertEqual(
+            alloc.translate_loc_from_full_to_swa(full_idx).tolist(),
+            [4, 5, 6],
+        )
+
+        alloc.full_to_swa_index_mapping[full_idx] = torch.tensor(
+            [7, 8, 9], dtype=torch.int64, device=device
+        )
+        self.assertEqual(
+            alloc.translate_loc_from_full_to_swa(full_idx).tolist(),
+            [7, 8, 9],
+        )
+
     def test_swa_backup_pending_no_pending_frees_immediately(self):
         """Default (no pending refcount) ``free_swa`` is a fast direct free.
 
