@@ -432,10 +432,7 @@ class ModelConfig:
             self.hf_config.architectures[0] = "DeepseekV4ForCausalLMNextN"
             self.hf_config.num_nextn_predict_layers = 1
 
-        if (
-            is_draft_model
-            and self.hf_config.architectures[0] == "WeLMV4MoeForCausalLM"
-        ):
+        if is_draft_model and self.hf_config.architectures[0] == "WeLMV4MoeForCausalLM":
             self.hf_config.architectures[0] = "WeLMV4MoeForCausalLMNextN"
 
         if is_draft_model and self.hf_config.architectures[0] in [
@@ -1562,6 +1559,7 @@ multimodal_model_archs = [
     "VoxtralForConditionalGeneration",
     "WhisperForConditionalGeneration",
     "Step3VLForConditionalGeneration",
+    "WeLMV4VLMForConditionalGeneration",
     "POINTSV15ChatModel",
     "DotsVLMForCausalLM",
     "DotsOCRForCausalLM",

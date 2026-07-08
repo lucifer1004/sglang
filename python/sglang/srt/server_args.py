@@ -844,6 +844,8 @@ class ServerArgs:
     language_only: bool = False
     encoder_transfer_backend: str = ENCODER_TRANSFER_BACKEND_CHOICES[0]
     encoder_urls: List[str] = dataclasses.field(default_factory=list)
+    encoder_receiver_mooncake_ib_device: Optional[str] = None
+    encoder_receiver_mooncake_ib_gpu_id: Optional[int] = None
     enable_adaptive_dispatch_to_encoder: bool = False
 
     # For model weight update and weight loading
@@ -3940,9 +3942,7 @@ class ServerArgs:
             # can exempt it (WeLM MTP topk>1 has its own spec-v2 path).
             _is_welm_mtp_draft_early = False
             try:
-                _early_arch = (
-                    self.get_model_config().hf_config.architectures[0]
-                )
+                _early_arch = self.get_model_config().hf_config.architectures[0]
             except Exception:
                 _early_arch = None
             if (
@@ -3950,7 +3950,9 @@ class ServerArgs:
                 and self.speculative_draft_model_path is not None
             ):
                 try:
-                    from sglang.srt.utils.hf_transformers_utils import get_config as _early_get_config
+                    from sglang.srt.utils.hf_transformers_utils import (
+                        get_config as _early_get_config,
+                    )
 
                     _draft_cfg = _early_get_config(
                         self.speculative_draft_model_path,
@@ -3958,9 +3960,9 @@ class ServerArgs:
                         revision=self.speculative_draft_model_revision,
                         model_override_args=json.loads(self.json_model_override_args),
                     )
-                    _draft_arch = (
-                        getattr(_draft_cfg, "architectures", []) or [None]
-                    )[0]
+                    _draft_arch = (getattr(_draft_cfg, "architectures", []) or [None])[
+                        0
+                    ]
                     _is_welm_mtp_draft_early = (
                         _draft_arch
                         in ("WeLMV4MoeForCausalLM", "WeLMV4MoeForCausalLMNextN")
@@ -4058,8 +4060,7 @@ class ServerArgs:
                 ]
                 is_welm_mtp_draft = (
                     draft_arch in ("WeLMV4MoeForCausalLM", "WeLMV4MoeForCausalLMNextN")
-                    and int(getattr(draft_hf_config, "num_nextn_predict_layers", 0))
-                    > 0
+                    and int(getattr(draft_hf_config, "num_nextn_predict_layers", 0)) > 0
                 )
                 if is_welm_mtp_draft:
                     num_nextn_layers = int(
@@ -4424,6 +4425,10 @@ class ServerArgs:
             self.disaggregation_ib_device = self._validate_ib_devices(
                 self.disaggregation_ib_device
             )
+            if self.encoder_receiver_mooncake_ib_device is not None:
+                self.encoder_receiver_mooncake_ib_device = self._validate_ib_devices(
+                    self.encoder_receiver_mooncake_ib_device
+                )
 
         # Validate model type: only support Qwen models for now
         hf_config = self.get_model_config().hf_config
@@ -4441,17 +4446,19 @@ class ServerArgs:
             "Qwen2_5OmniForConditionalGeneration",
             "KimiVLForConditionalGeneration",
             "KimiK25ForConditionalGeneration",
+            "WeLMV4VLMForConditionalGeneration",
         ]:
             raise ValueError(
                 f"Model type {model_arch} is not supported for encoder disaggregation, only Qwen models are supported for now."
             )
 
-    def _validate_ib_devices(self, device_str: str) -> Optional[str]:
+    def _validate_ib_devices(self, device_str: Optional[str]) -> Optional[str]:
         """
         Validate IB devices before passing to mooncake.
 
         Args:
-            device_str: Comma-separated IB device names (e.g., "mlx5_0,mlx5_1")
+            device_str: Comma-separated IB device names (e.g., "mlx5_0,mlx5_1"),
+                JSON mapping content, or a path to a JSON mapping file.
 
         Returns:
             Normalized comma-separated string of validated device names, or None if input is None.
@@ -4461,6 +4468,10 @@ class ServerArgs:
                 "No IB devices specified for Mooncake backend, falling back to auto discovery."
             )
             return None
+
+        device_str = device_str.strip()
+        if device_str.startswith("{") or device_str.endswith(".json"):
+            return device_str
 
         # Strip whitespace from device names
         devices = [d.strip() for d in device_str.split(",") if d.strip()]
@@ -6499,7 +6510,8 @@ class ServerArgs:
             type=str,
             default=ServerArgs.mooncake_ib_device,
             help="The InfiniBand devices for Mooncake Backend transfer, accepts multiple comma-separated devices "
-            "(e.g., --mooncake-ib-device mlx5_0,mlx5_1). "
+            "(e.g., --mooncake-ib-device mlx5_0,mlx5_1), per-GPU JSON mapping, "
+            "role-aware JSON mapping, or a JSON file path. "
             "Default is None, which triggers automatic device detection when Mooncake Backend is enabled.",
         )
         parser.add_argument(
@@ -7262,7 +7274,8 @@ class ServerArgs:
             type=str,
             default=ServerArgs.disaggregation_ib_device,
             help="The InfiniBand devices for disaggregation transfer, accepts single device (e.g., --disaggregation-ib-device mlx5_0) "
-            "or multiple comma-separated devices (e.g., --disaggregation-ib-device mlx5_0,mlx5_1). "
+            "or multiple comma-separated devices (e.g., --disaggregation-ib-device mlx5_0,mlx5_1), "
+            "per-GPU JSON mapping, role-aware JSON mapping, or a JSON file path. "
             "Default is None, which triggers automatic device detection when mooncake backend is enabled.",
         )
         parser.add_argument(
@@ -7312,6 +7325,24 @@ class ServerArgs:
             type=str,
             default=[],
             help="List of encoder server urls.",
+        )
+        parser.add_argument(
+            "--encoder-receiver-mooncake-ib-device",
+            type=str,
+            default=ServerArgs.encoder_receiver_mooncake_ib_device,
+            help="Override the InfiniBand devices used by the language-only EPD "
+            "Mooncake embedding receiver. Accepts a comma-separated device list, "
+            "per-GPU JSON mapping, role-aware JSON mapping, or a JSON file path. "
+            "When unset, falls back to --disaggregation-ib-device or "
+            "--mooncake-ib-device.",
+        )
+        parser.add_argument(
+            "--encoder-receiver-mooncake-ib-gpu-id",
+            type=int,
+            default=ServerArgs.encoder_receiver_mooncake_ib_gpu_id,
+            help="GPU id key used to select from --encoder-receiver-mooncake-ib-device "
+            "for the language-only EPD Mooncake embedding receiver. When unset, "
+            "uses the scheduler GPU if available, otherwise --base-gpu-id.",
         )
         parser.add_argument(
             "--enable-adaptive-dispatch-to-encoder",

@@ -667,6 +667,7 @@ class Envs:
     # EPD
     SGLANG_ENCODER_RECV_TIMEOUT = EnvFloat(180.0)
     SGLANG_ENCODER_SEND_TIMEOUT = EnvFloat(180.0)
+    SGLANG_ENCODE_RECV_TIMEOUT = EnvFloat(600.0)
     SGLANG_ENCODER_DISPATCH_MIN_ITEMS = EnvInt(2)
 
     # Elastic EP Backup Port
@@ -680,7 +681,9 @@ class Envs:
     SGLANG_PLUGINS = EnvStr("")
 
     # WeLM related environment variables
-    WELM_ALLOW_PARTIAL_MTP_LOAD = EnvBool(False) # Skip mtp layer integration check. Useful for RL.
+    WELM_ALLOW_PARTIAL_MTP_LOAD = EnvBool(
+        False
+    )  # Skip mtp layer integration check. Useful for RL.
 
 
 envs = Envs()

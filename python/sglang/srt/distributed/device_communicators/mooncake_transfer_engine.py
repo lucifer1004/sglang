@@ -12,7 +12,93 @@ logger = logging.getLogger(__name__)
 _mooncake_transfer_engine: Optional["MooncakeTransferEngine"] = None
 
 
-def get_ib_devices_for_gpu(ib_device_str: Optional[str], gpu_id: int) -> Optional[str]:
+_ROLE_ALIASES = {
+    "encoder": ("encoder", "vision_encoder", "mm_encoder"),
+    "encoder_receiver": (
+        "encoder_receiver",
+        "receiver",
+        "mm_receiver",
+        "vlm_receiver",
+    ),
+    "worker": ("worker", "model_worker", "llm_worker", "scheduler"),
+    "elastic_ep": ("elastic_ep", "expert_backup"),
+}
+
+
+def _role_candidates(role: Optional[str]) -> List[str]:
+    if role is None:
+        return []
+    role = role.strip()
+    if not role:
+        return []
+
+    candidates = [role]
+    for canonical_role, aliases in _ROLE_ALIASES.items():
+        if role == canonical_role or role in aliases:
+            candidates.extend([canonical_role, *aliases])
+
+    return list(dict.fromkeys(candidates))
+
+
+def _is_gpu_mapping_key(key) -> bool:
+    return isinstance(key, int) or (
+        isinstance(key, str) and (key.isdigit() or key in ("default", "*"))
+    )
+
+
+def _is_legacy_gpu_mapping(mapping: dict) -> bool:
+    return all(
+        _is_gpu_mapping_key(key) and isinstance(value, str)
+        for key, value in mapping.items()
+    )
+
+
+def _resolve_gpu_mapping(mapping: dict, gpu_id: int, context: str) -> str:
+    gpu_mapping = {}
+    default_value = None
+    for gpu_key, ib_devices in mapping.items():
+        if not isinstance(ib_devices, str):
+            raise ValueError(f"Invalid {context}: mapping values must be strings")
+
+        if isinstance(gpu_key, str) and gpu_key.isdigit():
+            gpu_mapping[int(gpu_key)] = ib_devices.strip()
+        elif isinstance(gpu_key, int):
+            gpu_mapping[gpu_key] = ib_devices.strip()
+        elif isinstance(gpu_key, str) and gpu_key in ("default", "*"):
+            default_value = ib_devices.strip()
+        else:
+            raise ValueError(
+                f"Invalid {context}: keys must be integers, string integer "
+                "keys, 'default', or '*'"
+            )
+
+    if not gpu_mapping and default_value is None:
+        raise ValueError(f"No valid GPU mappings found in {context}")
+
+    if gpu_id in gpu_mapping:
+        return gpu_mapping[gpu_id]
+    if default_value is not None:
+        return default_value
+
+    raise ValueError(
+        f"No IB devices configured for GPU {gpu_id} in {context}. "
+        f"Available GPUs: {list(gpu_mapping.keys())}"
+    )
+
+
+def _resolve_role_value(value, gpu_id: int, context: str) -> str:
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, dict):
+        return _resolve_gpu_mapping(value, gpu_id, context)
+    raise ValueError(f"Invalid {context}: role values must be strings or mappings")
+
+
+def get_ib_devices_for_gpu(
+    ib_device_str: Optional[str],
+    gpu_id: int,
+    role: Optional[str] = None,
+) -> Optional[str]:
     """
     Parse IB device string and get IB devices for a specific GPU ID.
 
@@ -20,10 +106,19 @@ def get_ib_devices_for_gpu(ib_device_str: Optional[str], gpu_id: int) -> Optiona
     1. Old format: "ib0, ib1, ib2"
     2. New format: {0: "ib0, ib1", 1: "ib2, ib3", 2: "ib4"}
     3. JSON file: path to a JSON file containing the mapping
+    4. Role-aware JSON:
+       {
+         "encoder": {"0": "ib0", "1": "ib1"},
+         "encoder_receiver": "ib4,ib5",
+         "worker": {"4": "ib4", "5": "ib5"},
+         "default": "ib0,ib1"
+       }
 
     Args:
         ib_device_str: The original IB device string or path to JSON file
         gpu_id: The GPU ID to get devices for
+        role: Optional process role, e.g. "encoder", "encoder_receiver",
+            "worker". Role-specific entries are preferred when present.
 
     Returns:
         IB devices string for the GPU, or None if not available
@@ -32,13 +127,14 @@ def get_ib_devices_for_gpu(ib_device_str: Optional[str], gpu_id: int) -> Optiona
         return None
 
     ib_device_str = ib_device_str.strip()
+    original_ib_device_str = ib_device_str
 
     # Check if it's a JSON file first and load its content
     is_json_file = ib_device_str.endswith(".json")
     if is_json_file:
         try:
             if os.path.isfile(ib_device_str):
-                with open(ib_device_str, "r") as f:
+                with open(ib_device_str, "r", encoding="utf-8") as f:
                     ib_device_str = f.read()
             else:
                 # File doesn't exist, treat as old format
@@ -51,40 +147,38 @@ def get_ib_devices_for_gpu(ib_device_str: Optional[str], gpu_id: int) -> Optiona
     try:
         parsed_json = json.loads(ib_device_str)
         if isinstance(parsed_json, dict):
-            # Validate format - keys should be integers (or string rep), values should be strings
-            gpu_mapping = {}
-            for gpu_key, ib_devices in parsed_json.items():
-                if (
-                    isinstance(gpu_key, str)
-                    and gpu_key.isdigit()
-                    and isinstance(ib_devices, str)
-                ):
-                    gpu_mapping[int(gpu_key)] = ib_devices.strip()
-                elif isinstance(gpu_key, int) and isinstance(ib_devices, str):
-                    gpu_mapping[gpu_key] = ib_devices.strip()
-                else:
-                    raise ValueError(
-                        "Invalid format: keys must be integers (or string "
-                        "representations of integers) and values must be strings"
+            # Prefer role-specific mappings when the caller supplies a role.
+            for role_key in _role_candidates(role):
+                if role_key in parsed_json:
+                    return _resolve_role_value(
+                        parsed_json[role_key],
+                        gpu_id,
+                        f"role '{role_key}' IB mapping",
                     )
 
-            if not gpu_mapping:
-                raise ValueError("No valid GPU mappings found in JSON")
+            for default_key in ("default", "*"):
+                if default_key in parsed_json and not _is_legacy_gpu_mapping(
+                    parsed_json
+                ):
+                    return _resolve_role_value(
+                        parsed_json[default_key],
+                        gpu_id,
+                        f"'{default_key}' IB mapping",
+                    )
 
-            # Return devices for specific GPU
-            if gpu_id in gpu_mapping:
-                return gpu_mapping[gpu_id]
-            else:
-                raise ValueError(
-                    f"No IB devices configured for GPU {gpu_id}. "
-                    f"Available GPUs: {list(gpu_mapping.keys())}"
-                )
+            if _is_legacy_gpu_mapping(parsed_json):
+                return _resolve_gpu_mapping(parsed_json, gpu_id, "IB mapping")
+
+            raise ValueError(
+                f"No IB devices configured for role {role!r}. "
+                f"Available role keys: {list(parsed_json.keys())}"
+            )
 
     except json.JSONDecodeError:
         if is_json_file:
             # It was supposed to be a JSON file but failed to parse
             raise RuntimeError(
-                f"Failed to parse JSON content from file {ib_device_str}"
+                f"Failed to parse JSON content from file {original_ib_device_str}"
             )
         # Not JSON format, treat as old format - return same devices for all GPUs
         return ib_device_str
@@ -98,6 +192,7 @@ class MooncakeTransferEngine:
         hostname: str,
         gpu_id: Optional[int] = None,
         ib_device: Optional[str] = None,
+        role: Optional[str] = None,
     ):
         try:
             from mooncake.engine import TransferEngine
@@ -111,7 +206,14 @@ class MooncakeTransferEngine:
         self.engine = TransferEngine()
         self.hostname = hostname
         self.gpu_id = gpu_id if gpu_id is not None else 0
-        self.ib_device = get_ib_devices_for_gpu(ib_device, self.gpu_id)
+        self.role = role
+        self.ib_device = get_ib_devices_for_gpu(ib_device, self.gpu_id, role=role)
+        logger.info(
+            "Mooncake Transfer Engine IB selection: role=%s gpu_id=%s ib_device=%s",
+            self.role,
+            self.gpu_id,
+            self.ib_device,
+        )
 
         self.initialize(
             hostname=self.hostname,
@@ -265,6 +367,7 @@ def init_mooncake_transfer_engine(
     hostname: str,
     gpu_id: Optional[int] = None,
     ib_device: Optional[str] = None,
+    role: Optional[str] = None,
 ) -> MooncakeTransferEngine:
     """
     Initialize the shared MooncakeTransferEngine. Note: if already
@@ -274,9 +377,25 @@ def init_mooncake_transfer_engine(
     """
     global _mooncake_transfer_engine
     if _mooncake_transfer_engine is not None:
+        if ib_device is not None:
+            requested_gpu_id = (
+                gpu_id if gpu_id is not None else _mooncake_transfer_engine.gpu_id
+            )
+            requested_ib_device = get_ib_devices_for_gpu(
+                ib_device, requested_gpu_id, role=role
+            )
+            existing_ib_device = _mooncake_transfer_engine.get_ib_device()
+            if requested_ib_device != existing_ib_device:
+                raise RuntimeError(
+                    "Mooncake Transfer Engine is already initialized with "
+                    f"ib_device={existing_ib_device!r}, but requested "
+                    f"ib_device={requested_ib_device!r} for role={role!r} "
+                    f"gpu_id={requested_gpu_id}. A single process cannot reuse "
+                    "one Mooncake Transfer Engine with different IB bindings."
+                )
         return _mooncake_transfer_engine
     _mooncake_transfer_engine = MooncakeTransferEngine(
-        hostname=hostname, gpu_id=gpu_id, ib_device=ib_device
+        hostname=hostname, gpu_id=gpu_id, ib_device=ib_device, role=role
     )
     return _mooncake_transfer_engine
 

@@ -1208,7 +1208,20 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if self.device == "cuda" and self.server_args.elastic_ep_backend == "mooncake":
             backend = "mooncake"
             if self.server_args.mooncake_ib_device:
-                mooncake_ib_device = self.server_args.mooncake_ib_device.split(",")
+                from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
+                    get_ib_devices_for_gpu,
+                )
+
+                resolved_mooncake_ib_device = get_ib_devices_for_gpu(
+                    self.server_args.mooncake_ib_device,
+                    self.gpu_id,
+                    role="elastic_ep",
+                )
+                mooncake_ib_device = (
+                    resolved_mooncake_ib_device.split(",")
+                    if resolved_mooncake_ib_device
+                    else []
+                )
                 try:
                     from mooncake import ep as mooncake_ep
 
@@ -1346,6 +1359,48 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         )
         return pre_model_load_memory
 
+    def _get_mooncake_transfer_engine_role(self) -> str:
+        if (
+            self.server_args.encoder_only
+            and self.server_args.encoder_transfer_backend == "mooncake"
+        ):
+            return "encoder"
+        if (
+            self.server_args.language_only
+            and self.server_args.encoder_transfer_backend == "mooncake"
+        ):
+            return "encoder_receiver"
+        if (
+            self.server_args.enable_elastic_expert_backup
+            and self.server_args.elastic_ep_backend == "mooncake"
+        ):
+            return "elastic_ep"
+        return "worker"
+
+    def _get_mooncake_transfer_engine_gpu_id(self) -> int:
+        if (
+            self.server_args.language_only
+            and self.server_args.encoder_transfer_backend == "mooncake"
+            and self.server_args.encoder_receiver_mooncake_ib_gpu_id is not None
+        ):
+            return self.server_args.encoder_receiver_mooncake_ib_gpu_id
+        return self.gpu_id
+
+    def _get_mooncake_transfer_engine_ib_device(self) -> Optional[str]:
+        if (
+            self.server_args.language_only
+            and self.server_args.encoder_transfer_backend == "mooncake"
+        ):
+            return (
+                self.server_args.encoder_receiver_mooncake_ib_device
+                or self.server_args.disaggregation_ib_device
+                or self.server_args.mooncake_ib_device
+            )
+        return (
+            self.server_args.disaggregation_ib_device
+            or self.server_args.mooncake_ib_device
+        )
+
     def init_shared_mooncake_transfer_engine(self):
         """
         Need MooncakeTransferEngine when:
@@ -1384,11 +1439,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
             init_mooncake_transfer_engine(
                 hostname=get_local_ip_auto(),
-                gpu_id=self.gpu_id,
-                ib_device=(
-                    self.server_args.disaggregation_ib_device
-                    or self.server_args.mooncake_ib_device
-                ),
+                gpu_id=self._get_mooncake_transfer_engine_gpu_id(),
+                ib_device=self._get_mooncake_transfer_engine_ib_device(),
+                role=self._get_mooncake_transfer_engine_role(),
             )
 
     def load_model(self):

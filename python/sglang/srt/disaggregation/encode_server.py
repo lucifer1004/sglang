@@ -213,6 +213,7 @@ class MMEncoder:
         self.model_type = getattr(
             self.model_config.hf_config, "model_type", "unknown"
         ).lower()
+        self._gpu_image_decode = self._lookup_gpu_image_decode()
 
         self.device = server_args.device
         self.gpu_id = server_args.base_gpu_id + rank
@@ -301,6 +302,7 @@ class MMEncoder:
                             self.server_args.disaggregation_ib_device
                             or self.server_args.mooncake_ib_device
                         ),
+                        role="encoder",
                     )
 
             self.embedding_to_send = dict()
@@ -440,6 +442,32 @@ class MMEncoder:
             logger.warning(f"Failed to load audio processor: {e}")
             self.audio_processor = None
 
+    def _lookup_gpu_image_decode(self) -> bool:
+        """Return the single-server image decode policy for this model."""
+        try:
+            from sglang.srt.managers.multimodal_processor import (
+                PROCESSOR_MAPPING,
+                import_processors,
+            )
+            from sglang.srt.multimodal.processors.base_processor import (
+                BaseMultimodalProcessor,
+            )
+
+            import_processors("sglang.srt.multimodal.processors")
+
+            archs = getattr(self.model_config.hf_config, "architectures", []) or []
+            for model_cls, processor_cls in PROCESSOR_MAPPING.items():
+                if model_cls.__name__ in archs:
+                    return bool(getattr(processor_cls, "gpu_image_decode", True))
+            return bool(getattr(BaseMultimodalProcessor, "gpu_image_decode", True))
+        except Exception as e:  # pragma: no cover - defensive fallback
+            logger.warning(
+                f"Failed to look up gpu_image_decode (archs="
+                f"{getattr(self.model_config.hf_config, 'architectures', None)}): "
+                f"{e}. Falling back to True."
+            )
+            return True
+
     def _load_single_item(
         self,
         data,
@@ -456,7 +484,7 @@ class MMEncoder:
             return data
         try:
             if modality == Modality.IMAGE:
-                img, _ = load_image(data, False)
+                img, _ = load_image(data, self._gpu_image_decode)
                 if (
                     discard_alpha_channel
                     and not isinstance(img, torch.Tensor)

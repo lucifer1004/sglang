@@ -19,10 +19,7 @@ import zmq
 import zmq.asyncio
 from transformers import PretrainedConfig
 
-from sglang.srt.distributed.parallel_state import (
-    GroupCoordinator,
-    get_mooncake_transfer_engine,
-)
+from sglang.srt.distributed.parallel_state import GroupCoordinator
 from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import GenerateReqInput, TokenizedGenerateReqInput
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
@@ -620,6 +617,26 @@ def _determine_tensor_transport_mode(server_args):
         return "cuda_ipc"
 
 
+def _select_encoder_receiver_mooncake_gpu_id(
+    server_args: ServerArgs, scheduler: Optional["Scheduler"]
+) -> int:
+    if server_args.encoder_receiver_mooncake_ib_gpu_id is not None:
+        return server_args.encoder_receiver_mooncake_ib_gpu_id
+    if scheduler is not None and getattr(scheduler, "gpu_id", None) is not None:
+        return scheduler.gpu_id
+    return server_args.base_gpu_id
+
+
+def _select_encoder_receiver_mooncake_ib_device(
+    server_args: ServerArgs,
+) -> Optional[str]:
+    return (
+        server_args.encoder_receiver_mooncake_ib_device
+        or server_args.disaggregation_ib_device
+        or server_args.mooncake_ib_device
+    )
+
+
 class MMReceiverBase(ABC):
     def __init__(
         self,
@@ -637,19 +654,30 @@ class MMReceiverBase(ABC):
         self.host = get_local_ip_auto(server_args.host)
         if self.encoder_transfer_backend == "mooncake":
             self.dtype = dtype
-            self.embeddings_engine = get_mooncake_transfer_engine()
-            if self.embeddings_engine is None:
-                from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
-                    init_mooncake_transfer_engine,
-                )
+            from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
+                init_mooncake_transfer_engine,
+            )
 
-                self.embeddings_engine = init_mooncake_transfer_engine(
-                    hostname=self.host,
-                    ib_device=(
-                        server_args.disaggregation_ib_device
-                        or server_args.mooncake_ib_device
-                    ),
-                )
+            receiver_gpu_id = _select_encoder_receiver_mooncake_gpu_id(
+                server_args, scheduler
+            )
+            receiver_ib_device = _select_encoder_receiver_mooncake_ib_device(
+                server_args
+            )
+            self.embeddings_engine = init_mooncake_transfer_engine(
+                hostname=self.host,
+                gpu_id=receiver_gpu_id,
+                ib_device=receiver_ib_device,
+                role="encoder_receiver",
+            )
+            logger.info(
+                "EPD Mooncake receiver IB selection: requested_gpu_id=%s "
+                "engine_role=%s engine_gpu_id=%s ib_device=%s",
+                receiver_gpu_id,
+                getattr(self.embeddings_engine, "role", None),
+                getattr(self.embeddings_engine, "gpu_id", None),
+                self.embeddings_engine.get_ib_device(),
+            )
             self.embeddings_buffer = dict()
         elif self.encoder_transfer_backend == "zmq_to_scheduler":
             self.pp_rank = pp_rank
@@ -716,6 +744,7 @@ class MMReceiverBase(ABC):
         self, request_obj, mm_processor, prompt, need_wait_for_mm_inputs=True
     ):
         req_id = None
+        recv_timeout = envs.SGLANG_ENCODE_RECV_TIMEOUT.get()
         try:
             if len(self.encode_urls) == 0 or not need_wait_for_mm_inputs:
                 return None
@@ -729,10 +758,12 @@ class MMReceiverBase(ABC):
             )
             return await asyncio.wait_for(
                 self._recv_mm_data(req_id, recv_socket, mm_processor, prompt),
-                timeout=20,
+                timeout=recv_timeout,
             )
         except asyncio.TimeoutError:
-            logger.warning(f"Embedding recv timeout for request {req_id}")
+            logger.warning(
+                f"Embedding recv timeout for request {req_id} after {recv_timeout}s"
+            )
             if req_id is not None:
                 self._cleanup_mooncake_buffer(req_id)
             return None
