@@ -2375,9 +2375,9 @@ class Qwen2MoeAttention(nn.Module):
             self.kv_mirror_imitated_layers,
         )
         if len(sliding_window_size_layerwise) > self.config_layer_idx:
-            self.sliding_window_size = self._normalize_sliding_window_size(
-                config, sliding_window_size_layerwise[self.config_layer_idx]
-            )
+            self.sliding_window_size = sliding_window_size_layerwise[
+                self.config_layer_idx
+            ]
         else:
             self.sliding_window_size = -1
         logger.debug(

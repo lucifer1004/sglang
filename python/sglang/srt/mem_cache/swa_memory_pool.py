@@ -182,7 +182,7 @@ class SWAKVPool(BaseSWAKVPool):
         layer_id = layer.layer_id
         layer_id_pool, is_swa_layer = self.layers_mapping[layer_id]
         if is_swa_layer:
-            if self.swa_loc is not None:
+            if self.swa_loc is not None and self.swa_loc.numel() == loc.numel():
                 loc = self.swa_loc
             else:
                 if self.full_to_swa_index_mapping is not None:
