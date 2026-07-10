@@ -322,13 +322,21 @@ RUN --mount=type=cache,target=/root/.cache/uv \
         --out dist && \
     uv pip install --python "${VENV_PATH}/bin/python" dist/*.whl && \
     "${VENV_PATH}/bin/python" - <<'PY'
-from importlib.metadata import version
+from importlib.metadata import PackageNotFoundError, version
 
 import sglang_router
 import sglang_router.launch_router
 import sglang_router.sglang_router_rs
 
-print(f"sglang-router={version('sglang-router')}")
+for router_dist_name in ("welm-sglang-router", "sglang-router"):
+    try:
+        router_version = version(router_dist_name)
+        break
+    except PackageNotFoundError:
+        pass
+else:
+    raise SystemExit("Neither welm-sglang-router nor sglang-router is installed")
+print(f"{router_dist_name}={router_version}")
 print(f"sglang_router_module={sglang_router.__file__}")
 PY
 
@@ -364,10 +372,11 @@ PY
 
 RUN --mount=type=cache,target=/root/.cache/uv \
     SETUPTOOLS_SCM_PRETEND_VERSION_FOR_SGLANG="${SGLANG_VERSION}" \
+    SETUPTOOLS_SCM_PRETEND_VERSION_FOR_WELM_SGLANG="${SGLANG_VERSION}" \
     uv pip install --python "${VENV_PATH}/bin/python" --no-deps /sgl-workspace/python && \
     uv pip check --python "${VENV_PATH}/bin/python" && \
     "${VENV_PATH}/bin/python" - <<'PY'
-from importlib.metadata import version
+from importlib.metadata import PackageNotFoundError, version
 import pathlib
 import sys
 import sysconfig
@@ -385,9 +394,17 @@ if not cuda_python.startswith("12."):
     raise SystemExit(f"cuda-python must be 12.x, got {cuda_python}")
 if not str(torch.version.cuda).startswith("12."):
     raise SystemExit(f"torch CUDA runtime must be 12.x, got {torch.version.cuda}")
+for sglang_dist_name in ("welm-sglang", "sglang"):
+    try:
+        sglang_version = version(sglang_dist_name)
+        break
+    except PackageNotFoundError:
+        pass
+else:
+    raise SystemExit("Neither welm-sglang nor sglang is installed")
 print(f"python={sys.executable}")
 print(f"python_include={include_dir}")
-print(f"sglang={version('sglang')}")
+print(f"{sglang_dist_name}={sglang_version}")
 print(f"torch={torch.__version__}, torch_cuda={torch.version.cuda}")
 print(f"cuda-python={cuda_python}")
 print(f"deep_gemm={version('sgl-deep-gemm')}, deep_gemm_module={deep_gemm.__file__}")
