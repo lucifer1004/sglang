@@ -228,6 +228,8 @@ class TestSWA(unittest.TestCase):
             enable_kvcache_transpose=False,
             device=device,
         )
+        self.assertFalse(pool.is_swa_layer(full_attention_layer_ids[0]))
+        self.assertTrue(pool.is_swa_layer(swa_attention_layer_ids[0]))
         alloc = SWATokenToKVPoolAllocator(
             size=size,
             size_swa=size_swa,

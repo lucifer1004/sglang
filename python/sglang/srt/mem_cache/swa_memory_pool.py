@@ -159,6 +159,9 @@ class SWAKVPool(BaseSWAKVPool):
         else:
             return self.full_kv_pool.get_kv_buffer(layer_id_pool)
 
+    def is_swa_layer(self, layer_id: int) -> bool:
+        return self.layers_mapping[layer_id][1]
+
     def set_swa_loc(self, loc: torch.Tensor):
         self.swa_loc = loc
 
