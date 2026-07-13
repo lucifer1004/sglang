@@ -153,32 +153,50 @@ def get_processor(
     revision = kwargs.pop("revision", tokenizer_revision)
     tokenizer_name = resolve_runai_obj_uri(tokenizer_name)
 
-    if is_mistral_model(tokenizer_name):
-        config = load_mistral_config(
-            tokenizer_name,
-            trust_remote_code=trust_remote_code,
-            revision=revision,
+    try:
+        if is_mistral_model(tokenizer_name):
+            config = load_mistral_config(
+                tokenizer_name,
+                trust_remote_code=trust_remote_code,
+                revision=revision,
+            )
+        else:
+            config = AutoConfig.from_pretrained(
+                tokenizer_name,
+                trust_remote_code=trust_remote_code,
+                revision=revision,
+                **kwargs,
+            )
+    except ValueError as e:
+        error_message = str(e)
+        missing_model_config = (
+            "Unrecognized model in" in error_message
+            and "model_type" in error_message
         )
-    else:
-        config = AutoConfig.from_pretrained(
+        if not missing_model_config:
+            raise
+        logger.info(
+            "Processor path %s does not expose a model config; falling back to "
+            "AutoProcessor.from_pretrained directly.",
             tokenizer_name,
-            trust_remote_code=trust_remote_code,
-            revision=revision,
-            **kwargs,
         )
-    is_ocr2 = _is_deepseek_ocr2_model(config)
-    if _is_deepseek_ocr_model(config) or is_ocr2:
-        config.model_type = "deepseek-ocr"
-        config.update({"architectures": ["DeepseekOCRForCausalLM"]})
-        if is_ocr2:
-            _override_v_head_dim_if_zero(config)
+        config = None
 
-    if config.model_type in {"qwen2_vl", "sarashina2_vision"}:
-        if "size" not in kwargs:
-            kwargs["size"] = {"shortest_edge": 3136, "longest_edge": 1003520}
+    if config is not None:
+        is_ocr2 = _is_deepseek_ocr2_model(config)
+        if _is_deepseek_ocr_model(config) or is_ocr2:
+            config.model_type = "deepseek-ocr"
+            config.update({"architectures": ["DeepseekOCRForCausalLM"]})
+            if is_ocr2:
+                _override_v_head_dim_if_zero(config)
 
-    if config.model_type not in {"llava", "clip"}:
+        if config.model_type in {"qwen2_vl", "sarashina2_vision"}:
+            if "size" not in kwargs:
+                kwargs["size"] = {"shortest_edge": 3136, "longest_edge": 1003520}
+
+    if config is None or config.model_type not in {"llava", "clip"}:
         kwargs["use_fast"] = use_fast
+
     try:
         if "InternVL3_5" in tokenizer_name:
             processor = AutoTokenizer.from_pretrained(
@@ -189,7 +207,7 @@ def get_processor(
                 **kwargs,
             )
         else:
-            if config.model_type in _CUSTOMIZED_MM_PROCESSOR:
+            if config is not None and config.model_type in _CUSTOMIZED_MM_PROCESSOR:
                 processor = _CUSTOMIZED_MM_PROCESSOR[config.model_type].from_pretrained(
                     tokenizer_name,
                     *args,
@@ -222,6 +240,8 @@ def get_processor(
                 **kwargs,
             )
         elif "Unrecognized feature extractor" in error_message:
+            if config is None:
+                raise
             logger.info(
                 "AutoProcessor failed on feature extractor for %s, "
                 "constructing processor manually",

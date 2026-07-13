@@ -78,6 +78,7 @@ def _make_model_runner(
     mr.kv_cache_dtype = "fake_bf16"
 
     sa = SimpleNamespace()
+    sa.enable_suffix_parallel = False
     sa.swa_full_tokens_ratio = swa_full_tokens_ratio
     sa.page_size = page_size
     mr.server_args = sa

@@ -60,6 +60,13 @@ ENV DEBIAN_FRONTEND=noninteractive \
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
 RUN --mount=type=cache,target=/var/cache/apt \
+    for cmd in /usr/bin/systemctl /usr/sbin/service /usr/sbin/invoke-rc.d /usr/sbin/update-rc.d; do \
+        dpkg-divert --local --rename --add "${cmd}"; \
+        printf '#!/bin/sh\nexit 0\n' > "${cmd}" && \
+        chmod +x "${cmd}"; \
+    done && \
+    printf '#!/bin/sh\nexit 101\n' > /usr/sbin/policy-rc.d && \
+    chmod +x /usr/sbin/policy-rc.d && \
     apt-get update && \
     apt-get install -y \
         bash \
@@ -102,8 +109,16 @@ RUN --mount=type=cache,target=/var/cache/apt \
         zstd \
         bzip2 \
         dstat \
+        ffmpeg \
         htop && \
     cd /var/lib/pcp/pmns && /usr/lib/pcp/pmns/Rebuild && \
+    rm -f /usr/sbin/policy-rc.d && \
+    for cmd in /usr/bin/systemctl /usr/sbin/service /usr/sbin/invoke-rc.d /usr/sbin/update-rc.d; do \
+        rm -f "${cmd}"; \
+        if dpkg-divert --list "${cmd}" >/dev/null; then \
+            dpkg-divert --rename --remove "${cmd}"; \
+        fi; \
+    done && \
     rm -rf /var/lib/apt/lists/*
 
 COPY --from=go-builder /out/sr /usr/local/bin/sr
@@ -297,7 +312,9 @@ pathlib.Path("/tmp/sgl-deep-gemm-version.txt").write_text(deep_gemm_version)
 PY
 
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv pip install --python "${VENV_PATH}/bin/python" -r /tmp/sglang-runtime-requirements.txt
+    uv pip install --python "${VENV_PATH}/bin/python" \
+        -r /tmp/sglang-runtime-requirements.txt \
+        decord2
 
 RUN --mount=type=cache,target=/root/.cache/uv <<'BASH'
 set -euo pipefail
@@ -382,6 +399,7 @@ import sys
 import sysconfig
 
 import deep_gemm
+import decord
 import sglang
 import torch
 
@@ -407,6 +425,7 @@ print(f"python_include={include_dir}")
 print(f"{sglang_dist_name}={sglang_version}")
 print(f"torch={torch.__version__}, torch_cuda={torch.version.cuda}")
 print(f"cuda-python={cuda_python}")
+print(f"decord_module={decord.__file__}")
 print(f"deep_gemm={version('sgl-deep-gemm')}, deep_gemm_module={deep_gemm.__file__}")
 print(f"sglang_module={sglang.__file__}")
 PY

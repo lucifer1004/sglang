@@ -29,7 +29,7 @@ version: v1
 # ─── target 连接参数（被测模型）─── 5 个 jobs 共享，可在各 job 段覆盖
 defaults:
   base_url: http://<host>:<port>/v1
-  api_key:  dummy 
+  api_key:  dummy
   model:    <模型ID> # 填服务启动时的 model id
   rtx:      ""
   output_root: ./runs/<run_name> # <run_name> 改成当前的 eval name

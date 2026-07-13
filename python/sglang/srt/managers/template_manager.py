@@ -44,6 +44,7 @@ from sglang.srt.parser.conversation import (
     SeparatorStyle,
     chat_template_exists,
     get_conv_template_by_model_path,
+    get_model_type,
     register_conv_template,
 )
 from sglang.srt.parser.jinja_template_utils import detect_jinja_template_content_format
@@ -162,6 +163,16 @@ class TemplateManager:
                     logger.info(
                         f"Using default HuggingFace chat template with detected content format: {self._jinja_template_content_format}"
                     )
+                elif self._try_load_local_jinja_template(
+                    tokenizer_manager, model_path
+                ):
+                    pass
+                elif get_model_type(model_path) == "welmv4_vlm":
+                    raise RuntimeError(
+                        "WeLM v4 VLM requires chat_template.jinja in the model "
+                        f"directory or a chat_template on the loaded tokenizer/processor. "
+                        f"Model path: {model_path}"
+                    )
                 else:
                     # Default to string content format if no template was found
                     self._jinja_template_content_format = "string"
@@ -275,6 +286,21 @@ class TemplateManager:
         logger.info(
             f"Detected user specified Jinja chat template with content format: {self._jinja_template_content_format}"
         )
+
+    def _try_load_local_jinja_template(
+        self, tokenizer_manager: TokenizerManager, model_path: str
+    ) -> bool:
+        """Load ``chat_template.jinja`` from the model checkpoint directory."""
+        if not model_path or not tokenizer_manager.tokenizer:
+            return False
+
+        jinja_path = os.path.join(model_path, "chat_template.jinja")
+        if not os.path.isfile(jinja_path):
+            return False
+
+        self._load_jinja_template(tokenizer_manager, jinja_path)
+        logger.info(f"Loaded chat template from model path: {jinja_path}")
+        return True
 
     def _load_json_chat_template(self, template_path: str) -> None:
         """Load a JSON chat template file."""

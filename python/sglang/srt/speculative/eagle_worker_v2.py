@@ -435,10 +435,10 @@ class EagleDraftWorker(BaseDraftWorker):
                         f"max_tree_tokens={max_tree_tokens}, topk={self.topk}, "
                         f"steps={self.speculative_num_steps}."
                     )
-            if num_nextn_layers not in (1, self.speculative_num_steps):
+            if num_nextn_layers != 1 and num_nextn_layers < self.speculative_num_steps:
                 raise ValueError(
                     "WeLM MTP requires num_nextn_predict_layers to be either 1 "
-                    "or speculative_num_steps, got "
+                    "or at least speculative_num_steps, got "
                     f"layers={num_nextn_layers}, steps={self.speculative_num_steps}."
                 )
 

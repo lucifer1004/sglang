@@ -13,6 +13,16 @@ from sglang.srt.utils import ImageData
 
 logger = logging.getLogger(__name__)
 
+
+def _is_pre_sampled_video_frames(url) -> bool:
+    return (
+        isinstance(url, list)
+        and bool(url)
+        and isinstance(url[0], dict)
+        and ("image" in url[0] or "url" in url[0])
+    )
+
+
 # ============================================================================
 # JINJA TEMPLATE CONTENT FORMAT DETECTION
 # ============================================================================
@@ -175,21 +185,35 @@ def process_content_for_template_format(
                     processed_content_parts.append({"type": "image"})
                 elif chunk_type == "video_url":
                     video_obj = chunk.get("video_url") or {}
-                    mdp = video_obj.get("max_dynamic_patch", None)
-                    if mdp is None:
-                        video_data.append(chunk["video_url"]["url"])
+                    url = video_obj.get("url") if isinstance(video_obj, dict) else video_obj
+                    video_entry = {"url": url}
+                    for key in (
+                        "fps",
+                        "num_frames",
+                        "max_dynamic_patch",
+                        "min_dynamic_patch",
+                        "resized_height",
+                        "resized_width",
+                        "min_pixels",
+                        "max_pixels",
+                    ):
+                        value = chunk.get(key)
+                        if value is None and isinstance(video_obj, dict):
+                            value = video_obj.get(key)
+                        if value is not None:
+                            video_entry[key] = value
+                    if len(video_entry) == 1 and isinstance(video_entry["url"], str):
+                        video_data.append(video_entry["url"])
                     else:
-                        # Keep structured info for backend, but template only sees {"type":"video"}
-                        video_data.append(
-                            {
-                                "url": video_obj["url"],
-                                "max_dynamic_patch": mdp,
-                            }
-                        )
+                        video_data.append(video_entry)
                     if chunk.get("modalities"):
                         modalities.append(chunk.get("modalities"))
-                    # Normalize to simple 'video' type for template compatibility
-                    processed_content_parts.append({"type": "video"})
+                    if _is_pre_sampled_video_frames(url):
+                        # WeLM native pre-sampled frames: keep the full block so
+                        # HF WeLM processors can read timestamps from the request.
+                        processed_content_parts.append(chunk)
+                    else:
+                        processed_content_parts.append({"type": "video"})
                 elif chunk_type == "audio_url":
                     audio_data.append(chunk["audio_url"]["url"])
                     # Normalize to simple 'audio' type

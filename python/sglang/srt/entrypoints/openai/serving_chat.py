@@ -232,6 +232,11 @@ class OpenAIServingChat(OpenAIServingBase):
             and hasattr(self.tokenizer_manager.model_config.hf_config, "model_type")
             and self.tokenizer_manager.model_config.hf_config.model_type == "gemma4"
         )
+        self.mm_prompt_input_type = getattr(
+            getattr(self.tokenizer_manager, "mm_processor", None),
+            "prompt_input_type",
+            "text",
+        )
 
         # Which Python-based chat encoder (if any) bypasses apply_chat_template.
         # Values: "dsv32", "dsv4", or None.
@@ -395,8 +400,17 @@ class OpenAIServingChat(OpenAIServingBase):
             tool_call_constraint=processed_messages.tool_call_constraint,
         )
 
+        use_mm_prompt_ids = (
+            is_multimodal
+            and self.mm_prompt_input_type == "token_ids"
+            and processed_messages.prompt_ids
+            and not isinstance(processed_messages.prompt_ids, str)
+        )
+
         # Handle single vs multiple requests
-        if is_multimodal:
+        if use_mm_prompt_ids:
+            prompt_kwargs = {"input_ids": processed_messages.prompt_ids}
+        elif is_multimodal:
             prompt_kwargs = {"text": processed_messages.prompt}
         else:
             if isinstance(processed_messages.prompt_ids, str):
@@ -478,12 +492,12 @@ class OpenAIServingChat(OpenAIServingBase):
             request.skip_special_tokens = False
             if not isinstance(request.tool_choice, str):
                 tools = [
-                    item.model_dump()
+                    item.model_dump(exclude_unset=True)
                     for item in request.tools
                     if item.function.name == request.tool_choice.function.name
                 ]
             else:
-                tools = [item.model_dump() for item in request.tools]
+                tools = [item.model_dump(exclude_unset=True) for item in request.tools]
             if self.tool_call_parser:
                 parser = FunctionCallParser(request.tools, self.tool_call_parser)
                 tool_call_constraint = parser.get_structure_constraint(
@@ -570,7 +584,9 @@ class OpenAIServingChat(OpenAIServingBase):
                 # insert an empty system prompt to help render tool system prompt
                 messages.insert(0, {"role": "system", "content": ""})
             if request.tools:
-                messages[0]["tools"] = [tool.model_dump() for tool in request.tools]
+                messages[0]["tools"] = [
+                    tool.model_dump(exclude_unset=True) for tool in request.tools
+                ]
 
             if self.chat_encoding_spec == "dsv4":
                 # V4 encoder only accepts "max" / "high" / None.
@@ -692,7 +708,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     prompt_ids, assistant_prefix
                 )
 
-            if is_multimodal:
+            if is_multimodal and self.mm_prompt_input_type != "token_ids":
                 prompt = self.tokenizer_manager.tokenizer.decode(prompt_ids)
 
         stop = request.stop

@@ -47,6 +47,7 @@ MIMO_V2_MODEL_ARCHS = (
 WELMV4_MODEL_ARCHS = (
     "WeLMV4MoeForCausalLM",
     "WeLMV4MoeForCausalLMNextN",
+    "WeLMV4VLMForConditionalGeneration",
 )
 MIMO_V2_MULTIMODAL_ARCHS = ("MiMoV2ForCausalLM",)
 
@@ -432,8 +433,13 @@ class ModelConfig:
             self.hf_config.architectures[0] = "DeepseekV4ForCausalLMNextN"
             self.hf_config.num_nextn_predict_layers = 1
 
-        if is_draft_model and self.hf_config.architectures[0] == "WeLMV4MoeForCausalLM":
+        if is_draft_model and self.hf_config.architectures[0] in [
+            "WeLMV4MoeForCausalLM",
+            "WeLMV4VLMForConditionalGeneration",
+        ]:
             self.hf_config.architectures[0] = "WeLMV4MoeForCausalLMNextN"
+            self.hf_config.num_target_hidden_layers = self.hf_config.num_hidden_layers
+            self.hf_config.num_hidden_layers = self.hf_config.num_nextn_predict_layers
 
         if is_draft_model and self.hf_config.architectures[0] in [
             "Glm4MoeForCausalLM",

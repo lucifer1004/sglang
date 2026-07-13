@@ -239,6 +239,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     && touch README.md \
     && touch LICENSE \
     && python3 -m pip install --extra-index-url https://download.pytorch.org/whl/cu${CUINDEX} ".[${BUILD_TYPE}]" \
+    && python3 -m pip install decord \
     && if [ "${CUDA_VERSION%%.*}" = "12" ]; then \
            pip list --format=freeze | awk -F'==' '/-cu13(==|$)/ {print $1}' \
                | xargs -r python3 -m pip uninstall -y && \

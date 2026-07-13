@@ -568,6 +568,45 @@ def _get_full_multimodal_text_prompt(
     return "\n".join([modality_token] * left + [text_prompt])
 
 
+# Optional video sampling / resize overrides forwarded to the multimodal
+# processors. Kept in sync with ``process_content_for_template_format`` in
+# ``jinja_template_utils`` so both request-parsing entrypoints behave the same.
+_VIDEO_PREPROCESS_FIELDS = (
+    "fps",
+    "num_frames",
+    "max_dynamic_patch",
+    "min_dynamic_patch",
+    "resized_height",
+    "resized_width",
+    "min_pixels",
+    "max_pixels",
+)
+
+
+def _video_part_to_video_item(content) -> Union[str, Dict]:
+    """Build a ``video_data`` item from an OpenAI ``video_url`` content part.
+
+    Mirrors ``process_content_for_template_format`` so the legacy conversation
+    path forwards the optional sampling / resize fields (``fps`` /
+    ``num_frames`` / ``resized_*`` / ``min_pixels`` / ``max_pixels`` /
+    dynamic-patch overrides) instead of silently dropping them. Flat fields on
+    the content part take precedence over the nested ``video_url`` fields, and
+    a bare URL string is returned when no extra fields are present.
+    """
+    video_url = content.video_url
+    url = getattr(video_url, "url", video_url)
+    video_item: Dict = {"url": url}
+    for key in _VIDEO_PREPROCESS_FIELDS:
+        value = getattr(content, key, None)
+        if value is None:
+            value = getattr(video_url, key, None)
+        if value is not None:
+            video_item[key] = value
+    if len(video_item) == 1 and isinstance(url, str):
+        return url
+    return video_item
+
+
 def generate_chat_conv(
     request: ChatCompletionRequest, template_name: str
 ) -> Conversation:
@@ -649,7 +688,7 @@ def generate_chat_conv(
                         )
                     elif content.type == "video_url":
                         real_content += video_token
-                        conv.append_video(content.video_url.url)
+                        conv.append_video(_video_part_to_video_item(content))
                     elif content.type == "audio_url":
                         real_content += audio_token
                         conv.append_audio(content.audio_url.url)
@@ -852,23 +891,6 @@ register_conv_template(
     )
 )
 
-# Reference: aligned with Qwen3-VL chat template (ChatML style with
-# <|im_start|>/<|im_end|> tokens) so the WeLM-v4 VLM /v1/chat/completions
-# endpoint emits prompts identical in shape to Qwen3-VL.
-register_conv_template(
-    Conversation(
-        name="welmv4-vlm",
-        system_message="You are a helpful assistant.",
-        system_template="<|im_start|>system\n{system_message}",
-        roles=("<|im_start|>user", "<|im_start|>assistant"),
-        sep="<|im_end|>\n",
-        sep_style=SeparatorStyle.ADD_NEW_LINE_SINGLE,
-        stop_str=["<|im_end|>"],
-        image_token="<|vision_start|><|image_pad|><|vision_end|>",
-        video_token="<|vision_start|><|video_pad|><|vision_end|>",
-    )
-)
-
 register_conv_template(
     Conversation(
         name="deepseek-ocr",
@@ -1042,7 +1064,6 @@ MODEL_TYPE_TO_TEMPLATE = {
     "minicpmo": "minicpmo",
     "moss_vl": "moss-vl",
     "deepseek-ocr": "deepseek-ocr",
-    "welmv4_vlm": "welmv4-vlm",
 }
 
 
@@ -1147,6 +1168,7 @@ def match_deepseek_ocr(model_path: str):
 
 
 @register_conv_template_matching_function
-def match_welmv4_vlm(model_path: str):
-    model_type = get_model_type(model_path)
-    return MODEL_TYPE_TO_TEMPLATE.get(model_type)
+def match_welmv4_vlm(_model_path: str):
+    # WeLM v4 VLM must use chat_template.jinja from the model directory,
+    # not a built-in SGLang conversation template.
+    return None
