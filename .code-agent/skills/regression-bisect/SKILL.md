@@ -1,11 +1,11 @@
 ---
-name: fix-bug
-description: Reproduce, bisect, and minimally fix software bugs or regressions. Use when Codex is asked to fix a bug, debug a regression, find the commit that introduced a bug, run git bisect, or make a low-risk bug fix while preserving the original intent and performance of the introducing change.
+name: regression-bisect
+description: Bisect regressions to their introducing commit and make a minimal fix that preserves the original intent and performance. Use when Codex is asked to reproduce and debug a regression, identify the first bad commit, run git bisect, or fix a regression without undoing the introducing change's intended behavior.
 ---
 
-# Fix Bug
+# Regression Bisect
 
-Use this workflow for bug fixes and regressions.
+Use this workflow for regressions that require history bisection and a minimal fix.
 
 ## Workflow
 
