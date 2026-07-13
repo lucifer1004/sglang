@@ -80,6 +80,12 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromTensorReqOutput,
     PostProcessWeightsReqInput,
     PostProcessWeightsReqOutput,
+    ReportShardTransferTargetReqInput,
+    ReportShardTransferTargetReqOutput,
+    InstallShardTransferPlanReqInput,
+    InstallShardTransferPlanReqOutput,
+    UpdateWeightsFromShardTransferReqInput,
+    UpdateWeightsFromShardTransferReqOutput,
 )
 from sglang.srt.server_args import LoRARef, ServerArgs
 from sglang.srt.utils import get_bool_env_var
@@ -103,6 +109,9 @@ _COMMUNICATOR_SPECS = [
     ),
     ("send_weights_to_remote_instance", SendWeightsToRemoteInstanceReqOutput),
     ("update_weights_from_tensor", UpdateWeightsFromTensorReqOutput),
+    ("report_shard_transfer_target", ReportShardTransferTargetReqOutput),
+    ("install_shard_transfer_plan", InstallShardTransferPlanReqOutput),
+    ("update_weights_from_shard_transfer", UpdateWeightsFromShardTransferReqOutput),
     ("update_weights_from_ipc", UpdateWeightsFromIPCReqOutput),
     ("post_process_weights", PostProcessWeightsReqOutput),
     ("get_weights_by_name", GetWeightsByNameReqOutput),
@@ -498,6 +507,48 @@ class TokenizerControlMixin:
             message += f" Weight version updated to {obj.weight_version}."
 
         return success, message
+
+    async def report_shard_transfer_target(
+        self: TokenizerManager,
+        obj: ReportShardTransferTargetReqInput,
+        request: Optional[fastapi.Request] = None,
+    ):
+        self.auto_create_handle_loop()
+        results = await self.report_shard_transfer_target_communicator(obj)
+        success, message = FanOutCommunicator.merge_results(results)
+        # Layout is a declaration, identical across DP ranks; take the leader's.
+        serialized_targets = results[0].serialized_targets if success else None
+        return success, message, serialized_targets
+
+    async def install_shard_transfer_plan(
+        self: TokenizerManager,
+        obj: InstallShardTransferPlanReqInput,
+        request: Optional[fastapi.Request] = None,
+    ) -> Tuple[bool, str]:
+        self.auto_create_handle_loop()
+        async with self.model_update_lock.writer_lock:
+            results = await self.install_shard_transfer_plan_communicator(obj)
+        return FanOutCommunicator.merge_results(results)
+
+    async def update_weights_from_shard_transfer(
+        self: TokenizerManager,
+        obj: UpdateWeightsFromShardTransferReqInput,
+        request: Optional[fastapi.Request] = None,
+    ):
+        self.auto_create_handle_loop()
+        async with self.model_update_lock.writer_lock:
+            results = await self.update_weights_from_shard_transfer_communicator(obj)
+        success, message = FanOutCommunicator.merge_results(results)
+        # Each scheduler response already aggregates its TP ranks. Shard transfer
+        # currently uses a single DP replica, so return that replica's totals.
+        leader = results[0]
+        stats = {
+            "entries": leader.entries,
+            "bytes": leader.bytes,
+            "seconds": leader.seconds,
+            "per_target": leader.per_target,
+        }
+        return success, message, stats
 
     async def update_weights_from_ipc(
         self: TokenizerManager,

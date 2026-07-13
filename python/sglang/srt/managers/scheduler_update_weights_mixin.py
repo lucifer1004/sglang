@@ -37,6 +37,12 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromIPCReqOutput,
     UpdateWeightsFromTensorReqInput,
     UpdateWeightsFromTensorReqOutput,
+    ReportShardTransferTargetReqInput,
+    ReportShardTransferTargetReqOutput,
+    InstallShardTransferPlanReqInput,
+    InstallShardTransferPlanReqOutput,
+    UpdateWeightsFromShardTransferReqInput,
+    UpdateWeightsFromShardTransferReqOutput,
 )
 
 if TYPE_CHECKING:
@@ -289,7 +295,15 @@ class SchedulerUpdateWeightsMixin:
 
     def check_weights(self: Scheduler, recv_req: CheckWeightsReqInput):
         try:
-            payload = self.tp_worker.model_runner.check_weights(action=recv_req.action)
+            if recv_req.include_draft:
+                payload = {
+                    name: mr.check_weights(action=recv_req.action)
+                    for name, mr in _iter_weight_model_runners(self)
+                }
+            else:
+                payload = self.tp_worker.model_runner.check_weights(
+                    action=recv_req.action
+                )
             return CheckWeightsReqOutput(
                 success=True, message="Success.", payload=payload
             )
@@ -297,6 +311,105 @@ class SchedulerUpdateWeightsMixin:
             logger.warning(f"check_weights see error: {e}")
             traceback.print_exc()
             return CheckWeightsReqOutput(success=False, message=f"{e}")
+
+    # ---- Shard transfer control plane ----
+
+    def report_shard_transfer_target(
+        self: Scheduler, recv_req: ReportShardTransferTargetReqInput
+    ):
+        from sglang.srt.managers.shard_transfer_backend import (
+            get_shard_transfer_backend,
+        )
+
+        try:
+            backend = get_shard_transfer_backend()
+            targets = dict(_iter_weight_model_runners(self))
+            return ReportShardTransferTargetReqOutput(
+                success=True,
+                message="Success.",
+                serialized_targets=backend.report_targets(targets),
+            )
+        except Exception as e:
+            logger.warning(f"report_shard_transfer_target see error: {e}")
+            traceback.print_exc()
+            return ReportShardTransferTargetReqOutput(success=False, message=f"{e}")
+
+    def install_shard_transfer_plan(
+        self: Scheduler, recv_req: InstallShardTransferPlanReqInput
+    ):
+        from sglang.srt.managers.shard_transfer_backend import (
+            get_shard_transfer_backend,
+        )
+
+        try:
+            message = get_shard_transfer_backend().install_plan(
+                recv_req.serialized_state, self.tp_rank
+            )
+            local = {
+                "success": True,
+                "message": message,
+            }
+        except Exception as e:
+            logger.warning(f"install_shard_transfer_plan see error: {e}")
+            traceback.print_exc()
+            local = {"success": False, "message": str(e)}
+
+        results = _gather_shard_transfer_rank_results(self.tp_cpu_group, local)
+        failures = _shard_transfer_failures(results, phase="install")
+        if failures:
+            return InstallShardTransferPlanReqOutput(
+                success=False, message=" | ".join(failures)
+            )
+        return InstallShardTransferPlanReqOutput(
+            success=True, message=results[0]["message"]
+        )
+
+    def update_weights_from_shard_transfer(
+        self: Scheduler, recv_req: UpdateWeightsFromShardTransferReqInput
+    ):
+        from sglang.srt.managers.shard_transfer_backend import (
+            get_shard_transfer_backend,
+        )
+
+        phase = "update"
+        try:
+            backend = get_shard_transfer_backend()
+            per_target = {}
+            for name, mr in _iter_weight_model_runners(self):
+                per_target[name] = backend.update_weights(name, mr)
+            if recv_req.flush_cache:
+                phase = "flush"
+                self.flush_cache_after_weight_update(recv_req)
+            local = {
+                "success": True,
+                "message": "Success.",
+                "per_target": per_target,
+            }
+        except Exception as e:
+            logger.warning(f"update_weights_from_shard_transfer see error: {e}")
+            traceback.print_exc()
+            local = {
+                "success": False,
+                "message": f"{phase}: {e}",
+                "per_target": {},
+            }
+
+        results = _gather_shard_transfer_rank_results(self.tp_cpu_group, local)
+        failures = _shard_transfer_failures(results)
+        if failures:
+            return UpdateWeightsFromShardTransferReqOutput(
+                success=False, message=" | ".join(failures)
+            )
+
+        entries, nbytes, seconds, per_target = _aggregate_shard_transfer_stats(results)
+        return UpdateWeightsFromShardTransferReqOutput(
+            success=True,
+            message=f"pulled {entries} entries, {nbytes / 1e9:.2f}GB in {seconds:.2f}s",
+            entries=entries,
+            bytes=nbytes,
+            seconds=seconds,
+            per_target=per_target,
+        )
 
     def save_remote_model(self: Scheduler, params):
         url = params["url"]
@@ -316,6 +429,57 @@ class SchedulerUpdateWeightsMixin:
             pattern=params["pattern"],
             max_size=params["max_size"],
         )
+
+
+def _iter_weight_model_runners(scheduler):
+    """Yield the main and optional draft model runners.
+
+    Draft resolution uses the scheduler's own ``_get_draft_model_runner`` so
+    the receiver side never has to guess sglang's internal spec-decode layout.
+    """
+    yield "main", scheduler.tp_worker.model_runner
+    draft_runner = scheduler._get_draft_model_runner()
+    if draft_runner is not None and draft_runner is not scheduler.tp_worker.model_runner:
+        yield "draft", draft_runner
+
+
+def _gather_shard_transfer_rank_results(group, local: dict) -> list[dict]:
+    results = [None] * torch.distributed.get_world_size(group=group)
+    torch.distributed.all_gather_object(results, local, group=group)
+    return results
+
+
+def _shard_transfer_failures(
+    results: list[dict], *, phase: str = "update"
+) -> list[str]:
+    return [
+        f"{phase} rank {rank}: {result['message']}"
+        for rank, result in enumerate(results)
+        if not result["success"]
+    ]
+
+
+def _aggregate_shard_transfer_stats(
+    results: list[dict],
+) -> tuple[int, int, float, dict]:
+    per_target = {}
+    rank_seconds = []
+    for result in results:
+        rank_seconds.append(
+            sum(stats["seconds"] for stats in result["per_target"].values())
+        )
+        for target, stats in result["per_target"].items():
+            total = per_target.setdefault(
+                target, {"entries": 0, "bytes": 0, "seconds": 0.0}
+            )
+            total["entries"] += stats["entries"]
+            total["bytes"] += stats["bytes"]
+            total["seconds"] = max(total["seconds"], stats["seconds"])
+
+    entries = sum(stats["entries"] for stats in per_target.values())
+    nbytes = sum(stats["bytes"] for stats in per_target.values())
+    seconds = max(rank_seconds, default=0.0)
+    return entries, nbytes, seconds, per_target
 
 
 def _export_static_state(model):

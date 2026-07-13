@@ -33,6 +33,7 @@ from sglang.srt.models.welmv4 import (
     _welm_select_kv_mirror_rows,
     _welm_should_contract_kv_mirror,
     _welm_update_contracted_dp_metadata,
+    welm_nextn_local_to_hf_name,
     welm_use_previous_precision,
 )
 from sglang.srt.server_args import get_global_server_args
@@ -293,6 +294,7 @@ class WeLMV4ModelNextN(nn.Module):
                         self.oe_vocab_sizes[i],
                         self.oe_dim,
                         use_attn_tp_group=is_dp_attention_enabled(),
+                        padding_size=get_global_server_args().welm_vocab_padding_size,
                     )
                     for i in range(len(self.oe_vocab_sizes))
                 ]
@@ -812,6 +814,9 @@ class WeLMV4MoeForCausalLMNextN(WeLMV4MoeForCausalLM):
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         super().load_weights(weights, is_nextn=True)
+
+    def get_hf_weight_name(self, local_name: str) -> Optional[str]:
+        return welm_nextn_local_to_hf_name(self.config, local_name)
 
 
 EntryClass = WeLMV4MoeForCausalLMNextN

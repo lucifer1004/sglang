@@ -887,6 +887,11 @@ class ServerArgs:
     # For WeLM over encoding / KV mirror local optimizations
     enable_over_encoding: bool = False
     enable_welm_kv_mirror_opt: bool = False
+    # WeLM vocab embedding padding multiple. Default mirrors sglang's
+    # DEFAULT_VOCAB_PADDING_SIZE (layers.vocab_parallel_embedding); slime's
+    # shard transfer passes 128 to align with mmq checkpoint's 128-padded vocab.
+    # Not imported here to keep server_args import-light; keep in sync with source.
+    welm_vocab_padding_size: int = 64
     prepare_n_gram_inputs: bool = False
     enable_suffix_parallel: bool = False
     suffix_parallel_size: int = 0
@@ -7532,6 +7537,14 @@ class ServerArgs:
             action="store_true",
             dest="enable_welm_kv_mirror_opt",
             help="Deprecated: use --enable-welm-kv-mirror-opt instead.",
+        )
+        parser.add_argument(
+            "--welm-vocab-padding-size",
+            type=int,
+            default=ServerArgs.welm_vocab_padding_size,
+            help="WeLM vocab embedding padding multiple. Default matches sglang's "
+            "DEFAULT_VOCAB_PADDING_SIZE; slime shard transfer passes 128 to align "
+            "with mmq checkpoint's 128-padded vocab.",
         )
         parser.add_argument(
             "--prepare-n-gram-inputs",

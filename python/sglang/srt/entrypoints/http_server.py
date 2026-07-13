@@ -141,6 +141,9 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromTensorReqInput,
     UpdateWeightVersionReqInput,
     PostProcessWeightsReqInput,
+    ReportShardTransferTargetReqInput,
+    InstallShardTransferPlanReqInput,
+    UpdateWeightsFromShardTransferReqInput,
     VertexGenerateReqInput,
 )
 from sglang.srt.managers.multi_tokenizer_mixin import (
@@ -1223,6 +1226,57 @@ async def update_weights_from_distributed(
         return ORJSONResponse(content, status_code=200)
     else:
         return ORJSONResponse(content, status_code=HTTPStatus.BAD_REQUEST)
+
+
+@app.post("/report_shard_transfer_target")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def report_shard_transfer_target(
+    obj: ReportShardTransferTargetReqInput, request: Request
+):
+    """Report each live target's layout for shard-transfer plan compilation."""
+    success, message, serialized_targets = (
+        await _global_state.tokenizer_manager.report_shard_transfer_target(obj, request)
+    )
+    content = {
+        "success": success,
+        "message": message,
+        "serialized_targets": serialized_targets,
+    }
+    return ORJSONResponse(
+        content, status_code=200 if success else HTTPStatus.BAD_REQUEST
+    )
+
+
+@app.post("/install_shard_transfer_plan")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def install_shard_transfer_plan(
+    obj: InstallShardTransferPlanReqInput, request: Request
+):
+    """Install the connect-time active shard-transfer plan and backup addresses."""
+    success, message = (
+        await _global_state.tokenizer_manager.install_shard_transfer_plan(obj, request)
+    )
+    content = {"success": success, "message": message}
+    return ORJSONResponse(
+        content, status_code=200 if success else HTTPStatus.BAD_REQUEST
+    )
+
+
+@app.post("/update_weights_from_shard_transfer")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def update_weights_from_shard_transfer(
+    obj: UpdateWeightsFromShardTransferReqInput, request: Request
+):
+    """Trigger workers to pull, replay and load their slice of the active plan."""
+    success, message, stats = (
+        await _global_state.tokenizer_manager.update_weights_from_shard_transfer(
+            obj, request
+        )
+    )
+    content = {"success": success, "message": message, **stats}
+    return ORJSONResponse(
+        content, status_code=200 if success else HTTPStatus.BAD_REQUEST
+    )
 
 
 @app.post("/update_weights_from_ipc")

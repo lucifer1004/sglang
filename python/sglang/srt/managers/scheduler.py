@@ -147,6 +147,9 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromIPCReqInput,
     UpdateWeightsFromTensorReqInput,
     PostProcessWeightsReqInput,
+    ReportShardTransferTargetReqInput,
+    InstallShardTransferPlanReqInput,
+    UpdateWeightsFromShardTransferReqInput,
 )
 from sglang.srt.managers.mm_utils import (
     has_shm_features,
@@ -1571,6 +1574,18 @@ class Scheduler(
                 ),
                 (UpdateWeightsFromTensorReqInput, self.update_weights_from_tensor),
                 (UpdateWeightsFromIPCReqInput, self.update_weights_from_ipc),
+                (
+                    ReportShardTransferTargetReqInput,
+                    self.report_shard_transfer_target,
+                ),
+                (
+                    InstallShardTransferPlanReqInput,
+                    self.install_shard_transfer_plan,
+                ),
+                (
+                    UpdateWeightsFromShardTransferReqInput,
+                    self.update_weights_from_shard_transfer,
+                ),
                 (PostProcessWeightsReqInput, self.post_process_weights),
                 (GetWeightsByNameReqInput, self.get_weights_by_name),
                 (ReleaseMemoryOccupationReqInput, self.release_memory_occupation),

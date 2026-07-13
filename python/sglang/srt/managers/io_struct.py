@@ -1521,6 +1521,55 @@ class UpdateWeightsFromTensorReqOutput(BaseReq):
     message: str
 
 
+# ---- Shard transfer control plane ----
+# The receiver-side implementation lives in a slime plugin registered as a
+# shard-transfer backend; these are the stable request/response shells.
+
+
+@dataclass
+class ReportShardTransferTargetReqInput(BaseReq):
+    pass
+
+
+@dataclass
+class ReportShardTransferTargetReqOutput(BaseReq):
+    success: bool
+    message: str
+    # Opaque, versioned payload owned by the registered backend.
+    serialized_targets: Optional[str] = None
+
+
+@dataclass
+class InstallShardTransferPlanReqInput(BaseReq):
+    # Opaque, versioned connect-time payload owned by the registered backend.
+    serialized_state: str
+
+
+@dataclass
+class InstallShardTransferPlanReqOutput(BaseReq):
+    success: bool
+    message: str
+
+
+@dataclass
+class UpdateWeightsFromShardTransferReqInput(BaseReq):
+    # Step-time trigger; reuses the active plan installed at connect. Only
+    # carries per-step flags, never addresses.
+    flush_cache: bool = True
+    torch_empty_cache: bool = False
+
+
+@dataclass
+class UpdateWeightsFromShardTransferReqOutput(BaseReq):
+    success: bool
+    message: str
+    entries: int = 0
+    bytes: int = 0
+    seconds: float = 0.0
+    # {target_name: {"entries": int, "bytes": int, "seconds": float}}
+    per_target: Optional[Dict[str, Any]] = None
+
+
 @dataclass
 class InitWeightsSendGroupForRemoteInstanceReqInput(BaseReq):
     # The master address
@@ -1683,6 +1732,7 @@ class ResumeMemoryOccupationReqOutput(BaseReq):
 @dataclass
 class CheckWeightsReqInput(BaseReq):
     action: str
+    include_draft: bool = False
 
 
 @dataclass

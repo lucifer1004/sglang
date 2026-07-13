@@ -3287,6 +3287,7 @@ class Qwen2MoeModel(nn.Module):
                         self.oe_vocab_sizes[i],
                         self.oe_dim,
                         use_attn_tp_group=is_dp_attention_enabled(),
+                        padding_size=get_global_server_args().welm_vocab_padding_size,
                     )
                     for i in range(len(self.oe_vocab_sizes))
                 ]
@@ -3306,6 +3307,7 @@ class Qwen2MoeModel(nn.Module):
                         config.vocab_size,
                         config.hidden_size,
                         use_attn_tp_group=is_dp_attention_enabled(),
+                        padding_size=get_global_server_args().welm_vocab_padding_size,
                     )
                     for _ in range(self.scale_seq_times)
                 ]
@@ -3319,6 +3321,7 @@ class Qwen2MoeModel(nn.Module):
                                     self.oe_vocab_sizes[j],
                                     self.oe_dim,
                                     use_attn_tp_group=is_dp_attention_enabled(),
+                                    padding_size=get_global_server_args().welm_vocab_padding_size,
                                 )
                                 for j in range(len(self.oe_vocab_sizes))
                             ]
@@ -3343,6 +3346,7 @@ class Qwen2MoeModel(nn.Module):
                 config.vocab_size,
                 config.hidden_size,
                 use_attn_tp_group=is_dp_attention_enabled(),
+                padding_size=get_global_server_args().welm_vocab_padding_size,
                 prefix=add_prefix("embed_tokens", prefix),
             )
         else:
@@ -3615,6 +3619,53 @@ class Qwen2MoeModel(nn.Module):
         return hidden_states, aux_hidden_states
 
 
+_WELM_NEXTN_PROJECTOR_NAMES = {
+    "shared_head.norm": "ln_f",
+    "eh_proj": "eh_proj",
+    "enorm": "enorm",
+    "hnorm": "hnorm",
+}
+
+
+def _welm_nextn_target_layer_count(config: PretrainedConfig) -> int:
+    count = getattr(config, "num_target_hidden_layers", None)
+    return int(config.num_hidden_layers if count is None else count)
+
+
+def _welm_nextn_hf_to_local_name(
+    name: str, num_target_layers: int
+) -> Tuple[str, bool]:
+    parts = name.split(".")
+    step = int(parts[2]) - num_target_layers
+    remainder = ".".join(parts[3:])
+    for hf_name, local_name in _WELM_NEXTN_PROJECTOR_NAMES.items():
+        if hf_name in remainder:
+            remainder = remainder.replace(hf_name, local_name, 1)
+            return f"model.projectors.{step}.{remainder}", True
+    return f"model.decoder_layers.{step}.{remainder}", False
+
+
+def welm_nextn_local_to_hf_name(
+    config: PretrainedConfig, name: str
+) -> Optional[str]:
+    if name in ("", "model"):
+        return name
+
+    match = re.match(r"model\.decoder_layers\.(\d+)\.(.*)", name)
+    if match:
+        layer = _welm_nextn_target_layer_count(config) + int(match.group(1))
+        return f"model.layers.{layer}.{match.group(2)}"
+
+    match = re.match(r"model\.projectors\.(\d+)\.(.*)", name)
+    if not match:
+        return None
+    layer = _welm_nextn_target_layer_count(config) + int(match.group(1))
+    remainder = match.group(2)
+    if remainder == "ln_f" or remainder.startswith("ln_f."):
+        remainder = remainder.replace("ln_f", "shared_head.norm", 1)
+    return f"model.layers.{layer}.{remainder}"
+
+
 class WeLMV4MoeForCausalLM(nn.Module):
     fall_back_to_pt_during_load = False
 
@@ -3641,6 +3692,7 @@ class WeLMV4MoeForCausalLM(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("lm_head", prefix),
             use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
+            padding_size=get_global_server_args().welm_vocab_padding_size,
         )
         self.logits_processor = LogitsProcessor(config)
         # For EAGLE3 support
@@ -3842,11 +3894,7 @@ class WeLMV4MoeForCausalLM(nn.Module):
         if is_nextn:
             if hasattr(self.config, "num_nextn_predict_layers"):
                 num_nextn_layers = self.config.num_nextn_predict_layers
-                num_target_layers = getattr(
-                    self.config,
-                    "num_target_hidden_layers",
-                    self.config.num_hidden_layers,
-                )
+                num_target_layers = _welm_nextn_target_layer_count(self.config)
             else:
                 raise ValueError("num_nextn_predict_layers is not in the config")
 
@@ -3900,12 +3948,6 @@ class WeLMV4MoeForCausalLM(nn.Module):
             return True
 
         if is_nextn:
-            nextn_spec_weight_names = [
-                "shared_head.norm",
-                "eh_proj",
-                "enorm",
-                "hnorm",
-            ]
             is_welm_mtp_nextn = bool(
                 getattr(self.config, "architectures", [None])[0]
                 == "WeLMV4MoeForCausalLMNextN"
@@ -3950,35 +3992,31 @@ class WeLMV4MoeForCausalLM(nn.Module):
                 if "shared_head.head" in name or "embed_tokens" in name:
                     continue
 
-                is_decoder = True
-                # For nextn specific weights
-                for weight_name in nextn_spec_weight_names:
-                    if weight_name in name:
-                        if is_welm_mtp_nextn:
-                            step = layer_idx - num_target_layers
-                            seen_nextn_projector_steps.add(step)
-                            remainder = ".".join(name_list[3:])
-                            if "shared_head.norm" in remainder:
-                                remainder = remainder.replace(
-                                    "shared_head.norm", "ln_f"
-                                )
-                            name = f"model.projectors.{step}.{remainder}"
-                        else:
-                            name = ".".join(["model", *name_list[3:]])
-                        is_decoder = False
-                        break
-                # For decoder layer weights
-                if is_decoder:
-                    if is_welm_mtp_nextn:
-                        seen_nextn_decoder_steps.add(layer_idx - num_target_layers)
-                    name = ".".join(
-                        [
-                            "model",
-                            "decoder_layers",
-                            str(layer_idx - num_target_layers),
-                            *name_list[3:],
-                        ]
+                if is_welm_mtp_nextn:
+                    name, is_projector = _welm_nextn_hf_to_local_name(
+                        name, num_target_layers
                     )
+                    step = layer_idx - num_target_layers
+                    if is_projector:
+                        seen_nextn_projector_steps.add(step)
+                    else:
+                        seen_nextn_decoder_steps.add(step)
+                else:
+                    is_decoder = True
+                    for weight_name in _WELM_NEXTN_PROJECTOR_NAMES:
+                        if weight_name in name:
+                            name = ".".join(["model", *name_list[3:]])
+                            is_decoder = False
+                            break
+                    if is_decoder:
+                        name = ".".join(
+                            [
+                                "model",
+                                "decoder_layers",
+                                str(layer_idx - num_target_layers),
+                                *name_list[3:],
+                            ]
+                        )
             layer_id = get_layer_id(name)
             if (
                 layer_id is not None
