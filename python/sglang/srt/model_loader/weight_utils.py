@@ -16,6 +16,7 @@ import os
 import re
 import struct
 import tempfile
+import time
 from collections import defaultdict
 from pathlib import Path
 from typing import (
@@ -875,6 +876,38 @@ def _prefetch_all_checkpoints(
         )
 
     threading.Thread(target=_run_prefetch, daemon=True).start()
+
+
+def prefetch_all_checkpoints_sync(
+    sorted_files: List[str], num_threads: int = 4
+) -> None:
+    """Populate the node page cache once before mmap-based weight loading.
+
+    Local ranks split the shard list, then synchronize so every rank observes
+    a warm shared page cache. This is intentionally opt-in at the call site.
+    """
+    if torch.distributed.is_initialized():
+        world_group = get_world_group()
+        local_rank = world_group.local_rank
+        local_world_size = world_group.local_size or world_group.world_size
+    else:
+        local_rank = 0
+        local_world_size = 1
+
+    my_files = sorted_files[local_rank::local_world_size]
+    start = time.perf_counter()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=num_threads) as executor:
+        list(executor.map(_prefetch_checkpoint_file, my_files))
+
+    if torch.distributed.is_initialized():
+        world_group.barrier()
+    logger.info(
+        "Rank %d: synchronous checkpoint prefetch finished (%d/%d shards) in %.2fs",
+        local_rank,
+        len(my_files),
+        len(sorted_files),
+        time.perf_counter() - start,
+    )
 
 
 def _drop_file_cache_after_load(path: str) -> None:

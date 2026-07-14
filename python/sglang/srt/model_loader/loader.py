@@ -102,6 +102,7 @@ from sglang.srt.model_loader.weight_utils import (
     maybe_add_mtp_safetensors,
     multi_thread_pt_weights_iterator,
     np_cache_weights_iterator,
+    prefetch_all_checkpoints_sync,
     pt_weights_iterator,
     safetensors_weights_iterator,
     set_runai_streamer_env,
@@ -533,6 +534,11 @@ class DefaultModelLoader(BaseModelLoader):
             weight_loader_drop_cache_after_load = (
                 server_args.weight_loader_drop_cache_after_load
             )
+
+            if get_bool_env_var("SGLANG_SYNC_WEIGHT_PREFETCH"):
+                prefetch_all_checkpoints_sync(
+                    sorted(hf_weights_files), num_threads=prefetch_num_threads
+                )
 
             if self.load_config.load_format == LoadFormat.FASTSAFETENSORS:
                 weights_iterator = fastsafetensors_weights_iterator(
