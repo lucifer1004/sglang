@@ -399,7 +399,7 @@ class DecodeInputBuffers(ForwardInputBuffers):
         raw_bs: int,
         raw_num_token: int,
         bs: int,
-        seq_len_fill_value: int,
+        seq_len_padding_value: int,
         require_gathered_buffer: bool,
         num_tokens_per_bs: int,
         nsa_enable_prefill_cp: bool,
@@ -407,7 +407,7 @@ class DecodeInputBuffers(ForwardInputBuffers):
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ):
         if bs != raw_bs:
-            self.seq_lens.fill_(seq_len_fill_value)
+            self.seq_lens.fill_(seq_len_padding_value)
             self.out_cache_loc.zero_()
             # Padded SWA indices left over from a previous replay would point
             # into real SWA slots, so set_kv_buffer on padded tokens would
@@ -595,7 +595,7 @@ class DecodeInputBuffers(ForwardInputBuffers):
         # CPU tensor copy (cannot be batched with GPU tensors).
         if forward_batch.seq_lens_cpu is not None:
             if bs != raw_bs:
-                self.seq_lens_cpu.fill_(seq_len_fill_value)
+                self.seq_lens_cpu.fill_(seq_len_padding_value)
             self.seq_lens_cpu[:raw_bs].copy_(forward_batch.seq_lens_cpu)
 
 
@@ -1199,13 +1199,20 @@ class CudaGraphRunner:
         is_attn_cp_sharded_kv = bool(
             getattr(self.attn_backend, "is_attn_cp_sharded_kv", False)
         )
+        full_context_fallback_bs = self._build_full_context_fallback_batch_sizes()
+        skew_bucket_bs = self._build_skew_bucket_batch_sizes(
+            full_context_fallback_bs
+        )
         values: Dict[int, List[int]] = {}
         prev_bs = 0
         # AttnCP sharded-KV selects a CUDA graph by max(seq_lens), while KV
         # residency is constrained by sum(seq_lens). Long-context eval batches
-        # can therefore be highly skewed. Capture the extra long buckets only
-        # for that backend; other modes keep the standard bucket plan.
-        skew_bucket_max_bs = 64
+        # can therefore be arbitrarily skewed. A sparse, geometrically spaced
+        # batch frontier captures the full context length, guaranteeing a graph
+        # for every supported batch and sequence length with at most roughly 2x
+        # batch padding. Add the common 2:1-skew bucket only immediately after
+        # each frontier point, where it avoids the largest padding jump without
+        # adding one whole-model graph for every captured batch size.
         for bs in sorted(int(x) for x in self.capture_bs):
             bs_int = max(1, int(bs))
             min_real_bs = bs_int if self.disable_padding else prev_bs + 1
@@ -1230,19 +1237,14 @@ class CudaGraphRunner:
                 buckets.append(buckets[-1] * 2)
             if buckets[-1] != cap:
                 buckets.append(cap)
-            use_attncp_skew_buckets = (
-                is_attn_cp_sharded_kv and bs_int <= skew_bucket_max_bs
-            )
-            if use_attncp_skew_buckets and skew_cap > cap:
+            if (
+                is_attn_cp_sharded_kv
+                and bs_int in skew_bucket_bs
+                and skew_cap > cap
+            ):
                 buckets.append(skew_cap)
-            if use_attncp_skew_buckets:
-                long_cap = max_seq_cap
-                next_bucket = max(buckets)
-                while next_bucket * 2 < long_cap:
-                    next_bucket *= 2
-                    buckets.append(next_bucket)
-                if long_cap > max(buckets):
-                    buckets.append(long_cap)
+            if is_attn_cp_sharded_kv and bs_int in full_context_fallback_bs:
+                buckets.append(max_seq_cap)
             values[bs_int] = sorted(
                 {
                     self._align_seq_len_bucket(max(1, x), page_size, max_seq_cap)
@@ -1251,6 +1253,52 @@ class CudaGraphRunner:
             )
             prev_bs = bs_int
         return values
+
+    def _build_full_context_fallback_batch_sizes(self) -> set[int]:
+        """Choose a sparse batch frontier that covers all padded batch sizes.
+
+        Each successive fallback graph is the largest captured batch no more
+        than twice the previous one. Runtime selection may move to a larger
+        batch graph when the closest graph lacks the requested sequence cap.
+        """
+        capture_bs = sorted({max(1, int(bs)) for bs in self.capture_bs})
+        if not capture_bs:
+            return set()
+        if self.disable_padding:
+            return set(capture_bs)
+
+        fallback_bs = {capture_bs[0]}
+        current = capture_bs[0]
+        while current < capture_bs[-1]:
+            within_bound = [bs for bs in capture_bs if current < bs <= 2 * current]
+            if within_bound:
+                next_bs = within_bound[-1]
+            else:
+                next_bs = next(bs for bs in capture_bs if bs > current)
+            fallback_bs.add(next_bs)
+            current = next_bs
+        return fallback_bs
+
+    def _build_skew_bucket_batch_sizes(
+        self, full_context_fallback_bs: set[int]
+    ) -> set[int]:
+        """Place skew buckets only at costly full-frontier transitions.
+
+        The first captured batch after a full-context frontier point represents
+        the narrow range where falling through to the next frontier would add
+        the most batch padding. Frontier points themselves already have the
+        full-context graph, so they do not need a separate skew bucket.
+        """
+        if self.disable_padding:
+            return set()
+
+        capture_bs = sorted({max(1, int(bs)) for bs in self.capture_bs})
+        skew_bucket_bs = {
+            capture_bs[index + 1]
+            for index, bs in enumerate(capture_bs[:-1])
+            if bs in full_context_fallback_bs
+        }
+        return skew_bucket_bs - full_context_fallback_bs
 
     @staticmethod
     def _align_seq_len_bucket(
@@ -1278,6 +1326,53 @@ class CudaGraphRunner:
         if index >= len(buckets):
             return None
         return buckets[index]
+
+    def _select_graph_shape(
+        self, cuda_graph_bs: int, max_seq_len: Optional[int] = None
+    ) -> Tuple[Optional[int], Optional[int]]:
+        """Select the closest captured (batch, sequence-cap) graph shape.
+
+        Sequence buckets are not necessarily present at every batch size. If
+        the closest padded batch cannot cover a long sequence, continue to a
+        larger batch on the full-context fallback frontier.
+        """
+        requested_bs = int(cuda_graph_bs)
+        if self.disable_padding:
+            candidate_bs = [requested_bs] if requested_bs in self.capture_bs else []
+        else:
+            index = bisect.bisect_left(self.capture_bs, requested_bs)
+            candidate_bs = self.capture_bs[index:]
+
+        for graph_bs in candidate_bs:
+            seq_len_bucket = self._select_seq_len_fill_value_for_bs(
+                graph_bs,
+                max_seq_len if self.enable_seq_len_graph_buckets else None,
+            )
+            if seq_len_bucket is not None:
+                return int(graph_bs), int(seq_len_bucket)
+        return None, None
+
+    def _prepare_seq_lens_for_capture(
+        self,
+        seq_lens: torch.Tensor,
+        seq_lens_cpu: torch.Tensor,
+        seq_len_fill_value: int,
+    ) -> None:
+        """Materialize the graph shape without making every row long.
+
+        One row establishes the static maximum sequence dimension. Empty rows
+        are safe for AttnCP's zero dummy slot and keep full-context fallback
+        graph capture proportional to one long sequence instead of bs long
+        sequences.
+        """
+        if self.enable_seq_len_graph_buckets:
+            seq_lens.zero_()
+            seq_lens_cpu.zero_()
+            seq_lens[0] = int(seq_len_fill_value)
+            seq_lens_cpu[0] = int(seq_len_fill_value)
+        else:
+            seq_lens.fill_(int(seq_len_fill_value))
+            seq_lens_cpu.fill_(int(seq_len_fill_value))
 
     def _graph_seq_len_key(self, seq_len_fill_value: Optional[int]) -> Optional[int]:
         return int(seq_len_fill_value) if self.enable_seq_len_graph_buckets else None
@@ -1330,28 +1425,16 @@ class CudaGraphRunner:
         else:
             cuda_graph_bs = forward_batch.batch_size
 
-        if self.disable_padding:
-            graph_bs = int(cuda_graph_bs)
-        else:
-            index = bisect.bisect_left(self.capture_bs, cuda_graph_bs)
-            graph_bs = (
-                int(self.capture_bs[index]) if index < len(self.capture_bs) else None
-            )
-
         max_seq_len = None
-        seq_len_bucket = None
-        if graph_bs is not None:
-            if self.enable_seq_len_graph_buckets:
-                seq_lens_cpu = forward_batch.seq_lens_cpu
-                if hasattr(seq_lens_cpu, "max"):
-                    max_seq_len = int(seq_lens_cpu.max().item())
-                else:
-                    max_seq_len = int(max(seq_lens_cpu))
-                seq_len_bucket = self._select_seq_len_fill_value_for_bs(
-                    graph_bs, max_seq_len
-                )
+        if self.enable_seq_len_graph_buckets:
+            seq_lens_cpu = forward_batch.seq_lens_cpu
+            if hasattr(seq_lens_cpu, "max"):
+                max_seq_len = int(seq_lens_cpu.max().item())
             else:
-                seq_len_bucket = self._select_seq_len_fill_value_for_bs(graph_bs)
+                max_seq_len = int(max(seq_lens_cpu))
+        graph_bs, seq_len_bucket = self._select_graph_shape(
+            cuda_graph_bs, max_seq_len
+        )
 
         if forward_batch.return_logprob and getattr(
             attn_backend, "is_attn_cp_sharded_kv", False
@@ -1592,8 +1675,9 @@ class CudaGraphRunner:
         req_pool_indices = buffers.req_pool_indices[:bs]
         seq_lens = buffers.seq_lens[:bs]
         seq_lens_cpu = buffers.seq_lens_cpu[:bs]
-        seq_lens.fill_(seq_len_fill_value)
-        seq_lens_cpu.fill_(seq_len_fill_value)
+        self._prepare_seq_lens_for_capture(
+            seq_lens, seq_lens_cpu, seq_len_fill_value
+        )
         out_cache_loc = buffers.out_cache_loc[:num_tokens]
         positions = buffers.positions[:num_tokens]
         if self.is_encoder_decoder:
@@ -1928,41 +2012,40 @@ class CudaGraphRunner:
         # Pad
         if self.require_mlp_tp_gather:
             max_num_tokens = max(forward_batch.global_num_tokens_cpu)
-            max_batch_size = (
+            requested_graph_bs = (
                 max_num_tokens / self.num_tokens_per_bs
                 if self.model_runner.spec_algorithm.is_eagle()
                 or self.model_runner.spec_algorithm.is_standalone()
                 or self.model_runner.spec_algorithm.is_dflash()
                 else max_num_tokens
             )
-            index = bisect.bisect_left(self.capture_bs, max_batch_size)
         else:
-            index = bisect.bisect_left(self.capture_bs, raw_bs)
-        bs = self.capture_bs[index]
+            requested_graph_bs = raw_bs
         if self.enable_seq_len_graph_buckets:
             if forward_batch.seq_lens_cpu is not None:
                 max_seq_len = int(forward_batch.seq_lens_cpu.max().item())
             else:
                 max_seq_len = int(forward_batch.seq_lens.max().item())
-            seq_len_fill_value = self._select_seq_len_fill_value_for_bs(
-                bs, max_seq_len
-            )
         else:
             max_seq_len = None
-            seq_len_fill_value = self._select_seq_len_fill_value_for_bs(bs)
-        if seq_len_fill_value is None:
+        bs, seq_len_fill_value = self._select_graph_shape(
+            requested_graph_bs, max_seq_len
+        )
+        if bs is None or seq_len_fill_value is None:
             raise RuntimeError(
-                "CUDA graph replay requested without a captured sequence bucket: "
-                f"bs={bs}, max_seq_len={max_seq_len}, "
-                f"buckets={self._seq_len_fill_values_for_bs(bs)}"
+                "CUDA graph replay requested without a captured graph shape: "
+                f"requested_bs={requested_graph_bs}, max_seq_len={max_seq_len}"
             )
+        seq_len_padding_value = (
+            0 if self.enable_seq_len_graph_buckets else seq_len_fill_value
+        )
 
         buffers.populate_from_forward_batch(
             forward_batch=forward_batch,
             raw_bs=raw_bs,
             raw_num_token=raw_num_token,
             bs=bs,
-            seq_len_fill_value=seq_len_fill_value,
+            seq_len_padding_value=seq_len_padding_value,
             require_gathered_buffer=self.require_gathered_buffer,
             num_tokens_per_bs=self.num_tokens_per_bs,
             nsa_enable_prefill_cp=self.nsa_enable_prefill_cp,
@@ -2083,7 +2166,7 @@ class CudaGraphRunner:
                 bs,
                 buffers.req_pool_indices[:bs],
                 buffers.seq_lens[:bs],
-                forward_batch.seq_lens_sum + (bs - raw_bs) * seq_len_fill_value,
+                forward_batch.seq_lens_sum + (bs - raw_bs) * seq_len_padding_value,
                 buffers.encoder_lens[:bs] if self.is_encoder_decoder else None,
                 self.capture_forward_mode,
                 forward_batch.spec_info,
