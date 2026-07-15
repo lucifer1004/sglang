@@ -160,9 +160,7 @@ def test_welm_oe_decode_hash_accepts_graph_buffer_view():
     )
 
     input_ids = input_ids_cpu.to(device)
-    graph_buffer = torch.empty(
-        (len(oe_grams), 16), dtype=torch.int64, device=device
-    )
+    graph_buffer = torch.empty((len(oe_grams), 16), dtype=torch.int64, device=device)
     hashed_out = graph_buffer[:, : input_ids.numel()]
 
     assert not hashed_out.is_contiguous()
@@ -566,6 +564,87 @@ def test_welm_oe_draft_extend_after_verify_hash_from_history(
     torch.cuda.synchronize()
 
     assert torch.equal(hashed_out.cpu(), expected_hash)
+    assert torch.equal(next_history.cpu(), expected_history)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("input_dtype", [torch.int64, torch.int32])
+def test_welm_oe_draft_extend_accepts_packed_ragged_inputs(input_dtype):
+    device = "cuda"
+    vocab_size = 32017
+    oe_grams = (2, 3, 4)
+    oe_vocab_sizes = (257, 263, 269)
+    draft_token_num = 4
+    accept_lens_cpu = [2, 1, 4]
+    dense_input_ids_cpu = torch.tensor(
+        [31, 32, 32, 32, 41, 41, 41, 41, 51, 52, 53, 54],
+        dtype=torch.int64,
+    )
+    packed_input_ids_cpu = torch.tensor([31, 32, 41, 51, 52, 53, 54], dtype=torch.int64)
+    accepted_cpu = torch.tensor(
+        [
+            [20, 21, -1, -1],
+            [-1, 30, -1, -1],
+            [40, 41, 42, 43],
+        ],
+        dtype=torch.int64,
+    )
+    entry_history_cpu = torch.tensor(
+        [
+            [10, 11, 12, 20],
+            [20, 21, 22, 30],
+            [30, 31, 32, 40],
+        ],
+        dtype=torch.int64,
+    )
+    dense_hash, expected_history = (
+        _reference_draft_extend_after_verify_hash_from_history(
+            dense_input_ids_cpu,
+            accepted_cpu.tolist(),
+            accept_lens_cpu,
+            entry_history_cpu,
+            oe_grams,
+            oe_vocab_sizes,
+            vocab_size,
+            draft_token_num,
+            True,
+        )
+    )
+    expected_packed_hash = torch.cat(
+        [
+            dense_hash[:, row * draft_token_num : row * draft_token_num + length]
+            for row, length in enumerate(accept_lens_cpu)
+        ],
+        dim=1,
+    )
+
+    packed_input_ids = packed_input_ids_cpu.to(device=device, dtype=input_dtype)
+    accepted = accepted_cpu.to(device=device, dtype=input_dtype)
+    accept_lens = torch.tensor(accept_lens_cpu, dtype=torch.int64, device=device)
+    entry_history = entry_history_cpu.to(device=device)
+    hashed_out = torch.empty(
+        (len(oe_grams), packed_input_ids.numel()),
+        dtype=torch.int64,
+        device=device,
+    )
+    next_history = torch.empty_like(entry_history)
+
+    welm_oe_hash_mtp_draft_extend_after_verify_from_history_cuda(
+        packed_input_ids,
+        accepted,
+        accept_lens,
+        entry_history,
+        oe_grams,
+        oe_vocab_sizes,
+        hashed_out,
+        next_history,
+        vocab_size,
+        draft_token_num,
+        use_entry_history_for_extend_hash_prefix=True,
+    )
+    torch.cuda.synchronize()
+
+    assert torch.equal(hashed_out.cpu(), expected_packed_hash)
     assert torch.equal(next_history.cpu(), expected_history)
 
 

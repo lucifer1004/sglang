@@ -111,6 +111,7 @@ if triton is not None:
         local_values_ptr,
         local_indices_ptr,
         temperature_ptr,
+        top_p_ptr,
         uniform_ptr,
         sampled_probs_ptr,
         sampled_indices_ptr,
@@ -119,6 +120,7 @@ if triton is not None:
         num_blocks: tl.constexpr,
         topk: tl.constexpr,
         reduce_block: tl.constexpr,
+        use_top_p: tl.constexpr,
     ):
         row = tl.program_id(0)
         offsets = tl.arange(0, reduce_block)
@@ -152,6 +154,19 @@ if triton is not None:
         exp_vals = tl.exp(scaled - stable_max)
         denom = tl.sum(exp_vals, axis=0)
         probs = exp_vals / denom
+        if use_top_p:
+            # Candidates are in descending-logit order. Match
+            # sgl_kernel.top_p_renorm_prob by retaining the candidate that
+            # crosses the nucleus threshold, then renormalizing the prefix.
+            top_p = tl.load(top_p_ptr + row)
+            pre_filter_cdf = tl.cumsum(probs, axis=0)
+            prefix_keep = (pre_filter_cdf - probs) < top_p
+            # The SGL kernel retains every probability tied with the cutoff
+            # value, even if only one of those equal-valued candidates is the
+            # mathematical crossing point.
+            cutoff = tl.min(tl.where(prefix_keep, probs, float("inf")), axis=0)
+            probs = tl.where(probs >= cutoff, probs, 0.0)
+            probs = probs / tl.sum(probs, axis=0)
         tl.store(topk_probs_ptr + out_base + k_offsets, probs)
 
         cdf = tl.cumsum(probs, axis=0)
@@ -161,6 +176,74 @@ if triton is not None:
         sampled_prob = tl.load(topk_probs_ptr + out_base + sample_pos)
         tl.store(sampled_indices_ptr + row, sampled_token_id)
         tl.store(sampled_probs_ptr + row, sampled_prob)
+
+    @triton.jit
+    def _reduce_local_topk_pack_kernel(
+        local_values_ptr,
+        local_indices_ptr,
+        packed_ptr,
+        num_blocks: tl.constexpr,
+        topk: tl.constexpr,
+        reduce_block: tl.constexpr,
+        index_offset: tl.constexpr,
+    ):
+        """Reduce block candidates and pack FP32 values/global ids together."""
+        row = tl.program_id(0)
+        candidate_count = num_blocks * topk
+        offsets = tl.arange(0, reduce_block)
+        mask = offsets < candidate_count
+        source_base = row * candidate_count
+        values = tl.load(
+            local_values_ptr + source_base + offsets,
+            mask=mask,
+            other=-float("inf"),
+        )
+        indices = tl.load(
+            local_indices_ptr + source_base + offsets,
+            mask=mask,
+            other=0x7FFFFFFF,
+        ).to(tl.int64)
+        output_base = row * (2 * topk)
+        for k in tl.static_range(0, topk):
+            max_value = tl.max(values, axis=0)
+            # Deterministic tie-break by the actual local vocabulary id.
+            max_index = tl.min(
+                tl.where(values == max_value, indices, 0x7FFFFFFF), axis=0
+            )
+            tl.store(packed_ptr + output_base + k, max_value)
+            # The global vocabulary is far below 2**24, so FP32 represents
+            # every token id exactly and permits one collective for value+id.
+            tl.store(
+                packed_ptr + output_base + topk + k,
+                (max_index + index_offset).to(tl.float32),
+            )
+            values = tl.where(indices == max_index, -float("inf"), values)
+
+    @triton.jit
+    def _unpack_gathered_topk_kernel(
+        gathered_ptr,
+        values_ptr,
+        indices_ptr,
+        rows,
+        topk: tl.constexpr,
+        world_size: tl.constexpr,
+        block_k: tl.constexpr,
+    ):
+        row = tl.program_id(0)
+        valid_row = row < rows
+        k = tl.arange(0, block_k)
+        valid = valid_row & (k < topk)
+        gathered_row_base = row * world_size * 2 * topk
+        output_row_base = row * world_size * topk
+        for rank in tl.static_range(0, world_size):
+            source_base = gathered_row_base + rank * 2 * topk
+            target_base = output_row_base + rank * topk
+            values = tl.load(gathered_ptr + source_base + k, mask=valid, other=0.0)
+            indices = tl.load(
+                gathered_ptr + source_base + topk + k, mask=valid, other=0.0
+            ).to(tl.int64)
+            tl.store(values_ptr + target_base + k, values, mask=valid)
+            tl.store(indices_ptr + target_base + k, indices, mask=valid)
 
     @triton.jit
     def _verify_top1_sparse_kernel(
@@ -547,6 +630,7 @@ def can_use_welmv4_mtp_fused_topk_sample(
     temperature: torch.Tensor,
     uniform: torch.Tensor,
     topk: int,
+    top_p: Optional[torch.Tensor] = None,
 ) -> bool:
     return (
         triton is not None
@@ -556,10 +640,105 @@ def can_use_welmv4_mtp_fused_topk_sample(
         and logits.dim() == 2
         and temperature.numel() >= logits.shape[0]
         and uniform.numel() >= logits.shape[0]
+        and (top_p is None or (top_p.is_cuda and top_p.numel() >= logits.shape[0]))
         and int(topk) in _SUPPORTED_TOPK
         and 0 < int(topk) < logits.shape[1]
         and logits.shape[0] > 0
     )
+
+
+def welmv4_mtp_local_topk_pack(
+    logits: torch.Tensor,
+    topk: int,
+    *,
+    index_offset: int = 0,
+    block_size: int = 1024,
+) -> Optional[torch.Tensor]:
+    """Return each shard's exact top-k as one packed FP32 value/id tensor."""
+    if (
+        triton is None
+        or not logits.is_cuda
+        or logits.ndim != 2
+        or logits.shape[0] <= 0
+        or logits.shape[1] <= 0
+        or int(topk) not in _SUPPORTED_TOPK
+        or int(topk) > int(logits.shape[1])
+        or int(index_offset) < 0
+        or int(index_offset) + int(logits.shape[1]) > (1 << 24)
+    ):
+        return None
+    rows, vocab_size = logits.shape
+    topk = int(topk)
+    num_blocks = triton.cdiv(vocab_size, block_size)
+    reduce_block = triton.next_power_of_2(num_blocks * topk)
+    local_values = torch.empty(
+        (rows, num_blocks, topk), dtype=torch.float32, device=logits.device
+    )
+    local_indices = torch.empty(
+        (rows, num_blocks, topk), dtype=torch.int64, device=logits.device
+    )
+    packed = torch.empty((rows, 2 * topk), dtype=torch.float32, device=logits.device)
+    _local_topk_kernel[(rows, num_blocks)](
+        logits,
+        local_values,
+        local_indices,
+        vocab_size,
+        num_blocks,
+        block_size,
+        topk,
+        num_warps=8,
+    )
+    _reduce_local_topk_pack_kernel[(rows,)](
+        local_values,
+        local_indices,
+        packed,
+        num_blocks,
+        topk,
+        reduce_block,
+        int(index_offset),
+        num_warps=8,
+    )
+    return packed
+
+
+def welmv4_mtp_unpack_gathered_topk(
+    gathered: torch.Tensor,
+    output_indices: torch.Tensor,
+    *,
+    topk: int,
+    world_size: int,
+) -> Optional[torch.Tensor]:
+    """Unpack rank-major packed candidates after one TP all-gather."""
+    topk = int(topk)
+    world_size = int(world_size)
+    if (
+        triton is None
+        or not gathered.is_cuda
+        or not output_indices.is_cuda
+        or gathered.ndim != 2
+        or output_indices.ndim != 2
+        or gathered.dtype != torch.float32
+        or output_indices.dtype != torch.int64
+        or topk not in _SUPPORTED_TOPK
+        or world_size <= 0
+        or int(gathered.shape[1]) != world_size * 2 * topk
+        or tuple(output_indices.shape) != (int(gathered.shape[0]), world_size * topk)
+    ):
+        return None
+    values = torch.empty(
+        output_indices.shape, dtype=torch.float32, device=gathered.device
+    )
+    _unpack_gathered_topk_kernel[(int(gathered.shape[0]),)](
+        gathered,
+        values,
+        output_indices,
+        int(gathered.shape[0]),
+        topk=topk,
+        world_size=world_size,
+        block_k=triton.next_power_of_2(topk),
+        num_warps=1,
+    )
+    return values
 
 
 def welmv4_mtp_fused_topk_softmax_sample(
@@ -568,15 +747,17 @@ def welmv4_mtp_fused_topk_softmax_sample(
     uniform: torch.Tensor,
     topk: int,
     *,
+    top_p: Optional[torch.Tensor] = None,
     block_size: int = 1024,
 ) -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]:
     """Return sampled prob/id plus sparse topK q distribution for WeLMV4 MTP.
 
-    This is an exact topK over the full vocab for small K. It deliberately does
-    not implement top-p; callers should fall back to the PyTorch path when top-p
-    filtering is required.
+    This is an exact topK over the full vocab for small K. When ``top_p`` is
+    provided, nucleus filtering is applied to those candidates before sample.
     """
-    if not can_use_welmv4_mtp_fused_topk_sample(logits, temperature, uniform, topk):
+    if not can_use_welmv4_mtp_fused_topk_sample(
+        logits, temperature, uniform, topk, top_p
+    ):
         return None
 
     rows, vocab_size = logits.shape
@@ -597,6 +778,8 @@ def welmv4_mtp_fused_topk_softmax_sample(
 
     temperature = temperature.reshape(-1)
     uniform = uniform.reshape(-1)
+    use_top_p = top_p is not None
+    top_p = temperature if top_p is None else top_p.reshape(-1)
 
     _local_topk_kernel[(rows, num_blocks)](
         logits,
@@ -612,6 +795,7 @@ def welmv4_mtp_fused_topk_softmax_sample(
         local_values,
         local_indices,
         temperature,
+        top_p,
         uniform,
         sampled_probs,
         sampled_indices,
@@ -620,6 +804,7 @@ def welmv4_mtp_fused_topk_softmax_sample(
         num_blocks,
         topk,
         reduce_block,
+        use_top_p=use_top_p,
         num_warps=8,
     )
     return sampled_probs, sampled_indices, topk_indices, topk_probs

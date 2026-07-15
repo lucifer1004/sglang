@@ -7,13 +7,15 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbeddingShardIndices
+from sglang.srt.layers.vocab_parallel_embedding import (
+    VocabParallelEmbeddingShardIndices,
+)
 from sglang.srt.models.welm_perf_opt import (
-    _can_use_specialized_welm_oe_prehashed_lookup_concat,
-    _compute_welm_oe_concat_local_partials_prehashed_specialized_4x512,
     WELM_OE_IMPL_ENV,
     WELM_OE_POST_PROJ_ALL_REDUCE_ENV,
     WELM_OE_TRITON_PREPROCESS_ENV,
+    _can_use_specialized_welm_oe_prehashed_lookup_concat,
+    _compute_welm_oe_concat_local_partials_prehashed_specialized_4x512,
     compute_welm_oe_concat_local_partials,
     compute_welm_oe_embedding,
     get_welm_oe_implementation,
@@ -36,7 +38,9 @@ class FakeProjModule(nn.Module):
         super().__init__()
         self.weight = nn.Parameter(weight.clone(), requires_grad=False)
         self.bias = (
-            nn.Parameter(bias.clone(), requires_grad=False) if bias is not None else None
+            nn.Parameter(bias.clone(), requires_grad=False)
+            if bias is not None
+            else None
         )
 
     def forward(self, x: torch.Tensor):
@@ -88,9 +92,7 @@ class TestWelmV4OEEmbedding(unittest.TestCase):
         self.oe_grams = [2, 4]
         self.oe_vocab_sizes = [11, 13]
         self.full_weight_0 = torch.arange(33, dtype=torch.float32).reshape(11, 3) / 7.0
-        self.full_weight_1 = (
-            torch.arange(39, dtype=torch.float32).reshape(13, 3) / 11.0
-        )
+        self.full_weight_1 = torch.arange(39, dtype=torch.float32).reshape(13, 3) / 11.0
         proj_weight = torch.arange(36, dtype=torch.float32).reshape(6, 6) / 13.0
         proj_bias = torch.arange(6, dtype=torch.float32) / 17.0
         self.proj_module = FakeProjModule(proj_weight, proj_bias)
@@ -241,7 +243,9 @@ class TestWelmV4OEEmbedding(unittest.TestCase):
         expected_proj = F.linear(expected_concat, proj_module.weight, proj_module.bias)
         expected = (base_hidden_states + expected_proj) / 2.0
 
-        with patch.dict(os.environ, {WELM_OE_IMPL_ENV: "fused_ngram_hash"}, clear=False):
+        with patch.dict(
+            os.environ, {WELM_OE_IMPL_ENV: "fused_ngram_hash"}, clear=False
+        ):
             rank1_concat = compute_welm_oe_concat_local_partials(
                 input_ids=input_ids,
                 forward_batch=forward_batch,
@@ -267,6 +271,32 @@ class TestWelmV4OEEmbedding(unittest.TestCase):
         torch.testing.assert_close(actual, expected)
 
         rank1_proj_no_bias = F.linear(rank1_concat, proj_module.weight, bias=None)
+        rank0_base = base_hidden_states * 0.375
+        rank1_base = base_hidden_states - rank0_base
+        rank1_combined = (rank1_base + rank1_proj_no_bias) / 2.0
+        with patch.dict(
+            os.environ,
+            {
+                WELM_OE_IMPL_ENV: "fused_ngram_hash",
+                WELM_OE_POST_PROJ_ALL_REDUCE_ENV: "0",
+            },
+            clear=False,
+        ):
+            actual_shared_all_reduce = compute_welm_oe_embedding(
+                input_ids=input_ids,
+                forward_batch=forward_batch,
+                base_hidden_states=rank0_base,
+                oe_grams=self.oe_grams,
+                oe_vocab_sizes=oe_vocab_sizes,
+                vocab_size=self.vocab_size,
+                oe_embed_modules=rank0_modules,
+                oe_proj_module=proj_module,
+                use_triton_preprocess=False,
+                all_reduce_fn=lambda x: x + rank1_combined,
+                fuse_base_embedding_allreduce=True,
+            )
+        torch.testing.assert_close(actual_shared_all_reduce, expected)
+
         with patch.dict(
             os.environ,
             {
@@ -344,7 +374,9 @@ class TestWelmV4OEEmbedding(unittest.TestCase):
             )
         )
 
-        with patch.dict(os.environ, {WELM_OE_IMPL_ENV: "fused_ngram_hash"}, clear=False):
+        with patch.dict(
+            os.environ, {WELM_OE_IMPL_ENV: "fused_ngram_hash"}, clear=False
+        ):
             generic_rank0 = compute_welm_oe_concat_local_partials(
                 input_ids=input_ids,
                 forward_batch=forward_batch,
@@ -391,9 +423,11 @@ class TestWelmV4OEEmbedding(unittest.TestCase):
                 use_triton_preprocess=False,
             )
 
-        direct_rank0 = _compute_welm_oe_concat_local_partials_prehashed_specialized_4x512(
-            hashed_inputs=hashed_inputs,
-            oe_embed_modules=rank0_modules,
+        direct_rank0 = (
+            _compute_welm_oe_concat_local_partials_prehashed_specialized_4x512(
+                hashed_inputs=hashed_inputs,
+                oe_embed_modules=rank0_modules,
+            )
         )
         torch.testing.assert_close(fused_rank0, generic_rank0)
         torch.testing.assert_close(fused_rank1, generic_rank1)
@@ -424,9 +458,7 @@ class TestWelmV4OEEmbedding(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "invalid"):
             get_welm_oe_implementation("bad-value")
         self.assertFalse(should_use_welm_oe_triton_preprocess(False))
-        with patch.dict(
-            os.environ, {WELM_OE_TRITON_PREPROCESS_ENV: "1"}, clear=False
-        ):
+        with patch.dict(os.environ, {WELM_OE_TRITON_PREPROCESS_ENV: "1"}, clear=False):
             self.assertTrue(should_use_welm_oe_triton_preprocess())
 
 

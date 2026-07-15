@@ -25,6 +25,7 @@ from triton.language.extra import libdevice
 
 from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
+    get_tp_group,
     tensor_model_parallel_all_gather,
 )
 from sglang.srt.environ import envs
@@ -56,6 +57,10 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
 )
 from sglang.srt.server_args import get_global_server_args
+from sglang.srt.speculative.welmv4_mtp_sampling import (
+    welmv4_mtp_local_topk_pack,
+    welmv4_mtp_unpack_gathered_topk,
+)
 from sglang.srt.utils.common import is_npu, use_intel_amx_backend
 
 logger = logging.getLogger(__name__)
@@ -158,6 +163,16 @@ class LogitsMetadata:
 
     mm_input_embeds: Optional[torch.Tensor] = None
 
+    # Merged draft steps can temporarily use DECODE mode, so carry an explicit
+    # marker and step index for the distributed top-k fast path.
+    welm_mtp_step_idx: Optional[int] = None
+    welm_mtp_is_draft: bool = False
+    # MTP proposal graphs need only the global small-K candidates.  When set,
+    # _get_logits performs local top-K followed by a tiny TP all-gather instead
+    # of materializing the full-vocabulary logits on every rank.
+    welm_mtp_distributed_topk: int = 0
+    welm_mtp_candidate_indices_buffer: Optional[torch.Tensor] = None
+
     @classmethod
     def from_forward_batch(cls, forward_batch: ForwardBatch):
         if (
@@ -212,6 +227,21 @@ class LogitsMetadata:
             welm_kv_mirror_contracted=forward_batch.welm_kv_mirror_contracted,
             scale_seq_factor=forward_batch.scale_seq_factor,
             mm_input_embeds=forward_batch.mm_input_embeds,
+            welm_mtp_step_idx=getattr(forward_batch, "mtp_step_idx", None),
+            welm_mtp_is_draft=bool(
+                getattr(forward_batch, "welm_mtp_merge_kv_fill_draft", False)
+            ),
+            welm_mtp_distributed_topk=int(
+                getattr(forward_batch, "welm_mtp_distributed_topk", 0)
+            ),
+            welm_mtp_candidate_indices_buffer=(
+                None
+                if getattr(forward_batch, "welm_mtp_candidate_indices_buffer", None)
+                is None
+                else forward_batch.welm_mtp_candidate_indices_buffer[
+                    int(getattr(forward_batch, "mtp_step_idx", 0))
+                ]
+            ),
         )
 
     def compute_dp_attention_metadata(self):
@@ -878,6 +908,56 @@ class LogitsProcessor(nn.Module):
 
         if self.logit_scale is not None:
             logits.mul_(self.logit_scale)
+
+        distributed_topk = int(logits_metadata.welm_mtp_distributed_topk)
+        if distributed_topk > 0:
+            if (
+                not logits_metadata.welm_mtp_is_draft
+                or not self.do_tensor_parallel_all_gather
+                or self.use_attn_tp_group
+                or self.do_tensor_parallel_all_gather_dp_attn
+                or self.vocab_size % get_tensor_model_parallel_world_size() != 0
+            ):
+                raise RuntimeError(
+                    "WeLM MTP distributed top-k is only valid for ordinary "
+                    "vocab-parallel draft logits with evenly sharded vocab."
+                )
+            candidate_buffer = logits_metadata.welm_mtp_candidate_indices_buffer
+            if candidate_buffer is None:
+                raise RuntimeError("Missing WeLM MTP distributed top-k id buffer.")
+            local_k = min(distributed_topk, int(logits.shape[-1]))
+            tp_world_size = get_tensor_model_parallel_world_size()
+            # Compute exact shard top-k, pack FP32 values and exactly
+            # representable global token ids together, then use one compact
+            # collective instead of separate FP32 and int64 all-gathers.
+            packed_candidates = welmv4_mtp_local_topk_pack(
+                logits,
+                local_k,
+                index_offset=(
+                    int(get_tp_group().rank_in_group) * int(logits.shape[-1])
+                ),
+            )
+            if packed_candidates is None:
+                raise RuntimeError(
+                    "WeLM MTP packed distributed top-k requires CUDA Triton inputs."
+                )
+            gathered_candidates = tensor_model_parallel_all_gather(packed_candidates)
+            expected_shape = (int(logits.shape[0]), local_k * tp_world_size)
+            if tuple(candidate_buffer.shape) != expected_shape:
+                raise RuntimeError(
+                    "WeLM MTP distributed top-k buffer shape mismatch: "
+                    f"buffer={tuple(candidate_buffer.shape)} "
+                    f"expected={expected_shape}"
+                )
+            candidate_values = welmv4_mtp_unpack_gathered_topk(
+                gathered_candidates,
+                candidate_buffer,
+                topk=local_k,
+                world_size=tp_world_size,
+            )
+            if candidate_values is None:
+                raise RuntimeError("Failed to unpack WeLM MTP distributed top-k.")
+            return candidate_values
 
         if self.do_tensor_parallel_all_gather:
             if self.use_attn_tp_group:

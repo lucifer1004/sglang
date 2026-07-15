@@ -13,8 +13,8 @@ import triton.language as tl
 from sglang.srt.distributed import tensor_model_parallel_all_reduce
 from sglang.srt.layers.communicator import get_attn_tp_context
 from sglang.srt.layers.dp_attention import attn_tp_all_reduce
-from sglang.srt.layers.welmv4_op import welm_use_previous_precision
 from sglang.srt.layers.vocab_parallel_embedding import get_masked_input_and_mask
+from sglang.srt.layers.welmv4_op import welm_use_previous_precision
 
 logger = logging.getLogger(__name__)
 
@@ -614,9 +614,18 @@ def _compute_welm_oe_embedding_legacy(
     return (base_hidden_states + emb_new) / 2.0
 
 
-def _lookup_local_embedding(module, token_ids: torch.Tensor) -> torch.Tensor:
+def compute_welm_local_embedding(module, token_ids: torch.Tensor) -> torch.Tensor:
+    """Return this TP rank's masked vocab-embedding contribution.
+
+    Unlike :class:`VocabParallelEmbedding.forward`, this helper deliberately
+    does not launch an all-reduce.  It is used by the WeLM MTP path to combine
+    the base-token and projected OE partials before one shared collective.
+    """
+
     if not hasattr(module, "shard_indices"):
-        if hasattr(module, "quant_method") and hasattr(module.quant_method, "embedding"):
+        if hasattr(module, "quant_method") and hasattr(
+            module.quant_method, "embedding"
+        ):
             return module.quant_method.embedding(module, token_ids.long())
         return F.embedding(token_ids.long(), module.weight)
 
@@ -680,7 +689,7 @@ def compute_welm_oe_concat_local_partials(
     local_embeddings = []
     for i, _ in enumerate(oe_vocab_sizes):
         module = oe_embed_modules[i]
-        local_embeddings.append(_lookup_local_embedding(module, hashed_inputs[i]))
+        local_embeddings.append(compute_welm_local_embedding(module, hashed_inputs[i]))
 
     return torch.cat(local_embeddings, dim=-1)
 
@@ -1852,6 +1861,7 @@ def compute_welm_oe_embedding(
     implementation: str | None = None,
     use_triton_preprocess: bool | None = None,
     all_reduce_fn=None,
+    fuse_base_embedding_allreduce: bool = False,
 ) -> torch.Tensor:
     """Compute WelmV4 OE embeddings with an OE-specific delayed-all-reduce fast path.
 
@@ -1865,6 +1875,12 @@ def compute_welm_oe_embedding(
     """
     if not oe_grams:
         return base_hidden_states
+
+    if fuse_base_embedding_allreduce and welm_use_previous_precision():
+        raise RuntimeError(
+            "Fused WeLM MTP base/OE all-reduce is incompatible with "
+            "WELM_USE_PREVIOUS_PRECISION."
+        )
 
     if welm_use_previous_precision():
         legacy_hidden = _compute_welm_oe_embedding_legacy(
@@ -1911,6 +1927,22 @@ def compute_welm_oe_embedding(
         oe_embed_modules=oe_embed_modules,
         use_triton_preprocess=use_triton_preprocess,
     )
+    if fuse_base_embedding_allreduce:
+        # The normal path computes
+        #   (AR(base_local) + W * AR(oe_local) + bias) / 2.
+        # ``oe_gate_up_proj`` is replicated and linear, so this is equivalent
+        # to
+        #   AR((base_local + W * oe_local) / 2) + bias / 2.
+        # This removes one TP collective per MTP step (three per MTP3 cycle).
+        emb_new_local = _apply_oe_proj_no_bias(oe_proj_module, concat_hidden)
+        combined_hidden = (base_hidden_states + emb_new_local) / 2.0
+        if any(getattr(module, "tp_size", 1) > 1 for module in oe_embed_modules):
+            combined_hidden = all_reduce_fn(combined_hidden)
+        bias = getattr(oe_proj_module, "bias", None)
+        if bias is not None:
+            combined_hidden = combined_hidden + bias / 2.0
+        return combined_hidden
+
     if should_use_welm_oe_post_proj_all_reduce():
         emb_new_local = _apply_oe_proj_no_bias(oe_proj_module, concat_hidden)
         if any(getattr(module, "tp_size", 1) > 1 for module in oe_embed_modules):

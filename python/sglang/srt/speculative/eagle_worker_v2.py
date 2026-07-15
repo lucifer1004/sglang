@@ -38,8 +38,8 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
-from sglang.srt.managers.utils import DraftContinuationState
 from sglang.srt.managers.tp_worker import TpModelWorker
+from sglang.srt.managers.utils import DraftContinuationState
 from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
@@ -885,11 +885,14 @@ class EagleDraftWorker(BaseDraftWorker):
         ):
             return
         spec_info = forward_batch.spec_info
+        hash_seq_lens = getattr(
+            spec_info, "welm_mtp_oe_hash_seq_lens", forward_batch.seq_lens
+        )
         forward_batch.welm_oe_decode_hashed_inputs = (
             self._compute_welmv4_mtp_target_verify_hash_inputs(
                 forward_batch.input_ids,
                 spec_info.custom_mask,
-                forward_batch.seq_lens,
+                hash_seq_lens,
                 history_state,
                 int(spec_info.draft_token_num),
             )
@@ -911,7 +914,7 @@ class EagleDraftWorker(BaseDraftWorker):
             self._compute_welmv4_mtp_target_verify_hash_inputs(
                 verify_input.draft_token,
                 verify_input.custom_mask,
-                batch.seq_lens,
+                getattr(verify_input, "welm_mtp_oe_hash_seq_lens", batch.seq_lens),
                 history_state,
                 int(verify_input.draft_token_num),
             )
@@ -955,11 +958,23 @@ class EagleDraftWorker(BaseDraftWorker):
             batch_size,
             history_width,
         )
+        dense_token_num = batch_size * draft_token_num
+        if int(input_ids.numel()) > dense_token_num:
+            raise RuntimeError(
+                "WeLMV4 MTP accepted-only draft extend input is larger than "
+                f"the dense capacity: input_tokens={input_ids.numel()} "
+                f"capacity={dense_token_num}."
+            )
+        fused_prepare = _welm_mtp_env_flag("SGLANG_WELM_MTP_FUSED_PREPARE")
+        if fused_prepare and envs.SGLANG_SPEC_OOB_DETECTION.get():
+            torch._assert_async(
+                accept_lens.sum() == input_ids.numel(),
+                "WeLMV4 MTP accepted-only draft extend input length mismatch.",
+            )
         kernel_input_ids = input_ids
         kernel_hashed_out = hashed_out
         accepted_lens_cpu = None
-        dense_token_num = batch_size * draft_token_num
-        if int(input_ids.numel()) != dense_token_num:
+        if not fused_prepare and int(input_ids.numel()) != dense_token_num:
             accepted_lens_cpu = [int(x) for x in accept_lens.detach().cpu().tolist()]
             if sum(accepted_lens_cpu) != int(input_ids.numel()):
                 raise RuntimeError(
@@ -2838,7 +2853,15 @@ class EagleDraftWorker(BaseDraftWorker):
                     draft_input_id_buffers = getattr(
                         forward_batch, "welm_mtp_draft_input_ids", None
                     )
-                    if draft_input_id_buffers is not None:
+                    if getattr(
+                        forward_batch, "welm_mtp_linear_proposal_fast_path", False
+                    ):
+                        # CUDA graph allocations have stable addresses.  For
+                        # top-k=1 the sampled-id output can feed the next MTP
+                        # step directly; copying it through one runner-owned
+                        # buffer per step only adds three tiny graph nodes.
+                        input_ids = next_input_ids
+                    elif draft_input_id_buffers is not None:
                         input_ids = draft_input_id_buffers[
                             step, : next_input_ids.numel()
                         ]
@@ -2852,23 +2875,67 @@ class EagleDraftWorker(BaseDraftWorker):
             for name, value in original_spec_token_attrs.items():
                 setattr(spec_info, name, value)
 
-        spec_info.topk_p = torch.cat(topk_p_list, dim=1)
-        spec_info.topk_index = torch.cat(topk_index_list, dim=1)
-        spec_info.draft_probs = self._pad_welmv4_mtp_draft_probs_for_verify(
-            draft_probs_list
+        linear_graph_outputs = getattr(
+            forward_batch, "welm_mtp_linear_graph_output_buffers", None
         )
-        spec_info.welm_mtp_draft_topk_indices = (
-            self._pad_welmv4_mtp_draft_topk_for_verify(
-                draft_topk_indices_list,
-                pad_value=0,
+        fused_linear_graph_outputs = bool(
+            linear_graph_outputs is not None
+            and not use_tree_proposal
+            and not draft_probs_list
+            and len(topk_p_list) == 3
+            and len(topk_index_list) == 3
+            and len(draft_topk_indices_list) == 3
+            and len(draft_topk_values_list) == 3
+        )
+        if fused_linear_graph_outputs:
+            from sglang.srt.speculative.welmv4_mtp_staging import (
+                pack_welm_mtp_linear_graph_outputs,
             )
-        )
-        spec_info.welm_mtp_draft_topk_values = (
-            self._pad_welmv4_mtp_draft_topk_for_verify(
-                draft_topk_values_list,
-                pad_value=0.0,
+
+            pack_welm_mtp_linear_graph_outputs(
+                sampled_probs=topk_p_list,
+                sampled_indices=topk_index_list,
+                draft_topk_indices=draft_topk_indices_list,
+                draft_topk_values=draft_topk_values_list,
+                bonus_tokens=linear_graph_outputs["bonus_tokens"],
+                base_positions=linear_graph_outputs["base_positions"],
+                hot_token_map=self.hot_token_id,
+                output_topk_p=linear_graph_outputs["topk_p"],
+                output_topk_index=linear_graph_outputs["topk_index"],
+                output_proposal_tokens=linear_graph_outputs["proposal_tokens"],
+                output_draft_indices=linear_graph_outputs["draft_topk_indices"],
+                output_draft_values=linear_graph_outputs["draft_topk_values"],
+                output_verify_tokens=linear_graph_outputs["verify_tokens"],
+                output_verify_positions=linear_graph_outputs["verify_positions"],
+                batch_size=int(forward_batch.batch_size),
             )
-        )
+            spec_info.topk_p = linear_graph_outputs["topk_p"]
+            spec_info.topk_index = linear_graph_outputs["topk_index"]
+            spec_info.draft_probs = None
+            spec_info.welm_mtp_draft_topk_indices = linear_graph_outputs[
+                "draft_topk_indices"
+            ]
+            spec_info.welm_mtp_draft_topk_values = linear_graph_outputs[
+                "draft_topk_values"
+            ]
+        else:
+            spec_info.topk_p = torch.cat(topk_p_list, dim=1)
+            spec_info.topk_index = torch.cat(topk_index_list, dim=1)
+            spec_info.draft_probs = self._pad_welmv4_mtp_draft_probs_for_verify(
+                draft_probs_list
+            )
+            spec_info.welm_mtp_draft_topk_indices = (
+                self._pad_welmv4_mtp_draft_topk_for_verify(
+                    draft_topk_indices_list,
+                    pad_value=0,
+                )
+            )
+            spec_info.welm_mtp_draft_topk_values = (
+                self._pad_welmv4_mtp_draft_topk_for_verify(
+                    draft_topk_values_list,
+                    pad_value=0.0,
+                )
+            )
         if use_tree_proposal and main_hidden_states is not None:
             final_hidden_states = main_hidden_states.reshape(
                 int(base_positions.numel()), self.topk, main_hidden_states.shape[-1]
@@ -2897,6 +2964,23 @@ class EagleDraftWorker(BaseDraftWorker):
                 token_list,
                 parents_list,
                 self.speculative_num_draft_tokens,
+            )
+        elif getattr(forward_batch, "welm_mtp_linear_proposal_fast_path", False):
+            # With top-k=1 every sampled step is retained in order.  Therefore
+            # proposal_tokens is exactly the concatenated sampled-token tensor,
+            # parent_list is [-1, 0, 1, ...], and top_scores_index is
+            # [0, 1, 2, ...].  Avoid the generic cumulative-score/topk/sort/
+            # gather construction inside the proposal CUDA graph.
+            spec_info.draft_proposal_parent_list = (
+                forward_batch.welm_mtp_linear_proposal_parent_list
+            )
+            spec_info.draft_proposal_top_scores_index = (
+                forward_batch.welm_mtp_linear_proposal_top_scores_index
+            )
+            spec_info.draft_proposal_tokens = (
+                linear_graph_outputs["proposal_tokens"]
+                if fused_linear_graph_outputs
+                else self._maybe_map_hot_token_id(spec_info.topk_index)
             )
         else:
             (
@@ -3197,6 +3281,19 @@ class EagleDraftWorker(BaseDraftWorker):
 
     def draft(self, model_worker_batch: ModelWorkerBatch):
         draft_input: EagleDraftInput = model_worker_batch.spec_info
+        prebuilt_verify = getattr(draft_input, "welm_mtp_prebuilt_verify_input", None)
+        if (
+            prebuilt_verify is not None
+            and not model_worker_batch.forward_mode.is_idle()
+            and int(getattr(draft_input, "welm_mtp_prebuilt_verify_bs", -1))
+            == int(model_worker_batch.seq_lens.shape[0])
+        ):
+            # The previous verify->proposal phase assembled this immutable
+            # top-k=1 verify object while its CUDA graph was executing.  All
+            # tensors are persistent runner-owned views, so the next cycle has
+            # no tree bookkeeping or Python dataclass construction on its
+            # critical path. Batch changes deliberately fall through.
+            return prebuilt_verify
         is_welmv4_mtp = self._is_welmv4_mtp_draft_model()
         use_welmv4_mtp_draft_proposal = (
             is_welmv4_mtp and self._has_welmv4_mtp_draft_proposal(draft_input)
@@ -3321,27 +3418,46 @@ class EagleDraftWorker(BaseDraftWorker):
             self.target_worker.model_runner.attn_backend.get_verify_buffers_to_fill_after_draft()
         )
 
-        (
-            tree_mask,
-            position,
-            retrieve_index,
-            retrieve_next_token,
-            retrieve_next_sibling,
-            draft_tokens,
-        ) = build_tree_kernel_efficient(
-            draft_input.bonus_tokens,
-            parent_list,
-            top_scores_index,
-            draft_tokens,
-            model_worker_batch.seq_lens,
-            model_worker_batch.seq_lens_sum,
-            self.topk,
-            self.speculative_num_steps,
-            self.speculative_num_draft_tokens,
-            self.tree_mask_mode,
-            tree_mask_buf,
-            position_buf,
-        )
+        linear_verify = None
+        if self.cuda_graph_runner_for_draft_proposal is not None:
+            linear_verify = (
+                self.cuda_graph_runner_for_draft_proposal.build_linear_verify_inputs(
+                    draft_input, model_worker_batch.seq_lens
+                )
+            )
+        linear_hash_seq_lens = None
+        if linear_verify is not None:
+            (
+                tree_mask,
+                position,
+                retrieve_index,
+                retrieve_next_token,
+                retrieve_next_sibling,
+                draft_tokens,
+                linear_hash_seq_lens,
+            ) = linear_verify
+        else:
+            (
+                tree_mask,
+                position,
+                retrieve_index,
+                retrieve_next_token,
+                retrieve_next_sibling,
+                draft_tokens,
+            ) = build_tree_kernel_efficient(
+                draft_input.bonus_tokens,
+                parent_list,
+                top_scores_index,
+                draft_tokens,
+                model_worker_batch.seq_lens,
+                model_worker_batch.seq_lens_sum,
+                self.topk,
+                self.speculative_num_steps,
+                self.speculative_num_draft_tokens,
+                self.tree_mask_mode,
+                tree_mask_buf,
+                position_buf,
+            )
 
         verify_input = EagleVerifyInput(
             draft_token=draft_tokens,
@@ -3367,6 +3483,8 @@ class EagleDraftWorker(BaseDraftWorker):
             verify_input.welm_mtp_oe_history_state = (
                 draft_input.welm_mtp_oe_history_state
             )
+        if linear_hash_seq_lens is not None:
+            verify_input.welm_mtp_oe_hash_seq_lens = linear_hash_seq_lens
         return verify_input
 
     def draft_forward(self, forward_batch: ForwardBatch):
@@ -3839,13 +3957,13 @@ class EagleDraftWorker(BaseDraftWorker):
             model_specific_states=batch_result.logits_output.model_specific_states,
             mirrored_kv_indices=next_draft_input.mirrored_kv_indices,
         )
-        select_index = (
-            torch.arange(len(batch.seq_lens), device=self.device)
-            * self.speculative_num_draft_tokens
-            + batch_result.accept_lens
-            - 1
-        )
         if _WELM_VERIFY_AFTER_DUMP_ENABLED:
+            select_index = (
+                torch.arange(len(batch.seq_lens), device=self.device)
+                * self.speculative_num_draft_tokens
+                + batch_result.accept_lens
+                - 1
+            )
             _dump_verify_after_event(
                 "draft_extend_for_decode",
                 {
@@ -3865,6 +3983,28 @@ class EagleDraftWorker(BaseDraftWorker):
                 or self.topk > 1
             )
         ):
+            proposal_runner = self.cuda_graph_runner_for_draft_proposal
+            if proposal_runner is not None and proposal_runner.can_replay_from_verify(
+                batch, batch_result
+            ):
+                # The target verify and this call share the compute stream, so
+                # its outputs are already ordered.  Write them directly into
+                # persistent proposal-graph buffers instead of compacting to a
+                # ragged temporary batch and expanding back to width four.
+                proposal_runner.replay_from_verify(
+                    batch,
+                    batch_result,
+                    next_draft_input,
+                    entry_history_state=welmv4_mtp_oe_entry_history,
+                )
+                batch.spec_info = next_draft_input
+                return
+            select_index = (
+                torch.arange(len(batch.seq_lens), device=self.device)
+                * self.speculative_num_draft_tokens
+                + batch_result.accept_lens
+                - 1
+            )
             if self.plan_stream and next_draft_input.verify_done is not None:
                 self.plan_stream.wait_event(next_draft_input.verify_done)
             with self.plan_stream_ctx:

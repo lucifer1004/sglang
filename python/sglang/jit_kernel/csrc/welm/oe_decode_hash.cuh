@@ -292,22 +292,34 @@ __global__ void welm_oe_hash_mtp_draft_extend_after_verify_from_history_kernel(
     int64_t* __restrict__ next_history_state,
     int32_t draft_token_num,
     int32_t accepted_width,
+    int32_t packed_input,
     int32_t use_entry_history_for_extend_hash_prefix,
     WelmOeHashRuntimeParams params) {
   const int32_t seq_id = static_cast<int32_t>(blockIdx.x);
   if (seq_id >= params.num_segments) return;
 
   const int32_t history_width = params.history_width;
+  int32_t row_start = seq_id * draft_token_num;
+  int32_t row_len = draft_token_num;
+  if (packed_input) {
+    row_start = 0;
+    for (int32_t row = 0; row < seq_id; ++row) {
+      row_start += static_cast<int32_t>(accept_lens[row]);
+    }
+    row_len = static_cast<int32_t>(accept_lens[seq_id]);
+    if (row_len < 0) row_len = 0;
+    if (row_len > draft_token_num) row_len = draft_token_num;
+  }
   if (threadIdx.x < static_cast<uint32_t>(history_width)) {
     const int32_t col = static_cast<int32_t>(threadIdx.x);
     int64_t value = 0;
     if (col + 1 == history_width) {
       int32_t selected_pos = static_cast<int32_t>(accept_lens[seq_id]) - 1;
       if (selected_pos < 0) selected_pos = 0;
-      if (selected_pos >= draft_token_num) selected_pos = draft_token_num - 1;
+      if (selected_pos >= row_len) selected_pos = row_len - 1;
+      if (selected_pos < 0) selected_pos = 0;
       value = static_cast<int64_t>(
-          input_ids[static_cast<size_t>(seq_id) * draft_token_num +
-                    selected_pos]);
+          input_ids[static_cast<size_t>(row_start) + selected_pos]);
     } else {
       const int32_t prefix_lag = history_width - col - 1;
       value = static_cast<int64_t>(get_after_accept_history_token(
@@ -324,9 +336,9 @@ __global__ void welm_oe_hash_mtp_draft_extend_after_verify_from_history_kernel(
   }
 
   for (int32_t local_pos = static_cast<int32_t>(threadIdx.x);
-       local_pos < draft_token_num;
+       local_pos < row_len;
        local_pos += static_cast<int32_t>(blockDim.x)) {
-    const int32_t token_idx = seq_id * draft_token_num + local_pos;
+    const int32_t token_idx = row_start + local_pos;
     const uint32_t input = static_cast<uint32_t>(input_ids[token_idx]);
 
     for (int32_t branch_idx = 0; branch_idx < params.num_branches; ++branch_idx) {
@@ -588,6 +600,7 @@ void launch_welm_oe_hash_mtp_draft_extend_after_verify_from_history(
     int64_t* next_history_state,
     int32_t draft_token_num,
     int32_t accepted_width,
+    int32_t packed_input,
     int32_t use_entry_history_for_extend_hash_prefix,
     const tvm::ffi::Shape& oe_grams,
     const tvm::ffi::Shape& oe_vocab_sizes,
@@ -613,6 +626,7 @@ void launch_welm_oe_hash_mtp_draft_extend_after_verify_from_history(
       next_history_state,
       draft_token_num,
       accepted_width,
+      packed_input,
       use_entry_history_for_extend_hash_prefix,
       params);
 }
@@ -1132,8 +1146,8 @@ struct WelmOeHashMtpDraftExtendAfterVerifyFromHistory {
     const size_t num_branches = B.unwrap();
     RuntimeCheck(draft_token_num > 0, "draft_token_num must be positive");
     RuntimeCheck(
-        num_tokens == batch_size * static_cast<size_t>(draft_token_num),
-        "draft-extend token count must equal batch_size * draft_token_num");
+        num_tokens <= batch_size * static_cast<size_t>(draft_token_num),
+        "draft-extend token count must not exceed batch_size * draft_token_num");
     if (num_tokens == 0) return;
 
     check_runtime_hash_inputs(
@@ -1149,6 +1163,8 @@ struct WelmOeHashMtpDraftExtendAfterVerifyFromHistory {
     const bool input_is_int32 = input_dtype.unwrap().bits == 32;
     const bool accepted_is_int32 = accepted_dtype.unwrap().bits == 32;
     const bool accept_lens_is_int32 = accept_lens_dtype.unwrap().bits == 32;
+    const bool packed_input =
+        num_tokens != batch_size * static_cast<size_t>(draft_token_num);
 
 #define DISPATCH_WELM_OE_HASH_DRAFT_EXTEND_HISTORY(                          \
     INPUT_T, ACCEPTED_T, ACCEPT_LEN_T)                                       \
@@ -1165,6 +1181,7 @@ struct WelmOeHashMtpDraftExtendAfterVerifyFromHistory {
         static_cast<int64_t*>(next_history_state.data_ptr()),                \
         static_cast<int32_t>(draft_token_num),                               \
         static_cast<int32_t>(accepted_width),                                \
+        static_cast<int32_t>(packed_input),                                  \
         static_cast<int32_t>(use_entry_history_for_extend_hash_prefix),       \
         oe_grams,                                                            \
         oe_vocab_sizes,                                                      \

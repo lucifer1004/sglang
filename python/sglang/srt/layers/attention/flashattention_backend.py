@@ -4976,37 +4976,39 @@ class FlashAttentionBackend(AttentionBackend):
 
         elif forward_mode.is_draft_extend():
             metadata = self.draft_extend_metadata[bs]
-            metadata.cache_seqlens_int32.copy_(seq_lens)
-
             metadata.max_seq_len_k = seq_lens_cpu.max().item()
-            metadata.cu_seqlens_k[1:].copy_(
-                torch.cumsum(metadata.cache_seqlens_int32, dim=0, dtype=torch.int32)
-            )
             extend_lens = spec_info.num_accept_tokens[:bs]
             if spec_info.num_accept_tokens_cpu:
                 metadata.max_seq_len_q = max(spec_info.num_accept_tokens_cpu)
             else:
                 metadata.max_seq_len_q = 1
-
-            metadata.cu_seqlens_q[1:].copy_(
-                torch.cumsum(extend_lens, dim=0, dtype=torch.int32)
-            )
-
             max_seq_pages = (
                 metadata.max_seq_len_k + self.page_size - 1
             ) // self.page_size
-            page_indices = self.req_to_token[
-                req_pool_indices[:, None],
-                self.draft_extend_metadata["strided_indices"][:max_seq_pages],
-            ]
-            if self.use_sliding_window_kv_pool and metadata.swa_page_table is not None:
-                swa_page_indices = self.token_to_kv_pool.translate_loc_from_full_to_swa(
-                    page_indices
+            normal_decode_set_metadata(
+                metadata.cache_seqlens_int32,
+                metadata.cu_seqlens_k,
+                metadata.page_table,
+                self.req_to_token,
+                req_pool_indices,
+                self.draft_extend_metadata["strided_indices"],
+                max_seq_pages,
+                seq_lens,
+                0,
+                self.page_size,
+                metadata.swa_page_table,
+                self.token_to_kv_pool if self.use_sliding_window_kv_pool else None,
+            )
+            # Fixed-width proposal CUDA graphs capture all query rows at the
+            # same length, so cu_seqlens_q is already correct.  Retain the
+            # generic update only for variable accepted-token layouts.
+            if not (
+                spec_info.num_accept_tokens_cpu
+                and len(set(spec_info.num_accept_tokens_cpu)) == 1
+            ):
+                metadata.cu_seqlens_q[1:].copy_(
+                    torch.cumsum(extend_lens, dim=0, dtype=torch.int32)
                 )
-                metadata.swa_page_table[:, :max_seq_pages].copy_(
-                    swa_page_indices // self.page_size
-                )
-            metadata.page_table[:, :max_seq_pages].copy_(page_indices // self.page_size)
 
         elif forward_mode.is_draft_extend_v2():
             metadata = self.draft_extend_metadata[bs]

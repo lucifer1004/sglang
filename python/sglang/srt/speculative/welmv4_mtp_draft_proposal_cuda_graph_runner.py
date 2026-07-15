@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import bisect
 import contextlib
+import logging
 from dataclasses import dataclass
 from functools import partial
 from typing import TYPE_CHECKING, Callable, List, Optional
@@ -34,8 +35,11 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.model_executor.input_buffers import ForwardInputBuffers
 from sglang.srt.models.welm_perf_opt import get_welm_oe_hash_config
-from sglang.srt.speculative.eagle_info import EagleDraftInput
-from sglang.srt.speculative.welmv4_mtp_sampling import welm_mtp_deterministic_uniforms
+from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
+from sglang.srt.speculative.welmv4_mtp_sampling import (
+    welm_mtp_deterministic_uniforms,
+    welmv4_mtp_fused_topk_softmax_sample,
+)
 from sglang.srt.utils import (
     get_bool_env_var,
     require_attn_tp_gather,
@@ -48,6 +52,7 @@ from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 _is_cuda = is_cuda()
 _is_musa = is_musa()
+logger = logging.getLogger(__name__)
 
 if _is_cuda or _is_musa:
     from sgl_kernel import top_p_renorm_prob
@@ -73,6 +78,7 @@ class WelmMTPDraftProposalInputBuffers(ForwardInputBuffers):
     num_accept_tokens: torch.Tensor
     custom_last_index: torch.Tensor
     custom_last_cache_loc: torch.Tensor
+    base_positions: torch.Tensor
     next_token_logits_buffer: torch.Tensor
     temperature: torch.Tensor
     top_p: torch.Tensor
@@ -88,6 +94,21 @@ class WelmMTPDraftProposalInputBuffers(ForwardInputBuffers):
     welm_mtp_oe_output_prev_input_ids: Optional[torch.Tensor]
     welm_mtp_oe_hash_out_batch_major: Optional[torch.Tensor]
     welm_mtp_draft_input_ids: Optional[torch.Tensor]
+    welm_mtp_candidate_indices: Optional[torch.Tensor]
+    linear_verify_tokens: torch.Tensor
+    linear_verify_positions: torch.Tensor
+    linear_verify_mask: torch.Tensor
+    linear_verify_retrieve_index: torch.Tensor
+    linear_verify_retrieve_next_token: torch.Tensor
+    linear_verify_retrieve_next_sibling: torch.Tensor
+    linear_verify_hash_seq_lens: torch.Tensor
+    linear_proposal_parent_list: torch.Tensor
+    linear_proposal_top_scores_index: torch.Tensor
+    linear_proposal_topk_p: torch.Tensor
+    linear_proposal_topk_index: torch.Tensor
+    linear_proposal_tokens: torch.Tensor
+    linear_proposal_draft_topk_indices: Optional[torch.Tensor]
+    linear_proposal_draft_topk_values: Optional[torch.Tensor]
     welm_mtp_branch_step_cache_locs: Optional[torch.Tensor]
     welm_mtp_branch_flat_cache_locs: Optional[torch.Tensor]
     global_num_tokens_gpu: Optional[torch.Tensor]
@@ -152,6 +173,67 @@ class WelmMTPDraftProposalCudaGraphRunner:
             and eagle_worker.welmv4_mtp_draft_fixed_top_p < 1.0
             and (_is_cuda or _is_musa)
         )
+        self.fused_topk_sample = get_bool_env_var(
+            "SGLANG_WELM_MTP_FUSED_DRAFT_TOPK_SAMPLE"
+        )
+        if self.fused_topk_sample:
+            logger.info(
+                "SGLANG_WELM_MTP_FUSED_DRAFT_TOPK_SAMPLE=1: use the exact "
+                "small-K Triton top-k/top-p/sample path in the MTP draft graph."
+            )
+        self.distributed_topk = (
+            self.fused_topk_sample
+            and self.tp_size > 1
+            and self.dp_size == 1
+            and get_bool_env_var("SGLANG_WELM_MTP_DISTRIBUTED_TOPK")
+        )
+        if self.distributed_topk:
+            logger.info(
+                "SGLANG_WELM_MTP_DISTRIBUTED_TOPK=1: replace full-vocab TP "
+                "all-gather with local top-k plus compact candidate gather."
+            )
+        self.fused_prepare = get_bool_env_var("SGLANG_WELM_MTP_FUSED_PREPARE")
+        if self.fused_prepare:
+            logger.info(
+                "SGLANG_WELM_MTP_FUSED_PREPARE=1: pack ragged accepted tokens "
+                "into CUDA-graph buffers with one fused Triton launch."
+            )
+        self.persistent_handoff = self.fused_prepare and get_bool_env_var(
+            "SGLANG_WELM_MTP_PERSISTENT_HANDOFF"
+        )
+        if self.persistent_handoff:
+            logger.info(
+                "SGLANG_WELM_MTP_PERSISTENT_HANDOFF=1: write target-verify "
+                "outputs directly into persistent MTP proposal graph buffers."
+            )
+        self.linear_verify_prepare = (
+            self.persistent_handoff
+            and int(model_runner.server_args.speculative_eagle_topk) == 1
+            and get_bool_env_var("SGLANG_WELM_MTP_LINEAR_VERIFY_PREPARE")
+        )
+        self.fused_linear_graph_outputs = (
+            self.linear_verify_prepare
+            and self.speculative_num_steps == 3
+            and self.speculative_num_draft_tokens == 4
+            and self.sample_draft
+            and self.sampling_topk > 0
+            and get_bool_env_var("SGLANG_WELM_MTP_FUSED_LINEAR_GRAPH_OUTPUTS")
+        )
+        if self.fused_linear_graph_outputs:
+            logger.info(
+                "SGLANG_WELM_MTP_FUSED_LINEAR_GRAPH_OUTPUTS=1: fuse MTP3 "
+                "proposal output assembly into one proposal-graph kernel."
+            )
+        self.synced_draft_generator = None
+        if self.fused_prepare and self.sample_draft:
+            # TP workers receive the same server seed before model-runner init.
+            # A dedicated generator therefore produces identical draft samples
+            # on every TP rank without a per-replay NCCL broadcast, while being
+            # isolated from unrelated model/runtime RNG consumption.
+            self.synced_draft_generator = torch.Generator(device=model_runner.device)
+            self.synced_draft_generator.manual_seed(
+                int(model_runner.server_args.random_seed)
+            )
 
         self.topk = int(model_runner.server_args.speculative_eagle_topk)
         self.branch_tokens_per_bs = int(self.topk * self.speculative_num_steps)
@@ -232,6 +314,7 @@ class WelmMTPDraftProposalCudaGraphRunner:
                 - 1
             )
             custom_last_cache_loc = torch.zeros((self.max_bs,), dtype=torch.int64)
+            base_positions = torch.zeros((self.max_bs,), dtype=torch.int64)
             if hasattr(self.model_runner.model_config.hf_config, "draft_vocab_size"):
                 vocab_size = self.model_runner.model_config.hf_config.draft_vocab_size
             elif hasattr(self.model_runner.model_config.hf_config, "hot_vocab_size"):
@@ -242,13 +325,97 @@ class WelmMTPDraftProposalCudaGraphRunner:
                 (self.max_num_token, vocab_size),
                 dtype=torch.float,
             )
-            temperature = torch.ones((self.max_bs, 1), dtype=torch.float32)
-            top_p = torch.ones((self.max_bs,), dtype=torch.float32)
+            temperature = torch.full(
+                (self.max_bs, 1),
+                (
+                    1.0
+                    if eagle_worker.welmv4_mtp_draft_fixed_temperature is None
+                    else eagle_worker.welmv4_mtp_draft_fixed_temperature
+                ),
+                dtype=torch.float32,
+            )
+            top_p = torch.full(
+                (self.max_bs,),
+                (
+                    1.0
+                    if eagle_worker.welmv4_mtp_draft_fixed_top_p is None
+                    else eagle_worker.welmv4_mtp_draft_fixed_top_p
+                ),
+                dtype=torch.float32,
+            )
             uniform_samples = torch.full(
                 (self.speculative_num_steps, self.max_bs, 1),
                 0.5,
                 dtype=torch.float32,
             )
+            welm_mtp_candidate_indices = (
+                torch.zeros(
+                    (
+                        self.speculative_num_steps,
+                        self.max_bs,
+                        self.sampling_topk * self.tp_size,
+                    ),
+                    dtype=torch.int64,
+                )
+                if self.distributed_topk
+                else None
+            )
+            linear_verify_tokens = torch.zeros((self.max_num_token,), dtype=torch.int64)
+            linear_verify_positions = torch.zeros(
+                (self.max_num_token,), dtype=torch.int64
+            )
+            linear_verify_mask = (
+                torch.ones(
+                    (self.max_bs, self.num_tokens_per_bs, self.num_tokens_per_bs),
+                    dtype=torch.bool,
+                )
+                .tril()
+                .reshape(-1)
+            )
+            linear_verify_retrieve_index = torch.arange(
+                self.max_num_token, dtype=torch.int64
+            ).reshape(self.max_bs, self.num_tokens_per_bs)
+            linear_verify_retrieve_next_token = torch.arange(
+                1, self.num_tokens_per_bs + 1, dtype=torch.int64
+            ).repeat(self.max_bs, 1)
+            linear_verify_retrieve_next_token[:, -1].fill_(-1)
+            linear_verify_retrieve_next_sibling = torch.full(
+                (self.max_bs, self.num_tokens_per_bs), -1, dtype=torch.int64
+            )
+            linear_verify_hash_seq_lens = torch.zeros((self.max_bs,), dtype=torch.int32)
+            # A top-k=1, three-step proposal is always the same chain.  The
+            # generic proposal builder derives these two tensors with
+            # cumulative products, topk, sort and gather on every replay even
+            # though the result is invariant.  Keep exact static equivalents
+            # for both the fast verify path and its generic-tree rollback.
+            linear_proposal_parent_list = torch.tensor(
+                [-1, *range(self.speculative_num_steps - 1)],
+                dtype=torch.int64,
+            ).repeat(self.max_bs, 1)
+            linear_proposal_top_scores_index = torch.arange(
+                self.speculative_num_steps, dtype=torch.int64
+            ).repeat(self.max_bs, 1)
+            linear_proposal_topk_p = torch.zeros(
+                (self.max_bs, self.speculative_num_steps), dtype=torch.float32
+            )
+            linear_proposal_topk_index = torch.zeros(
+                (self.max_bs, self.speculative_num_steps), dtype=torch.int64
+            )
+            linear_proposal_tokens = torch.zeros(
+                (self.max_bs, self.speculative_num_steps), dtype=torch.int64
+            )
+            if self.sample_draft:
+                linear_proposal_draft_topk_indices = torch.zeros(
+                    (self.max_bs, self.num_tokens_per_bs, self.sampling_topk),
+                    dtype=torch.int64,
+                )
+                linear_proposal_draft_topk_values = torch.zeros(
+                    (self.max_bs, self.num_tokens_per_bs, self.sampling_topk),
+                    dtype=torch.float32,
+                )
+            else:
+                linear_proposal_draft_topk_indices = None
+                linear_proposal_draft_topk_values = None
             if self.topk > 1:
                 welm_mtp_branch_step_cache_locs = torch.zeros(
                     (self.speculative_num_steps, self.max_bs * self.topk),
@@ -375,6 +542,7 @@ class WelmMTPDraftProposalCudaGraphRunner:
             num_accept_tokens=num_accept_tokens,
             custom_last_index=custom_last_index,
             custom_last_cache_loc=custom_last_cache_loc,
+            base_positions=base_positions,
             next_token_logits_buffer=next_token_logits_buffer,
             temperature=temperature,
             top_p=top_p,
@@ -390,6 +558,21 @@ class WelmMTPDraftProposalCudaGraphRunner:
             welm_mtp_oe_output_prev_input_ids=welm_mtp_oe_output_prev_input_ids,
             welm_mtp_oe_hash_out_batch_major=welm_mtp_oe_hash_out_batch_major,
             welm_mtp_draft_input_ids=welm_mtp_draft_input_ids,
+            welm_mtp_candidate_indices=welm_mtp_candidate_indices,
+            linear_verify_tokens=linear_verify_tokens,
+            linear_verify_positions=linear_verify_positions,
+            linear_verify_mask=linear_verify_mask,
+            linear_verify_retrieve_index=linear_verify_retrieve_index,
+            linear_verify_retrieve_next_token=linear_verify_retrieve_next_token,
+            linear_verify_retrieve_next_sibling=linear_verify_retrieve_next_sibling,
+            linear_verify_hash_seq_lens=linear_verify_hash_seq_lens,
+            linear_proposal_parent_list=linear_proposal_parent_list,
+            linear_proposal_top_scores_index=linear_proposal_top_scores_index,
+            linear_proposal_topk_p=linear_proposal_topk_p,
+            linear_proposal_topk_index=linear_proposal_topk_index,
+            linear_proposal_tokens=linear_proposal_tokens,
+            linear_proposal_draft_topk_indices=linear_proposal_draft_topk_indices,
+            linear_proposal_draft_topk_values=linear_proposal_draft_topk_values,
             welm_mtp_branch_step_cache_locs=welm_mtp_branch_step_cache_locs,
             welm_mtp_branch_flat_cache_locs=welm_mtp_branch_flat_cache_locs,
             global_num_tokens_gpu=global_num_tokens_gpu,
@@ -405,6 +588,49 @@ class WelmMTPDraftProposalCudaGraphRunner:
                 f"Capture WeLM MTP draft proposal cuda graph failed: {e}\n"
                 f"{CUDA_GRAPH_CAPTURE_FAILED_MSG}"
             )
+
+    def build_linear_verify_inputs(
+        self, draft_input: EagleDraftInput, seq_lens: torch.Tensor
+    ):
+        """Return persistent verify tensors for the fixed top-k=1 MTP chain."""
+        if not self.linear_verify_prepare:
+            return None
+        proposal_tokens = getattr(draft_input, "draft_proposal_tokens", None)
+        bonus_tokens = getattr(draft_input, "bonus_tokens", None)
+        if proposal_tokens is None or bonus_tokens is None:
+            return None
+        bs = int(seq_lens.numel())
+        if bs <= 0 or bs > self.max_bs:
+            return None
+        from sglang.srt.speculative.welmv4_mtp_staging import (
+            build_welm_mtp_linear_verify_inputs,
+        )
+
+        num_tokens = bs * self.num_tokens_per_bs
+        graph_verify_ready = bool(
+            self.fused_linear_graph_outputs
+            and getattr(draft_input, "welm_mtp_linear_verify_ready", False)
+        )
+        if not graph_verify_ready:
+            build_welm_mtp_linear_verify_inputs(
+                bonus_tokens=bonus_tokens,
+                proposal_tokens=proposal_tokens,
+                seq_lens=seq_lens,
+                output_tokens=self.buffers.linear_verify_tokens,
+                output_positions=self.buffers.linear_verify_positions,
+                batch_size=bs,
+                tokens_per_bs=self.num_tokens_per_bs,
+            )
+        mask_tokens = bs * self.num_tokens_per_bs * self.num_tokens_per_bs
+        return (
+            self.buffers.linear_verify_mask[:mask_tokens],
+            self.buffers.linear_verify_positions[:num_tokens],
+            self.buffers.linear_verify_retrieve_index[:bs],
+            self.buffers.linear_verify_retrieve_next_token[:bs],
+            self.buffers.linear_verify_retrieve_next_sibling[:bs],
+            self.buffers.linear_verify_tokens[:num_tokens],
+            self.buffers.linear_verify_hash_seq_lens[:bs],
+        )
 
     def _filter_contracted_dp_capture_bs(self, capture_bs: list[int]) -> list[int]:
         if (
@@ -467,35 +693,66 @@ class WelmMTPDraftProposalCudaGraphRunner:
         }
 
     def _copy_welmv4_mtp_mirror_kv_states(
-        self, forward_batch: ForwardBatch, graph_num_tokens: int
+        self,
+        forward_batch: Optional[ForwardBatch],
+        graph_num_tokens: int,
+        *,
+        model_specific_states=None,
+        mirrored_kv_indices=None,
     ) -> None:
         if not self.welm_mtp_mirror_kv_states:
             return
-        mirrored_kv_indices = getattr(
-            forward_batch.spec_info, "mirrored_kv_indices", None
-        )
-        required_kv_len = (
-            int(forward_batch.input_ids.numel()) if mirrored_kv_indices is None else 0
-        )
-        if mirrored_kv_indices is not None and mirrored_kv_indices.numel() > 0:
-            required_kv_len = int(mirrored_kv_indices.max().item()) + 1
-        if required_kv_len == 0:
+        if forward_batch is not None:
+            mirrored_kv_indices = getattr(
+                forward_batch.spec_info, "mirrored_kv_indices", None
+            )
+            model_specific_states = forward_batch.model_specific_states
+        if mirrored_kv_indices is not None and mirrored_kv_indices.numel() == 0:
             for dst_k, dst_v in self.welm_mtp_mirror_kv_states.values():
                 dst_k[self.welm_mtp_mirror_padding_index].zero_()
                 dst_v[self.welm_mtp_mirror_padding_index].zero_()
             return
-        model_specific_states = forward_batch.model_specific_states or {}
+        model_specific_states = model_specific_states or {}
         kv_states = model_specific_states.get("welm_kv_mirror_states")
         if not isinstance(kv_states, dict):
             raise RuntimeError(
                 "Missing WeLM MTP mirrored KV states for draft proposal graph replay."
             )
+        # Target verify materializes a dense KV tensor for all verify slots.  Copy
+        # that tensor's statically known first dimension instead of synchronizing
+        # the GPU every replay with mirrored_kv_indices.max().item().  The graph
+        # consumes only the rows selected by mirrored_kv_indices.
+        required_kv_len = None
+        for layer_idx in self.welm_mtp_mirror_kv_states:
+            src_pair = kv_states.get(layer_idx)
+            if src_pair is None:
+                raise RuntimeError(
+                    "Missing WeLM MTP mirrored KV state for draft proposal graph "
+                    f"replay: {layer_idx=}."
+                )
+            src_k, src_v = src_pair
+            if src_k.shape[0] != src_v.shape[0]:
+                raise RuntimeError(
+                    "WeLM MTP mirrored K/V row counts differ: "
+                    f"{layer_idx=} k_len={src_k.shape[0]} v_len={src_v.shape[0]}."
+                )
+            if required_kv_len is None:
+                required_kv_len = int(src_k.shape[0])
+            elif required_kv_len != int(src_k.shape[0]):
+                raise RuntimeError(
+                    "WeLM MTP mirrored KV layers have inconsistent row counts: "
+                    f"expected={required_kv_len} {layer_idx=} got={src_k.shape[0]}."
+                )
+        required_kv_len = int(required_kv_len or 0)
         if required_kv_len > self.welm_mtp_mirror_padding_index:
             raise RuntimeError(
-                "WeLM MTP mirrored_kv_indices exceed draft proposal graph "
-                "mirror-KV source capacity: "
+                "WeLM MTP mirrored KV source exceeds draft proposal graph capacity: "
                 f"{required_kv_len=} capacity={self.welm_mtp_mirror_padding_index}"
             )
+        real_dsts = []
+        real_srcs = []
+        padding_dsts = []
+        padding_srcs = []
         for layer_idx, (dst_k, dst_v) in self.welm_mtp_mirror_kv_states.items():
             src_pair = kv_states.get(layer_idx)
             if src_pair is None:
@@ -511,17 +768,26 @@ class WelmMTPDraftProposalCudaGraphRunner:
                     f"k_len={src_k.shape[0]} v_len={src_v.shape[0]}"
                 )
             if required_kv_len > 0:
-                dst_k[:required_kv_len].copy_(src_k[:required_kv_len])
-                dst_v[:required_kv_len].copy_(src_v[:required_kv_len])
-                dst_k[self.welm_mtp_mirror_padding_index].copy_(
-                    src_k[required_kv_len - 1]
+                real_dsts.extend([dst_k[:required_kv_len], dst_v[:required_kv_len]])
+                real_srcs.extend([src_k[:required_kv_len], src_v[:required_kv_len]])
+                padding_dsts.extend(
+                    [
+                        dst_k[self.welm_mtp_mirror_padding_index],
+                        dst_v[self.welm_mtp_mirror_padding_index],
+                    ]
                 )
-                dst_v[self.welm_mtp_mirror_padding_index].copy_(
-                    src_v[required_kv_len - 1]
+                padding_srcs.extend(
+                    [src_k[required_kv_len - 1], src_v[required_kv_len - 1]]
                 )
             else:
                 dst_k[self.welm_mtp_mirror_padding_index].zero_()
                 dst_v[self.welm_mtp_mirror_padding_index].zero_()
+        # One multi-tensor launch per copy shape replaces two launches for every
+        # mirrored layer.  All tensors share device/dtype and foreach-copy keeps
+        # exactly the same asynchronous stream semantics as Tensor.copy_.
+        if real_dsts:
+            torch._foreach_copy_(real_dsts, real_srcs)
+            torch._foreach_copy_(padding_dsts, padding_srcs)
 
     def _copy_welmv4_mtp_mirrored_kv_indices(
         self, forward_batch: ForwardBatch, graph_num_tokens: int
@@ -597,12 +863,46 @@ class WelmMTPDraftProposalCudaGraphRunner:
         hidden_states: torch.Tensor,
         mirrored_kv_indices: Optional[torch.Tensor],
         cached_hash: Optional[torch.Tensor],
+        accept_lens: torch.Tensor,
+        extend_start_loc: torch.Tensor,
         accepted_lens_cpu: list[int],
         padded_lens_cpu: list[int],
         raw_bs: int,
         graph_num_tokens: int,
     ) -> None:
         buffers = self.buffers
+        if self.fused_prepare:
+            if buffers.mirrored_kv_indices is None:
+                raise RuntimeError(
+                    "Fused WeLM MTP graph staging requires a mirror-index buffer."
+                )
+            from sglang.srt.speculative.welmv4_mtp_staging import (
+                pack_welm_mtp_graph_inputs,
+            )
+
+            pack_welm_mtp_graph_inputs(
+                input_ids=input_ids,
+                out_cache_loc=out_cache_loc,
+                positions=positions,
+                hidden_states=hidden_states,
+                mirrored_kv_indices=mirrored_kv_indices,
+                cached_hash=cached_hash,
+                accept_lens=accept_lens,
+                extend_start_loc=extend_start_loc,
+                output_input_ids=buffers.input_ids,
+                output_cache_loc=buffers.out_cache_loc,
+                output_positions=buffers.positions,
+                output_hidden_states=buffers.hidden_states,
+                output_mirrored_kv_indices=buffers.mirrored_kv_indices,
+                output_hash=buffers.welm_mtp_oe_hash_out,
+                custom_last_index=buffers.custom_last_index,
+                custom_last_cache_loc=buffers.custom_last_cache_loc,
+                raw_bs=raw_bs,
+                graph_num_tokens=graph_num_tokens,
+                tokens_per_bs=self.num_tokens_per_bs,
+                mirror_padding_index=self.welm_mtp_mirror_padding_index,
+            )
+            return
         buffers.input_ids[:graph_num_tokens].zero_()
         buffers.out_cache_loc[:graph_num_tokens].zero_()
         buffers.positions[:graph_num_tokens].zero_()
@@ -727,25 +1027,24 @@ class WelmMTPDraftProposalCudaGraphRunner:
         metadata.mirror_max_seq_len_q = 1
 
     def _copy_sampling_params(self, forward_batch: ForwardBatch, raw_bs: int, bs: int):
+        self._copy_sampling_params_from_info(forward_batch.sampling_info, raw_bs, bs)
+
+    def _copy_sampling_params_from_info(self, sampling_info, raw_bs: int, bs: int):
         buffers = self.buffers
         fixed_temperature = self.eagle_worker.welmv4_mtp_draft_fixed_temperature
         fixed_top_p = self.eagle_worker.welmv4_mtp_draft_fixed_top_p
 
-        buffers.temperature[:bs].fill_(
-            1.0 if fixed_temperature is None else fixed_temperature
-        )
-        buffers.top_p[:bs].fill_(1.0 if fixed_top_p is None else fixed_top_p)
-
-        sampling_info = forward_batch.sampling_info
         if sampling_info is None:
             return
         if fixed_temperature is None:
+            buffers.temperature[:bs].fill_(1.0)
             temperatures = getattr(sampling_info, "temperatures", None)
             if temperatures is not None:
                 buffers.temperature[:raw_bs].copy_(
                     temperatures[:raw_bs].to(dtype=torch.float32)
                 )
         if fixed_top_p is None:
+            buffers.top_p[:bs].fill_(1.0)
             top_ps = getattr(sampling_info, "top_ps", None)
             if top_ps is not None:
                 buffers.top_p[:raw_bs].copy_(top_ps[:raw_bs].to(dtype=torch.float32))
@@ -753,14 +1052,23 @@ class WelmMTPDraftProposalCudaGraphRunner:
     def _copy_sampling_randomness(
         self, forward_batch: ForwardBatch, raw_bs: int, bs: int
     ):
+        self._copy_sampling_randomness_from_info(
+            forward_batch.sampling_info,
+            forward_batch.seq_lens,
+            raw_bs,
+            bs,
+        )
+
+    def _copy_sampling_randomness_from_info(
+        self, sampling_info, seq_lens: torch.Tensor, raw_bs: int, bs: int
+    ):
         if not self.sample_draft:
             return
-        sampling_info = forward_batch.sampling_info
         if (
             sampling_info is not None
             and getattr(sampling_info, "sampling_seed", None) is not None
         ):
-            base_positions = (forward_batch.seq_lens[:raw_bs] - 1).to(
+            base_positions = (seq_lens[:raw_bs] - 1).to(
                 dtype=self.buffers.positions.dtype
             )
             deterministic_uniforms = welm_mtp_deterministic_uniforms(
@@ -775,15 +1083,23 @@ class WelmMTPDraftProposalCudaGraphRunner:
                 self.buffers.uniform_samples[:, :raw_bs, 0].copy_(
                     deterministic_uniforms.transpose(0, 1).contiguous()
                 )
-                if self.model_runner.tp_group.world_size > 1:
+                # The hash is stateless and its seed/position inputs are the
+                # same on all TP ranks, so fused prepare needs no collective.
+                if (
+                    self.synced_draft_generator is None
+                    and self.model_runner.tp_group.world_size > 1
+                ):
                     uniform_samples = self.buffers.uniform_samples[:, :bs]
                     broadcast_samples = uniform_samples.contiguous()
                     self.model_runner.tp_group.broadcast(broadcast_samples, src=0)
                     uniform_samples.copy_(broadcast_samples)
                 return
         uniform_samples = self.buffers.uniform_samples[:, :bs]
-        uniform_samples.uniform_()
-        if self.model_runner.tp_group.world_size > 1:
+        uniform_samples.uniform_(generator=self.synced_draft_generator)
+        if (
+            self.synced_draft_generator is None
+            and self.model_runner.tp_group.world_size > 1
+        ):
             broadcast_samples = uniform_samples.contiguous()
             self.model_runner.tp_group.broadcast(broadcast_samples, src=0)
             uniform_samples.copy_(broadcast_samples)
@@ -943,6 +1259,26 @@ class WelmMTPDraftProposalCudaGraphRunner:
                 topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
             return topk_p, topk_index, None, None
 
+        if self.fused_topk_sample and _is_cuda:
+            fused = welmv4_mtp_fused_topk_softmax_sample(
+                logits,
+                self.buffers.temperature[:bs],
+                self.buffers.uniform_samples[step, :bs],
+                self.sampling_topk,
+                top_p=self.buffers.top_p[:bs] if self.use_top_p else None,
+            )
+            if fused is not None:
+                if self.distributed_topk:
+                    sampled_p, sampled_pos, top_pos, top_probs = fused
+                    candidate_ids = self.buffers.welm_mtp_candidate_indices[step, :bs]
+                    return (
+                        sampled_p,
+                        torch.gather(candidate_ids, 1, sampled_pos),
+                        torch.gather(candidate_ids, 1, top_pos),
+                        top_probs,
+                    )
+                return fused
+
         top_logits, top_indices = torch.topk(
             logits.float(),
             k=self.sampling_topk,
@@ -959,6 +1295,10 @@ class WelmMTPDraftProposalCudaGraphRunner:
         sample_pos = torch.clamp(sample_pos, max=self.sampling_topk - 1)
         topk_p = torch.gather(probs, dim=-1, index=sample_pos)
         topk_index = torch.gather(top_indices, dim=-1, index=sample_pos)
+        if self.distributed_topk:
+            candidate_ids = self.buffers.welm_mtp_candidate_indices[step, :bs]
+            topk_index = torch.gather(candidate_ids, 1, topk_index)
+            top_indices = torch.gather(candidate_ids, 1, top_indices)
         return topk_p, topk_index, top_indices, probs
 
     def _get_dp_cuda_graph_request_bs(
@@ -1213,7 +1553,38 @@ class WelmMTPDraftProposalCudaGraphRunner:
         )
         forward_batch.custom_last_index = custom_last_index
         forward_batch.custom_last_cache_loc = custom_last_cache_loc
+        if self.distributed_topk:
+            forward_batch.welm_mtp_distributed_topk = self.sampling_topk
+            forward_batch.welm_mtp_candidate_indices_buffer = (
+                buffers.welm_mtp_candidate_indices[:, :bs]
+            )
         forward_batch.welm_mtp_draft_extend_metadata_bs = bs
+        if self.topk == 1:
+            forward_batch.welm_mtp_linear_proposal_fast_path = True
+            forward_batch.welm_mtp_linear_proposal_parent_list = (
+                buffers.linear_proposal_parent_list[:bs]
+            )
+            forward_batch.welm_mtp_linear_proposal_top_scores_index = (
+                buffers.linear_proposal_top_scores_index[:bs]
+            )
+            if self.fused_linear_graph_outputs:
+                forward_batch.welm_mtp_linear_graph_output_buffers = {
+                    "bonus_tokens": first_input_ids,
+                    "base_positions": buffers.base_positions[:bs],
+                    "topk_p": buffers.linear_proposal_topk_p[:bs],
+                    "topk_index": buffers.linear_proposal_topk_index[:bs],
+                    "proposal_tokens": buffers.linear_proposal_tokens[:bs],
+                    "draft_topk_indices": buffers.linear_proposal_draft_topk_indices[
+                        :bs
+                    ],
+                    "draft_topk_values": buffers.linear_proposal_draft_topk_values[:bs],
+                    "verify_tokens": buffers.linear_verify_tokens[
+                        : bs * self.num_tokens_per_bs
+                    ],
+                    "verify_positions": buffers.linear_verify_positions[
+                        : bs * self.num_tokens_per_bs
+                    ],
+                }
         if self.topk > 1:
             forward_batch.welm_mtp_first_next_token_logits_buffer = (
                 buffers.next_token_logits_buffer[:bs]
@@ -1294,8 +1665,8 @@ class WelmMTPDraftProposalCudaGraphRunner:
             set_is_extend_in_batch(False)
 
             hidden_states_backup = forward_batch.spec_info.hidden_states
-            forward_batch.welm_mtp_draft_graph_select_fn = (
-                lambda logits, step: self._select_topk(logits, step, bs)
+            forward_batch.welm_mtp_draft_graph_select_fn = partial(
+                self._select_topk, bs=bs
             )
             forward_batch.welm_mtp_skip_draft_proposal_build = True
             try:
@@ -1340,6 +1711,261 @@ class WelmMTPDraftProposalCudaGraphRunner:
         set_global_graph_memory_pool(graph.pool())
         self.forward_batches[bs] = forward_batch
         return graph, out
+
+    def can_replay_from_verify(self, batch, batch_result) -> bool:
+        """Whether the fixed top-k=1 verify result can bypass ragged staging."""
+        if not self.persistent_handoff or self.topk != 1 or self.dp_size != 1:
+            return False
+        if batch.forward_mode.is_idle() or batch.seq_lens_cpu is None:
+            return False
+        raw_bs = int(batch.seq_lens.shape[0])
+        index = bisect.bisect_left(self.capture_bs, raw_bs)
+        if raw_bs <= 0 or index >= len(self.capture_bs):
+            return False
+        accept_index = getattr(batch_result, "spec_accept_index", None)
+        accept_lens = getattr(batch_result, "accept_lens", None)
+        logits_output = getattr(batch_result, "logits_output", None)
+        return bool(
+            accept_index is not None
+            and accept_index.ndim == 2
+            and int(accept_index.shape[0]) == raw_bs
+            and int(accept_index.shape[1]) >= self.num_tokens_per_bs
+            and accept_lens is not None
+            and int(accept_lens.numel()) == raw_bs
+            and getattr(logits_output, "hidden_states", None) is not None
+            and batch.out_cache_loc is not None
+            and batch.req_pool_indices is not None
+        )
+
+    def replay_from_verify(
+        self,
+        batch,
+        batch_result,
+        next_draft_input: EagleDraftInput,
+        *,
+        entry_history_state: Optional[torch.Tensor],
+    ) -> None:
+        """Replay proposal graph from target outputs without a temporary batch.
+
+        This is the latency-critical top-k=1 path.  All graph inputs are
+        filled in their final fixed-width layout on device.  There is no
+        accept-lens D2H synchronization, boolean compaction, temporary
+        ``ModelWorkerBatch`` mutation, or ``ForwardBatch.init_new``.
+        """
+        if not self.can_replay_from_verify(batch, batch_result):
+            raise RuntimeError("Persistent WeLM MTP handoff preconditions are not met.")
+
+        self.deepep_adapter.replay()
+        buffers = self.buffers
+        raw_bs = int(batch.seq_lens.shape[0])
+        index = bisect.bisect_left(self.capture_bs, raw_bs)
+        bs = self.capture_bs[index]
+        graph_num_tokens = bs * self.num_tokens_per_bs
+        accept_lens = batch_result.accept_lens
+        accept_index = batch_result.spec_accept_index
+        target_hidden_states = batch_result.logits_output.hidden_states
+
+        from sglang.srt.speculative.welmv4_mtp_staging import (
+            gather_welm_mtp_last_hash,
+            pack_welm_mtp_verify_handoff,
+        )
+
+        pack_welm_mtp_verify_handoff(
+            predict=batch_result.next_token_ids,
+            accept_index=accept_index,
+            accept_lens=accept_lens,
+            target_cache_loc=batch.out_cache_loc,
+            target_hidden_states=target_hidden_states,
+            old_seq_lens=batch.seq_lens,
+            req_pool_indices=batch.req_pool_indices,
+            bonus_tokens=next_draft_input.bonus_tokens,
+            output_input_ids=buffers.input_ids,
+            output_cache_loc=buffers.out_cache_loc,
+            output_positions=buffers.positions,
+            output_hidden_states=buffers.hidden_states,
+            output_mirrored_kv_indices=buffers.mirrored_kv_indices,
+            output_seq_lens=buffers.seq_lens,
+            output_req_pool_indices=buffers.req_pool_indices,
+            output_first_input_ids=buffers.first_input_ids,
+            output_base_positions=buffers.base_positions,
+            custom_last_index=buffers.custom_last_index,
+            custom_last_cache_loc=buffers.custom_last_cache_loc,
+            raw_bs=raw_bs,
+            graph_bs=bs,
+            tokens_per_bs=self.num_tokens_per_bs,
+            mirror_padding_index=self.welm_mtp_mirror_padding_index,
+            seq_len_fill_value=self.seq_len_fill_value,
+        )
+        if buffers.welm_mtp_oe_hash_out is not None:
+            accepted_draft_token_ids = getattr(
+                batch_result, "welm_mtp_accepted_draft_token_ids", None
+            )
+            if accepted_draft_token_ids is None or entry_history_state is None:
+                raise RuntimeError(
+                    "Persistent WeLM MTP handoff requires accepted draft tokens "
+                    "and the compact OE entry history."
+                )
+            from sglang.jit_kernel.welm_oe import (
+                welm_oe_hash_mtp_draft_extend_after_verify_from_history_cuda,
+            )
+
+            oe_grams, oe_vocab_sizes = get_welm_oe_hash_config(
+                self.model_runner.model_config
+            )
+            next_history = buffers.welm_mtp_oe_work_history_a[:raw_bs]
+            welm_oe_hash_mtp_draft_extend_after_verify_from_history_cuda(
+                buffers.input_ids[: raw_bs * self.num_tokens_per_bs],
+                accepted_draft_token_ids.reshape(raw_bs, -1),
+                accept_lens,
+                entry_history_state[:raw_bs],
+                oe_grams,
+                oe_vocab_sizes,
+                buffers.welm_mtp_oe_hash_out[:, : raw_bs * self.num_tokens_per_bs],
+                next_history,
+                self.model_runner.model_config.vocab_size,
+                self.num_tokens_per_bs,
+                use_entry_history_for_extend_hash_prefix=True,
+            )
+            buffers.welm_mtp_oe_entry_history[:raw_bs].copy_(next_history)
+            gather_welm_mtp_last_hash(
+                buffers.welm_mtp_oe_hash_out,
+                accept_lens,
+                buffers.welm_mtp_query_hash_inputs,
+                raw_bs=raw_bs,
+                tokens_per_bs=self.num_tokens_per_bs,
+            )
+            if raw_bs < bs:
+                buffers.welm_mtp_query_hash_inputs[:, raw_bs:bs].zero_()
+                buffers.welm_mtp_oe_entry_history[raw_bs:bs].zero_()
+            next_draft_input.welm_mtp_oe_history_state = (
+                buffers.welm_mtp_oe_entry_history[:raw_bs]
+            )
+        self._copy_welmv4_mtp_mirror_kv_states(
+            None,
+            graph_num_tokens,
+            model_specific_states=batch_result.logits_output.model_specific_states,
+            mirrored_kv_indices=buffers.mirrored_kv_indices[:graph_num_tokens],
+        )
+        self._copy_sampling_params_from_info(batch.sampling_info, raw_bs, bs)
+        self._copy_sampling_randomness_from_info(
+            batch.sampling_info, buffers.seq_lens, raw_bs, bs
+        )
+        # The GPU sequence lengths are exact.  CPU lengths are used only to set
+        # a conservative attention maximum; avoiding accept_lens.cpu() is the key
+        # synchronization win here.
+        buffers.seq_lens_cpu[:raw_bs].copy_(
+            batch.seq_lens_cpu[:raw_bs] + self.num_tokens_per_bs
+        )
+        if raw_bs < bs:
+            buffers.seq_lens_cpu[raw_bs:bs].fill_(self.seq_len_fill_value)
+        if self.require_gathered_buffer:
+            buffers.global_num_tokens_gpu.fill_(graph_num_tokens)
+            buffers.global_num_tokens_for_logprob_gpu.fill_(graph_num_tokens)
+        replay_forward_batch = self.forward_batches[bs]
+        replay_forward_batch.spec_info.extend_seq_lens_cpu = list(
+            self.extend_seq_lens_cpu[:bs]
+        )
+        replay_forward_batch.spec_info.extend_seq_lens_tensor = buffers.extend_seq_lens[
+            :bs
+        ]
+        replay_forward_batch.seq_lens_sum = (
+            int(batch.seq_lens_sum)
+            + (raw_bs * self.num_tokens_per_bs)
+            + (bs - raw_bs) * int(self.seq_len_fill_value)
+        )
+        self.draft_extend_attn_backend.init_forward_metadata_replay_cuda_graph(
+            bs=bs,
+            req_pool_indices=buffers.req_pool_indices,
+            seq_lens=buffers.seq_lens,
+            seq_lens_sum=replay_forward_batch.seq_lens_sum,
+            encoder_lens=None,
+            forward_mode=replay_forward_batch.forward_mode,
+            spec_info=replay_forward_batch.spec_info,
+            seq_lens_cpu=buffers.seq_lens_cpu,
+        )
+        self._set_welmv4_mtp_mirror_metadata(bs)
+        self._init_tree_draft_attn_graph_metadata_replay(
+            replay_forward_batch, bs, raw_bs
+        )
+        self.raw_bs = raw_bs
+        self.bs = bs
+        self._replay()
+        (
+            topk_p,
+            topk_index,
+            hidden_states,
+            draft_probs,
+            draft_topk_indices,
+            draft_topk_values,
+            proposal_parent_list,
+            proposal_top_scores_index,
+            proposal_tokens,
+        ) = self.output_buffers[bs]
+        next_draft_input.topk_p = topk_p[:raw_bs]
+        next_draft_input.topk_index = topk_index[:raw_bs]
+        next_draft_input.hidden_states = hidden_states[:raw_bs]
+        next_draft_input.draft_probs = (
+            None if draft_probs is None else draft_probs[:raw_bs]
+        )
+        next_draft_input.welm_mtp_draft_topk_indices = (
+            None if draft_topk_indices is None else draft_topk_indices[:raw_bs]
+        )
+        next_draft_input.welm_mtp_draft_topk_values = (
+            None if draft_topk_values is None else draft_topk_values[:raw_bs]
+        )
+        next_draft_input.draft_proposal_parent_list = (
+            None if proposal_parent_list is None else proposal_parent_list[:raw_bs]
+        )
+        next_draft_input.draft_proposal_top_scores_index = (
+            None
+            if proposal_top_scores_index is None
+            else proposal_top_scores_index[:raw_bs]
+        )
+        next_draft_input.draft_proposal_tokens = (
+            None if proposal_tokens is None else proposal_tokens[:raw_bs]
+        )
+        next_draft_input.welm_mtp_linear_verify_ready = bool(
+            self.fused_linear_graph_outputs
+        )
+        next_draft_input.welm_mtp_base_positions = buffers.base_positions[:raw_bs]
+        if self.fused_linear_graph_outputs:
+            num_verify_tokens = raw_bs * self.num_tokens_per_bs
+            prebuilt_verify = EagleVerifyInput(
+                draft_token=buffers.linear_verify_tokens[:num_verify_tokens],
+                custom_mask=buffers.linear_verify_mask[
+                    : num_verify_tokens * self.num_tokens_per_bs
+                ],
+                positions=buffers.linear_verify_positions[:num_verify_tokens],
+                retrieve_index=buffers.linear_verify_retrieve_index[:raw_bs],
+                retrieve_next_token=buffers.linear_verify_retrieve_next_token[:raw_bs],
+                retrieve_next_sibling=buffers.linear_verify_retrieve_next_sibling[
+                    :raw_bs
+                ],
+                retrieve_cum_len=None,
+                spec_steps=self.speculative_num_steps,
+                topk=self.topk,
+                draft_token_num=self.speculative_num_draft_tokens,
+                capture_hidden_mode=None,
+                seq_lens_sum=None,
+                seq_lens_cpu=None,
+                draft_probs=None,
+                draft_topk_indices=(
+                    None if draft_topk_indices is None else draft_topk_indices[:raw_bs]
+                ),
+                draft_topk_values=(
+                    None if draft_topk_values is None else draft_topk_values[:raw_bs]
+                ),
+            )
+            next_history_state = getattr(
+                next_draft_input, "welm_mtp_oe_history_state", None
+            )
+            if next_history_state is not None:
+                prebuilt_verify.welm_mtp_oe_history_state = next_history_state
+            prebuilt_verify.welm_mtp_oe_hash_seq_lens = (
+                buffers.linear_verify_hash_seq_lens[:raw_bs]
+            )
+            next_draft_input.welm_mtp_prebuilt_verify_input = prebuilt_verify
+            next_draft_input.welm_mtp_prebuilt_verify_bs = raw_bs
 
     def replay(
         self,
@@ -1388,22 +2014,34 @@ class WelmMTPDraftProposalCudaGraphRunner:
                 "WeLM MTP draft proposal graph replay is missing dense OE hashes."
             )
 
-        buffers.seq_lens[:bs].fill_(self.seq_len_fill_value)
-        buffers.seq_lens_cpu[:bs].fill_(self.seq_len_fill_value)
-        buffers.req_pool_indices[:bs].zero_()
-        buffers.req_pool_indices[:raw_bs].copy_(forward_batch.req_pool_indices)
-        buffers.first_input_ids[:bs].zero_()
-        if buffers.welm_mtp_oe_hash_out is not None:
-            buffers.welm_mtp_query_hash_inputs[:, :bs].zero_()
-            buffers.welm_mtp_oe_entry_history[:bs].zero_()
-            buffers.welm_mtp_oe_work_history_a[:graph_num_tokens].zero_()
-            buffers.welm_mtp_oe_work_history_b[:graph_num_tokens].zero_()
-            buffers.welm_mtp_oe_parent_indices[:graph_num_tokens].zero_()
-            buffers.welm_mtp_oe_prev_input_ids[:graph_num_tokens].zero_()
-            buffers.welm_mtp_oe_prev_prev_input_ids[:graph_num_tokens].zero_()
-            buffers.welm_mtp_oe_output_prev_input_ids[:graph_num_tokens].zero_()
-            buffers.welm_mtp_oe_hash_out_batch_major[:graph_num_tokens].zero_()
-
+        if self.fused_prepare:
+            # Real rows are overwritten below and OE work buffers are outputs of
+            # captured kernels.  Initialize only graph-padding rows; clearing all
+            # scratch tensors here launched nine redundant kernels per replay.
+            if raw_bs < bs:
+                buffers.seq_lens[raw_bs:bs].fill_(self.seq_len_fill_value)
+                buffers.seq_lens_cpu[raw_bs:bs].fill_(self.seq_len_fill_value)
+                buffers.req_pool_indices[raw_bs:bs].zero_()
+                buffers.first_input_ids[raw_bs:bs].zero_()
+                if buffers.welm_mtp_oe_hash_out is not None:
+                    buffers.welm_mtp_query_hash_inputs[:, raw_bs:bs].zero_()
+                    buffers.welm_mtp_oe_entry_history[raw_bs:bs].zero_()
+        else:
+            buffers.seq_lens[:bs].fill_(self.seq_len_fill_value)
+            buffers.seq_lens_cpu[:bs].fill_(self.seq_len_fill_value)
+            buffers.req_pool_indices[:bs].zero_()
+            buffers.req_pool_indices[:raw_bs].copy_(forward_batch.req_pool_indices)
+            buffers.first_input_ids[:bs].zero_()
+            if buffers.welm_mtp_oe_hash_out is not None:
+                buffers.welm_mtp_query_hash_inputs[:, :bs].zero_()
+                buffers.welm_mtp_oe_entry_history[:bs].zero_()
+                buffers.welm_mtp_oe_work_history_a[:graph_num_tokens].zero_()
+                buffers.welm_mtp_oe_work_history_b[:graph_num_tokens].zero_()
+                buffers.welm_mtp_oe_parent_indices[:graph_num_tokens].zero_()
+                buffers.welm_mtp_oe_prev_input_ids[:graph_num_tokens].zero_()
+                buffers.welm_mtp_oe_prev_prev_input_ids[:graph_num_tokens].zero_()
+                buffers.welm_mtp_oe_output_prev_input_ids[:graph_num_tokens].zero_()
+                buffers.welm_mtp_oe_hash_out_batch_major[:graph_num_tokens].zero_()
         if padded_lens_cpu is None:
             raise RuntimeError(
                 "Cannot fit WeLM MTP draft proposal accepted lengths into graph "
@@ -1416,6 +2054,8 @@ class WelmMTPDraftProposalCudaGraphRunner:
             hidden_states=spec_info.hidden_states,
             mirrored_kv_indices=getattr(spec_info, "mirrored_kv_indices", None),
             cached_hash=cached_hash,
+            accept_lens=spec_info.num_accept_tokens,
+            extend_start_loc=forward_batch.extend_start_loc,
             accepted_lens_cpu=accepted_lens_cpu,
             padded_lens_cpu=padded_lens_cpu,
             raw_bs=raw_bs,
@@ -1429,14 +2069,21 @@ class WelmMTPDraftProposalCudaGraphRunner:
             buffers.seq_lens_cpu[:raw_bs].copy_(forward_batch.seq_lens_cpu)
         buffers.req_pool_indices[:raw_bs].copy_(forward_batch.req_pool_indices)
         buffers.first_input_ids[:raw_bs].copy_(first_input_ids)
-        padded_lens = torch.tensor(
-            padded_lens_cpu,
-            dtype=torch.int32,
-            device=buffers.extend_seq_lens.device,
-        )
-        buffers.extend_seq_lens[:bs].copy_(padded_lens)
-        buffers.num_accept_tokens[:bs].copy_(padded_lens)
-        buffers.num_correct_drafts[:bs].copy_(padded_lens - 1)
+        if self.fused_prepare:
+            if any(x != self.num_tokens_per_bs for x in padded_lens_cpu):
+                raise RuntimeError(
+                    "Fused WeLM MTP staging requires full fixed graph rows: "
+                    f"padded_lens={padded_lens_cpu}."
+                )
+        else:
+            padded_lens = torch.tensor(
+                padded_lens_cpu,
+                dtype=torch.int32,
+                device=buffers.extend_seq_lens.device,
+            )
+            buffers.extend_seq_lens[:bs].copy_(padded_lens)
+            buffers.num_accept_tokens[:bs].copy_(padded_lens)
+            buffers.num_correct_drafts[:bs].copy_(padded_lens - 1)
         self.extend_seq_lens_cpu[:bs] = padded_lens_cpu
 
         if buffers.welm_mtp_oe_hash_out is not None and raw_bs > 0:
@@ -1452,7 +2099,6 @@ class WelmMTPDraftProposalCudaGraphRunner:
         if self.require_gathered_buffer:
             buffers.global_num_tokens_gpu.fill_(graph_num_tokens)
             buffers.global_num_tokens_for_logprob_gpu.fill_(graph_num_tokens)
-
         replay_forward_batch = self.forward_batches[bs]
         replay_forward_batch.spec_info.extend_seq_lens_cpu = list(
             self.extend_seq_lens_cpu[:bs]
@@ -1479,7 +2125,6 @@ class WelmMTPDraftProposalCudaGraphRunner:
             bs,
             raw_bs,
         )
-
         self.raw_bs = raw_bs
         self.bs = bs
         self._replay()
@@ -1497,33 +2142,30 @@ class WelmMTPDraftProposalCudaGraphRunner:
 
         spec_info = forward_batch.spec_info
         assert isinstance(spec_info, EagleDraftInput)
-        spec_info.topk_p = topk_p[:raw_bs].clone()
-        spec_info.topk_index = topk_index[:raw_bs].clone()
-        spec_info.hidden_states = hidden_states[:raw_bs].clone()
-        spec_info.draft_probs = (
-            None if draft_probs is None else draft_probs[:raw_bs].clone()
-        )
+        # CUDA-graph outputs are persistent runner-owned buffers.  The proposal
+        # is consumed by draft() before the next replay, so views are sufficient
+        # and avoid eight tiny device-to-device clone launches per cycle.
+        spec_info.topk_p = topk_p[:raw_bs]
+        spec_info.topk_index = topk_index[:raw_bs]
+        spec_info.hidden_states = hidden_states[:raw_bs]
+        spec_info.draft_probs = None if draft_probs is None else draft_probs[:raw_bs]
         spec_info.welm_mtp_draft_topk_indices = (
-            None if draft_topk_indices is None else draft_topk_indices[:raw_bs].clone()
+            None if draft_topk_indices is None else draft_topk_indices[:raw_bs]
         )
         spec_info.welm_mtp_draft_topk_values = (
-            None if draft_topk_values is None else draft_topk_values[:raw_bs].clone()
+            None if draft_topk_values is None else draft_topk_values[:raw_bs]
         )
         spec_info.draft_proposal_parent_list = (
-            None
-            if proposal_parent_list is None
-            else proposal_parent_list[:raw_bs].clone()
+            None if proposal_parent_list is None else proposal_parent_list[:raw_bs]
         )
         spec_info.draft_proposal_top_scores_index = (
             None
             if proposal_top_scores_index is None
-            else proposal_top_scores_index[:raw_bs].clone()
+            else proposal_top_scores_index[:raw_bs]
         )
         spec_info.draft_proposal_tokens = (
-            None if proposal_tokens is None else proposal_tokens[:raw_bs].clone()
+            None if proposal_tokens is None else proposal_tokens[:raw_bs]
         )
         base_position_index = buffers.custom_last_index[:raw_bs]
-        spec_info.welm_mtp_base_positions = buffers.positions[
-            base_position_index
-        ].clone()
+        spec_info.welm_mtp_base_positions = buffers.positions[base_position_index]
         forward_batch.mtp_step_idx = 0

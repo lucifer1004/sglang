@@ -22,7 +22,10 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.models.welm_perf_opt import compute_welm_oe_embedding
+from sglang.srt.models.welm_perf_opt import (
+    compute_welm_local_embedding,
+    compute_welm_oe_embedding,
+)
 from sglang.srt.models.welmv4 import (
     Qwen2MoeDecoderLayer,
     WelmV4FusedRMSNorm,
@@ -58,6 +61,7 @@ _MTP_GRAPH_DUMP_CURRENT_PREFIX = None
 _MTP_GRAPH_DUMP_PREV_NAME_PREFIX = ""
 _MTP_DUMP_CONTEXT_ENV = "SGLANG_DUMP_MTP_ACTIVATIONS_CONTEXT"
 _MTP_TRUE_ENV_VALUES = {"1", "true", "on", "yes"}
+_MTP_FUSE_EMBEDDING_ALLREDUCE_ENV = "SGLANG_WELM_MTP_FUSE_EMBEDDING_ALLREDUCE"
 _MTP_DUMP_ENABLED = (
     os.environ.get("SGLANG_DUMP_MTP_ACTIVATIONS", "0").strip().lower()
     in _MTP_TRUE_ENV_VALUES
@@ -286,6 +290,10 @@ class WeLMV4ModelNextN(nn.Module):
         self.oe_dim = config.oe_dim
         self.oe_grams = config.oe_grams
         self.oe_vocab_sizes = config.oe_vocab_sizes
+        self.fuse_embedding_allreduce = (
+            os.environ.get(_MTP_FUSE_EMBEDDING_ALLREDUCE_ENV, "0").strip().lower()
+            in _MTP_TRUE_ENV_VALUES
+        )
 
         if len(self.oe_vocab_sizes) > 0:
             self.oe_embed = nn.ModuleList(
@@ -331,6 +339,39 @@ class WeLMV4ModelNextN(nn.Module):
                 for i in range(self.num_physical_mtp_layers)
             ]
         )
+        if self.fuse_embedding_allreduce:
+            logger.info(
+                "%s=1: MTP base-token and OE partials will share one TP "
+                "all-reduce per draft step.",
+                _MTP_FUSE_EMBEDDING_ALLREDUCE_ENV,
+            )
+
+    def _can_fuse_embedding_allreduce(
+        self,
+        input_ids: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> bool:
+        return (
+            self.fuse_embedding_allreduce
+            and not welm_use_previous_precision()
+            and len(self.oe_grams) > 0
+            and self.oe_embed is not None
+            and self.oe_gate_up_proj is not None
+            and input_ids.numel() > 0
+            and not forward_batch.forward_mode.is_idle()
+        )
+
+    def _apply_base_embedding(
+        self,
+        input_ids: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> tuple[torch.Tensor, bool]:
+        """Compute base embedding and report whether it is still TP-local."""
+
+        fuse_allreduce = self._can_fuse_embedding_allreduce(input_ids, forward_batch)
+        if fuse_allreduce:
+            return compute_welm_local_embedding(self.embed_tokens, input_ids), True
+        return self.embed_tokens(input_ids), False
 
     def _get_physical_step_idx(self, step_idx: int) -> int:
         if step_idx < 0:
@@ -362,12 +403,17 @@ class WeLMV4ModelNextN(nn.Module):
         forward_batch: ForwardBatch,
         *,
         hashed_inputs: Optional[torch.Tensor] = None,
+        base_hidden_is_local: bool = False,
     ) -> torch.Tensor:
         if (
             len(self.oe_grams) == 0
             or input_ids.numel() == 0
             or forward_batch.forward_mode.is_idle()
         ):
+            if base_hidden_is_local:
+                raise RuntimeError(
+                    "A TP-local WeLM base embedding cannot bypass OE fusion."
+                )
             return hidden_states
 
         if hashed_inputs is None:
@@ -382,6 +428,7 @@ class WeLMV4ModelNextN(nn.Module):
                 vocab_size=self.vocab_size,
                 oe_embed_modules=self.oe_embed,
                 oe_proj_module=self.oe_gate_up_proj,
+                fuse_base_embedding_allreduce=base_hidden_is_local,
             )
 
         from sglang.srt.speculative.welm_mtp_draft_ngram_hash import (
@@ -402,6 +449,7 @@ class WeLMV4ModelNextN(nn.Module):
                 vocab_size=self.vocab_size,
                 oe_embed_modules=self.oe_embed,
                 oe_proj_module=self.oe_gate_up_proj,
+                fuse_base_embedding_allreduce=base_hidden_is_local,
             )
         finally:
             if had_attr:
@@ -442,7 +490,9 @@ class WeLMV4ModelNextN(nn.Module):
                 f"last-query rows: {query_input_ids.shape[0]} vs {expected_rows}."
             )
 
-        query_hidden = self.embed_tokens(query_input_ids)
+        query_hidden, query_hidden_is_local = self._apply_base_embedding(
+            query_input_ids, forward_batch
+        )
         query_hashed_inputs = getattr(
             forward_batch, "welm_mtp_query_oe_hashed_inputs", None
         )
@@ -466,6 +516,7 @@ class WeLMV4ModelNextN(nn.Module):
             query_hidden,
             forward_batch,
             hashed_inputs=query_hashed_inputs,
+            base_hidden_is_local=query_hidden_is_local,
         )
 
     def _maybe_override_merged_query_embedding(
@@ -519,7 +570,9 @@ class WeLMV4ModelNextN(nn.Module):
                 f"last-query rows: {query_input_ids.shape[0]} vs {expected_rows}."
             )
 
-        query_hidden = self.embed_tokens(query_input_ids)
+        query_hidden, query_hidden_is_local = self._apply_base_embedding(
+            query_input_ids, forward_batch
+        )
         query_hidden = self._apply_oe_embedding(
             query_input_ids,
             query_hidden,
@@ -527,6 +580,7 @@ class WeLMV4ModelNextN(nn.Module):
             hashed_inputs=getattr(
                 forward_batch, "welm_mtp_query_oe_hashed_inputs", None
             ),
+            base_hidden_is_local=query_hidden_is_local,
         )
         hidden_states = hidden_states.clone()
         hidden_states[custom_last_index] = query_hidden.to(hidden_states.dtype)
@@ -553,14 +607,24 @@ class WeLMV4ModelNextN(nn.Module):
         hidden_states = self._build_merged_query_embedding_only(
             forward_batch, input_ids.device
         )
+        needs_merged_query_override = hidden_states is None
         if hidden_states is None:
+            base_hidden_is_local = False
             if input_embeds is None:
-                hidden_states = self.embed_tokens(input_ids)
+                hidden_states, base_hidden_is_local = self._apply_base_embedding(
+                    input_ids, forward_batch
+                )
             else:
                 hidden_states = input_embeds
             hidden_states = self._apply_oe_embedding(
-                input_ids, hidden_states, forward_batch
+                input_ids,
+                hidden_states,
+                forward_batch,
+                base_hidden_is_local=base_hidden_is_local,
             )
+        if hidden_states is None:
+            raise RuntimeError("WeLM MTP embedding path returned no hidden states")
+        if needs_merged_query_override:
             hidden_states = self._maybe_override_merged_query_embedding(
                 hidden_states, forward_batch
             )
