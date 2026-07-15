@@ -646,6 +646,11 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def get_kvcache(self):
         return self._kvcache
 
+    def _invalidate_loc_cache(self) -> None:
+        invalidate = getattr(self._kvcache, "invalidate_loc_cache", None)
+        if invalidate is not None:
+            invalidate()
+
     def translate_loc_from_full_to_swa(self, kv_indices: torch.Tensor):
         assert self._kvcache.full_to_swa_index_mapping is not None
         return self._kvcache.translate_loc_from_full_to_swa(kv_indices)
@@ -832,7 +837,11 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         assert self.swa_attn_allocator.available_size() <= self.swa_attn_allocator.size
 
     def set_full_to_swa_mapping(
-        self, full_indices: torch.Tensor, swa_indices: torch.Tensor
+        self,
+        full_indices: torch.Tensor,
+        swa_indices: torch.Tensor,
+        *,
+        filter_dummy: bool = True,
     ) -> None:
         """Write full_to_swa_index_mapping[full_indices[i]] = swa_indices[i].
 
@@ -841,12 +850,17 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if full_indices.numel() == 0:
             return
         assert full_indices.numel() == swa_indices.numel()
+        if filter_dummy:
+            valid = full_indices != 0
+            full_indices = full_indices[valid]
+            swa_indices = swa_indices[valid]
         if _is_npu:
             self.full_to_swa_index_mapping[full_indices.to(torch.int64)] = (
                 swa_indices.to(torch.int64)
             )
         else:
             self.full_to_swa_index_mapping[full_indices] = swa_indices
+        self._invalidate_loc_cache()
 
     def free_swa(self, free_index: torch.Tensor):
         swa_indices = self.full_to_swa_index_mapping[free_index]
@@ -865,6 +879,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             else:
                 self.swa_attn_allocator.free(swa_indices)
         self.full_to_swa_index_mapping[free_index] = 0
+        self._invalidate_loc_cache()
 
     def add_backup_pending(self, swa_indices: torch.Tensor) -> None:
         """Mark SWA slots as having an in-flight backup.
@@ -1021,9 +1036,7 @@ class SuffixTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         return self.suffix_attn_allocator.available_size()
 
     def swa_available_size(self):
-        return (
-            self.swa_attn_allocator.available_size() if self.enable_swa else 0
-        )
+        return self.swa_attn_allocator.available_size() if self.enable_swa else 0
 
     @property
     def size_full(self):
@@ -1102,8 +1115,7 @@ class SuffixTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         )
         if self.enable_swa:
             assert (
-                self.swa_attn_allocator.available_size()
-                <= self.swa_attn_allocator.size
+                self.swa_attn_allocator.available_size() <= self.swa_attn_allocator.size
             )
 
     def free_suffix(self, free_index: torch.Tensor):

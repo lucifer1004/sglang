@@ -24,8 +24,9 @@ import torch
 from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorageConfig,
     HiCacheStorageExtraInfo,
-    hicache_timing_enabled,
+    PoolTransfer,
     hicache_gib_per_s,
+    hicache_timing_enabled,
     log_hicache_timing,
 )
 
@@ -711,10 +712,15 @@ class HiCacheController:
         device_indices: torch.Tensor,
         priority: Optional[int] = None,
         node_id: int = -1,
+        extra_pools: Optional[List[PoolTransfer]] = None,
     ) -> Optional[torch.Tensor]:
         """
         Back up KV caches from device memory to host memory.
         """
+        if extra_pools:
+            raise NotImplementedError(
+                "Extra HiCache pools require HybridCacheController"
+            )
         host_indices = self.mem_pool_host.alloc(len(device_indices))
         if host_indices is None:
             return None
@@ -766,16 +772,24 @@ class HiCacheController:
         host_indices: torch.Tensor,
         priority: Optional[int] = None,
         node_id: int = -1,
+        device_indices: Optional[torch.Tensor] = None,
+        extra_pools: Optional[List[PoolTransfer]] = None,
     ) -> Optional[torch.Tensor]:
         """
         Load KV caches from host memory to device memory.
         """
-        device_indices = self.mem_pool_device_allocator.alloc(len(host_indices))
+        if extra_pools:
+            raise NotImplementedError(
+                "Extra HiCache pools require HybridCacheController"
+            )
         if device_indices is None:
-            return None
-        self.load_queue.append(
-            CacheOperation(host_indices, device_indices, node_id, priority)
-        )
+            device_indices = self.mem_pool_device_allocator.alloc(len(host_indices))
+            if device_indices is None:
+                return None
+        if len(host_indices) > 0:
+            self.load_queue.append(
+                CacheOperation(host_indices, device_indices, node_id, priority)
+            )
         return device_indices
 
     def move_indices(self, host_indices: torch.Tensor, device_indices: torch.Tensor):

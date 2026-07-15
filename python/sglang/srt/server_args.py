@@ -3172,12 +3172,49 @@ class ServerArgs:
             raise ValueError(
                 "--attn-cp-mode sharded-kv currently requires --kv-cache-dtype auto"
             )
-        if self.cpu_offload_gb > 0 or self.enable_hierarchical_cache:
+        if self.cpu_offload_gb > 0:
             raise ValueError(
-                "--attn-cp-mode sharded-kv currently does not support CPU KV "
-                "offload or hierarchical cache"
+                "--attn-cp-mode sharded-kv currently does not support CPU KV offload"
             )
-        if not self.disable_radix_cache:
+        if self.disaggregation_decode_enable_radix_cache:
+            raise ValueError(
+                "--attn-cp-mode sharded-kv currently does not support "
+                "decode-side radix cache; disable "
+                "--disaggregation-decode-enable-radix-cache"
+            )
+        if self.enable_hierarchical_cache:
+            if not self.disable_overlap_schedule:
+                raise ValueError(
+                    "AttnCP sharded-KV + HiCache requires --disable-overlap-schedule"
+                )
+            if self.schedule_policy != "fcfs":
+                logger.warning(
+                    "FCFS scheduling is required for AttnCP sharded-KV + "
+                    "HiCache because cache residency is rank-local."
+                )
+                self.schedule_policy = "fcfs"
+            if self.disaggregation_mode == "decode":
+                raise ValueError(
+                    "--attn-cp-mode sharded-kv + hierarchical cache supports "
+                    "HiCache only on prefill or non-PD processes; disable "
+                    "--enable-hierarchical-cache on PD decode servers"
+                )
+            if self.hicache_storage_backend is not None:
+                raise ValueError(
+                    "--attn-cp-mode sharded-kv + hierarchical cache currently "
+                    "supports only CPU L2 HiCache; L3 storage backends are not supported"
+                )
+            if self.enable_lmcache:
+                raise ValueError(
+                    "--attn-cp-mode sharded-kv + hierarchical cache currently "
+                    "does not support LMCache"
+                )
+            if self.disaggregation_decode_enable_offload_kvcache:
+                raise ValueError(
+                    "--attn-cp-mode sharded-kv + hierarchical cache currently "
+                    "does not support decode KV offload"
+                )
+        elif not self.disable_radix_cache:
             logger.warning(
                 "Radix cache is disabled because --attn-cp-mode sharded-kv "
                 "uses DUMMY slots and sharded logical capacity accounting."
@@ -3647,6 +3684,17 @@ class ServerArgs:
             or self.disaggregation_decode_enable_offload_kvcache
         ):
             return
+
+        if (
+            self.enable_hierarchical_cache
+            and self.attn_cp_mode == "sharded-kv"
+            and self.hicache_io_backend == "kernel"
+        ):
+            self.hicache_io_backend = "direct"
+            logger.warning(
+                "AttnCP sharded-KV + HiCache requires FA3; switching HiCache "
+                "to direct I/O so backend normalization keeps FA3 decode."
+            )
 
         # Step 1: Initial layout-io compatibility normalization.
         self._resolve_layout_io_compatibility()

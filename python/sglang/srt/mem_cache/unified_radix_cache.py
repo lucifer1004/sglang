@@ -24,6 +24,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchResult,
 )
 from sglang.srt.mem_cache.hicache_storage import (
+    CPHiCacheTransferPlan,
     PoolName,
     PoolTransfer,
     SidecarPoolSpec,
@@ -548,7 +549,12 @@ class UnifiedRadixCache(BasePrefixCache):
                 )
                 if cl is not None:
                     effective_cache_len = min(effective_cache_len, cl)
-
+            prompt_cache_limit = self._attncp_hicache_prompt_cache_limit(req)
+            if prompt_cache_limit is not None:
+                effective_cache_len = min(effective_cache_len, prompt_cache_limit)
+            self._clamp_swa_evicted_seqlen_for_cache_len(
+                insert_params, effective_cache_len
+            )
             # Truncate if needed
             if effective_cache_len < len(token_ids):
                 free_start = max(effective_cache_len, req.cache_protected_len)
@@ -613,7 +619,10 @@ class UnifiedRadixCache(BasePrefixCache):
             )
             if cl is not None:
                 effective_cache_len = min(effective_cache_len, cl)
-
+        prompt_cache_limit = self._attncp_hicache_prompt_cache_limit(req)
+        if prompt_cache_limit is not None:
+            effective_cache_len = min(effective_cache_len, prompt_cache_limit)
+        self._clamp_swa_evicted_seqlen_for_cache_len(insert_params, effective_cache_len)
         if effective_cache_len <= 0:
             req.prefix_indices = kv_indices_orig.to(dtype=torch.int64, copy=True)
             for comp in self._components_tuple:
@@ -680,6 +689,23 @@ class UnifiedRadixCache(BasePrefixCache):
 
     # ---- Internal Helpers ----
 
+    def _attncp_hicache_prompt_cache_limit(self, req: Req) -> Optional[int]:
+        if self.cache_controller is None:
+            return None
+        if not self._has_cp_hicache_allocator():
+            return None
+        return (len(req.origin_input_ids) // self.page_size) * self.page_size
+
+    def _clamp_swa_evicted_seqlen_for_cache_len(
+        self, params: InsertParams, cache_len: int
+    ) -> None:
+        sliding_window_size = self.sliding_window_size
+        if sliding_window_size is None:
+            return
+        max_evicted = max(0, int(cache_len) - int(sliding_window_size))
+        max_evicted = (max_evicted // self.page_size) * self.page_size
+        params.swa_evicted_seqlen = min(params.swa_evicted_seqlen, max_evicted)
+
     def _match_prefix_helper(
         self, key: RadixKey
     ) -> tuple[list[torch.Tensor], UnifiedTreeNode, UnifiedTreeNode, int]:
@@ -735,6 +761,8 @@ class UnifiedRadixCache(BasePrefixCache):
                 break
 
             prefix_len = child.key.match(key, page_size=self.page_size)
+            if prefix_len <= 0:
+                break
             if prefix_len < len(child.key):
                 node = self._split_node(child.key, child, prefix_len)
                 if not node.evicted:
@@ -779,15 +807,16 @@ class UnifiedRadixCache(BasePrefixCache):
             cur_time -= 0.00001
             node_update = node_update.parent
 
-        # last_host_node will be used as the starting node for the subsequent
-        # `prefetch_from_storage` flow. We directly use best_match_node here,
-        # because best_match_node represents the node where all components
-        # have reached consensus on both device & host availability.
-        last_host_node = (
-            best_match_node
-            if self.cache_controller is not None
-            else best_match_device_node
-        )
+        if self.cache_controller is None:
+            last_host_node = best_match_device_node
+        elif best_match_node is best_match_device_node:
+            # A fully device-resident match needs no load-back, even if an
+            # ancestor also has a host backup.
+            last_host_node = best_match_device_node
+        else:
+            last_host_node = best_match_node
+            while last_host_node is not self.root_node and not last_host_node.backuped:
+                last_host_node = last_host_node.parent
 
         if best_match_device_value_len > 0:
             device_indices = torch.cat(value[:best_match_device_value_len])
@@ -874,9 +903,8 @@ class UnifiedRadixCache(BasePrefixCache):
         ct = BASE_COMPONENT_TYPE
         cd = node.component_data[ct]
         assert cd.value is None
-        n = len(fresh_value)
         cd.value = fresh_value.clone()
-        self.component_evictable_size_[ct] += n
+        self.component_evictable_size_[ct] += len(fresh_value)
         self._update_evictable_leaf_sets(node)
         if node.parent is not None:
             self._update_evictable_leaf_sets(node.parent)
@@ -898,7 +926,7 @@ class UnifiedRadixCache(BasePrefixCache):
         ct = BASE_COMPONENT_TYPE
         cd = node.component_data[ct]
         host_value = cd.host_value
-        if host_value is None or len(host_value) != len(fresh_value):
+        if host_value is None:
             return False
 
         if node.id in self.ongoing_write_through:
@@ -906,7 +934,38 @@ class UnifiedRadixCache(BasePrefixCache):
             if node.id in self.ongoing_write_through:
                 return False
 
-        host_indices, device_indices = cc.move_indices(host_value, fresh_value)
+        cp_meta = cd.metadata.get(FullComponent.CP_HICACHE_META_KEY)
+        if cp_meta is None:
+            if len(host_value) != len(fresh_value):
+                return False
+            restore_device_value = fresh_value
+        else:
+            owned_offsets = cp_meta["owned_logical_offsets"].to(
+                device=fresh_value.device, dtype=torch.long
+            )
+            if owned_offsets.numel() > len(host_value):
+                return False
+            if owned_offsets.numel() == 0:
+                restore_device_value = torch.empty(
+                    (0,), dtype=torch.int64, device=fresh_value.device
+                )
+            else:
+                if int(owned_offsets.max().item()) >= fresh_value.numel():
+                    return False
+                restore_device_value = fresh_value.reshape(-1)[owned_offsets].to(
+                    dtype=torch.int64
+                )
+            pad_slots = getattr(
+                self.token_to_kv_pool_allocator, "_pad_transfer_slots", None
+            )
+            if pad_slots is not None:
+                restore_device_value = pad_slots(
+                    restore_device_value, target_len=len(host_value)
+                )
+            elif len(restore_device_value) != len(host_value):
+                return False
+
+        host_indices, device_indices = cc.move_indices(host_value, restore_device_value)
         pool_transfers = self._build_host_sidecar_restores(node, fresh_value)
         device_module = get_device_module()
         start_event = device_module.Event()
@@ -975,8 +1034,6 @@ class UnifiedRadixCache(BasePrefixCache):
         host_value = cd.host_value
         if cd.value is not None or host_value is None or len(host_value) == 0:
             return transfers
-        if len(host_value) > len(fresh_value):
-            return transfers
 
         translator = getattr(
             self.token_to_kv_pool_allocator, "translate_loc_from_full_to_swa", None
@@ -984,8 +1041,33 @@ class UnifiedRadixCache(BasePrefixCache):
         if translator is None:
             return transfers
 
-        full_tail = fresh_value[-len(host_value) :]
-        device_value = translator(full_tail).to(torch.int64)
+        swa_offsets = cd.metadata.get(SWAComponent.HICACHE_OFFSETS_KEY)
+        if swa_offsets is not None:
+            swa_offsets = swa_offsets.to(device=fresh_value.device, dtype=torch.long)
+            if swa_offsets.numel() > len(host_value):
+                return transfers
+            if swa_offsets.numel() == 0:
+                device_value = torch.empty(
+                    (0,), dtype=torch.int64, device=fresh_value.device
+                )
+            else:
+                if int(swa_offsets.max().item()) >= fresh_value.numel():
+                    return transfers
+                device_value = translator(fresh_value.reshape(-1)[swa_offsets]).to(
+                    torch.int64
+                )
+            pad_slots = getattr(
+                self.token_to_kv_pool_allocator, "_pad_transfer_slots", None
+            )
+            if pad_slots is not None:
+                device_value = pad_slots(device_value, target_len=len(host_value))
+            elif len(device_value) != len(host_value):
+                return transfers
+        else:
+            if len(host_value) > len(fresh_value):
+                return transfers
+            full_tail = fresh_value[-len(host_value) :]
+            device_value = translator(full_tail).to(torch.int64)
         host_indices, device_indices = cc.move_indices(host_value, device_value)
         transfers.append(
             PoolTransfer(
@@ -1013,6 +1095,8 @@ class UnifiedRadixCache(BasePrefixCache):
             node = node.children[child_key]
             self._touch_node(node)
             prefix_len = node.key.match(key, page_size=self.page_size)
+            if prefix_len <= 0:
+                return InsertResult(prefix_len=total_prefix_length)
             if prefix_len < len(node.key):
                 node = self._split_node(node.key, node, prefix_len)
 
@@ -1177,12 +1261,16 @@ class UnifiedRadixCache(BasePrefixCache):
                     )
 
         # Now that all components (including SWA which depends on Full.value)
-        # have been freed, we can safely tombstone Full.value.
-        # This is deferred from evict_component because free_swa needs it.
+        # have been freed, release any paired SWA mapping left by a FULL-only
+        # HiCache load and then tombstone Full.value.
         if (
             target is EvictLayer.DEVICE
             and trigger.component_type == BASE_COMPONENT_TYPE
         ):
+            full_value = node.component_data[trigger.component_type].value
+            free_swa = getattr(self.token_to_kv_pool_allocator, "free_swa", None)
+            if full_value is not None and free_swa is not None:
+                free_swa(full_value)
             node.component_data[trigger.component_type].value = None
 
         self._update_evictable_leaf_sets(node)
@@ -1413,6 +1501,198 @@ class UnifiedRadixCache(BasePrefixCache):
 
     # ---- HiCache: Backup / LoadBack ----
 
+    def _node_logical_start(self, node: UnifiedTreeNode) -> int:
+        logical_start = 0
+        cur = node.parent
+        while cur is not None and cur is not self.root_node:
+            logical_start += len(cur.key)
+            cur = cur.parent
+        return logical_start
+
+    def _has_cp_hicache_allocator(self) -> bool:
+        return hasattr(self.token_to_kv_pool_allocator, "build_hicache_write_plan")
+
+    def _build_cp_hicache_load_plan(
+        self, kv_xfer: PoolTransfer
+    ) -> Optional[CPHiCacheTransferPlan]:
+        allocator = self.token_to_kv_pool_allocator
+        plans: list[CPHiCacheTransferPlan] = []
+
+        def release() -> None:
+            for plan in plans:
+                allocator.free(plan.full_device_indices)
+
+        for node in kv_xfer.nodes_to_load or []:
+            cd = node.component_data[BASE_COMPONENT_TYPE]
+            meta = cd.metadata.get(FullComponent.CP_HICACHE_META_KEY)
+            if meta is None or cd.host_value is None:
+                release()
+                logger.warning(
+                    "Ignoring incomplete AttnCP HiCache metadata for node %s",
+                    node.id,
+                )
+                return None
+            try:
+                plan = allocator.alloc_hicache_load_plan(
+                    logical_start=int(meta["logical_start"]),
+                    logical_len=int(meta["logical_len"]),
+                    host_indices=cd.host_value,
+                )
+            except RuntimeError as error:
+                release()
+                logger.warning(
+                    "Cannot build AttnCP HiCache load plan for node %s: %s",
+                    node.id,
+                    error,
+                )
+                return None
+            if plan is None:
+                release()
+                return None
+            expected = meta["owned_logical_offsets"].to("cpu", dtype=torch.int64)
+            if not torch.equal(plan.owned_logical_offsets, expected):
+                allocator.free(plan.full_device_indices)
+                release()
+                logger.warning(
+                    "Ignoring changed AttnCP HiCache owner mapping for node %s",
+                    node.id,
+                )
+                return None
+            plans.append(plan)
+
+        if not plans:
+            empty = torch.empty(0, dtype=torch.int64, device=allocator.device)
+            return CPHiCacheTransferPlan(0, 0, empty, empty, empty.cpu())
+
+        logical_offset = 0
+        owned_offsets = []
+        for plan in plans:
+            owned_offsets.append(plan.owned_logical_offsets + logical_offset)
+            logical_offset += plan.logical_len
+        return CPHiCacheTransferPlan(
+            logical_start=plans[0].logical_start,
+            logical_len=logical_offset,
+            full_device_indices=torch.cat([p.full_device_indices for p in plans]),
+            owned_device_indices=torch.cat([p.owned_device_indices for p in plans]),
+            owned_logical_offsets=torch.cat(owned_offsets),
+        )
+
+    def _fill_cp_hicache_swa_load_devices(
+        self,
+        kv_xfer: PoolTransfer,
+        cp_load_plan: CPHiCacheTransferPlan,
+        comp_xfers: dict[ComponentType, list[PoolTransfer]],
+    ) -> bool:
+        """Reuse CP load-back's preallocated SWA slots for SWA extra-pool H2D.
+
+        CPShardedKVPoolAllocator allocates paired FULL/SWA pages for a Full-KV
+        load-back plan. If the SWA extra-pool transfer is left without
+        device_indices, HybridCacheController allocates another SWA copy and
+        overwrites the full->swa mapping, leaking the paired SWA pages.
+        """
+        swa_xfers = comp_xfers.get(ComponentType.SWA)
+        if not swa_xfers:
+            return True
+
+        allocator = self.token_to_kv_pool_allocator
+        translator = getattr(allocator, "translate_loc_from_full_to_swa", None)
+        if translator is None:
+            return False
+
+        full_slices: dict[int, torch.Tensor] = {}
+        offset = 0
+        for node in kv_xfer.nodes_to_load or []:
+            meta = node.component_data[BASE_COMPONENT_TYPE].metadata.get(
+                FullComponent.CP_HICACHE_META_KEY
+            )
+            if meta is None:
+                return False
+            n_len = int(meta["logical_len"])
+            full_slices[node.id] = cp_load_plan.full_device_indices[
+                offset : offset + n_len
+            ]
+            offset += n_len
+        if offset != cp_load_plan.full_device_indices.numel():
+            return False
+
+        pad_slots = getattr(allocator, "_pad_transfer_slots", None)
+
+        def build_paired_device_value(
+            node: UnifiedTreeNode, full_value: torch.Tensor, host_len: int
+        ) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
+            cd = node.component_data[ComponentType.SWA]
+            offsets = cd.metadata.get(SWAComponent.HICACHE_OFFSETS_KEY)
+            if offsets is None:
+                meta = node.component_data[BASE_COMPONENT_TYPE].metadata.get(
+                    FullComponent.CP_HICACHE_META_KEY
+                )
+                offsets = (
+                    meta["owned_logical_offsets"].to(device="cpu", dtype=torch.int64)
+                    if meta is not None
+                    else None
+                )
+
+            if offsets is not None:
+                offsets = offsets.to(device=full_value.device, dtype=torch.long)
+                if offsets.numel() == 0:
+                    device_value = torch.empty(
+                        (0,), dtype=torch.int64, device=full_value.device
+                    )
+                else:
+                    if int(offsets.max().item()) >= full_value.numel():
+                        return None
+                    selected_full = full_value.reshape(-1)[offsets]
+                    device_value = translator(selected_full).to(torch.int64)
+                keep = torch.zeros(
+                    full_value.numel(), dtype=torch.bool, device=full_value.device
+                )
+                keep[offsets] = True
+                unused_full = full_value.reshape(-1)[~keep]
+                if pad_slots is not None:
+                    return pad_slots(device_value, target_len=host_len), unused_full
+                if len(device_value) != host_len:
+                    return None
+                return device_value, unused_full
+
+            if host_len > len(full_value):
+                return None
+            return (
+                translator(full_value[-host_len:]).to(torch.int64),
+                full_value[:-host_len],
+            )
+
+        used_full_nodes: set[int] = set()
+        for xfer in swa_xfers:
+            device_values: list[torch.Tensor] = []
+            for node in xfer.nodes_to_load or []:
+                cd = node.component_data[ComponentType.SWA]
+                host_value = cd.host_value
+                if host_value is None:
+                    return False
+
+                full_value = full_slices.get(node.id)
+                if full_value is None:
+                    # Loading SWA without loading its FULL node would require a
+                    # separate rank-synchronized allocation transaction. Fall
+                    # back to cold prefill instead of allocating asymmetrically.
+                    return False
+
+                result = build_paired_device_value(node, full_value, len(host_value))
+                if result is None:
+                    return False
+                device_value, unused_full = result
+                allocator.free_swa(unused_full)
+                device_values.append(device_value)
+                used_full_nodes.add(node.id)
+
+            if device_values:
+                xfer.device_indices = torch.cat(device_values)
+
+        for node_id, full_value in full_slices.items():
+            if node_id not in used_full_nodes:
+                allocator.free_swa(full_value)
+        return True
+
     def write_backup(self, node: UnifiedTreeNode, write_back: bool = False) -> int:
         """Backup a node's data from device to host (D->H)."""
         if self.cache_controller is None:
@@ -1425,14 +1705,30 @@ class UnifiedRadixCache(BasePrefixCache):
             return 0
 
         device_value = node.component_data[BASE_COMPONENT_TYPE].value
-        kv_xfer = PoolTransfer(name=PoolName.KV, device_indices=device_value)
+        cp_plan = None
+        transfer_device_value = device_value
+        if self._has_cp_hicache_allocator():
+            cp_plan = self.token_to_kv_pool_allocator.build_hicache_write_plan(
+                self._node_logical_start(node), device_value
+            )
+            transfer_device_value = cp_plan.owned_device_indices
+
+        kv_xfer = PoolTransfer(
+            name=PoolName.KV,
+            device_indices=transfer_device_value,
+            cp_plan=cp_plan,
+        )
 
         # Build aux transfers, keyed per component.
         comp_xfers: dict[ComponentType, list] = {}
         for comp in self._components_tuple:
             if comp.component_type == BASE_COMPONENT_TYPE:
                 continue
-            t = comp.build_hicache_transfers(node, CacheTransferPhase.BACKUP_HOST)
+            t = comp.build_hicache_transfers(
+                node,
+                CacheTransferPhase.BACKUP_HOST,
+                cp_plan=cp_plan,
+            )
             if t:
                 comp_xfers[comp.component_type] = t
         sidecar_xfers = self._build_sidecar_transfers(
@@ -1440,7 +1736,7 @@ class UnifiedRadixCache(BasePrefixCache):
         )
 
         # Pre-evict host if insufficient
-        kv_tokens = len(device_value)
+        kv_tokens = len(transfer_device_value)
         host_avail = self.cache_controller.mem_pool_host.available_size()
         if host_avail < kv_tokens:
             needed = kv_tokens - host_avail
@@ -1451,13 +1747,15 @@ class UnifiedRadixCache(BasePrefixCache):
         aux_xfers = [x for xfers in comp_xfers.values() for x in xfers]
         aux_xfers.extend(sidecar_xfers)
         host_indices = self.cache_controller.write(
-            device_value, node_id=node.id, extra_pools=aux_xfers or None
+            transfer_device_value, node_id=node.id, extra_pools=aux_xfers or None
         )
         if host_indices is None:
             return 0
 
         # Commit
-        kv_xfer = PoolTransfer(name=PoolName.KV, host_indices=host_indices)
+        kv_xfer = PoolTransfer(
+            name=PoolName.KV, host_indices=host_indices, cp_plan=cp_plan
+        )
         self.components[BASE_COMPONENT_TYPE].commit_hicache_transfer(
             node,
             CacheTransferPhase.BACKUP_HOST,
@@ -1494,7 +1792,10 @@ class UnifiedRadixCache(BasePrefixCache):
         # Lock path & pre-evict if device pool is insufficient
         result = self.inc_lock_ref(best_match_node)
         ancestor_lock_params = result.to_dec_params()
+        cp_load_plan = None
+        is_cp_hicache = self._has_cp_hicache_allocator()
         kv_tokens = len(kv_xfer.host_indices)
+        kv_physical_tokens = len(kv_xfer.host_indices)
 
         # Build aux transfers, keyed per component.
         comp_xfers: dict[ComponentType, list] = {}
@@ -1513,35 +1814,92 @@ class UnifiedRadixCache(BasePrefixCache):
         # Skip if there is nothing to load, or if the Full-KV transfer is too
         # small / exceeds memory quota. Aux transfers should still run even
         # when the Full-KV load is skipped by thresholding.
-        if (kv_tokens < self.load_back_threshold and not comp_xfers) or (
-            mem_quota is not None and kv_tokens > mem_quota + result.delta
+        if not is_cp_hicache and (
+            (kv_tokens < self.load_back_threshold and not comp_xfers)
+            or (mem_quota is not None and kv_tokens > mem_quota + result.delta)
         ):
             self.dec_lock_ref(best_match_node, ancestor_lock_params)
             return False
 
-        avail = self.token_to_kv_pool_allocator.available_size()
-        if avail < kv_tokens:
-            needed = kv_tokens - avail
-            result = self.evict(EvictParams(num_tokens=needed))
-            if result.num_tokens_evicted < needed:
+        if is_cp_hicache:
+            avail = self.token_to_kv_pool_allocator.physical_available_size()
+            needed_physical = max(0, kv_physical_tokens - avail)
+            if needed_physical > 0:
+                # Pending write-through copies keep otherwise evictable nodes
+                # locked. Finish local D2H work before selecting victims.
+                self.writing_check(write_back=True)
+                avail = self.token_to_kv_pool_allocator.physical_available_size()
+                needed_physical = max(0, kv_physical_tokens - avail)
+                cp_size = int(getattr(self.token_to_kv_pool_allocator, "cp_size", 1))
+                if needed_physical > 0:
+                    self.evict(EvictParams(num_tokens=needed_physical * cp_size))
+            load_plan_ready = (
+                self.token_to_kv_pool_allocator.physical_available_size()
+                >= kv_physical_tokens
+            )
+        else:
+            avail = self.token_to_kv_pool_allocator.available_size()
+            if avail < kv_tokens:
+                needed = kv_tokens - avail
+                result = self.evict(EvictParams(num_tokens=needed))
+                if result.num_tokens_evicted < needed:
+                    self.dec_lock_ref(best_match_node, ancestor_lock_params)
+                    return False
+
+        if is_cp_hicache:
+            if load_plan_ready:
+                cp_load_plan = self._build_cp_hicache_load_plan(kv_xfer)
+                load_plan_ready = cp_load_plan is not None
+            if load_plan_ready:
+                load_plan_ready = self._fill_cp_hicache_swa_load_devices(
+                    kv_xfer, cp_load_plan, comp_xfers
+                )
+            if not load_plan_ready and cp_load_plan is not None:
+                self.token_to_kv_pool_allocator.free(cp_load_plan.full_device_indices)
+                cp_load_plan = None
+
+            ready = torch.tensor(int(load_plan_ready), dtype=torch.int32)
+            if self.tp_world_size > 1:
+                torch.distributed.all_reduce(
+                    ready, op=torch.distributed.ReduceOp.MIN, group=self.tp_group
+                )
+            if not bool(ready.item()):
+                if cp_load_plan is not None:
+                    self.token_to_kv_pool_allocator.free(
+                        cp_load_plan.full_device_indices
+                    )
                 self.dec_lock_ref(best_match_node, ancestor_lock_params)
                 return False
 
         # Load H→D
         aux_xfers = [x for xfers in comp_xfers.values() for x in xfers]
         aux_xfers.extend(sidecar_xfers)
+        has_load_payload = kv_physical_tokens > 0 or any(
+            x.host_indices is not None and x.host_indices.numel() > 0 for x in aux_xfers
+        )
+        copy_device_indices = (
+            cp_load_plan.owned_device_indices if cp_load_plan is not None else None
+        )
         device_indices = self.cache_controller.load(
             host_indices=kv_xfer.host_indices,
             node_id=best_match_node.id,
             extra_pools=aux_xfers or None,
+            device_indices=copy_device_indices,
         )
 
         self.dec_lock_ref(best_match_node, ancestor_lock_params)
         if device_indices is None:
+            if cp_load_plan is not None:
+                self.token_to_kv_pool_allocator.free(cp_load_plan.full_device_indices)
+            if is_cp_hicache:
+                raise RuntimeError("AttnCP HiCache failed to enqueue load-back")
             return False
 
         # Commit: each component gets only its own transfers
-        kv_xfer.device_indices = device_indices
+        if cp_load_plan is not None:
+            kv_xfer.device_indices = cp_load_plan.full_device_indices
+        else:
+            kv_xfer.device_indices = device_indices
         self.components[BASE_COMPONENT_TYPE].commit_hicache_transfer(
             best_match_node,
             CacheTransferPhase.LOAD_BACK,
@@ -1555,10 +1913,11 @@ class UnifiedRadixCache(BasePrefixCache):
             )
 
         self._update_evictable_leaf_sets(best_match_node)
-        self.ongoing_load_back[best_match_node.id] = (
-            best_match_node,
-            self.inc_lock_ref(best_match_node).to_dec_params(),
-        )
+        if has_load_payload:
+            self.ongoing_load_back[best_match_node.id] = (
+                best_match_node,
+                self.inc_lock_ref(best_match_node).to_dec_params(),
+            )
         return True
 
     def _build_sidecar_transfers(
@@ -2085,10 +2444,7 @@ class UnifiedRadixCache(BasePrefixCache):
             self.drain_storage_control_queues()
 
     def _flush_pending_storage_backups_before_reset(self) -> None:
-        if (
-            not getattr(self, "enable_storage", False)
-            or self.cache_controller is None
-        ):
+        if not getattr(self, "enable_storage", False) or self.cache_controller is None:
             return
 
         self.writing_check(write_back=True)
@@ -2225,9 +2581,11 @@ class UnifiedRadixCache(BasePrefixCache):
                 break
             finish_count += 1
 
-        # TP sync: MIN across all ranks for consistent tree updates
+        # CP HiCache residency is rank-local. Cache-match synchronization will
+        # cold-prefill on mismatches, so write acknowledgements must not wait on
+        # ranks that have no corresponding compact backup.
         queue_size = torch.tensor(finish_count, dtype=torch.int, device="cpu")
-        if self.tp_world_size > 1:
+        if not self._has_cp_hicache_allocator() and self.tp_world_size > 1:
             torch.distributed.all_reduce(
                 queue_size, op=torch.distributed.ReduceOp.MIN, group=self.tp_group
             )
@@ -2309,7 +2667,14 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def check_hicache_events(self) -> None:
         """Called per scheduler step to poll async HiCache events."""
-        self.poll_storage_work()
+        if self._has_cp_hicache_allocator():
+            # CP ranks may finish compact D2H writes at different times. Drain
+            # them before prefill admission so rank-local lock state cannot
+            # produce different scheduling decisions.
+            self.writing_check(write_back=True)
+            self.loading_check()
+        else:
+            self.poll_storage_work()
         if self.enable_storage_metrics and self.storage_metrics_collector is not None:
             self.storage_metrics_collector.log_storage_metrics(
                 self.cache_controller.storage_backend.get_stats()

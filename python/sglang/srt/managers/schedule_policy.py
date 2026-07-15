@@ -483,6 +483,7 @@ class PrefillAdder:
         )
         self.cp_sharded_local_token_offset = 0
         self.cp_sharded_available_and_evictable_override: Optional[int] = None
+        self.cp_sharded_swa_available_and_evictable_override: Optional[int] = None
         self.cp_sharded_physical_available_override: Optional[int] = None
 
         self.priority_scheduling_preemption_threshold = (
@@ -600,11 +601,13 @@ class PrefillAdder:
 
     @property
     def rem_swa_tokens(self):
-        return (
-            self.token_to_kv_pool_allocator.swa_available_size()
+        available_and_evictable = (
+            self.cp_sharded_swa_available_and_evictable_override
+            if self.cp_sharded_swa_available_and_evictable_override is not None
+            else self.token_to_kv_pool_allocator.swa_available_size()
             + self.tree_cache.swa_evictable_size()
-            - self.rem_swa_token_offset
         )
+        return available_and_evictable - self.rem_swa_token_offset
 
     @property
     def cur_rem_tokens(self):

@@ -6,6 +6,7 @@ from sglang.srt.mem_cache.allocator import (
     PagedTokenToKVPoolAllocator,
     TokenToKVPoolAllocator,
 )
+from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.cp_sharded_allocator import (
     DUMMY_SLOT,
     CPShardedKVPoolAllocator,
@@ -13,7 +14,6 @@ from sglang.srt.mem_cache.cp_sharded_allocator import (
     filter_dummy_slots,
     get_cp_owner,
 )
-from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -327,6 +327,84 @@ class TestCPShardedKVPoolAllocator(unittest.TestCase):
         self.assertEqual(base.swa_attn_allocator.available_size(), 64)
         self.assertEqual(kvcache.full_to_swa_index_mapping[slots].tolist(), [0] * 4)
 
+    def test_paged_swa_frees_tail_slice_pages(self):
+        kvcache = _DummySWAKVPool()
+        base = SWATokenToKVPoolAllocator(
+            size=128,
+            size_swa=128,
+            page_size=4,
+            dtype=torch.float32,
+            device="cpu",
+            kvcache=kvcache,
+            need_sort=False,
+        )
+        allocator = CPShardedKVPoolAllocator(
+            base,
+            cp_rank=0,
+            cp_size=2,
+            cp_kv_chunk_size=8,
+        )
+
+        slots = allocator.alloc_for_positions(torch.arange(0, 24, dtype=torch.int64))
+        self.assertEqual(base.full_attn_allocator.available_size(), 112)
+        self.assertEqual(base.swa_attn_allocator.available_size(), 112)
+
+        allocator.free(slots[16:])
+
+        self.assertEqual(base.full_attn_allocator.available_size(), 120)
+        self.assertEqual(base.swa_attn_allocator.available_size(), 120)
+        self.assertEqual(
+            kvcache.full_to_swa_index_mapping[filter_dummy_slots(slots[16:])].tolist(),
+            [0] * 8,
+        )
+
+        allocator.free_full(slots[:16])
+        self.assertEqual(base.full_attn_allocator.available_size(), 128)
+        self.assertEqual(base.swa_attn_allocator.available_size(), 120)
+        allocator.free_swa(slots[:16])
+        self.assertEqual(base.swa_attn_allocator.available_size(), 128)
+
+    def test_paged_hicache_plan_round_trip(self):
+        base = PagedTokenToKVPoolAllocator(
+            size=128,
+            page_size=16,
+            dtype=torch.float32,
+            device="cpu",
+            kvcache=None,
+            need_sort=False,
+        )
+        allocator = CPShardedKVPoolAllocator(
+            base,
+            cp_rank=1,
+            cp_size=2,
+            cp_kv_chunk_size=32,
+        )
+        positions = torch.arange(16, 96, dtype=torch.int64)
+        device_slots = allocator.alloc_for_positions(positions)
+        write_plan = allocator.build_hicache_write_plan(16, device_slots)
+
+        allocator.free(device_slots)
+        load_plan = allocator.alloc_hicache_load_plan(
+            logical_start=16,
+            logical_len=80,
+            host_indices=torch.arange(
+                write_plan.owned_device_indices.numel(), dtype=torch.int64
+            ),
+        )
+
+        self.assertIsNotNone(load_plan)
+        self.assertEqual(load_plan.full_device_indices.numel(), 80)
+        self.assertTrue(
+            torch.equal(
+                load_plan.owned_logical_offsets,
+                write_plan.owned_logical_offsets,
+            )
+        )
+        self.assertEqual(
+            filter_dummy_slots(load_plan.full_device_indices).numel(),
+            write_plan.owned_logical_offsets.numel(),
+        )
+
     def test_paged_alloc_rejects_unaligned_chunk_size(self):
         base = PagedTokenToKVPoolAllocator(
             size=64,
@@ -344,6 +422,7 @@ class TestCPShardedKVPoolAllocator(unittest.TestCase):
                 cp_size=2,
                 cp_kv_chunk_size=6,
             )
+
 
 if __name__ == "__main__":
     unittest.main()

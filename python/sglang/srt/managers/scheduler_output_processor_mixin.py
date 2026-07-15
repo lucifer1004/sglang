@@ -520,9 +520,7 @@ class SchedulerOutputProcessorMixin:
             result.copy_done.synchronize()
         if profile_enabled:
             now_ns = time.perf_counter_ns()
-            profile_extra["copy_done_wait_ms"] = (
-                now_ns - phase_begin_ns
-            ) / 1.0e6
+            profile_extra["copy_done_wait_ms"] = (now_ns - phase_begin_ns) / 1.0e6
             phase_begin_ns = now_ns
         if result.routed_experts_output is not None:
             result.routed_experts_output.finalize()
@@ -774,7 +772,15 @@ class SchedulerOutputProcessorMixin:
             else:
                 if self.enable_hisparse:
                     self.hisparse_coordinator.request_finished(req)
-                release_kv_cache(req, self.tree_cache)
+                release_kv_cache(
+                    req,
+                    self.tree_cache,
+                    is_insert=not (
+                        self.enable_hierarchical_cache
+                        and self.server_args.attn_cp_mode == "sharded-kv"
+                        and self.attn_cp_size > 1
+                    ),
+                )
 
             req.time_stats.set_completion_time()
 
@@ -1448,12 +1454,12 @@ class SchedulerOutputProcessorMixin:
                         "finished_count": sum(
                             reason is not None for reason in finished_reasons
                         ),
-                        "completion_min": min(completion_tokens)
-                        if completion_tokens
-                        else None,
-                        "completion_max": max(completion_tokens)
-                        if completion_tokens
-                        else None,
+                        "completion_min": (
+                            min(completion_tokens) if completion_tokens else None
+                        ),
+                        "completion_max": (
+                            max(completion_tokens) if completion_tokens else None
+                        ),
                         "output_tokens_sent": output_tokens_sent,
                         "send_output_ms": (now_ns - send_begin_ns) / 1.0e6,
                         "is_idle_batch": is_idle_batch,

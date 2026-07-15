@@ -190,7 +190,9 @@ def validate_router_replay_experts(
         )
 
     tensor = tensor.to(device="cpu", dtype=torch.int32)
-    if tensor.numel() > 0 and not getattr(tensor, "_sglang_router_replay_trusted", False):
+    if tensor.numel() > 0 and not getattr(
+        tensor, "_sglang_router_replay_trusted", False
+    ):
         if bool((tensor < -1).any()):
             min_id = int(tensor.min().item())
             raise ValueError(
@@ -911,9 +913,7 @@ class OverEncodingContext:
         self_prefixes = self.hash_prefixes
         other_prefixes = other.hash_prefixes
         if self_prefixes is None or other_prefixes is None:
-            raise ValueError(
-                "WeLM OE contexts must contain CUDA hash prefixes."
-            )
+            raise ValueError("WeLM OE contexts must contain CUDA hash prefixes.")
         if len(self_prefixes) != len(other_prefixes):
             raise ValueError(
                 "Cannot merge WeLM OE hash prefixes with different history "
@@ -930,7 +930,8 @@ class OverEncodingContext:
                     f"{len(other.legacy_prefixes)}."
                 )
             self.legacy_prefixes = [
-                lhs + rhs for lhs, rhs in zip(self.legacy_prefixes, other.legacy_prefixes)
+                lhs + rhs
+                for lhs, rhs in zip(self.legacy_prefixes, other.legacy_prefixes)
             ]
 
     def __bool__(self) -> bool:
@@ -2158,7 +2159,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if get_global_server_args().prepare_n_gram_inputs:
             oe_grams, _ = get_welm_oe_hash_config(self.model_config)
             if not oe_grams:
-                raise RuntimeError("WeLM OE requires oe_grams for the CUDA hash kernel.")
+                raise RuntimeError(
+                    "WeLM OE requires oe_grams for the CUDA hash kernel."
+                )
             if torch.device(self.device).type != "cuda":
                 raise RuntimeError("WeLM OE requires the CUDA hash kernel.")
             if not should_use_welm_oe_hash_kernel(self.model_config):
@@ -2562,7 +2565,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.extend_num_tokens = extend_num_tokens * scale
         self.extend_logprob_start_lens = [r.extend_logprob_start_len for r in reqs]
 
-
     def prepare_for_split_prefill(self):
         self.prepare_for_extend()
         # For split prefill, we need to set the forward mode to SPLIT_PREFILL
@@ -2667,9 +2669,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     def retract_decode(
         self,
         server_args: ServerArgs,
-        check_decode_mem: Optional[
-            Callable[[Optional[List[int]]], bool]
-        ] = None,
+        check_decode_mem: Optional[Callable[[Optional[List[int]]], bool]] = None,
     ) -> Tuple[List[Req], float, List[Req]]:
         """Retract the decoding requests when there is not enough memory."""
         check_decode_mem = check_decode_mem or self.check_decode_mem
@@ -2681,19 +2681,19 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # TODO(sang): Clean up finish path and support better retract
         # policy.
         if not server_args.speculative_algorithm:
+            use_deterministic_cp_tiebreaker = server_args.attn_cp_mode == "sharded-kv"
             sorted_indices.sort(
                 key=lambda i: (
                     len(self.reqs[i].output_ids),
                     -len(self.reqs[i].origin_input_ids),
+                    (str(self.reqs[i].rid) if use_deterministic_cp_tiebreaker else ""),
                 ),
                 reverse=True,
             )
 
         retracted_reqs = []
         first_iter = True
-        while first_iter or (
-            not check_decode_mem(selected_indices=sorted_indices)
-        ):
+        while first_iter or (not check_decode_mem(selected_indices=sorted_indices)):
             if len(sorted_indices) == 1:
                 # Always keep at least one request
                 break
@@ -2854,7 +2854,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if get_global_server_args().prepare_n_gram_inputs:
             oe_grams, _ = get_welm_oe_hash_config(self.model_config)
             if not oe_grams:
-                raise RuntimeError("WeLM OE requires oe_grams for the CUDA hash kernel.")
+                raise RuntimeError(
+                    "WeLM OE requires oe_grams for the CUDA hash kernel."
+                )
             if torch.device(self.device).type != "cuda":
                 raise RuntimeError("WeLM OE requires the CUDA hash kernel.")
             if not should_use_welm_oe_hash_kernel(self.model_config):
@@ -3072,6 +3074,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 new_indices=keep_indices_device,
                 has_been_filtered=has_been_filtered,
             )
+
     def merge_batch(self, other: "ScheduleBatch"):
         # In the regular scheduler path:
         # 1) self is always prefill, whose seq_lens is not a future

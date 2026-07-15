@@ -3,16 +3,16 @@ import math
 
 import pytest
 import torch
-
 from sgl_kernel import merge_state_v2
+
+from sglang.jit_kernel.flash_attention import (
+    flash_attn_with_kvcache,
+)
 from sglang.srt.layers.attention import attncp_fused_ops as fused_ops
 from sglang.srt.layers.attention.attncp_fused_ops import (
     attncp_cp2_fused_q_fa_decode,
     attncp_cp2_fused_q_fa_supports_shape,
     attncp_sharded_kv_local_cap,
-)
-from sglang.jit_kernel.flash_attention import (
-    flash_attn_with_kvcache,
 )
 
 
@@ -132,6 +132,45 @@ def test_attncp_cp2_fused_q_fa_kernel_source_stays_kv_stationary():
         assert source.count("tl.load(value_cache") == 1
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_attncp_cp2_fused_merge_sanitizes_empty_lse_states():
+    torch.manual_seed(13)
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+    batch_size = 2
+    local_q_heads = 2
+    full_q_heads = local_q_heads * 2
+    head_dim = 64
+
+    gathered_o = torch.randn(
+        batch_size * 2, full_q_heads, head_dim, device=device, dtype=dtype
+    )
+    gathered_lse = torch.full(
+        (batch_size * 2, full_q_heads),
+        -float("inf"),
+        device=device,
+        dtype=torch.float32,
+    )
+    gathered_lse[0, 0] = float("nan")
+    gathered_lse[batch_size, 0] = float("inf")
+    gathered_lse[0, 1] = float("inf")
+    gathered_lse[1, 0] = float("nan")
+    out = torch.empty(batch_size, local_q_heads, head_dim, device=device, dtype=dtype)
+
+    fused_ops.attncp_cp2_merge_local_head_slice(
+        gathered_o,
+        gathered_lse,
+        out,
+        batch_size=batch_size,
+        full_q_heads=full_q_heads,
+        local_q_heads=local_q_heads,
+        head_dim=head_dim,
+        head_start=0,
+    )
+
+    torch.testing.assert_close(out, torch.zeros_like(out), atol=0, rtol=0)
+
+
 @pytest.mark.parametrize(
     ("max_seq_len", "chunk_size", "cp_size", "expected"),
     [
@@ -191,7 +230,9 @@ def test_attncp_cp2_fused_q_fa_decode_launch_grid_is_kv_stationary(monkeypatch):
     full_q_heads = local_q_heads * 2
     num_kv_heads = 1
     head_dim = 64
-    q_local = torch.empty(batch_size, local_q_heads, head_dim, device=device, dtype=dtype)
+    q_local = torch.empty(
+        batch_size, local_q_heads, head_dim, device=device, dtype=dtype
+    )
     q_peer = torch.empty_like(q_local)
     out = torch.empty(batch_size, full_q_heads, head_dim, device=device, dtype=dtype)
     lse = torch.empty(batch_size, full_q_heads, device=device, dtype=torch.float32)
@@ -215,7 +256,9 @@ def test_attncp_cp2_fused_q_fa_decode_launch_grid_is_kv_stationary(monkeypatch):
     )
     assert non_split_kernel.grids == [(batch_size, num_kv_heads)]
 
-    split_o = torch.empty(8, batch_size, full_q_heads, head_dim, device=device, dtype=dtype)
+    split_o = torch.empty(
+        8, batch_size, full_q_heads, head_dim, device=device, dtype=dtype
+    )
     split_lse = torch.empty(
         8, batch_size, full_q_heads, device=device, dtype=torch.float32
     )
@@ -252,7 +295,9 @@ def test_attncp_cp2_fused_q_fa_decode_rejects_q_head_split_shape():
     num_kv_heads = 1
     head_dim = 16
 
-    q_local = torch.empty(batch_size, local_q_heads, head_dim, device=device, dtype=dtype)
+    q_local = torch.empty(
+        batch_size, local_q_heads, head_dim, device=device, dtype=dtype
+    )
     q_peer = torch.empty_like(q_local)
     key_cache = torch.empty(1, 1, num_kv_heads, head_dim, device=device, dtype=dtype)
     value_cache = torch.empty_like(key_cache)
@@ -281,9 +326,7 @@ def test_attncp_cp2_fused_q_fa_decode_rejects_q_head_split_shape():
 @pytest.mark.parametrize("cp_rank", [0, 1])
 @pytest.mark.parametrize("use_sinks", [False, True])
 @pytest.mark.parametrize("softcap", [0.0, 15.0])
-def test_attncp_cp2_fused_q_fa_decode_matches_reference(
-    cp_rank, use_sinks, softcap
-):
+def test_attncp_cp2_fused_q_fa_decode_matches_reference(cp_rank, use_sinks, softcap):
     torch.manual_seed(3 + cp_rank)
     device = torch.device("cuda")
     dtype = torch.bfloat16
@@ -303,22 +346,14 @@ def test_attncp_cp2_fused_q_fa_decode_matches_reference(
         num_pages, 1, num_kv_heads, head_dim, device=device, dtype=dtype
     )
     value_cache = torch.randn_like(key_cache)
-    page_table = torch.empty(
-        batch_size, max_seq_len, device=device, dtype=torch.int32
-    )
+    page_table = torch.empty(batch_size, max_seq_len, device=device, dtype=torch.int32)
     perm = torch.randperm(num_pages, device=device, dtype=torch.int32)
     for batch_idx in range(batch_size):
         start = batch_idx * max_seq_len
         page_table[batch_idx] = perm[start : start + max_seq_len]
     cache_seqlens = torch.tensor([0, 7, 17], device=device, dtype=torch.int32)
-    sinks = (
-        torch.randn(full_q_heads, device=device, dtype=dtype)
-        if use_sinks
-        else None
-    )
-    out = torch.empty(
-        batch_size, full_q_heads, head_dim, device=device, dtype=dtype
-    )
+    sinks = torch.randn(full_q_heads, device=device, dtype=dtype) if use_sinks else None
+    out = torch.empty(batch_size, full_q_heads, head_dim, device=device, dtype=dtype)
     lse = torch.empty(batch_size, full_q_heads, device=device, dtype=torch.float32)
 
     attncp_cp2_fused_q_fa_decode(
@@ -357,7 +392,10 @@ def test_attncp_cp2_fused_q_fa_decode_matches_reference(
 @pytest.mark.parametrize("cp_rank", [0, 1])
 @pytest.mark.parametrize("use_sinks", [False, True])
 @pytest.mark.parametrize("window_left", [-1, 8])
-def test_attncp_cp2_fused_q_fa_decode_matches_fa3(cp_rank, use_sinks, window_left):
+@pytest.mark.parametrize("page_size", [1, 16])
+def test_attncp_cp2_fused_q_fa_decode_matches_fa3(
+    cp_rank, use_sinks, window_left, page_size
+):
     torch.manual_seed(11 + cp_rank)
     device = torch.device("cuda")
     dtype = torch.bfloat16
@@ -367,7 +405,8 @@ def test_attncp_cp2_fused_q_fa_decode_matches_fa3(cp_rank, use_sinks, window_lef
     num_kv_heads = 1
     head_dim = 64
     max_seq_len = 96
-    num_pages = batch_size * max_seq_len + 7
+    pages_per_row = (max_seq_len + page_size - 1) // page_size
+    num_pages = batch_size * pages_per_row + 7
 
     q_local = torch.randn(
         batch_size, local_q_heads, head_dim, device=device, dtype=dtype
@@ -378,26 +417,20 @@ def test_attncp_cp2_fused_q_fa_decode_matches_fa3(cp_rank, use_sinks, window_lef
     else:
         q_full = torch.cat([q_peer, q_local], dim=1).contiguous()
     key_cache = torch.randn(
-        num_pages, 1, num_kv_heads, head_dim, device=device, dtype=dtype
+        num_pages, page_size, num_kv_heads, head_dim, device=device, dtype=dtype
     )
     value_cache = torch.randn_like(key_cache)
     page_table = torch.empty(
-        batch_size, max_seq_len, device=device, dtype=torch.int32
+        batch_size, pages_per_row, device=device, dtype=torch.int32
     )
     perm = torch.randperm(num_pages, device=device, dtype=torch.int32)
     for batch_idx in range(batch_size):
-        start = batch_idx * max_seq_len
-        page_table[batch_idx] = perm[start : start + max_seq_len]
+        start = batch_idx * pages_per_row
+        page_table[batch_idx] = perm[start : start + pages_per_row]
     cache_seqlens = torch.tensor([1, 17, 63, 96], device=device, dtype=torch.int32)
-    sinks = (
-        torch.randn(full_q_heads, device=device, dtype=dtype)
-        if use_sinks
-        else None
-    )
+    sinks = torch.randn(full_q_heads, device=device, dtype=dtype) if use_sinks else None
 
-    out = torch.empty(
-        batch_size, full_q_heads, head_dim, device=device, dtype=dtype
-    )
+    out = torch.empty(batch_size, full_q_heads, head_dim, device=device, dtype=dtype)
     lse = torch.empty(batch_size, full_q_heads, device=device, dtype=torch.float32)
     fa_out = torch.empty(
         batch_size, 1, full_q_heads, head_dim, device=device, dtype=dtype
@@ -417,7 +450,7 @@ def test_attncp_cp2_fused_q_fa_decode_matches_fa3(cp_rank, use_sinks, window_lef
         softmax_scale=softmax_scale,
         window_left=window_left,
         sinks=sinks,
-        page_size=1,
+        page_size=page_size,
     )
     fa_result = flash_attn_with_kvcache(
         q=q_full.view(batch_size, 1, full_q_heads, head_dim),
@@ -468,23 +501,15 @@ def test_attncp_cp2_fused_q_fa_decode_split_matches_fa3(
         num_pages, 1, num_kv_heads, head_dim, device=device, dtype=dtype
     )
     value_cache = torch.randn_like(key_cache)
-    page_table = torch.empty(
-        batch_size, max_seq_len, device=device, dtype=torch.int32
-    )
+    page_table = torch.empty(batch_size, max_seq_len, device=device, dtype=torch.int32)
     perm = torch.randperm(num_pages, device=device, dtype=torch.int32)
     for batch_idx in range(batch_size):
         start = batch_idx * max_seq_len
         page_table[batch_idx] = perm[start : start + max_seq_len]
     cache_seqlens = torch.tensor([4097, 4608], device=device, dtype=torch.int32)
-    sinks = (
-        torch.randn(full_q_heads, device=device, dtype=dtype)
-        if use_sinks
-        else None
-    )
+    sinks = torch.randn(full_q_heads, device=device, dtype=dtype) if use_sinks else None
 
-    out = torch.empty(
-        batch_size, full_q_heads, head_dim, device=device, dtype=dtype
-    )
+    out = torch.empty(batch_size, full_q_heads, head_dim, device=device, dtype=dtype)
     lse = torch.empty(batch_size, full_q_heads, device=device, dtype=torch.float32)
     split_o = torch.empty(
         8, batch_size, full_q_heads, head_dim, device=device, dtype=dtype
@@ -560,15 +585,13 @@ def test_attncp_cp2_fused_q_fa_decode_head_dim_256_split_matches_fa3(cp_rank):
         num_pages, 1, num_kv_heads, head_dim, device=device, dtype=dtype
     )
     value_cache = torch.randn_like(key_cache)
-    page_table = torch.randperm(
-        num_pages, device=device, dtype=torch.int32
-    )[:max_seq_len].view(batch_size, max_seq_len)
+    page_table = torch.randperm(num_pages, device=device, dtype=torch.int32)[
+        :max_seq_len
+    ].view(batch_size, max_seq_len)
     cache_seqlens = torch.tensor([max_seq_len], device=device, dtype=torch.int32)
     sinks = torch.randn(full_q_heads, device=device, dtype=dtype)
 
-    out = torch.empty(
-        batch_size, full_q_heads, head_dim, device=device, dtype=dtype
-    )
+    out = torch.empty(batch_size, full_q_heads, head_dim, device=device, dtype=dtype)
     lse = torch.empty(batch_size, full_q_heads, device=device, dtype=torch.float32)
     split_o = torch.empty(
         4, batch_size, full_q_heads, head_dim, device=device, dtype=dtype
@@ -662,7 +685,9 @@ def test_attncp_cp2_fused_q_fa_decode_matches_service_merge(max_splits):
     lens0 = torch.tensor([0, 257, 4608], device=device, dtype=torch.int32)
     lens1 = torch.tensor([9, 1024, 4097], device=device, dtype=torch.int32)
 
-    fa_o0 = torch.empty(batch_size, 1, full_q_heads, head_dim, device=device, dtype=dtype)
+    fa_o0 = torch.empty(
+        batch_size, 1, full_q_heads, head_dim, device=device, dtype=dtype
+    )
     fa_o1 = torch.empty_like(fa_o0)
     fa0 = flash_attn_with_kvcache(
         q=q_full.view(batch_size, 1, full_q_heads, head_dim),
@@ -710,16 +735,24 @@ def test_attncp_cp2_fused_q_fa_decode_matches_service_merge(max_splits):
     )
     merged_fa_o = torch.empty_like(fa_o0[:, 0])
     merged_fa_lse = torch.empty_like(fa_lse0)
-    merge_state_v2(fa_o0[:, 0], fa_lse0, fa_o1[:, 0], fa_lse1, merged_fa_o, merged_fa_lse)
+    merge_state_v2(
+        fa_o0[:, 0], fa_lse0, fa_o1[:, 0], fa_lse1, merged_fa_o, merged_fa_lse
+    )
 
-    fused_o0 = torch.empty(batch_size, full_q_heads, head_dim, device=device, dtype=dtype)
-    fused_lse0 = torch.empty(batch_size, full_q_heads, device=device, dtype=torch.float32)
+    fused_o0 = torch.empty(
+        batch_size, full_q_heads, head_dim, device=device, dtype=dtype
+    )
+    fused_lse0 = torch.empty(
+        batch_size, full_q_heads, device=device, dtype=torch.float32
+    )
     fused_o1 = torch.empty_like(fused_o0)
     fused_lse1 = torch.empty_like(fused_lse0)
     split_o0 = torch.empty(
         4, batch_size, full_q_heads, head_dim, device=device, dtype=dtype
     )
-    split_lse0 = torch.empty(4, batch_size, full_q_heads, device=device, dtype=torch.float32)
+    split_lse0 = torch.empty(
+        4, batch_size, full_q_heads, device=device, dtype=torch.float32
+    )
     split_o1 = torch.empty_like(split_o0)
     split_lse1 = torch.empty_like(split_lse0)
     attncp_cp2_fused_q_fa_decode(

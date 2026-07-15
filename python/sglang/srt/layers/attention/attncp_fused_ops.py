@@ -4,7 +4,6 @@ import torch
 import triton
 import triton.language as tl
 
-
 _FUSED_Q_FA_TARGET_SPLIT_SIZE = 4096
 _FUSED_Q_FA_MAX_BLOCK_H = 16
 _FUSED_Q_FA_MAX_AUTO_SPLITS = 64
@@ -133,25 +132,24 @@ def _attncp_cp2_merge_local_head_slice_kernel(
         + token_idx * FULL_Q_HEADS
         + global_head_idx
     )
-    lse_a = tl.where(lse_a == float("inf"), -float("inf"), lse_a)
-    lse_b = tl.where(lse_b == float("inf"), -float("inf"), lse_b)
+    lse_a = tl.where((lse_a != lse_a) | (lse_a == float("inf")), -float("inf"), lse_a)
+    lse_b = tl.where((lse_b != lse_b) | (lse_b == float("inf")), -float("inf"), lse_b)
     max_lse = tl.maximum(lse_a, lse_b)
-    lse_a = lse_a - max_lse
-    lse_b = lse_b - max_lse
+    max_lse_safe = tl.where(max_lse == -float("inf"), 0.0, max_lse)
+    lse_a = lse_a - max_lse_safe
+    lse_b = lse_b - max_lse_safe
     se_a = tl.exp(lse_a)
     se_b = tl.exp(lse_b)
     out_se = se_a + se_b
-    scale_a = se_a / out_se
-    scale_b = se_b / out_se
+    scale_a = tl.where(out_se > 0.0, se_a / out_se, 0.0)
+    scale_b = tl.where(out_se > 0.0, se_b / out_se, 0.0)
 
     value_a = tl.load(gathered_o + base_a, mask=dim_mask).to(tl.float32)
     value_b = tl.load(gathered_o + base_b, mask=dim_mask).to(tl.float32)
     merged = value_a * scale_a + value_b * scale_b
 
     out_offsets = (
-        token_idx * LOCAL_Q_HEADS * HEAD_DIM
-        + local_head_idx * HEAD_DIM
-        + dim_offsets
+        token_idx * LOCAL_Q_HEADS * HEAD_DIM + local_head_idx * HEAD_DIM + dim_offsets
     )
     tl.store(out_o + out_offsets, merged, mask=dim_mask)
 
@@ -210,14 +208,10 @@ def _attncp_cp2_pack_local_head_slice_kernel(
     dim_mask = dim_offsets < HEAD_DIM
 
     src_offsets = (
-        token_idx * FULL_Q_HEADS * HEAD_DIM
-        + global_head_idx * HEAD_DIM
-        + dim_offsets
+        token_idx * FULL_Q_HEADS * HEAD_DIM + global_head_idx * HEAD_DIM + dim_offsets
     )
     dst_offsets = (
-        token_idx * LOCAL_Q_HEADS * HEAD_DIM
-        + local_head_idx * HEAD_DIM
-        + dim_offsets
+        token_idx * LOCAL_Q_HEADS * HEAD_DIM + local_head_idx * HEAD_DIM + dim_offsets
     )
     values = tl.load(local_o_full + src_offsets, mask=dim_mask)
     tl.store(packed_o + dst_offsets, values, mask=dim_mask)
@@ -284,14 +278,10 @@ def _attncp_cp2_merge_local_remote_head_slice_kernel(
     dim_mask = dim_offsets < HEAD_DIM
 
     local_offsets = (
-        token_idx * FULL_Q_HEADS * HEAD_DIM
-        + global_head_idx * HEAD_DIM
-        + dim_offsets
+        token_idx * FULL_Q_HEADS * HEAD_DIM + global_head_idx * HEAD_DIM + dim_offsets
     )
     remote_offsets = (
-        token_idx * LOCAL_Q_HEADS * HEAD_DIM
-        + local_head_idx * HEAD_DIM
-        + dim_offsets
+        token_idx * LOCAL_Q_HEADS * HEAD_DIM + local_head_idx * HEAD_DIM + dim_offsets
     )
     local_lse = tl.load(local_lse_full + token_idx * FULL_Q_HEADS + global_head_idx)
     peer_lse = tl.load(remote_lse + token_idx * LOCAL_Q_HEADS + local_head_idx)
@@ -307,22 +297,21 @@ def _attncp_cp2_merge_local_remote_head_slice_kernel(
         value_a = tl.load(remote_o + remote_offsets, mask=dim_mask).to(tl.float32)
         value_b = tl.load(local_o_full + local_offsets, mask=dim_mask).to(tl.float32)
 
-    lse_a = tl.where(lse_a == float("inf"), -float("inf"), lse_a)
-    lse_b = tl.where(lse_b == float("inf"), -float("inf"), lse_b)
+    lse_a = tl.where((lse_a != lse_a) | (lse_a == float("inf")), -float("inf"), lse_a)
+    lse_b = tl.where((lse_b != lse_b) | (lse_b == float("inf")), -float("inf"), lse_b)
     max_lse = tl.maximum(lse_a, lse_b)
-    lse_a = lse_a - max_lse
-    lse_b = lse_b - max_lse
+    max_lse_safe = tl.where(max_lse == -float("inf"), 0.0, max_lse)
+    lse_a = lse_a - max_lse_safe
+    lse_b = lse_b - max_lse_safe
     se_a = tl.exp(lse_a)
     se_b = tl.exp(lse_b)
     out_se = se_a + se_b
-    scale_a = se_a / out_se
-    scale_b = se_b / out_se
+    scale_a = tl.where(out_se > 0.0, se_a / out_se, 0.0)
+    scale_b = tl.where(out_se > 0.0, se_b / out_se, 0.0)
     merged = value_a * scale_a + value_b * scale_b
 
     out_offsets = (
-        token_idx * LOCAL_Q_HEADS * HEAD_DIM
-        + local_head_idx * HEAD_DIM
-        + dim_offsets
+        token_idx * LOCAL_Q_HEADS * HEAD_DIM + local_head_idx * HEAD_DIM + dim_offsets
     )
     tl.store(out_o + out_offsets, merged, mask=dim_mask)
 
@@ -512,12 +501,9 @@ def _attncp_cp2_fused_q_fa_decode_kernel(
             )
             offsets_in_page = kv_positions - (kv_positions // PAGE_SIZE) * PAGE_SIZE
             kv_base = (
-                (
-                    (page_indices * PAGE_SIZE + offsets_in_page) * NUM_KV_HEADS
-                    + kv_head_idx
-                )
-                * HEAD_DIM
-            )
+                (page_indices * PAGE_SIZE + offsets_in_page) * NUM_KV_HEADS
+                + kv_head_idx
+            ) * HEAD_DIM
         kv_offsets = kv_base[:, None] + dim_offsets[None, :]
         kv_load_mask = kv_mask[:, None] & dim_mask[None, :]
         # The resident K/V tile is loaded once and reused for every CP Q head
@@ -653,9 +639,7 @@ def _attncp_cp2_fused_q_fa_decode_split_kernel(
         sink_vals = tl.load(sinks + global_q_heads, mask=head_mask, other=-float("inf"))
         use_sink = split_idx == 0
         m_i = tl.where(use_sink, sink_vals.to(tl.float32), -float("inf"))
-        l_i = tl.where(use_sink & (sink_vals != -float("inf")), 1.0, 0.0).to(
-            tl.float32
-        )
+        l_i = tl.where(use_sink & (sink_vals != -float("inf")), 1.0, 0.0).to(tl.float32)
     else:
         m_i = tl.full((BLOCK_H,), -float("inf"), dtype=tl.float32)
         l_i = tl.zeros((BLOCK_H,), dtype=tl.float32)
@@ -724,12 +708,9 @@ def _attncp_cp2_fused_q_fa_decode_split_kernel(
             )
             offsets_in_page = kv_positions - (kv_positions // PAGE_SIZE) * PAGE_SIZE
             kv_base = (
-                (
-                    (page_indices * PAGE_SIZE + offsets_in_page) * NUM_KV_HEADS
-                    + kv_head_idx
-                )
-                * HEAD_DIM
-            )
+                (page_indices * PAGE_SIZE + offsets_in_page) * NUM_KV_HEADS
+                + kv_head_idx
+            ) * HEAD_DIM
         kv_offsets = kv_base[:, None] + dim_offsets[None, :]
         kv_load_mask = kv_mask[:, None] & dim_mask[None, :]
         # The split owns a disjoint KV range; each loaded K/V tile is shared by
@@ -820,6 +801,7 @@ def _attncp_cp2_merge_fa_splits_kernel(
             + batch_idx * SPLIT_LSE_STRIDE_BATCH
             + q_head_idx * SPLIT_LSE_STRIDE_HEAD
         )
+        lse = tl.where((lse != lse) | (lse == float("inf")), -float("inf"), lse)
         m_new = tl.maximum(m_i, lse)
         m_new_safe = tl.where(m_new == -float("inf"), 0.0, m_new)
         alpha = tl.where(

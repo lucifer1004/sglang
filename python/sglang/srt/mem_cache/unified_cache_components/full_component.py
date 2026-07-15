@@ -28,6 +28,7 @@ if TYPE_CHECKING:
 
 class FullComponent(TreeComponent):
     component_type = ComponentType.FULL
+    CP_HICACHE_META_KEY = "cp_hicache"
 
     def __init__(self, cache, params):
         super().__init__(cache, params)
@@ -35,11 +36,46 @@ class FullComponent(TreeComponent):
         # When SWA is present, only free full-attention KV here;
         # SWA KV will be freed by cascade via SWAComponent.evict_component.
         if ComponentType.SWA in cache.tree_components:
-            self._free_full = allocator.full_attn_allocator.free
+            self._free_full = getattr(
+                allocator, "free_full", allocator.full_attn_allocator.free
+            )
         else:
             self._free_full = allocator.free
         # HiCache state: set to host KV pool when HiCache enabled
         self._full_kv_pool_host = None
+
+    def _cp_meta(self, node: UnifiedTreeNode) -> Optional[dict]:
+        return node.component_data[self.component_type].metadata.get(
+            self.CP_HICACHE_META_KEY
+        )
+
+    def _host_logical_len(self, node: UnifiedTreeNode) -> int:
+        meta = self._cp_meta(node)
+        if meta is not None:
+            return int(meta["logical_len"])
+        host_value = node.component_data[self.component_type].host_value
+        return len(host_value) if host_value is not None else 0
+
+    def _set_cp_meta(
+        self,
+        node: UnifiedTreeNode,
+        *,
+        logical_start: int,
+        logical_len: int,
+        owned_logical_offsets: torch.Tensor,
+    ) -> None:
+        node.component_data[self.component_type].metadata[self.CP_HICACHE_META_KEY] = {
+            "logical_start": int(logical_start),
+            "logical_len": int(logical_len),
+            "owned_logical_offsets": owned_logical_offsets.to(
+                device="cpu", dtype=torch.int64
+            ).clone(),
+        }
+
+    def _clear_cp_meta(self, node: UnifiedTreeNode) -> None:
+        node.component_data[self.component_type].metadata.pop(
+            self.CP_HICACHE_META_KEY, None
+        )
 
     def _node_host_ready(self, node: UnifiedTreeNode) -> bool:
         if node.component_data[self.component_type].host_value is None:
@@ -70,13 +106,12 @@ class FullComponent(TreeComponent):
     ) -> MatchResult:
         # Compute Full KV host hit length: walk from last_host_node up to
         # last_device_node, summing host_value lengths of evicted nodes.
-        ct = self.component_type
         kv_host_hit = 0
         node = result.last_host_node
         root_node = self.cache.root_node
         while node is not result.last_device_node and node is not root_node:
             if self._node_host_ready(node):
-                kv_host_hit += len(node.component_data[ct].host_value)
+                kv_host_hit += self._host_logical_len(node)
             node = node.parent
         if kv_host_hit > 0:
             return result._replace(
@@ -95,10 +130,41 @@ class FullComponent(TreeComponent):
             new_parent.component_data[ct].value = child_cd.value[:split_len].clone()
             child_cd.value = child_cd.value[split_len:].clone()
         if child_cd.host_value is not None:
-            new_parent.component_data[ct].host_value = child_cd.host_value[
-                :split_len
-            ].clone()
-            child_cd.host_value = child_cd.host_value[split_len:].clone()
+            cp_meta = child_cd.metadata.get(self.CP_HICACHE_META_KEY)
+            if cp_meta is None:
+                new_parent.component_data[ct].host_value = child_cd.host_value[
+                    :split_len
+                ].clone()
+                child_cd.host_value = child_cd.host_value[split_len:].clone()
+            else:
+                offsets = cp_meta["owned_logical_offsets"].to(
+                    device="cpu", dtype=torch.int64
+                )
+                parent_mask = offsets < split_len
+                child_mask = ~parent_mask
+                valid_host_value = child_cd.host_value[: offsets.numel()]
+                padded_tail = child_cd.host_value[offsets.numel() :]
+                if padded_tail.numel() > 0 and self._full_kv_pool_host is not None:
+                    self._full_kv_pool_host.free(padded_tail)
+                parent_host_value = valid_host_value[parent_mask].clone()
+                child_host_value = valid_host_value[child_mask].clone()
+                new_parent.component_data[ct].host_value = parent_host_value
+                child_cd.host_value = child_host_value
+
+                logical_start = int(cp_meta["logical_start"])
+                logical_len = int(cp_meta["logical_len"])
+                self._set_cp_meta(
+                    new_parent,
+                    logical_start=logical_start,
+                    logical_len=split_len,
+                    owned_logical_offsets=offsets[parent_mask],
+                )
+                self._set_cp_meta(
+                    child,
+                    logical_start=logical_start + split_len,
+                    logical_len=logical_len - split_len,
+                    owned_logical_offsets=offsets[child_mask] - split_len,
+                )
 
     def evict_component(
         self,
@@ -292,6 +358,16 @@ class FullComponent(TreeComponent):
         if phase == CacheTransferPhase.BACKUP_HOST:
             if transfers and transfers[0].host_indices is not None:
                 node.component_data[ct].host_value = transfers[0].host_indices.clone()
+                cp_plan = transfers[0].cp_plan
+                if cp_plan is not None:
+                    self._set_cp_meta(
+                        node,
+                        logical_start=cp_plan.logical_start,
+                        logical_len=cp_plan.logical_len,
+                        owned_logical_offsets=cp_plan.owned_logical_offsets,
+                    )
+                else:
+                    self._clear_cp_meta(node)
 
         elif phase == CacheTransferPhase.LOAD_BACK:
             if not transfers or transfers[0].device_indices is None:
@@ -303,11 +379,11 @@ class FullComponent(TreeComponent):
             offset = 0
             for n in xfer.nodes_to_load or []:
                 cd = n.component_data[ct]
-                n_len = len(cd.host_value)
+                n_len = self._host_logical_len(n)
                 cd.value = device_indices[offset : offset + n_len].clone()
                 offset += n_len
                 # Full uses leaf sets, not LRU
-                self.cache.component_evictable_size_[ct] += n_len
+                self.cache.component_evictable_size_[ct] += len(cd.value)
                 self.cache._update_evictable_leaf_sets(n)
 
             self.cache._update_evictable_leaf_sets(node)

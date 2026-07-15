@@ -480,6 +480,16 @@ class SchedulerRuntimeCheckerMixin:
             msg,
         )
 
+    def _skip_attn_cp_hicache_idle_cache_check(self: Scheduler) -> bool:
+        # The existing checker mixes logical CP capacity with rank-local
+        # physical residency. Keep request-pool checking enabled, but defer
+        # cache-pool/tree checking until it has CP-aware accounting.
+        return (
+            self.enable_hierarchical_cache
+            and getattr(self, "attn_cp_size", 1) > 1
+            and getattr(self.server_args, "attn_cp_mode", "none") == "sharded-kv"
+        )
+
     def _check_all_pools(
         self: Scheduler, ps: PoolStats, uncached: int = 0
     ) -> Tuple[bool, List[str]]:
@@ -541,6 +551,9 @@ class SchedulerRuntimeCheckerMixin:
         self.metrics_collector.log_stats(self.stats)
 
     def _check_tree_cache(self: Scheduler):
+        if self._skip_attn_cp_hicache_idle_cache_check():
+            return
+
         if (
             self.tree_cache.is_tree_cache()
             and (self.is_hybrid_swa and self.tree_cache.supports_swa())
@@ -556,9 +569,10 @@ class SchedulerRuntimeCheckerMixin:
         # memory leak check (skipped for hisparse — pool counters intentionally
         # diverge during host-backup, see _get_swa_token_info clamp).
         if not self.enable_hisparse:
-            has_leak, messages = self._check_all_pools(self.get_pool_stats())
-            if has_leak:
-                self._report_leak("pool", "\n".join(messages))
+            if not self._skip_attn_cp_hicache_idle_cache_check():
+                has_leak, messages = self._check_all_pools(self.get_pool_stats())
+                if has_leak:
+                    self._report_leak("pool", "\n".join(messages))
             self._check_req_pool()
 
         # tree cache sanity check

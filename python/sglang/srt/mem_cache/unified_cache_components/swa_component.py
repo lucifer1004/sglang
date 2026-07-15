@@ -15,7 +15,13 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
     MatchResult,
 )
-from sglang.srt.mem_cache.hicache_storage import PoolHitPolicy, PoolName, PoolTransfer
+from sglang.srt.mem_cache.hicache_storage import (
+    CPHiCacheTransferPlan,
+    PoolHitPolicy,
+    PoolName,
+    PoolTransfer,
+)
+from sglang.srt.mem_cache.unified_cache_components.full_component import FullComponent
 from sglang.srt.mem_cache.unified_cache_components.tree_component import (
     BASE_COMPONENT_TYPE,
     CacheTransferPhase,
@@ -149,9 +155,7 @@ def _split_swa_trailing_device_value_on_node_split(
     window, so the same interval split used for host_value must be applied to
     avoid attaching tail slots to older prefix nodes.
     """
-    return _split_swa_trailing_host_value_on_node_split(
-        value, old_node_len, split_len
-    )
+    return _split_swa_trailing_host_value_on_node_split(value, old_node_len, split_len)
 
 
 def _node_page_count(node, page_size: int) -> int:
@@ -232,6 +236,84 @@ class SWAComponent(TreeComponent):
         self._swa_kv_pool_host = None
 
     component_type = ComponentType.SWA
+    HICACHE_OFFSETS_KEY = "swa_hicache_offsets"
+
+    def _full_cp_meta(self, node: UnifiedTreeNode) -> Optional[dict]:
+        try:
+            full_data = node.component_data[BASE_COMPONENT_TYPE]
+        except (IndexError, KeyError):
+            return None
+        return getattr(full_data, "metadata", {}).get(FullComponent.CP_HICACHE_META_KEY)
+
+    def _logical_len(self, node: UnifiedTreeNode) -> int:
+        meta = self._full_cp_meta(node)
+        if meta is not None:
+            return int(meta["logical_len"])
+        cd = node.component_data[self.component_type]
+        value = cd.value if cd.value is not None else cd.host_value
+        return len(value) if value is not None else 0
+
+    def _host_covered_len(self, node: UnifiedTreeNode) -> int:
+        cd = node.component_data[self.component_type]
+        if cd.host_value is None:
+            return 0
+        valid_offsets = getattr(cd, "metadata", {}).get(self.HICACHE_OFFSETS_KEY)
+        if valid_offsets is not None:
+            node_len = min(self._logical_len(node), len(node.key))
+            owned_offsets = self._owned_offsets(node)
+            if owned_offsets is None:
+                owned_offsets = valid_offsets
+            owned_offsets = owned_offsets.to(device="cpu", dtype=torch.int64)
+            valid_offsets = valid_offsets.to(device="cpu", dtype=torch.int64)
+            if owned_offsets.numel() == 0:
+                return node_len
+
+            missing = owned_offsets[
+                ~torch.isin(owned_offsets, valid_offsets, assume_unique=False)
+            ]
+            if missing.numel() == 0:
+                return node_len
+            return max(0, node_len - int(missing.max().item()) - 1)
+        return min(len(cd.host_value), len(node.key))
+
+    def _owned_offsets(self, node: UnifiedTreeNode) -> Optional[torch.Tensor]:
+        meta = self._full_cp_meta(node)
+        if meta is None:
+            return None
+        return meta["owned_logical_offsets"].to(device="cpu", dtype=torch.int64)
+
+    def _compact_swa_value(
+        self,
+        node: UnifiedTreeNode,
+        value: torch.Tensor,
+        cp_plan: Optional[CPHiCacheTransferPlan] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        offsets = (
+            cp_plan.owned_logical_offsets
+            if cp_plan is not None
+            else self._owned_offsets(node)
+        )
+        if offsets is None:
+            flat = value.reshape(-1).to(torch.int64)
+            valid = flat > 0
+            valid_offsets = (
+                valid.nonzero(as_tuple=False)
+                .flatten()
+                .to(device="cpu", dtype=torch.int64)
+            )
+            return flat[valid], valid_offsets
+        if offsets.numel() == 0:
+            return (
+                torch.empty((0,), dtype=torch.int64, device=value.device),
+                torch.empty((0,), dtype=torch.int64),
+            )
+        compact_offsets = offsets.to(device=value.device)
+        compact = value.reshape(-1)[compact_offsets].to(torch.int64)
+        valid = compact > 0
+        valid_offsets = offsets[valid.to(device=offsets.device)].to(
+            device="cpu", dtype=torch.int64
+        )
+        return compact[valid], valid_offsets
 
     def _translate_full_to_swa(self, full_indices: torch.Tensor) -> torch.Tensor:
         return self.cache.token_to_kv_pool_allocator.translate_loc_from_full_to_swa(
@@ -275,7 +357,7 @@ class SWAComponent(TreeComponent):
             if cd.value is not None:
                 covered_len = node_len
             else:
-                covered_len = min(len(cd.host_value), node_len)
+                covered_len = self._host_covered_len(node)
 
             if covered_len >= node_len:
                 state["covered_tail_len"] += node_len
@@ -468,18 +550,49 @@ class SWAComponent(TreeComponent):
 
         child_swa_host_value = child.component_data[self.component_type].host_value
         if child_swa_host_value is not None:
-            child_host_lock_ref = child.component_data[self.component_type].host_lock_ref
+            child_host_lock_ref = child.component_data[
+                self.component_type
+            ].host_lock_ref
             split_len = len(new_parent.key)
-            old_node_len = split_len + len(child.key)
-            parent_host_value, child_host_value = (
-                _split_swa_trailing_host_value_on_node_split(
-                    child_swa_host_value, old_node_len, split_len
+            child_offsets_meta = child.component_data[self.component_type].metadata.get(
+                self.HICACHE_OFFSETS_KEY
+            )
+            if child_offsets_meta is not None:
+                child_offsets_meta = child_offsets_meta.to(
+                    device="cpu", dtype=torch.int64
                 )
-            )
-            new_parent.component_data[self.component_type].host_value = (
-                parent_host_value
-            )
-            child.component_data[self.component_type].host_value = child_host_value
+                parent_mask = child_offsets_meta < split_len
+                child_mask = ~parent_mask
+                parent_len = int(parent_mask.sum().item())
+                child_len = int(child_mask.sum().item())
+                parent_host_value = child_swa_host_value[:parent_len].clone()
+                child_host_value = child_swa_host_value[
+                    parent_len : parent_len + child_len
+                ].clone()
+                padded_tail = child_swa_host_value[parent_len + child_len :]
+                if padded_tail.numel() > 0 and self._swa_kv_pool_host is not None:
+                    self._swa_kv_pool_host.free(padded_tail)
+                new_parent.component_data[self.component_type].host_value = (
+                    parent_host_value
+                )
+                child.component_data[self.component_type].host_value = child_host_value
+                new_parent.component_data[self.component_type].metadata[
+                    self.HICACHE_OFFSETS_KEY
+                ] = child_offsets_meta[parent_mask].clone()
+                child.component_data[self.component_type].metadata[
+                    self.HICACHE_OFFSETS_KEY
+                ] = (child_offsets_meta[child_mask] - split_len).clone()
+            else:
+                old_node_len = split_len + len(child.key)
+                parent_host_value, child_host_value = (
+                    _split_swa_trailing_host_value_on_node_split(
+                        child_swa_host_value, old_node_len, split_len
+                    )
+                )
+                new_parent.component_data[self.component_type].host_value = (
+                    parent_host_value
+                )
+                child.component_data[self.component_type].host_value = child_host_value
             new_parent.component_data[self.component_type].host_lock_ref = (
                 child_host_lock_ref if parent_host_value is not None else 0
             )
@@ -514,9 +627,9 @@ class SWAComponent(TreeComponent):
         host_uuid = child.component_data[self.component_type].metadata.get("host_uuid")
         if host_uuid is not None:
             if new_parent.component_data[self.component_type].host_lock_ref > 0:
-                new_parent.component_data[self.component_type].metadata["host_uuid"] = (
-                    host_uuid
-                )
+                new_parent.component_data[self.component_type].metadata[
+                    "host_uuid"
+                ] = host_uuid
                 child.component_data[self.component_type].metadata.pop(
                     "host_uuid", None
                 )
@@ -629,7 +742,7 @@ class SWAComponent(TreeComponent):
                 swa_lock_size += min(len(value), len(cur.key))
             else:
                 if comp.lock_ref == 0:
-                    key_len = len(cur.key)
+                    key_len = len(comp.value)
                     self.cache.component_evictable_size_[ct] -= key_len
                     self.cache.component_protected_size_[ct] += key_len
                 comp.lock_ref += 1
@@ -692,7 +805,7 @@ class SWAComponent(TreeComponent):
                     cur = cur.parent
                     continue
                 if comp.lock_ref == 1:
-                    key_len = len(cur.key)
+                    key_len = len(comp.value)
                     self.cache.component_evictable_size_[ct] += key_len
                     self.cache.component_protected_size_[ct] -= key_len
                 comp.lock_ref -= 1
@@ -727,18 +840,41 @@ class SWAComponent(TreeComponent):
             cd = node.component_data[ct]
             if cd.value is None:
                 return None
+            cp_plan = kw.get("cp_plan")
             # cd.value already holds SWA-pool indices (translated at insert time).
-            # Host pools allocate whole pages. SWA values can cover only a
-            # trailing suffix after chunked generation, so keep the newest
-            # page-aligned suffix instead of padding missing device slots.
-            device_indices = _page_align_trailing_value(cd.value, self.cache.page_size)
-            if len(device_indices) == 0:
-                return None
+            if cp_plan is not None or self._owned_offsets(node) is not None:
+                compact_value, valid_offsets = self._compact_swa_value(
+                    node, cd.value, cp_plan=cp_plan
+                )
+                device_indices = compact_value
+                allocator = getattr(self.cache, "token_to_kv_pool_allocator", None)
+                if hasattr(allocator, "_pad_transfer_slots"):
+                    device_indices = allocator._pad_transfer_slots(compact_value)
+                transfer_cp_plan = CPHiCacheTransferPlan(
+                    logical_start=(
+                        int(cp_plan.logical_start) if cp_plan is not None else 0
+                    ),
+                    logical_len=self._logical_len(node),
+                    full_device_indices=cd.value,
+                    owned_device_indices=device_indices,
+                    owned_logical_offsets=valid_offsets,
+                )
+            else:
+                # Host pools allocate whole pages. SWA values can cover only a
+                # trailing suffix after chunked generation, so keep the newest
+                # page-aligned suffix instead of padding missing device slots.
+                device_indices = _page_align_trailing_value(
+                    cd.value, self.cache.page_size
+                ).to(torch.int64)
+                if len(device_indices) == 0:
+                    return None
+                transfer_cp_plan = None
             # Host pool indexing wants int64.
             return [
                 PoolTransfer(
                     name=PoolName.SWA,
-                    device_indices=device_indices.to(torch.int64),
+                    device_indices=device_indices,
+                    cp_plan=transfer_cp_plan,
                 )
             ]
 
@@ -751,15 +887,17 @@ class SWAComponent(TreeComponent):
             cur = node
             while cur is not self.cache.root_node and n_swa < self.sliding_window_size:
                 cd = cur.component_data[ct]
-                assert cd.host_value is not None or cd.value is not None
                 if cd.value is not None:
                     # device exists, skip it
-                    n_swa += len(cd.value)
-                else:
+                    n_swa += self._logical_len(cur)
+                elif cd.host_value is not None:
                     # host only, collect it
                     backed_up.append(cd.host_value)
                     nodes.append(cur)
-                    n_swa += len(cd.host_value)
+                    n_swa += self._host_covered_len(cur)
+                else:
+                    assert self._full_cp_meta(node) is not None
+                    break
                 cur = cur.parent
 
             if not backed_up:
@@ -886,9 +1024,17 @@ class SWAComponent(TreeComponent):
 
         if phase == CacheTransferPhase.BACKUP_HOST:
             if transfers and transfers[0].host_indices is not None:
+                xfer = transfers[0]
                 cd = node.component_data[ct]
                 if cd.host_value is None:
-                    cd.host_value = transfers[0].host_indices.clone()
+                    cd.host_value = xfer.host_indices.clone()
+                    cp_plan = xfer.cp_plan
+                    if cp_plan is not None:
+                        cd.metadata[self.HICACHE_OFFSETS_KEY] = (
+                            cp_plan.owned_logical_offsets.to(
+                                device="cpu", dtype=torch.int64
+                            ).clone()
+                        )
             return
 
         if phase == CacheTransferPhase.LOAD_BACK:
@@ -902,28 +1048,47 @@ class SWAComponent(TreeComponent):
                 n = original_node
                 cd_n = n.component_data[ct]
                 cd_full_n = n.component_data[BASE_COMPONENT_TYPE]
-                n_tokens = len(cd_n.host_value)
-                swa_chunk = device_indices[offset : offset + n_tokens].clone()
-
-                if n_tokens < len(n.key):
-                    split_len = len(n.key) - n_tokens
-                    self.cache._split_node(n.key, n, split_len)
-                    cd_n = n.component_data[ct]
-                    cd_full_n = n.component_data[BASE_COMPONENT_TYPE]
-                    assert len(n.key) == n_tokens
-
+                valid_offsets = cd_n.metadata.get(self.HICACHE_OFFSETS_KEY)
+                compact = None
+                if valid_offsets is not None:
+                    valid_offsets = valid_offsets.to(device="cpu", dtype=torch.int64)
+                    host_len = len(cd_n.host_value)
+                    n_tokens = int(valid_offsets.numel())
+                    compact = device_indices[offset : offset + host_len]
+                    swa_chunk = torch.zeros_like(cd_full_n.value)
+                    if n_tokens > 0:
+                        swa_chunk[valid_offsets.to(device=swa_chunk.device)] = compact[
+                            :n_tokens
+                        ].to(device=swa_chunk.device)
+                    offset += host_len
+                else:
+                    offsets = self._owned_offsets(n)
+                    if offsets is None:
+                        n_tokens = len(cd_n.host_value)
+                        compact = device_indices[offset : offset + n_tokens]
+                        swa_chunk = compact.clone()
+                        if n_tokens < len(n.key):
+                            split_len = len(n.key) - n_tokens
+                            self.cache._split_node(n.key, n, split_len)
+                            cd_n = n.component_data[ct]
+                            cd_full_n = n.component_data[BASE_COMPONENT_TYPE]
+                            assert len(n.key) == n_tokens
+                        offset += n_tokens
+                    else:
+                        n_tokens = int(offsets.numel())
+                        host_len = len(cd_n.host_value)
+                        compact = device_indices[offset : offset + host_len]
+                        swa_chunk = torch.zeros_like(cd_full_n.value)
+                        if n_tokens > 0:
+                            swa_chunk[offsets.to(device=swa_chunk.device)] = compact[
+                                :n_tokens
+                            ].to(device=swa_chunk.device)
+                        offset += host_len
                 self._restore_device_value(n, swa_chunk)
-                # SWA may cover only the trailing portion of the node's
-                # FULL range when the host_value came from a PREFETCH
-                # window-load (FULL has 6 pages, SWA has only the last
-                # 2). Map FULL→SWA over the trailing n_tokens slots only.
-                # When SWA covers the whole node (BACKUP_HOST path), this
-                # reduces to the full-range mapping and the trailing
-                # slice is a no-op.
+                assert compact is not None
                 assert cd_full_n.value is not None
-                assert len(cd_full_n.value) == n_tokens
+                assert len(cd_full_n.value) == len(swa_chunk)
                 allocator.set_full_to_swa_mapping(cd_full_n.value, swa_chunk)
-                offset += n_tokens
             assert offset == len(xfer.host_indices)
             return
 

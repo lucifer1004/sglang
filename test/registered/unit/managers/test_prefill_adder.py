@@ -6,11 +6,11 @@ import torch
 
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
+from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefResult,
     IncLockRefResult,
 )
-from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.cp_sharded_allocator import CPShardedKVPoolAllocator
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
@@ -639,6 +639,28 @@ class TestPrefillAdder(CustomTestCase):
 
         self.assertEqual(result, AddReqResult.OTHER)
         self.assertEqual(adder.can_run_list, [short_req])
+
+    def test_attncp_hicache_admission_requires_free_physical_cache(self):
+        allocator = self._create_cp_sharded_allocator(physical_size=16, logical_size=32)
+        allocator.base_allocator.alloc(14)
+        tree_cache = self.create_tree_cache(evictable_size=16)
+        tree_cache.cache_controller = object()
+        adder = self.create_adder(
+            self.create_running_batch(),
+            tree_cache=tree_cache,
+            token_to_kv_pool_allocator=allocator,
+        )
+
+        self.assertFalse(adder._cp_sharded_can_allocate_extend(0, 8))
+
+    def test_attncp_uses_synchronized_swa_admission_budget(self):
+        self.mock_token_allocator.swa_available_size.return_value = 100
+        adder = self.create_adder(self.create_running_batch())
+        adder.is_hybrid_swa = True
+        adder.cp_sharded_swa_available_and_evictable_override = 40
+        adder.rem_swa_token_offset = 8
+
+        self.assertEqual(adder.rem_swa_tokens, 32)
 
 
 if __name__ == "__main__":

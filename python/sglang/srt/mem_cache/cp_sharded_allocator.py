@@ -5,6 +5,7 @@ from typing import Optional
 import torch
 
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+from sglang.srt.mem_cache.hicache_storage import CPHiCacheTransferPlan
 
 DUMMY_SLOT = 0
 
@@ -41,7 +42,9 @@ def build_extend_positions(
         raise ValueError("prefix_lens_cpu and extend_lens_cpu must have same length")
 
     pieces = []
-    for prefix_len, extend_len in zip(prefix_lens_cpu.tolist(), extend_lens_cpu.tolist()):
+    for prefix_len, extend_len in zip(
+        prefix_lens_cpu.tolist(), extend_lens_cpu.tolist()
+    ):
         if extend_len <= 0:
             continue
         pieces.append(
@@ -87,9 +90,7 @@ class CPShardedKVPoolAllocator(BaseTokenToKVPoolAllocator):
             else int(base_allocator.size) * cp_size
         )
         self.full_size = (
-            int(logical_full_size)
-            if logical_full_size is not None
-            else self.size
+            int(logical_full_size) if logical_full_size is not None else self.size
         )
         self.swa_size = (
             int(logical_swa_size) if logical_swa_size is not None else self.size
@@ -158,12 +159,12 @@ class CPShardedKVPoolAllocator(BaseTokenToKVPoolAllocator):
                 self._free_compacted(torch.cat(self.free_group))
             else:
                 page_indices = [
-                    self._ordered_page_indices_from_slots(free_index)
+                    self._page_indices_from_slots(free_index)
                     for free_index in self.free_group
                 ]
                 page_indices = [x for x in page_indices if x.numel() > 0]
                 if page_indices:
-                    self._free_base_pages(torch.cat(page_indices))
+                    self._free_base_pages(torch.unique(torch.cat(page_indices)))
             self.free_group = []
 
     def clear(self):
@@ -197,7 +198,9 @@ class CPShardedKVPoolAllocator(BaseTokenToKVPoolAllocator):
                 count += max(0, min(end, chunk_end) - max(start, chunk_start))
             return count
 
-        first_new_page = ((start + self.page_size - 1) // self.page_size) * self.page_size
+        first_new_page = (
+            (start + self.page_size - 1) // self.page_size
+        ) * self.page_size
         if first_new_page >= end:
             return 0
         count = 0
@@ -215,6 +218,25 @@ class CPShardedKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
     def local_alloc_size_for_range(self, start: int, length: int) -> int:
         return self._range_local_alloc_size_for_rank(start, length, self.cp_rank)
+
+    def _pad_transfer_slots(
+        self, slots: torch.Tensor, target_len: int = 0
+    ) -> torch.Tensor:
+        slots = slots.reshape(-1).to(dtype=torch.int64)
+        target_len = max(int(target_len), int(slots.numel()))
+        if self.page_size > 1:
+            target_len = (
+                (target_len + self.page_size - 1) // self.page_size * self.page_size
+            )
+        if target_len == slots.numel():
+            return slots
+        padding = torch.full(
+            (target_len - slots.numel(),),
+            DUMMY_SLOT,
+            dtype=torch.int64,
+            device=slots.device,
+        )
+        return torch.cat((slots, padding))
 
     def _alloc_page_starts(self, page_starts: list[int]) -> Optional[dict[int, int]]:
         """Allocate one physical page for each logical page start."""
@@ -288,9 +310,8 @@ class CPShardedKVPoolAllocator(BaseTokenToKVPoolAllocator):
             return torch.empty((0,), dtype=torch.int64, device=self.device)
         if self._has_paired_swa_allocator():
             return self._alloc_paired_swa_page_slots(count)
-        if (
-            self.base_allocator.need_sort
-            and int(count) > len(self.base_allocator.free_pages)
+        if self.base_allocator.need_sort and int(count) > len(
+            self.base_allocator.free_pages
         ):
             # CP sharded residency does not require globally sorted physical page
             # reuse. Sorting the release list on the decode hot path stalls high
@@ -376,6 +397,101 @@ class CPShardedKVPoolAllocator(BaseTokenToKVPoolAllocator):
             owner_indices = owner_indices.to(device=out_slots.device, non_blocking=True)
         out_slots.view(-1)[owner_indices] = local_slots.to(device=out_slots.device)
         return out_slots
+
+    def build_hicache_write_plan(
+        self,
+        logical_start: int,
+        device_indices: torch.Tensor,
+    ) -> CPHiCacheTransferPlan:
+        """Build a compact D2H transfer plan for a full logical radix value."""
+        device_indices = device_indices.to(dtype=torch.int64)
+        flat = device_indices.reshape(-1)
+        owned_mask = flat != DUMMY_SLOT
+        owned_offsets = owned_mask.nonzero(as_tuple=False).squeeze(1)
+        owned_device_indices = self._pad_transfer_slots(flat[owned_offsets])
+        return CPHiCacheTransferPlan(
+            logical_start=int(logical_start),
+            logical_len=int(flat.numel()),
+            full_device_indices=device_indices,
+            owned_device_indices=owned_device_indices,
+            owned_logical_offsets=owned_offsets.to(device="cpu", dtype=torch.int64),
+        )
+
+    def alloc_hicache_load_plan(
+        self,
+        logical_start: int,
+        logical_len: int,
+        host_indices: torch.Tensor,
+    ) -> Optional[CPHiCacheTransferPlan]:
+        """Allocate full logical device slots for compact rank-local host KV."""
+        logical_start = int(logical_start)
+        logical_len = int(logical_len)
+        positions = torch.arange(
+            logical_start,
+            logical_start + logical_len,
+            dtype=torch.int64,
+            device=self.device,
+        )
+        if self.page_size > 1:
+            page_owner_positions = (
+                torch.div(positions, self.page_size, rounding_mode="floor")
+                * self.page_size
+            )
+            owner_mask = (
+                get_cp_owner(page_owner_positions, self.cp_size, self.cp_kv_chunk_size)
+                == self.cp_rank
+            )
+            page_starts = self._ordered_owned_page_starts(page_owner_positions)
+            page_to_slot = self._alloc_page_starts(page_starts)
+            if page_to_slot is None:
+                return None
+
+            full_device_indices = torch.full_like(
+                positions, DUMMY_SLOT, dtype=torch.int64
+            )
+            flat_out = full_device_indices.view(-1)
+            flat_owner_mask = owner_mask.reshape(-1)
+            positions_cpu = positions.to("cpu").reshape(-1).tolist()
+            values = []
+            indices = []
+            for idx, pos in enumerate(positions_cpu):
+                if not bool(flat_owner_mask[idx].item()):
+                    continue
+                page_start = (int(pos) // self.page_size) * self.page_size
+                indices.append(idx)
+                values.append(page_to_slot[page_start] + (int(pos) - page_start))
+            if indices:
+                flat_out[
+                    torch.tensor(indices, dtype=torch.long, device=positions.device)
+                ] = torch.tensor(values, dtype=torch.int64, device=positions.device)
+        else:
+            full_device_indices = self.alloc_for_positions(positions)
+        if full_device_indices is None:
+            return None
+
+        flat = full_device_indices.reshape(-1)
+        owned_mask = flat != DUMMY_SLOT
+        owned_offsets = owned_mask.nonzero(as_tuple=False).squeeze(1)
+        owned_device_indices = flat[owned_offsets]
+        if owned_device_indices.numel() > host_indices.numel():
+            self.free(full_device_indices)
+            raise RuntimeError(
+                "AttnCP HiCache owned slot count mismatch: "
+                f"allocated {owned_device_indices.numel()} device slots for "
+                f"logical range [{logical_start}, {logical_start + logical_len}), "
+                f"but host payload has {host_indices.numel()} slots"
+            )
+        owned_device_indices = self._pad_transfer_slots(
+            owned_device_indices, int(host_indices.numel())
+        )
+
+        return CPHiCacheTransferPlan(
+            logical_start=logical_start,
+            logical_len=logical_len,
+            full_device_indices=full_device_indices,
+            owned_device_indices=owned_device_indices,
+            owned_logical_offsets=owned_offsets.to(device="cpu", dtype=torch.int64),
+        )
 
     def alloc_extend(
         self,
@@ -511,9 +627,7 @@ class CPShardedKVPoolAllocator(BaseTokenToKVPoolAllocator):
                     if pos < first_new_page:
                         slot = prev_loc + (pos - prefix_len + 1)
                     else:
-                        slot = page_to_slot[(req_idx, page_start)] + (
-                            pos - page_start
-                        )
+                        slot = page_to_slot[(req_idx, page_start)] + (pos - page_start)
                     write_offsets.append(out_offset)
                     values.append(slot)
                 out_offset += 1
@@ -554,7 +668,8 @@ class CPShardedKVPoolAllocator(BaseTokenToKVPoolAllocator):
         )
         page_start = logical_page * self.page_size
         owner_mask = valid_mask & (
-            get_cp_owner(page_start, self.cp_size, self.cp_kv_chunk_size) == self.cp_rank
+            get_cp_owner(page_start, self.cp_size, self.cp_kv_chunk_size)
+            == self.cp_rank
         )
         new_page_mask = owner_mask & (pos % self.page_size == 0)
         out = torch.full_like(seq_lens, DUMMY_SLOT)
@@ -572,16 +687,16 @@ class CPShardedKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def _free_base_pages(self, page_indices: torch.Tensor):
         if page_indices.numel() == 0:
             return
+        page_indices = torch.unique(page_indices.reshape(-1))
 
         if self._has_paired_swa_allocator():
             page_offsets = torch.arange(
                 self.page_size, dtype=torch.int64, device=page_indices.device
             )
-            full_slots = (
-                page_indices.to(dtype=torch.int64)[:, None] * self.page_size
-                + page_offsets[None, :]
+            page_slots = (
+                page_indices.to(torch.int64)[:, None] * self.page_size + page_offsets
             ).reshape(-1)
-            self.base_allocator.free(full_slots)
+            self.base_allocator.free(page_slots)
             return
 
         if self.base_allocator.need_sort:
@@ -592,6 +707,24 @@ class CPShardedKVPoolAllocator(BaseTokenToKVPoolAllocator):
             self.base_allocator.free_pages = torch.cat(
                 (page_indices, self.base_allocator.free_pages)
             )
+
+    def _free_full_pages(self, page_indices: torch.Tensor):
+        if page_indices.numel() == 0:
+            return
+        page_indices = torch.unique(page_indices.reshape(-1))
+
+        full_allocator = getattr(self.base_allocator, "full_attn_allocator", None)
+        if full_allocator is None:
+            self._free_base_pages(page_indices)
+            return
+
+        page_offsets = torch.arange(
+            self.page_size, dtype=torch.int64, device=page_indices.device
+        )
+        page_slots = (
+            page_indices.to(torch.int64)[:, None] * self.page_size + page_offsets
+        ).reshape(-1)
+        full_allocator.free(page_slots)
 
     def _owned_page_count_for_length(self, num_tokens: int) -> int:
         num_pages = (int(num_tokens) + self.page_size - 1) // self.page_size
@@ -604,32 +737,15 @@ class CPShardedKVPoolAllocator(BaseTokenToKVPoolAllocator):
             chunk_idx += self.cp_size
         return count
 
-    def _ordered_page_indices_from_slots(self, free_index: torch.Tensor) -> torch.Tensor:
+    def _page_indices_from_slots(self, free_index: torch.Tensor) -> torch.Tensor:
         free_index = free_index.reshape(-1)
         if free_index.numel() == 0:
             return free_index
 
-        num_owned_pages = self._owned_page_count_for_length(free_index.numel())
-        if num_owned_pages == 0:
+        owned_slots = filter_dummy_slots(free_index)
+        if owned_slots.numel() == 0:
             return torch.empty((0,), dtype=torch.int64, device=free_index.device)
-
-        # req_to_token stores slots in request-position order. For paged CP
-        # sharding, page ownership is determined by the logical page start. Build
-        # the owned page offsets directly on the target device from the CP chunk
-        # formula so release does not run torch.unique, boolean filtering, or
-        # CPU->GPU offset copies on the hot path.
-        pages_per_chunk = self.cp_kv_chunk_size // self.page_size
-        local_page_ord = torch.arange(
-            num_owned_pages, dtype=torch.int64, device=free_index.device
-        )
-        owned_chunk_ord = torch.div(
-            local_page_ord, pages_per_chunk, rounding_mode="floor"
-        )
-        page_in_chunk = local_page_ord - owned_chunk_ord * pages_per_chunk
-        logical_page = (
-            self.cp_rank + owned_chunk_ord * self.cp_size
-        ) * pages_per_chunk + page_in_chunk
-        return free_index[logical_page * self.page_size] // self.page_size
+        return torch.unique(owned_slots // self.page_size)
 
     def _free_compacted(self, free_index: torch.Tensor):
         if free_index.numel() == 0:
@@ -639,7 +755,19 @@ class CPShardedKVPoolAllocator(BaseTokenToKVPoolAllocator):
             self.base_allocator.free(filter_dummy_slots(free_index))
             return
 
-        self._free_base_pages(self._ordered_page_indices_from_slots(free_index))
+        self._free_base_pages(self._page_indices_from_slots(free_index))
+
+    def free_full(self, free_index: torch.Tensor):
+        if free_index.numel() == 0:
+            return
+        if self.page_size == 1:
+            full_allocator = getattr(self.base_allocator, "full_attn_allocator", None)
+            if full_allocator is None:
+                self.base_allocator.free(filter_dummy_slots(free_index))
+            else:
+                full_allocator.free(filter_dummy_slots(free_index))
+            return
+        self._free_full_pages(self._page_indices_from_slots(free_index))
 
     def free(self, free_index: torch.Tensor):
         if free_index.numel() == 0:

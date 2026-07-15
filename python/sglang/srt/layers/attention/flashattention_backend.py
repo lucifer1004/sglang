@@ -824,9 +824,7 @@ class FlashAttentionBackend(AttentionBackend):
             return None
         return window_tokens
 
-    def _is_swa_kv_pool_layer(
-        self, layer: RadixAttention, token_to_kv_pool
-    ) -> bool:
+    def _is_swa_kv_pool_layer(self, layer: RadixAttention, token_to_kv_pool) -> bool:
         if self.use_sliding_window_kv_pool:
             is_swa_layer = getattr(token_to_kv_pool, "is_swa_layer", None)
             if not callable(is_swa_layer):
@@ -834,10 +832,7 @@ class FlashAttentionBackend(AttentionBackend):
                     "Hybrid SWA KV pool must expose is_swa_layer(layer_id)"
                 )
             return bool(is_swa_layer(layer.layer_id))
-        return (
-            layer.sliding_window_size is not None
-            and layer.sliding_window_size > -1
-        )
+        return layer.sliding_window_size is not None and layer.sliding_window_size > -1
 
     def _set_decode_swa_metadata(
         self,
@@ -897,9 +892,9 @@ class FlashAttentionBackend(AttentionBackend):
         cache_lens_long = cache_seqlens.to(torch.long)
         window_start = torch.clamp(cache_lens_long - window_tokens, min=0)
         first_page = torch.div(window_start, self.page_size, rounding_mode="floor")
-        relative_cache_seqlens = (
-            cache_lens_long - first_page * self.page_size
-        ).to(torch.int32)
+        relative_cache_seqlens = (cache_lens_long - first_page * self.page_size).to(
+            torch.int32
+        )
 
         if compact_cap > 0:
             page_offsets = torch.arange(
@@ -907,9 +902,7 @@ class FlashAttentionBackend(AttentionBackend):
             ).unsqueeze(0)
             page_cols = first_page.unsqueeze(1) + page_offsets
             valid = page_cols < table_len
-            valid = valid & (
-                page_cols * self.page_size < cache_lens_long.unsqueeze(1)
-            )
+            valid = valid & (page_cols * self.page_size < cache_lens_long.unsqueeze(1))
             safe_cols = torch.where(valid, page_cols, torch.zeros_like(page_cols))
             row_indices = torch.arange(
                 batch_size, device=slots.device, dtype=torch.long
@@ -1045,9 +1038,7 @@ class FlashAttentionBackend(AttentionBackend):
             ).unsqueeze(0)
             cache_lens_long = cache_seqlens.to(torch.long)
             window_start = torch.clamp(cache_lens_long - window_tokens, min=0)
-            first_page = torch.div(
-                window_start, self.page_size, rounding_mode="floor"
-            )
+            first_page = torch.div(window_start, self.page_size, rounding_mode="floor")
             page_cols = first_page.unsqueeze(1) + page_offsets
             valid_page = page_cols < table_len
             page_token_start = page_cols * self.page_size
@@ -1152,24 +1143,43 @@ class FlashAttentionBackend(AttentionBackend):
         local_page_table = (
             page_table if page_table is not None else metadata.swa_page_table
         )
+
+        # The captured kernel keeps the capture bucket's table width. Clear the
+        # full replay buffers so a narrower request cannot observe stale pages.
+        self.decode_cuda_graph_metadata["cp_swa_local_page_table"][:bs].zero_()
+        if "cp_swa_local_page_start_offsets" in self.decode_cuda_graph_metadata:
+            self.decode_cuda_graph_metadata["cp_swa_local_page_start_offsets"][
+                :bs
+            ].zero_()
+        if "cp_swa_local_page_token_counts" in self.decode_cuda_graph_metadata:
+            self.decode_cuda_graph_metadata["cp_swa_local_page_token_counts"][
+                :bs
+            ].zero_()
+
         self._set_sharded_kv_decode_swa_metadata(
             metadata,
             local_page_table,
             metadata.cache_seqlens_int32,
-            out_page_table=self.decode_cuda_graph_metadata["cp_swa_local_page_table"][:bs],
+            out_page_table=self.decode_cuda_graph_metadata["cp_swa_local_page_table"][
+                :bs
+            ],
             out_cache_seqlens=self.decode_cuda_graph_metadata[
                 "cp_swa_local_cache_seqlens"
             ][:bs],
-            out_page_start_offsets=self.decode_cuda_graph_metadata.get(
-                "cp_swa_local_page_start_offsets"
-            )[:bs]
-            if "cp_swa_local_page_start_offsets" in self.decode_cuda_graph_metadata
-            else None,
-            out_page_token_counts=self.decode_cuda_graph_metadata.get(
-                "cp_swa_local_page_token_counts"
-            )[:bs]
-            if "cp_swa_local_page_token_counts" in self.decode_cuda_graph_metadata
-            else None,
+            out_page_start_offsets=(
+                self.decode_cuda_graph_metadata.get("cp_swa_local_page_start_offsets")[
+                    :bs
+                ]
+                if "cp_swa_local_page_start_offsets" in self.decode_cuda_graph_metadata
+                else None
+            ),
+            out_page_token_counts=(
+                self.decode_cuda_graph_metadata.get("cp_swa_local_page_token_counts")[
+                    :bs
+                ]
+                if "cp_swa_local_page_token_counts" in self.decode_cuda_graph_metadata
+                else None
+            ),
         )
 
     def _build_attn_cp_local_merge_workspace(
@@ -1259,9 +1269,7 @@ class FlashAttentionBackend(AttentionBackend):
             )
 
         if self.enable_attn_cp_decode_cp2_fused_q_fa:
-            max_splits = attncp_cp2_fused_q_fa_max_splits(
-                self.cuda_graph_max_seq_len
-            )
+            max_splits = attncp_cp2_fused_q_fa_max_splits(self.cuda_graph_max_seq_len)
             local_merge_workspace["fused_q_fa_split_o"] = torch.empty(
                 max_splits,
                 max_bs,
@@ -1373,9 +1381,7 @@ class FlashAttentionBackend(AttentionBackend):
         head_dim = q_local.shape[2]
         q_gather = q_gather[: cp_group.world_size * batch_size]
         cp_group.all_gather_into_tensor(q_gather, q_local.contiguous())
-        q_view = q_gather.view(
-            cp_group.world_size, batch_size, local_q_heads, head_dim
-        )
+        q_view = q_gather.view(cp_group.world_size, batch_size, local_q_heads, head_dim)
         q_peer.copy_(q_view[peer_rank])
         return q_peer
 
@@ -1514,18 +1520,16 @@ class FlashAttentionBackend(AttentionBackend):
                 head_start = cp_rank * local_q_heads
                 peer_head_start = peer_rank * local_q_heads
                 q_peer = bufs["q_peer"][:batch_size, :local_q_heads, :]
-                q_full = bufs["q_full"][
-                    :batch_size, : local_q_heads * cp_world_size, :
-                ]
+                q_full = bufs["q_full"][:batch_size, : local_q_heads * cp_world_size, :]
                 with pynccl_comm.change_state(enable=True):
                     pynccl_comm.group_start()
                     pynccl_comm.recv(q_peer, peer_rank)
                     pynccl_comm.send(q_local, peer_rank)
                     pynccl_comm.group_end()
                 q_full[:, head_start : head_start + local_q_heads, :].copy_(q_local)
-                q_full[
-                    :, peer_head_start : peer_head_start + local_q_heads, :
-                ].copy_(q_peer)
+                q_full[:, peer_head_start : peer_head_start + local_q_heads, :].copy_(
+                    q_peer
+                )
                 return q_full
 
         q_gather = bufs["q_gather"][: cp_world_size * batch_size]
@@ -1796,7 +1800,9 @@ class FlashAttentionBackend(AttentionBackend):
             local_cache_seqlens = metadata.cp_local_cache_seqlens_int32
         if local_page_table is None or local_cache_seqlens is None:
             raise RuntimeError("CP sharded-KV decode missing local shard metadata")
-        attn_window_size = window_size if local_window_size is None else local_window_size
+        attn_window_size = (
+            window_size if local_window_size is None else local_window_size
+        )
 
         cp_group = get_sharded_kv_cp_group()
         cp_world_size = cp_group.world_size
@@ -1892,9 +1898,7 @@ class FlashAttentionBackend(AttentionBackend):
         )
 
         o_gather = bufs["o_gather"][: cp_world_size * batch_size, :full_q_heads, :]
-        lse_gather = bufs["lse_gather"][
-            : cp_world_size * batch_size, :full_q_heads
-        ]
+        lse_gather = bufs["lse_gather"][: cp_world_size * batch_size, :full_q_heads]
         cp2_exchange = self._attncp_exchange_cp2_local_head_slice(
             bufs,
             local_o_full,
@@ -2053,7 +2057,9 @@ class FlashAttentionBackend(AttentionBackend):
             local_cache_seqlens = metadata.cp_local_cache_seqlens_int32
         if local_page_table is None or local_cache_seqlens is None:
             raise RuntimeError("CP sharded-KV decode missing local shard metadata")
-        attn_window_size = window_size if local_window_size is None else local_window_size
+        attn_window_size = (
+            window_size if local_window_size is None else local_window_size
+        )
 
         cp_group = get_sharded_kv_cp_group()
         cp_world_size = cp_group.world_size
@@ -2338,7 +2344,15 @@ class FlashAttentionBackend(AttentionBackend):
                 active_indices is not None
                 and active_indices.numel() != metadata.page_table.shape[0]
             ):
-                page_table = page_table[active_indices]
+                if page_table.shape[0] == metadata.page_table.shape[0]:
+                    page_table = page_table[active_indices]
+                elif page_table.shape[0] != active_indices.numel():
+                    raise RuntimeError(
+                        "CP sharded-KV prefill has inconsistent KV-mirror rows: "
+                        f"page_table_rows={page_table.shape[0]}, "
+                        f"full_rows={metadata.page_table.shape[0]}, "
+                        f"active_rows={active_indices.numel()}"
+                    )
                 cache_seqlens = cache_seqlens[active_indices]
                 cu_seqlens_k = torch.nn.functional.pad(
                     torch.cumsum(cache_seqlens, dim=0, dtype=torch.int32), (1, 0)
@@ -2809,9 +2823,7 @@ class FlashAttentionBackend(AttentionBackend):
             kwargs["sinks"] = sinks.repeat(sf)
 
         sliding = layer.sliding_window_size
-        window_size = (
-            (sliding, 0) if sliding is not None and sliding > 0 else (-1, -1)
-        )
+        window_size = (sliding, 0) if sliding is not None and sliding > 0 else (-1, -1)
         o = flash_attn_with_kvcache(
             q=q_fold,
             k_cache=key_cache_fold,
@@ -2880,9 +2892,7 @@ class FlashAttentionBackend(AttentionBackend):
             kwargs["sinks"] = sinks
 
         sliding = layer.sliding_window_size
-        window_size = (
-            (sliding, 0) if sliding is not None and sliding > 0 else (-1, -1)
-        )
+        window_size = (sliding, 0) if sliding is not None and sliding > 0 else (-1, -1)
         o = flash_attn_with_kvcache(
             q=q.contiguous().view(-1, n_q_heads, head_dim),
             k_cache=key_cache,
@@ -2901,7 +2911,9 @@ class FlashAttentionBackend(AttentionBackend):
         return o.view(-1, n_q_heads * v_head_dim)
 
     @staticmethod
-    def _is_scp_suffix_layer(layer: RadixAttention, forward_batch: ForwardBatch) -> bool:
+    def _is_scp_suffix_layer(
+        layer: RadixAttention, forward_batch: ForwardBatch
+    ) -> bool:
         if getattr(layer, "scale_seq_attn_per_suffix", False) and getattr(
             layer, "suffix_parallel", False
         ):
@@ -3026,9 +3038,7 @@ class FlashAttentionBackend(AttentionBackend):
         # Calculate window size (can be moved to metadata if layer properties don't change)
         # we don't do layer.sliding_window_size - 1 since in model.get_attention_sliding_window_size() we already - 1
         # here is two side inclusive
-        is_swa_layer = self._is_swa_kv_pool_layer(
-            layer, forward_batch.token_to_kv_pool
-        )
+        is_swa_layer = self._is_swa_kv_pool_layer(layer, forward_batch.token_to_kv_pool)
         window_size = (layer.sliding_window_size, 0) if is_swa_layer else (-1, -1)
         k_descale, v_descale = None, None
         # only use kv scaling if: 1) fp8 kv is explicitly enabled, 2) RadixAttention
@@ -3611,9 +3621,7 @@ class FlashAttentionBackend(AttentionBackend):
         # Calculate window size (can be moved to metadata if layer properties don't change)
         # we don't do layer.sliding_window_size - 1 since in model.get_attention_sliding_window_size() we already - 1
         # here is two side inclusive
-        is_swa_layer = self._is_swa_kv_pool_layer(
-            layer, forward_batch.token_to_kv_pool
-        )
+        is_swa_layer = self._is_swa_kv_pool_layer(layer, forward_batch.token_to_kv_pool)
         window_size = (layer.sliding_window_size, 0) if is_swa_layer else (-1, -1)
 
         causal = True
@@ -3684,8 +3692,13 @@ class FlashAttentionBackend(AttentionBackend):
                         "CP sharded-KV decode does not support FP8 KV descaling"
                     )
 
+                uses_swa_kv_pool = (
+                    is_swa_layer
+                    and int(layer.sliding_window_size) < int(self.max_context_len)
+                    and self.use_sliding_window_kv_pool
+                )
                 page_table = metadata.page_table
-                if is_swa_layer and self.use_sliding_window_kv_pool:
+                if uses_swa_kv_pool:
                     if metadata.swa_page_table is not None:
                         page_table = metadata.swa_page_table
                     else:
@@ -3695,7 +3708,7 @@ class FlashAttentionBackend(AttentionBackend):
                             )
                         )
                 sched_meta = None
-                if metadata.scheduler_metadata is not None and not is_swa_layer:
+                if metadata.scheduler_metadata is not None and not uses_swa_kv_pool:
                     sched_meta = metadata.scheduler_metadata
                 o = self._forward_decode_sharded_kv(
                     q,
@@ -4016,13 +4029,11 @@ class FlashAttentionBackend(AttentionBackend):
                         max_num_pages,
                         (window_tokens + 2 * self.page_size - 2) // self.page_size,
                     )
-                self.decode_cuda_graph_metadata["swa_compact_page_table"] = (
-                    torch.zeros(
-                        max_bs,
-                        compact_cap,
-                        dtype=torch.int32,
-                        device=self.device,
-                    )
+                self.decode_cuda_graph_metadata["swa_compact_page_table"] = torch.zeros(
+                    max_bs,
+                    compact_cap,
+                    dtype=torch.int32,
+                    device=self.device,
                 )
                 self.decode_cuda_graph_metadata["swa_cache_seqlens"] = torch.zeros(
                     max_bs, dtype=torch.int32, device=self.device
@@ -4038,13 +4049,13 @@ class FlashAttentionBackend(AttentionBackend):
                 self.decode_cuda_graph_metadata["attncp_dense_window_rows"] = (
                     torch.arange(max_bs, dtype=torch.long, device=self.device)
                 )
-                self.decode_cuda_graph_metadata[
-                    "attncp_dense_window_compact_slots"
-                ] = torch.arange(
-                    max_bs * swa_window_tokens,
-                    dtype=torch.int32,
-                    device=self.device,
-                ).view(max_bs, swa_window_tokens)
+                self.decode_cuda_graph_metadata["attncp_dense_window_compact_slots"] = (
+                    torch.arange(
+                        max_bs * swa_window_tokens,
+                        dtype=torch.int32,
+                        device=self.device,
+                    ).view(max_bs, swa_window_tokens)
+                )
         if is_cp_kv_sharded() and self.enable_attn_cp_decode_local_merge:
             self.decode_cuda_graph_metadata["cp_local_cache_seqlens"] = torch.zeros(
                 max_bs, dtype=torch.int32, device=self.device
@@ -4069,11 +4080,13 @@ class FlashAttentionBackend(AttentionBackend):
                 self.decode_cuda_graph_metadata["cp_swa_local_cache_seqlens"] = (
                     torch.zeros(max_bs, dtype=torch.int32, device=self.device)
                 )
-                self.decode_cuda_graph_metadata["cp_swa_local_page_table"] = torch.zeros(
-                    max_bs,
-                    swa_local_table_cap,
-                    dtype=torch.int32,
-                    device=self.device,
+                self.decode_cuda_graph_metadata["cp_swa_local_page_table"] = (
+                    torch.zeros(
+                        max_bs,
+                        swa_local_table_cap,
+                        dtype=torch.int32,
+                        device=self.device,
+                    )
                 )
                 if self.page_size != 1:
                     self.decode_cuda_graph_metadata[
@@ -4467,9 +4480,7 @@ class FlashAttentionBackend(AttentionBackend):
                         "swa_page_table"
                     ][:bs, :]
                     if is_cp_kv_sharded():
-                        metadata.swa_page_table = full_swa_page_table[
-                            :, :max_seq_pages
-                        ]
+                        metadata.swa_page_table = full_swa_page_table[:, :max_seq_pages]
                     else:
                         self._set_decode_swa_metadata(
                             metadata,
@@ -4512,8 +4523,7 @@ class FlashAttentionBackend(AttentionBackend):
                     )
                     if (
                         self.enable_attn_cp_decode_local_merge_swa
-                        and
-                        self.use_sliding_window_kv_pool
+                        and self.use_sliding_window_kv_pool
                         and metadata.swa_page_table is not None
                     ):
                         self._set_cuda_graph_sharded_kv_decode_swa_metadata(
@@ -4815,8 +4825,7 @@ class FlashAttentionBackend(AttentionBackend):
                     )
                     if (
                         self.enable_attn_cp_decode_local_merge_swa
-                        and
-                        self.use_sliding_window_kv_pool
+                        and self.use_sliding_window_kv_pool
                         and metadata.swa_page_table is not None
                     ):
                         self._set_cuda_graph_sharded_kv_decode_swa_metadata(

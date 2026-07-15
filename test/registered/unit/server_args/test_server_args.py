@@ -3,8 +3,8 @@ import tempfile
 import unittest
 from unittest.mock import MagicMock, patch
 
-from sglang.srt.server_args import PortArgs, ServerArgs, prepare_server_args
 from sglang.srt.configs.model_config import AttentionArch
+from sglang.srt.server_args import PortArgs, ServerArgs, prepare_server_args
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN,
@@ -163,6 +163,59 @@ class TestShardedKvContextParallelArgs(unittest.TestCase):
 
         self.assertTrue(server_args.disable_radix_cache)
 
+    def test_sharded_kv_hicache_requires_disabled_overlap_and_keeps_radix(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            tp_size=8,
+            attn_cp_size=4,
+            attn_cp_mode="sharded-kv",
+            attention_backend="fa3",
+            enable_hierarchical_cache=True,
+            disable_overlap_schedule=True,
+        )
+        server_args.model_config = self._fake_mha_config()
+        server_args._handle_page_size()
+        server_args._handle_hicache()
+        server_args._handle_context_parallelism()
+
+        self.assertTrue(server_args.disable_overlap_schedule)
+        self.assertFalse(server_args.disable_radix_cache)
+        self.assertEqual(server_args.schedule_policy, "fcfs")
+        self.assertEqual(server_args.hicache_io_backend, "direct")
+        self.assertEqual(server_args.get_attention_backends(), ("fa3", "fa3"))
+
+    def test_sharded_kv_hicache_rejects_overlap_schedule(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            tp_size=8,
+            attn_cp_size=4,
+            attn_cp_mode="sharded-kv",
+            attention_backend="fa3",
+            enable_hierarchical_cache=True,
+        )
+        server_args.model_config = self._fake_mha_config()
+        server_args._handle_page_size()
+
+        with self.assertRaisesRegex(ValueError, "--disable-overlap-schedule"):
+            server_args._handle_context_parallelism()
+
+    def test_sharded_kv_hicache_rejects_pd_decode(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            tp_size=8,
+            attn_cp_size=4,
+            attn_cp_mode="sharded-kv",
+            attention_backend="fa3",
+            enable_hierarchical_cache=True,
+            disable_overlap_schedule=True,
+            disaggregation_mode="decode",
+        )
+        server_args.model_config = self._fake_mha_config()
+        server_args._handle_page_size()
+
+        with self.assertRaisesRegex(ValueError, "PD decode servers"):
+            server_args._handle_context_parallelism()
+
     def test_attn_cp_size_requires_mode(self):
         server_args = ServerArgs(
             model_path="dummy",
@@ -242,7 +295,9 @@ class TestShardedKvContextParallelArgs(unittest.TestCase):
         server_args.model_config = self._fake_mha_config(q_heads=24, kv_heads=4)
         server_args._handle_page_size()
 
-        with self.assertRaisesRegex(ValueError, "attention_tp_size == total_num_kv_heads"):
+        with self.assertRaisesRegex(
+            ValueError, "attention_tp_size == total_num_kv_heads"
+        ):
             server_args._handle_context_parallelism()
 
 

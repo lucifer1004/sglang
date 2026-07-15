@@ -429,6 +429,7 @@ class HybridCacheController(BaseHiCacheController):
         priority: Optional[int] = None,
         node_id: int = -1,
         extra_pools: Optional[list[PoolTransfer]] = None,
+        device_indices: Optional[torch.Tensor] = None,
     ) -> Optional[torch.Tensor]:
         need_load_kv = host_indices.numel() > 0
 
@@ -437,12 +438,16 @@ class HybridCacheController(BaseHiCacheController):
             "full_attn_allocator",
             self.mem_pool_device_allocator,
         )
-        if not need_load_kv:
+        if device_indices is not None:
+            allocated_device_indices = False
+        elif not need_load_kv:
             device_indices = torch.empty((0,), dtype=torch.int64, device=self.device)
+            allocated_device_indices = False
         else:
             device_indices = full_allocator.alloc(len(host_indices))
             if device_indices is None:
                 return None
+            allocated_device_indices = True
 
         pool_transfers = self._resolve_pool_transfers_allocation(
             extra_pools,
@@ -451,9 +456,16 @@ class HybridCacheController(BaseHiCacheController):
             kv_host_indices=host_indices,
         )
         if pool_transfers is None and extra_pools:
-            if need_load_kv:
+            if allocated_device_indices and need_load_kv:
                 full_allocator.free(device_indices)
             return None
+
+        has_pool_payload = any(
+            transfer.host_indices is not None and transfer.host_indices.numel() > 0
+            for transfer in pool_transfers or []
+        )
+        if not need_load_kv and not has_pool_payload:
+            return device_indices
 
         self.load_queue.append(
             CacheOperation(

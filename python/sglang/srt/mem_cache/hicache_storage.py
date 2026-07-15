@@ -1,8 +1,8 @@
 from __future__ import annotations
 
+import json
 import logging
 import os
-import json
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -157,6 +157,22 @@ class PoolHitPolicy(str, Enum):
 
 
 @dataclass
+class CPHiCacheTransferPlan:
+    """CP-aware mapping for HiCache compact host payloads.
+
+    ``full_device_indices`` keeps the full logical radix value shape and may
+    contain DUMMY slots. ``owned_device_indices`` is the compact physical list
+    that participates in D2H/H2D transfer.
+    """
+
+    logical_start: int
+    logical_len: int
+    full_device_indices: torch.Tensor
+    owned_device_indices: torch.Tensor
+    owned_logical_offsets: torch.Tensor
+
+
+@dataclass
 class PoolTransfer:
     """Unified per-pool transfer descriptor for batch v2 interface.
 
@@ -172,6 +188,7 @@ class PoolTransfer:
     hit_policy: PoolHitPolicy = PoolHitPolicy.ALL_PAGES
     nodes_to_load: Optional[List[Any]] = None
     indices_from_pool: Optional[PoolName] = None
+    cp_plan: Optional[CPHiCacheTransferPlan] = None
 
 
 @dataclass(frozen=True)

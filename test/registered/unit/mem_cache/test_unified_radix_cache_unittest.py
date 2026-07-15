@@ -1768,6 +1768,24 @@ class UnifiedRadixCacheSuite:
         self.assertEqual(len(result.device_indices), len(tokens) - len(leaf.key))
         self.assertEqual(result.host_hit_length, len(leaf.key))
 
+    def test_hicache_all_device_match_ignores_backed_ancestor(self):
+        if self.cfg.has_swa and self.cfg.has_mamba:
+            self.skipTest("combined SWA + Mamba HiCache is unsupported")
+        tree, allocator, req_to_token_pool = self._build_hicache_fixture()
+        chain = self._build_chain_pages(tree, allocator, req_to_token_pool, 2)
+        if len(chain) < 2:
+            self.skipTest("chain too short")
+        parent, leaf = chain[-2:]
+        tokens = self._match_tokens_for_chain(chain)
+
+        self._backup_node(tree, parent)
+        result = tree.match_prefix(MatchPrefixParams(key=RadixKey(tokens)))
+
+        self.assertIs(result.best_match_node, leaf)
+        self.assertIs(result.last_device_node, leaf)
+        self.assertIs(result.last_host_node, leaf)
+        self.assertEqual(result.host_hit_length, 0)
+
     def test_hicache_swa_host_best_match_keeps_device_anchor(self):
         if not self.cfg.has_swa or self.cfg.has_mamba or self.cfg.page_size != 1:
             self.skipTest("requires page_size=1 Full+SWA")
@@ -2621,7 +2639,7 @@ class UnifiedRadixCacheSuite:
         seq = self._make_seq(1, 3)
         self._insert(tree, allocator, req_to_token_pool, seq)
 
-        match = tree.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
+        match = tree.match_prefix(MatchPrefixParams(key=RadixKey(seq)))
         node = match.last_device_node
         self.assertEqual(len(node.key), 3 * page_size)
         old_full = node.component_data[ComponentType.FULL].value.clone()

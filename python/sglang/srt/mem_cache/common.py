@@ -348,8 +348,8 @@ def evict_from_tree_cache(tree_cache: BasePrefixCache | None, num_tokens: int):
     unwrapped_allocator = unwrap_cp_sharded_allocator(allocator)
     if isinstance(unwrapped_allocator, SWATokenToKVPoolAllocator):
         # Hybrid allocator
-        full_available_size = unwrapped_allocator.full_available_size()
-        swa_available_size = unwrapped_allocator.swa_available_size()
+        full_available_size = allocator.full_available_size()
+        swa_available_size = allocator.swa_available_size()
 
         if full_available_size < num_tokens or swa_available_size < num_tokens:
             full_num_tokens = max(0, num_tokens - full_available_size)
@@ -361,6 +361,30 @@ def evict_from_tree_cache(tree_cache: BasePrefixCache | None, num_tokens: int):
         # Standard allocator
         if allocator.available_size() < num_tokens:
             tree_cache.evict(EvictParams(num_tokens=num_tokens))
+
+
+def evict_from_tree_cache_for_decode(
+    tree_cache: BasePrefixCache | None, num_tokens: int
+) -> None:
+    if tree_cache is None:
+        return
+
+    allocator = tree_cache.token_to_kv_pool_allocator
+    if (
+        isinstance(allocator, CPShardedKVPoolAllocator)
+        and getattr(tree_cache, "cache_controller", None) is not None
+    ):
+        # Decode must not trigger rank-local Full-KV HiCache migration. Hybrid
+        # SWA pages outside the active window are independent and still need
+        # to be reclaimed so the next decode page can be allocated.
+        unwrapped_allocator = unwrap_cp_sharded_allocator(allocator)
+        if isinstance(unwrapped_allocator, SWATokenToKVPoolAllocator):
+            available = allocator.swa_available_size()
+            if available < num_tokens:
+                tree_cache.evict(EvictParams(swa_num_tokens=num_tokens - available))
+        return
+
+    evict_from_tree_cache(tree_cache, num_tokens)
 
 
 def alloc_paged_token_slots_extend(
@@ -532,7 +556,7 @@ def alloc_paged_token_slots_decode(
     allocator = tree_cache.token_to_kv_pool_allocator
     # Over estimate the number of tokens: assume each request needs a new page.
     num_tokens = len(seq_lens) * allocator.page_size
-    evict_from_tree_cache(tree_cache, num_tokens)
+    evict_from_tree_cache_for_decode(tree_cache, num_tokens)
 
     out_cache_loc = allocator.alloc_decode(seq_lens, seq_lens_cpu, last_loc)
 
@@ -584,7 +608,9 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
             else:
                 positions = locs
                 positions_cpu = locs_cpu
-            evict_from_tree_cache(batch.tree_cache, int(positions_cpu.numel()))
+            evict_from_tree_cache_for_decode(
+                batch.tree_cache, int(positions_cpu.numel())
+            )
             out_cache_loc = allocator.alloc_for_positions(
                 positions, positions_cpu=positions_cpu
             )
