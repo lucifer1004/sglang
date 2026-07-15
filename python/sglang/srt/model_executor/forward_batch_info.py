@@ -390,6 +390,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     global_num_tokens_for_logprob_gpu: Optional[torch.Tensor] = None
     global_num_reqs_cpu: Optional[List[int]] = None
     global_forward_modes: Optional[List[int]] = None
+    welm_kv_mirror_contract_flags: Optional[List[bool]] = None
     welm_mtp_global_prefill_num_tokens: Optional[List[int]] = None
     # The padding mode for DP attention
     dp_padding_mode: Optional[DpPaddingMode] = None
@@ -489,6 +490,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             global_forward_mode=batch.global_forward_mode,
             global_num_reqs_cpu=batch.global_num_reqs,
             global_forward_modes=batch.global_forward_modes,
+            welm_kv_mirror_contract_flags=batch.welm_kv_mirror_contract_flags,
             welm_mtp_global_prefill_num_tokens=(
                 batch.welm_mtp_global_prefill_num_tokens
             ),

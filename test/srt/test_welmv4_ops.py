@@ -14,9 +14,11 @@ Tolerances: atol=2e-2 (bf16 has ~0.0078 per-ULP precision).
 
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 
 import torch
 
+from sglang.srt.layers.dp_attention import DpPaddingMode
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.rotary_embedding import RotaryEmbedding
 from sglang.srt.layers.welmv4_op import (
@@ -25,7 +27,7 @@ from sglang.srt.layers.welmv4_op import (
     inplace_sigmoid_mul,
     mmq_style_add_residual,
 )
-from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
+from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
 from sglang.srt.models.welmv4 import (
     _pack_welm_kv_mirror_states,
     _unpack_welm_kv_mirror_states,
@@ -33,6 +35,8 @@ from sglang.srt.models.welmv4 import (
     _welm_kv_mirror_pp_key,
     _welm_scatter_kv_mirror_rows,
     _welm_select_kv_mirror_rows,
+    _welm_should_sync_kv_mirror_dp_metadata,
+    _welm_update_contracted_dp_metadata,
 )
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.test.test_utils import CustomTestCase
@@ -110,6 +114,244 @@ class TestWelmKvMirrorLastQSelection(CustomTestCase):
             scattered, forward_batch, first_contract=next_contract
         )
         torch.testing.assert_close(selected_again, token_states[[7]])
+
+
+class TestWelmKvMirrorDpMetadata(CustomTestCase):
+    def _make_forward_batch(self, forward_mode: ForwardMode):
+        return SimpleNamespace(
+            enable_welm_kv_mirror_opt=True,
+            forward_mode=forward_mode,
+            is_extend_in_batch=True,
+            # Decode has 13 real requests but is padded to 14 rows for attn-TP=2.
+            global_num_tokens_gpu=torch.tensor([8192, 14], dtype=torch.int64),
+            global_num_tokens_cpu=[8192, 14],
+            original_global_num_tokens_cpu=[8192, 14],
+            global_num_tokens_for_logprob_gpu=torch.tensor(
+                [1, 13], dtype=torch.int64
+            ),
+            global_num_tokens_for_logprob_cpu=[1, 13],
+            global_num_reqs_cpu=[1, 13],
+            global_forward_modes=[ForwardMode.EXTEND.value, forward_mode.value],
+            welm_kv_mirror_contract_flags=[True, False],
+            return_logprob=False,
+            scale_seq_factor=1,
+            dp_padding_mode=DpPaddingMode.SUM_LEN,
+            dp_local_start_pos=torch.tensor(1),
+            dp_local_num_tokens=torch.tensor(14),
+            global_dp_buffer_len=8206,
+        )
+
+    @mock.patch("sglang.srt.models.welmv4.is_dp_attention_enabled", return_value=True)
+    def test_decode_and_idle_peers_sync_metadata(self, _):
+        for mode in (ForwardMode.DECODE, ForwardMode.IDLE):
+            with self.subTest(mode=mode):
+                self.assertTrue(
+                    _welm_should_sync_kv_mirror_dp_metadata(
+                        self._make_forward_batch(mode)
+                    )
+                )
+
+        self.assertTrue(
+            _welm_should_sync_kv_mirror_dp_metadata(
+                self._make_forward_batch(ForwardMode.EXTEND)
+            )
+        )
+
+    @mock.patch(
+        "sglang.srt.models.welmv4._welm_cuda_graph_capture_active",
+        return_value=True,
+    )
+    @mock.patch(
+        "sglang.srt.models.welmv4.welm_use_previous_precision",
+        return_value=False,
+    )
+    @mock.patch("sglang.srt.models.welmv4.is_dp_attention_enabled", return_value=True)
+    @mock.patch("sglang.srt.layers.dp_attention.set_is_extend_in_batch")
+    @mock.patch("sglang.srt.layers.dp_attention.set_dp_buffer_len")
+    @mock.patch("sglang.srt.layers.dp_attention.get_attention_dp_rank", return_value=1)
+    def test_decode_peer_preserves_padded_rows_in_mixed_layout(
+        self,
+        _,
+        set_dp_buffer_len,
+        set_is_extend_in_batch,
+        _is_dp_attention_enabled,
+        _welm_use_previous_precision,
+        _cuda_graph_capture_active,
+    ):
+        forward_batch = self._make_forward_batch(ForwardMode.DECODE)
+
+        _welm_update_contracted_dp_metadata(
+            forward_batch,
+            14,
+            marker_attr="_welm_kv_mirror_contracted_dp_metadata_rows",
+            contract_to_request_counts=True,
+        )
+
+        self.assertEqual(forward_batch.global_num_tokens_cpu, [1, 14])
+        self.assertEqual(forward_batch.global_num_tokens_gpu.tolist(), [1, 14])
+        self.assertEqual(forward_batch.global_num_tokens_for_logprob_cpu, [1, 13])
+        self.assertEqual(
+            forward_batch.global_num_tokens_for_logprob_gpu.tolist(), [1, 13]
+        )
+        self.assertEqual(forward_batch.global_dp_buffer_len, 15)
+        self.assertIsNone(forward_batch.dp_local_start_pos)
+        self.assertIsNone(forward_batch.dp_local_num_tokens)
+        self.assertEqual(
+            forward_batch._welm_kv_mirror_contracted_dp_metadata_rows, 14
+        )
+        set_dp_buffer_len.assert_called_once_with(15, 14, False, [1, 14])
+        set_is_extend_in_batch.assert_called_once_with(True)
+
+    @mock.patch(
+        "sglang.srt.models.welmv4._welm_cuda_graph_capture_active",
+        return_value=True,
+    )
+    @mock.patch(
+        "sglang.srt.models.welmv4.welm_use_previous_precision",
+        return_value=False,
+    )
+    @mock.patch("sglang.srt.models.welmv4.is_dp_attention_enabled", return_value=True)
+    @mock.patch("sglang.srt.layers.dp_attention.set_is_extend_in_batch")
+    @mock.patch("sglang.srt.layers.dp_attention.set_dp_buffer_len")
+    @mock.patch("sglang.srt.layers.dp_attention.get_attention_dp_rank", return_value=0)
+    def test_extend_peer_builds_the_same_mixed_layout(
+        self,
+        _,
+        set_dp_buffer_len,
+        set_is_extend_in_batch,
+        _is_dp_attention_enabled,
+        _welm_use_previous_precision,
+        _cuda_graph_capture_active,
+    ):
+        forward_batch = self._make_forward_batch(ForwardMode.EXTEND)
+        forward_batch.global_forward_modes = [
+            ForwardMode.EXTEND.value,
+            ForwardMode.DECODE.value,
+        ]
+
+        _welm_update_contracted_dp_metadata(
+            forward_batch,
+            1,
+            marker_attr="_welm_kv_mirror_contracted_dp_metadata_rows",
+            contract_to_request_counts=True,
+        )
+
+        self.assertEqual(forward_batch.global_num_tokens_cpu, [1, 14])
+        self.assertEqual(forward_batch.global_num_tokens_gpu.tolist(), [1, 14])
+        self.assertEqual(forward_batch.global_num_tokens_for_logprob_cpu, [1, 13])
+        self.assertEqual(
+            forward_batch.global_num_tokens_for_logprob_gpu.tolist(), [1, 13]
+        )
+        self.assertEqual(forward_batch.global_dp_buffer_len, 15)
+        set_dp_buffer_len.assert_called_once_with(15, 1, False, [1, 14])
+        set_is_extend_in_batch.assert_called_once_with(True)
+
+    @mock.patch(
+        "sglang.srt.models.welmv4._welm_cuda_graph_capture_active",
+        return_value=True,
+    )
+    @mock.patch(
+        "sglang.srt.models.welmv4.welm_use_previous_precision",
+        return_value=False,
+    )
+    @mock.patch("sglang.srt.models.welmv4.is_dp_attention_enabled", return_value=True)
+    @mock.patch("sglang.srt.layers.dp_attention.set_is_extend_in_batch")
+    @mock.patch("sglang.srt.layers.dp_attention.set_dp_buffer_len")
+    @mock.patch("sglang.srt.layers.dp_attention.get_attention_dp_rank", return_value=0)
+    def test_input_logprob_extend_preserves_rows_while_peer_contracts(
+        self,
+        _,
+        set_dp_buffer_len,
+        set_is_extend_in_batch,
+        _is_dp_attention_enabled,
+        _welm_use_previous_precision,
+        _cuda_graph_capture_active,
+    ):
+        forward_batch = self._make_forward_batch(ForwardMode.EXTEND)
+        forward_batch.global_num_tokens_gpu = torch.tensor(
+            [8192, 4096], dtype=torch.int64
+        )
+        forward_batch.global_num_tokens_cpu = [8192, 4096]
+        forward_batch.original_global_num_tokens_cpu = [8192, 4096]
+        forward_batch.global_num_tokens_for_logprob_gpu = torch.tensor(
+            [1, 1], dtype=torch.int64
+        )
+        forward_batch.global_num_tokens_for_logprob_cpu = [1, 1]
+        forward_batch.global_num_reqs_cpu = [1, 1]
+        forward_batch.global_forward_modes = [
+            ForwardMode.EXTEND.value,
+            ForwardMode.EXTEND.value,
+        ]
+        forward_batch.welm_kv_mirror_contract_flags = [False, True]
+        forward_batch.return_logprob = True
+        forward_batch.extend_seq_lens_cpu = [8192]
+        forward_batch.extend_logprob_start_lens_cpu = [8191]
+
+        self.assertTrue(
+            _welm_should_sync_kv_mirror_dp_metadata(forward_batch)
+        )
+        _welm_update_contracted_dp_metadata(
+            forward_batch,
+            8192,
+            marker_attr="_welm_kv_mirror_contracted_dp_metadata_rows",
+            contract_to_request_counts=True,
+        )
+
+        self.assertEqual(forward_batch.global_num_tokens_cpu, [8192, 1])
+        self.assertEqual(forward_batch.global_num_tokens_gpu.tolist(), [8192, 1])
+        self.assertEqual(forward_batch.global_num_tokens_for_logprob_cpu, [1, 1])
+        self.assertEqual(forward_batch.global_dp_buffer_len, 8193)
+        set_dp_buffer_len.assert_called_once_with(8193, 8192, False, [8192, 1])
+        set_is_extend_in_batch.assert_called_once_with(True)
+
+    @mock.patch(
+        "sglang.srt.models.welmv4._welm_cuda_graph_capture_active",
+        return_value=True,
+    )
+    @mock.patch(
+        "sglang.srt.models.welmv4.welm_use_previous_precision",
+        return_value=False,
+    )
+    @mock.patch("sglang.srt.models.welmv4.is_dp_attention_enabled", return_value=True)
+    @mock.patch("sglang.srt.layers.dp_attention.set_is_extend_in_batch")
+    @mock.patch("sglang.srt.layers.dp_attention.set_dp_buffer_len")
+    @mock.patch("sglang.srt.layers.dp_attention.get_attention_dp_rank", return_value=1)
+    def test_nonshrinking_extend_rank_still_syncs_peer_contraction(
+        self,
+        _,
+        set_dp_buffer_len,
+        set_is_extend_in_batch,
+        _is_dp_attention_enabled,
+        _welm_use_previous_precision,
+        _cuda_graph_capture_active,
+    ):
+        forward_batch = self._make_forward_batch(ForwardMode.EXTEND)
+        forward_batch.global_num_tokens_gpu = torch.tensor(
+            [8192, 2], dtype=torch.int64
+        )
+        forward_batch.global_num_tokens_cpu = [8192, 2]
+        forward_batch.original_global_num_tokens_cpu = [8192, 2]
+        forward_batch.global_num_tokens_for_logprob_gpu = torch.tensor(
+            [1, 2], dtype=torch.int64
+        )
+        forward_batch.global_num_tokens_for_logprob_cpu = [1, 2]
+        forward_batch.global_num_reqs_cpu = [1, 2]
+        forward_batch.welm_kv_mirror_contract_flags = [True, True]
+
+        self.assertTrue(_welm_should_sync_kv_mirror_dp_metadata(forward_batch))
+        _welm_update_contracted_dp_metadata(
+            forward_batch,
+            2,
+            marker_attr="_welm_kv_mirror_contracted_dp_metadata_rows",
+            contract_to_request_counts=True,
+        )
+
+        self.assertEqual(forward_batch.global_num_tokens_cpu, [1, 2])
+        self.assertEqual(forward_batch.global_num_tokens_gpu.tolist(), [1, 2])
+        self.assertEqual(forward_batch.global_dp_buffer_len, 3)
+        set_dp_buffer_len.assert_called_once_with(3, 2, False, [1, 2])
+        set_is_extend_in_batch.assert_called_once_with(True)
+
 
 num_tokens_list = [127]
 

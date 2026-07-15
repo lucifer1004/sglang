@@ -1823,8 +1823,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     global_num_tokens_for_logprob: Optional[List[int]] = None
     global_num_reqs: Optional[List[int]] = None
     global_forward_modes: Optional[List[int]] = None
+    welm_kv_mirror_contract_flags: Optional[List[bool]] = None
     welm_mtp_global_prefill_num_tokens: Optional[List[int]] = None
     is_extend_in_batch: bool = False
+    has_cache_hit_extend_in_batch: bool = False
     all_extend_in_batch: bool = False
     can_run_dp_cuda_graph: bool = False
     tbo_split_seq_index: Optional[int] = None
@@ -3182,6 +3184,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             global_num_tokens_for_logprob=self.global_num_tokens_for_logprob,
             global_num_reqs=self.global_num_reqs,
             global_forward_modes=self.global_forward_modes,
+            welm_kv_mirror_contract_flags=self.welm_kv_mirror_contract_flags,
             welm_mtp_global_prefill_num_tokens=(
                 self.welm_mtp_global_prefill_num_tokens
             ),
@@ -3290,6 +3293,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             can_run_dp_cuda_graph=self.can_run_dp_cuda_graph,
             all_extend_in_batch=self.all_extend_in_batch,
             is_extend_in_batch=self.is_extend_in_batch,
+            has_cache_hit_extend_in_batch=self.has_cache_hit_extend_in_batch,
             is_prefill_only=self.is_prefill_only,
             router_replay_topk_ids=self.router_replay_topk_ids,
             router_replay_mask=self.router_replay_mask,
@@ -3432,6 +3436,7 @@ class ModelWorkerBatch:
     global_num_tokens_for_logprob: Optional[List[int]]
     global_num_reqs: Optional[List[int]]
     global_forward_modes: Optional[List[int]]
+    welm_kv_mirror_contract_flags: Optional[List[bool]]
     welm_mtp_global_prefill_num_tokens: Optional[List[int]]
     is_extend_in_batch: bool
     all_extend_in_batch: bool

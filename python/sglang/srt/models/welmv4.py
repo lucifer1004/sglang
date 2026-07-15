@@ -101,7 +101,10 @@ from sglang.srt.layers.welmv4_op import (
     welm_use_previous_precision,
 )
 from sglang.srt.model_executor.forward_batch_context import get_current_forward_batch
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.model_executor.forward_batch_info import (
+    ForwardBatch,
+    PPProxyTensors,
+)
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.welm_perf_opt import (
     compute_welm_oe_embedding,
@@ -569,13 +572,19 @@ def _welm_should_contract_kv_mirror(forward_batch: ForwardBatch) -> bool:
     )
 
 
-def _welm_should_contract_idle_extend_dp_metadata(
+def _welm_should_sync_kv_mirror_dp_metadata(
     forward_batch: ForwardBatch,
 ) -> bool:
+    """Install the same post-mirror DP row layout on every participating rank."""
+    contract_flags = getattr(forward_batch, "welm_kv_mirror_contract_flags", None)
+    has_contracting_peer = bool(contract_flags and any(contract_flags)) or (
+        getattr(forward_batch, "_welm_mtp_contract_global_num_tokens_cpu", None)
+        is not None
+    )
     return (
         forward_batch.enable_welm_kv_mirror_opt
-        and forward_batch.forward_mode.is_idle()
         and forward_batch.is_extend_in_batch
+        and has_contracting_peer
         and is_dp_attention_enabled()
         and getattr(forward_batch, "global_num_tokens_gpu", None) is not None
         and getattr(forward_batch, "global_num_reqs_cpu", None) is not None
@@ -777,6 +786,60 @@ def _welm_update_contracted_dp_metadata(
     if contract_to_request_counts:
         num_dp_slots = int(forward_batch.global_num_tokens_gpu.numel())
         raw_global_num_tokens = None
+        new_global_num_tokens_for_logprob = None
+
+        # In a normal mixed extend/decode batch, only extend ranks contract at
+        # the first KV-mirror layer.  Decode ranks keep the row padding that was
+        # installed by ForwardBatch.prepare_mlp_sync_batch (for example, 13
+        # requests become 14 rows when attention TP is 2).  Replacing every DP
+        # slot with global_num_reqs_cpu would therefore make the ranks use
+        # different collective buffer sizes.  Build the post-mirror layout
+        # deterministically from the synchronized contract flags instead:
+        # contract flagged slots and preserve the existing padded row count
+        # for every non-contracting slot.
+        contract_flags = getattr(
+            forward_batch, "welm_kv_mirror_contract_flags", None
+        )
+        current_global_num_tokens = getattr(
+            forward_batch, "global_num_tokens_cpu", None
+        )
+        global_num_reqs = getattr(forward_batch, "global_num_reqs_cpu", None)
+        mtp_contract_counts = getattr(
+            forward_batch, "_welm_mtp_contract_global_num_tokens_cpu", None
+        )
+        can_build_mixed_layout = (
+            mtp_contract_counts is None
+            and not getattr(forward_batch, "welm_mtp_merge_kv_fill_draft", False)
+            and contract_flags is not None
+            and current_global_num_tokens is not None
+            and global_num_reqs is not None
+            and len(contract_flags) == num_dp_slots
+            and len(current_global_num_tokens) == num_dp_slots
+            and len(global_num_reqs) == num_dp_slots
+        )
+        if can_build_mixed_layout:
+            mixed_global_num_tokens = [int(x) for x in current_global_num_tokens]
+            current_logprob_counts = getattr(
+                forward_batch, "global_num_tokens_for_logprob_cpu", None
+            )
+            mixed_logprob_counts = (
+                [int(x) for x in current_logprob_counts]
+                if current_logprob_counts is not None
+                and len(current_logprob_counts) == num_dp_slots
+                else [int(x) for x in global_num_reqs]
+            )
+            has_contracting_slot = False
+            for slot, will_contract in enumerate(contract_flags):
+                if will_contract:
+                    contracted_rows = int(global_num_reqs[slot])
+                    mixed_global_num_tokens[slot] = contracted_rows
+                    mixed_logprob_counts[slot] = contracted_rows
+                    has_contracting_slot = True
+
+            if has_contracting_slot:
+                raw_global_num_tokens = mixed_global_num_tokens
+                new_global_num_tokens_for_logprob = mixed_logprob_counts
+
         candidate_count_names = (
             "_welm_mtp_contract_global_num_tokens_cpu",
             "global_num_reqs_cpu",
@@ -785,15 +848,16 @@ def _welm_update_contracted_dp_metadata(
             "original_global_num_tokens_cpu",
         )
         candidate_count_values = {}
-        for name in candidate_count_names:
-            counts = getattr(forward_batch, name, None)
-            if counts is None or len(counts) != num_dp_slots:
-                continue
-            counts = [int(x) for x in counts]
-            candidate_count_values[name] = counts
-            if counts[dp_rank] == new_local_num_tokens:
-                raw_global_num_tokens = counts
-                break
+        if raw_global_num_tokens is None:
+            for name in candidate_count_names:
+                counts = getattr(forward_batch, name, None)
+                if counts is None or len(counts) != num_dp_slots:
+                    continue
+                counts = [int(x) for x in counts]
+                candidate_count_values[name] = counts
+                if counts[dp_rank] == new_local_num_tokens:
+                    raw_global_num_tokens = counts
+                    break
         if raw_global_num_tokens is None:
             if candidate_count_values:
                 raise RuntimeError(
@@ -837,11 +901,15 @@ def _welm_update_contracted_dp_metadata(
         if forward_batch.global_num_tokens_cpu is not None:
             forward_batch.global_num_tokens_cpu = new_global_num_tokens
         if forward_batch.global_num_tokens_for_logprob_gpu is not None:
+            if new_global_num_tokens_for_logprob is None:
+                new_global_num_tokens_for_logprob = new_global_num_tokens
             if copy_dp_counts_to_gpu(
                 forward_batch.global_num_tokens_for_logprob_gpu,
-                new_global_num_tokens,
+                new_global_num_tokens_for_logprob,
             ):
-                forward_batch.global_num_tokens_for_logprob_cpu = new_global_num_tokens
+                forward_batch.global_num_tokens_for_logprob_cpu = (
+                    new_global_num_tokens_for_logprob
+                )
     elif scale > 1:
         new_global_num_tokens_gpu = forward_batch.global_num_tokens_gpu // scale
         forward_batch.global_num_tokens_gpu.copy_(new_global_num_tokens_gpu)
@@ -3089,14 +3157,14 @@ class Qwen2MoeDecoderLayer(nn.Module):
             )
         is_kv_mirror_layer = self.self_attn.kv_mirror_layer_idx in self.kv_mirror_layers
         if (
-            _welm_should_contract_idle_extend_dp_metadata(forward_batch)
+            _welm_should_sync_kv_mirror_dp_metadata(forward_batch)
             and is_kv_mirror_layer
             and not self.is_nextn
             and not use_previous_precision
         ):
             _welm_update_contracted_dp_metadata(
                 forward_batch,
-                0,
+                hidden_states.shape[0],
                 marker_attr="_welm_kv_mirror_contracted_dp_metadata_rows",
                 contract_to_request_counts=True,
             )
@@ -3107,13 +3175,6 @@ class Qwen2MoeDecoderLayer(nn.Module):
             and residual.shape[0] != hidden_states.shape[0]
         ):
             residual = _welm_align_kv_mirror_residual_rows(residual, forward_batch)
-            if is_dp_attention_enabled() and not use_previous_precision:
-                _welm_update_contracted_dp_metadata(
-                    forward_batch,
-                    hidden_states.shape[0],
-                    marker_attr="_welm_kv_mirror_contracted_dp_metadata_rows",
-                    contract_to_request_counts=True,
-                )
 
         if use_mmq_norm_after_attn:
             if hidden_states.shape != residual.shape:

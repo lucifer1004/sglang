@@ -279,6 +279,27 @@ TEST_RETRACT_NO_PREFILL_BS = envs.SGLANG_TEST_RETRACT_NO_PREFILL_BS.get()
 _is_npu = is_npu()
 
 
+def _should_process_cache_hit_extend_before_schedule(
+    last_batch: Optional[ScheduleBatch],
+    *,
+    has_pending_result: bool,
+    require_mlp_sync: bool,
+) -> bool:
+    if last_batch is None or not has_pending_result:
+        return False
+
+    if require_mlp_sync:
+        # This flag is reduced as part of the existing DP scheduler all-gather,
+        # so every attention-DP rank makes the same overlap decision.  In
+        # particular, cached decode requests must not be mistaken for the
+        # cache-hit extend running on a peer rank.
+        return last_batch.has_cache_hit_extend_in_batch
+
+    if not last_batch.forward_mode.is_extend():
+        return False
+    return any(getattr(req, "cached_tokens", 0) > 0 for req in last_batch.reqs)
+
+
 @dataclass
 class EmbeddingBatchResult:
     """Result from an embedding/classification forward pass.
@@ -1719,21 +1740,10 @@ class Scheduler(
             self.process_batch_result(tmp_batch, tmp_result)
 
         def should_process_last_cache_hit_extend_before_schedule():
-            if self.last_batch is None or len(self.result_queue) == 0:
-                return False
-            if self.require_mlp_sync:
-                last_is_extend = self.last_batch.is_extend_in_batch
-            else:
-                last_is_extend = self.last_batch.forward_mode.is_extend()
-            if not last_is_extend:
-                return False
-
-            # Prefix-cache hit prefill result processing may rewrite
-            # req_to_token_pool and radix locks via cache_unfinished_req.
-            # Do it before preparing the next decode batch so decode metadata
-            # cannot observe stale or racing cache mappings.
-            return any(
-                getattr(req, "cached_tokens", 0) > 0 for req in self.last_batch.reqs
+            return _should_process_cache_hit_extend_before_schedule(
+                self.last_batch,
+                has_pending_result=len(self.result_queue) > 0,
+                require_mlp_sync=self.require_mlp_sync,
             )
 
         dp_spec_prefill_flag = torch.empty((1,), dtype=torch.int32)

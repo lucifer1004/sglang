@@ -21,6 +21,9 @@ if TYPE_CHECKING:
 _ENABLE_METRICS_DP_ATTENTION = envs.SGLANG_ENABLE_METRICS_DP_ATTENTION.get()
 _WELM_MTP_PREFILL_INFO_SHIFT = 32
 _WELM_MTP_PREFILL_INFO_REQ_MASK = (1 << _WELM_MTP_PREFILL_INFO_SHIFT) - 1
+_MLP_SYNC_FLAG_ROUTER_REPLAY = 1 << 0
+_MLP_SYNC_FLAG_CACHE_HIT_EXTEND = 1 << 1
+_MLP_SYNC_FLAG_WELM_KV_MIRROR_CONTRACT = 1 << 2
 
 
 def _pack_welm_mtp_prefill_info(prefill_num_tokens: int, num_reqs: int) -> int:
@@ -34,6 +37,34 @@ def _unpack_welm_mtp_prefill_info(value: int) -> tuple[int, int]:
     return (
         value >> _WELM_MTP_PREFILL_INFO_SHIFT,
         value & _WELM_MTP_PREFILL_INFO_REQ_MASK,
+    )
+
+
+def _has_cache_hit_extend(batch: Optional[ScheduleBatch]) -> bool:
+    if batch is None or not batch.forward_mode.is_extend():
+        return False
+
+    # mix_with_running() appends decode requests after the extend requests.
+    # Their cached-token accounting must not turn a mixed batch into a
+    # cache-hit extend batch.
+    num_decoding_reqs = len(batch.decoding_reqs or ())
+    extend_reqs = (
+        batch.reqs[:-num_decoding_reqs] if num_decoding_reqs else batch.reqs
+    )
+    return any(getattr(req, "cached_tokens", 0) > 0 for req in extend_reqs)
+
+
+def _will_contract_welm_kv_mirror(batch: Optional[ScheduleBatch]) -> bool:
+    if batch is None or not batch.forward_mode.is_extend_without_speculative():
+        return False
+    if not batch.return_logprob:
+        return True
+    return not any(
+        int(extend_len) - int(start_len) > 0
+        for extend_len, start_len in zip(
+            batch.extend_lens,
+            batch.extend_logprob_start_lens,
+        )
     )
 
 
@@ -51,6 +82,8 @@ class MLPSyncBatchInfo:
     local_can_run_tbo: bool
     local_forward_mode: int
     has_router_replay: bool = False
+    has_cache_hit_extend: bool = False
+    will_contract_welm_kv_mirror: bool = False
     welm_mtp_prefill_num_tokens: int = 0
 
     # some gathered elements
@@ -59,6 +92,7 @@ class MLPSyncBatchInfo:
     global_num_tokens_for_logprob: list[int] = None
     global_num_reqs: list[int] = None
     global_forward_modes: list[int] = None
+    welm_kv_mirror_contract_flags: list[bool] = None
     welm_mtp_global_prefill_num_tokens: list[int] = None
     tbo_split_seq_index: torch.Tensor = None
     global_forward_mode: int = None
@@ -73,7 +107,13 @@ class MLPSyncBatchInfo:
                 int(self.is_extend_in_batch),
                 int(self.local_can_run_tbo),
                 self.local_forward_mode,
-                int(self.has_router_replay),
+                (
+                    int(self.has_router_replay) * _MLP_SYNC_FLAG_ROUTER_REPLAY
+                    | int(self.has_cache_hit_extend)
+                    * _MLP_SYNC_FLAG_CACHE_HIT_EXTEND
+                    | int(self.will_contract_welm_kv_mirror)
+                    * _MLP_SYNC_FLAG_WELM_KV_MIRROR_CONTRACT
+                ),
                 _pack_welm_mtp_prefill_info(
                     self.welm_mtp_prefill_num_tokens,
                     self.num_reqs,
@@ -92,7 +132,7 @@ class MLPSyncBatchInfo:
                 0,  # is_extend_in_batch
                 1,  # local_can_run_tbo
                 ForwardMode.IDLE.value,  # local_forward_mode
-                0,  # has_router_replay
+                0,  # packed flags
                 _pack_welm_mtp_prefill_info(0, 0),  # welm_mtp_prefill_info
             ],
             device=device,
@@ -124,20 +164,30 @@ class MLPSyncBatchInfo:
         tp0_info = global_info_tensor[:, 0, :]
         self.tp0_info = tp0_info
         # Perform only one Device-to-Host (D2H) memory copy
-        cpu_data = tp0_info[:, [0, 1, 5, 7]].cpu()
+        cpu_data = tp0_info[:, [0, 1, 2, 3, 5, 6, 7]].cpu()
         self.global_num_tokens = cpu_data[:, 0].tolist()
         self.global_num_tokens_for_logprob = cpu_data[:, 1].tolist()
-        self.global_forward_modes = cpu_data[:, 2].tolist()
+        self.can_cuda_graph = bool(cpu_data[:, 2].min().item())
+        self.is_extend_in_batch = bool(cpu_data[:, 3].max().item())
+        self.global_forward_modes = cpu_data[:, 4].tolist()
+        packed_flags = cpu_data[:, 5].tolist()
+        self.has_router_replay = any(
+            value & _MLP_SYNC_FLAG_ROUTER_REPLAY for value in packed_flags
+        )
+        self.has_cache_hit_extend = any(
+            value & _MLP_SYNC_FLAG_CACHE_HIT_EXTEND for value in packed_flags
+        )
+        self.welm_kv_mirror_contract_flags = [
+            bool(value & _MLP_SYNC_FLAG_WELM_KV_MIRROR_CONTRACT)
+            for value in packed_flags
+        ]
         prefill_info = [
-            _unpack_welm_mtp_prefill_info(value) for value in cpu_data[:, 3].tolist()
+            _unpack_welm_mtp_prefill_info(value) for value in cpu_data[:, 6].tolist()
         ]
         self.welm_mtp_global_prefill_num_tokens = [
             item[0] for item in prefill_info
         ]
         self.global_num_reqs = [item[1] for item in prefill_info]
-        self.can_cuda_graph = bool(tp0_info[:, 2].min().item())
-        self.is_extend_in_batch = bool(tp0_info[:, 3].max().item())
-        self.has_router_replay = bool(tp0_info[:, 6].max().item())
         if _ENABLE_METRICS_DP_ATTENTION:
             self.dp_cooperation_info = DPCooperationInfo.create(tp0_info[:, 5].tolist())
 
@@ -182,6 +232,10 @@ def _update_gather_batch(
         batch.global_forward_mode = mlp_sync_info.global_forward_mode
         batch.global_forward_modes = mlp_sync_info.global_forward_modes
         batch.global_num_reqs = mlp_sync_info.global_num_reqs
+        batch.has_cache_hit_extend_in_batch = mlp_sync_info.has_cache_hit_extend
+        batch.welm_kv_mirror_contract_flags = (
+            mlp_sync_info.welm_kv_mirror_contract_flags
+        )
         batch.welm_mtp_global_prefill_num_tokens = (
             mlp_sync_info.welm_mtp_global_prefill_num_tokens
         )
@@ -274,6 +328,8 @@ def prepare_mlp_sync_batch_raw(
             or local_batch.has_router_replay()
         )
     )
+    has_cache_hit_extend = _has_cache_hit_extend(local_batch)
+    will_contract_welm_kv_mirror = _will_contract_welm_kv_mirror(local_batch)
     welm_mtp_prefill_num_tokens = _get_welm_mtp_prefill_num_tokens(local_batch)
 
     tbo_preparer = TboDPAttentionPreparer()
@@ -301,6 +357,8 @@ def prepare_mlp_sync_batch_raw(
         local_can_run_tbo=local_can_run_tbo,
         local_forward_mode=local_forward_mode,
         has_router_replay=has_router_replay,
+        has_cache_hit_extend=has_cache_hit_extend,
+        will_contract_welm_kv_mirror=will_contract_welm_kv_mirror,
         welm_mtp_prefill_num_tokens=welm_mtp_prefill_num_tokens,
     )
 
