@@ -1,9 +1,10 @@
 {
     "name": "sglang",
     "build": {
-        "dockerfile": "Dockerfile"
+        "dockerfile": "../Dockerfile",
+        "context": ".."
     },
-    "remoteUser": "devuser",
+    "remoteUser": "root",
     "customizations": {
         "vscode": {
             "extensions": [
