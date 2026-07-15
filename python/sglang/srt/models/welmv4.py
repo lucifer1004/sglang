@@ -156,6 +156,17 @@ _WELM_MTP_DUMP_ENABLED = (
 _WELM_GRAPH_DUMP_ENABLED = _WELM_DUMP_ENABLED or _WELM_MTP_DUMP_ENABLED
 
 
+def _get_welm_attention_sink_dtype() -> Optional[torch.dtype]:
+    """Return the sink dtype required by the configured attention backends."""
+    server_args = get_global_server_args()
+    attention_backends = (
+        getattr(server_args, "attention_backend", None),
+        getattr(server_args, "prefill_attention_backend", None),
+        getattr(server_args, "decode_attention_backend", None),
+    )
+    return torch.float32 if "trtllm_mha" in attention_backends else None
+
+
 class WelmV4CommunicatorRMSNorm(nn.Module):
     """Adapt WeLM fused RMSNorm to LayerCommunicator's return-value contract."""
 
@@ -2464,9 +2475,12 @@ class Qwen2MoeAttention(nn.Module):
             "self.enable_attention_sink:",
             self.enable_attention_sink,
         )
-        if self.enable_attention_sink == True:
+        if self.enable_attention_sink:
             self.attn_sink = nn.Parameter(
-                torch.empty(self.num_heads), requires_grad=False
+                torch.empty(
+                    self.num_heads, dtype=_get_welm_attention_sink_dtype()
+                ),
+                requires_grad=False,
             )
         else:
             self.attn_sink = None

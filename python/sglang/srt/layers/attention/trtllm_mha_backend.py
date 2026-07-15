@@ -61,6 +61,10 @@ class TRTLLMMHAMetadata:
     page_table: torch.Tensor = None
     # Page table for SWA layers (translated from full pool indices to SWA pool indices)
     swa_page_table: torch.Tensor = None
+    # Cumulative query lengths after WeLM KV mirror contracts each active request
+    # to its last query row.
+    mirror_cu_seqlens_q: torch.Tensor = None
+    mirror_max_seq_len_q: int = 1
 
 
 class TRTLLMHAAttnBackend(FlashInferAttnBackend):
@@ -215,6 +219,83 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             if is_swa:
                 return swa_pt
         return self.forward_metadata.page_table
+
+    def _get_context_attention_metadata(
+        self,
+        q: torch.Tensor,
+        forward_batch: ForwardBatch,
+        page_table: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, int, torch.Tensor, torch.Tensor]:
+        """Return context metadata matching the query rows passed to TRT-LLM.
+
+        WeLM KV mirror keeps the full KV sequence but contracts Q to one row per
+        active request after the mirror point. Passing the original extend-Q
+        lengths with that contracted tensor makes the TRT-LLM context kernel read
+        beyond Q and can corrupt device memory.
+        """
+        metadata = self.forward_metadata
+        cache_seqlens = metadata.cache_seqlens_int32
+        max_seq_len_q = metadata.max_seq_len_q
+        cu_seqlens_q = metadata.cu_seqlens_q
+        cu_seqlens_k = metadata.cu_seqlens_k
+
+        custom_last_index = getattr(forward_batch, "custom_last_index", None)
+        use_welm_custom_last_q = (
+            getattr(forward_batch, "welm_kv_mirror_contracted", False)
+            and custom_last_index is not None
+            and q.shape[0] == custom_last_index.numel()
+        )
+        if not use_welm_custom_last_q:
+            return (
+                page_table,
+                cache_seqlens,
+                max_seq_len_q,
+                cu_seqlens_q,
+                cu_seqlens_k,
+            )
+
+        cu_seqlens_q = metadata.mirror_cu_seqlens_q
+        max_seq_len_q = metadata.mirror_max_seq_len_q
+        if cu_seqlens_q is None:
+            raise RuntimeError(
+                "WeLM KV mirror contracted Q is missing TRT-LLM context metadata"
+            )
+
+        active_indices = getattr(
+            forward_batch, "kv_mirror_active_batch_indices", None
+        )
+        if (
+            active_indices is not None
+            and active_indices.numel() != page_table.shape[0]
+        ):
+            page_table = page_table[active_indices]
+            cache_seqlens = cache_seqlens[active_indices]
+            cu_seqlens_k = torch.nn.functional.pad(
+                torch.cumsum(cache_seqlens, dim=0, dtype=torch.int32), (1, 0)
+            )
+
+        num_sequences = cu_seqlens_q.shape[0] - 1
+        if (
+            q.shape[0] != num_sequences
+            or page_table.shape[0] != num_sequences
+            or cache_seqlens.shape[0] != num_sequences
+            or cu_seqlens_k.shape[0] != num_sequences + 1
+        ):
+            raise RuntimeError(
+                "Inconsistent WeLM KV mirror metadata for TRT-LLM context attention: "
+                f"q_rows={q.shape[0]}, query_sequences={num_sequences}, "
+                f"page_table_rows={page_table.shape[0]}, "
+                f"cache_seqlens={cache_seqlens.shape[0]}, "
+                f"cu_seqlens_k={cu_seqlens_k.shape[0]}"
+            )
+
+        return (
+            page_table,
+            cache_seqlens,
+            max_seq_len_q,
+            cu_seqlens_q,
+            cu_seqlens_k,
+        )
 
     def init_cuda_graph_state(
         self,
@@ -662,6 +743,16 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 forward_batch.req_pool_indices, : metadata.max_seq_len_k
             ]
 
+            if forward_batch.enable_welm_kv_mirror_opt:
+                mirror_num_queries = batch_size
+                if forward_batch.welm_kv_mirror_last_q_indices is not None:
+                    mirror_num_queries = (
+                        forward_batch.welm_kv_mirror_last_q_indices.numel()
+                    )
+                metadata.mirror_cu_seqlens_q = torch.arange(
+                    0, mirror_num_queries + 1, dtype=torch.int32, device=device
+                )
+
             if any(
                 forward_batch.extend_prefix_lens_cpu
             ) or forward_batch.forward_mode.is_draft_extend(include_v2=True):
@@ -866,19 +957,26 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 q_len_per_req=self.forward_metadata.max_seq_len_q,
             )
         else:
+            (
+                page_table,
+                cache_seqlens,
+                max_seq_len_q,
+                cu_seqlens_q,
+                cu_seqlens_k,
+            ) = self._get_context_attention_metadata(q, forward_batch, page_table)
             o = flashinfer.prefill.trtllm_batch_context_with_kv_cache(
                 query=q,
                 kv_cache=kv_cache,
                 workspace_buffer=self.workspace_buffer,
                 block_tables=page_table,
-                seq_lens=self.forward_metadata.cache_seqlens_int32,
-                max_q_len=self.forward_metadata.max_seq_len_q,
+                seq_lens=cache_seqlens,
+                max_q_len=max_seq_len_q,
                 max_kv_len=self.max_context_len,
                 bmm1_scale=bmm1_scale,
                 bmm2_scale=bmm2_scale,
-                batch_size=self.forward_metadata.cu_seqlens_q.shape[0] - 1,
-                cum_seq_lens_q=self.forward_metadata.cu_seqlens_q,
-                cum_seq_lens_kv=self.forward_metadata.cu_seqlens_k,
+                batch_size=cu_seqlens_q.shape[0] - 1,
+                cum_seq_lens_q=cu_seqlens_q,
+                cum_seq_lens_kv=cu_seqlens_k,
                 window_left=layer.sliding_window_size,
                 sinks=attention_sink,
                 skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_PREFILL_THRESHOLD_SCALE_FACTOR.get(),
