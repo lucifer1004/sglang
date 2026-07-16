@@ -25,7 +25,9 @@ class ShardTransferBackend(Protocol):
         """Decode and store this TP rank's active plan, returning a summary."""
         ...
 
-    def update_weights(self, target_name: str, model_runner: Any) -> dict:
+    def update_weights(
+        self, target_name: str, model_runner: Any, source_payload: str
+    ) -> dict:
         """Pull + replay + load this target's local slice of the active plan.
         Returns
         per-target stats: {"entries": int, "bytes": int, "seconds": float}."""

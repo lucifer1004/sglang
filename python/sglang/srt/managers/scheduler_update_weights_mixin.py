@@ -343,7 +343,7 @@ class SchedulerUpdateWeightsMixin:
 
         try:
             message = get_shard_transfer_backend().install_plan(
-                recv_req.serialized_state, self.tp_rank
+                recv_req.serialized_plan, self.tp_rank
             )
             local = {
                 "success": True,
@@ -376,7 +376,9 @@ class SchedulerUpdateWeightsMixin:
             backend = get_shard_transfer_backend()
             per_target = {}
             for name, mr in _iter_weight_model_runners(self):
-                per_target[name] = backend.update_weights(name, mr)
+                per_target[name] = backend.update_weights(
+                    name, mr, recv_req.serialized_source
+                )
             if recv_req.flush_cache:
                 phase = "flush"
                 self.flush_cache_after_weight_update(recv_req)

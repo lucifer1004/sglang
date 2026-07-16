@@ -1541,8 +1541,8 @@ class ReportShardTransferTargetReqOutput(BaseReq):
 
 @dataclass
 class InstallShardTransferPlanReqInput(BaseReq):
-    # Opaque, versioned connect-time payload owned by the registered backend.
-    serialized_state: str
+    # Opaque, versioned connect-time plan owned by the registered backend.
+    serialized_plan: str
 
 
 @dataclass
@@ -1553,8 +1553,9 @@ class InstallShardTransferPlanReqOutput(BaseReq):
 
 @dataclass
 class UpdateWeightsFromShardTransferReqInput(BaseReq):
-    # Step-time trigger; reuses the active plan installed at connect. Only
-    # carries per-step flags, never addresses.
+    # Opaque, versioned source references owned by the registered backend.
+    serialized_source: str
+    weight_version: Optional[str] = None
     flush_cache: bool = True
     torch_empty_cache: bool = False
 

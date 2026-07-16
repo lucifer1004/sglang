@@ -1252,7 +1252,7 @@ async def report_shard_transfer_target(
 async def install_shard_transfer_plan(
     obj: InstallShardTransferPlanReqInput, request: Request
 ):
-    """Install the connect-time active shard-transfer plan and backup addresses."""
+    """Install the connect-time active shard-transfer plan."""
     success, message = (
         await _global_state.tokenizer_manager.install_shard_transfer_plan(obj, request)
     )
@@ -1267,7 +1267,7 @@ async def install_shard_transfer_plan(
 async def update_weights_from_shard_transfer(
     obj: UpdateWeightsFromShardTransferReqInput, request: Request
 ):
-    """Trigger workers to pull, replay and load their slice of the active plan."""
+    """Pull from the supplied source references and load the active plan."""
     success, message, stats = (
         await _global_state.tokenizer_manager.update_weights_from_shard_transfer(
             obj, request

@@ -1,6 +1,7 @@
+import asyncio
 import unittest
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import maybe_stub_sgl_kernel
@@ -11,9 +12,13 @@ from sglang.srt.managers.io_struct import (  # noqa: E402
     CheckWeightsReqInput,
     InstallShardTransferPlanReqInput,
     UpdateWeightsFromShardTransferReqInput,
+    UpdateWeightsFromShardTransferReqOutput,
 )
 from sglang.srt.managers.scheduler_update_weights_mixin import (  # noqa: E402
     SchedulerUpdateWeightsMixin,
+)
+from sglang.srt.managers.tokenizer_control_mixin import (  # noqa: E402
+    TokenizerControlMixin,
 )
 from sglang.srt.utils.common import SafeUnpickler  # noqa: E402
 
@@ -126,15 +131,13 @@ class TestSchedulerShardTransfer(unittest.TestCase):
             output = SchedulerUpdateWeightsMixin.install_shard_transfer_plan(
                 scheduler,
                 InstallShardTransferPlanReqInput(
-                    serialized_state="shard-transfer-pickle-v1:state"
+                    serialized_plan="shard-transfer-pickle-v1:plan"
                 ),
             )
 
         self.assertFalse(output.success)
         self.assertIn("rank-local install failed", output.message)
-        backend.install_plan.assert_called_once_with(
-            "shard-transfer-pickle-v1:state", 0
-        )
+        backend.install_plan.assert_called_once_with("shard-transfer-pickle-v1:plan", 0)
         gather.assert_called_once()
 
     def test_update_propagates_remote_rank_failure(self):
@@ -165,11 +168,19 @@ class TestSchedulerShardTransfer(unittest.TestCase):
         ):
             output = SchedulerUpdateWeightsMixin.update_weights_from_shard_transfer(
                 scheduler,
-                UpdateWeightsFromShardTransferReqInput(flush_cache=False),
+                UpdateWeightsFromShardTransferReqInput(
+                    serialized_source="shard-transfer-pickle-v1:source",
+                    flush_cache=False,
+                ),
             )
 
         self.assertFalse(output.success)
         self.assertIn("rank-local pull failed", output.message)
+        backend.update_weights.assert_called_once_with(
+            "main",
+            scheduler.tp_worker.model_runner,
+            "shard-transfer-pickle-v1:source",
+        )
         gather.assert_called_once()
         barrier.assert_not_called()
 
@@ -201,7 +212,10 @@ class TestSchedulerShardTransfer(unittest.TestCase):
         ):
             output = SchedulerUpdateWeightsMixin.update_weights_from_shard_transfer(
                 scheduler,
-                UpdateWeightsFromShardTransferReqInput(flush_cache=False),
+                UpdateWeightsFromShardTransferReqInput(
+                    serialized_source="shard-transfer-pickle-v1:source",
+                    flush_cache=False,
+                ),
             )
 
         self.assertTrue(output.success)
@@ -242,13 +256,59 @@ class TestSchedulerShardTransfer(unittest.TestCase):
         ):
             output = SchedulerUpdateWeightsMixin.update_weights_from_shard_transfer(
                 scheduler,
-                UpdateWeightsFromShardTransferReqInput(flush_cache=True),
+                UpdateWeightsFromShardTransferReqInput(
+                    serialized_source="shard-transfer-pickle-v1:source",
+                    flush_cache=True,
+                ),
             )
 
         self.assertFalse(output.success)
         self.assertIn("rank 1", output.message)
         self.assertIn("rank-local flush failed", output.message)
         gather.assert_called_once()
+
+    def test_tokenizer_commits_version_only_after_successful_update(self):
+        class AsyncLock:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return False
+
+        output = UpdateWeightsFromShardTransferReqOutput(
+            success=True,
+            message="Success.",
+            entries=2,
+            bytes=20,
+            seconds=1.0,
+            per_target={"main": {"entries": 2, "bytes": 20, "seconds": 1.0}},
+        )
+        manager = SimpleNamespace(
+            auto_create_handle_loop=MagicMock(),
+            model_update_lock=SimpleNamespace(writer_lock=AsyncLock()),
+            update_weights_from_shard_transfer_communicator=AsyncMock(
+                return_value=[output]
+            ),
+            _update_weight_version_if_provided=MagicMock(),
+        )
+        request = UpdateWeightsFromShardTransferReqInput(
+            serialized_source="shard-transfer-pickle-v1:source",
+            weight_version="shard-transfer-7",
+        )
+
+        success, message, stats = asyncio.run(
+            TokenizerControlMixin.update_weights_from_shard_transfer(
+                manager,
+                request,
+            )
+        )
+
+        self.assertTrue(success)
+        self.assertIn("shard-transfer-7", message)
+        self.assertEqual(stats["entries"], 2)
+        manager._update_weight_version_if_provided.assert_called_once_with(
+            "shard-transfer-7"
+        )
 
 
 if __name__ == "__main__":
