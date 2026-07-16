@@ -14,6 +14,7 @@
 """A scheduler that manages a tensor parallel GPU worker."""
 
 import faulthandler
+import gc
 import logging
 import os
 import signal
@@ -4763,6 +4764,23 @@ def run_scheduler_process(
 ):
     # Load plugins so hooks can override Scheduler and its dependencies.
     load_plugins()
+    uses_shared_embedding = (
+        server_args.welm_shared_embedding_manifest_path is not None and pp_rank == 0
+    )
+    shared_embedding_numa_node = None
+    if uses_shared_embedding:
+        if server_args.numa_node is not None:
+            shared_embedding_numa_node = server_args.numa_node[gpu_id]
+        else:
+            from sglang.srt.utils.numa_utils import _query_numa_node_for_gpu
+
+            numa_nodes = _query_numa_node_for_gpu(gpu_id)
+            if len(numa_nodes) != 1:
+                raise RuntimeError(
+                    f"expected one NUMA node for shared embedding consumer GPU "
+                    f"{gpu_id}, found {numa_nodes}"
+                )
+            shared_embedding_numa_node = numa_nodes[0]
     dp_rank = configure_scheduler_process(
         server_args,
         gpu_id,
@@ -4788,6 +4806,16 @@ def run_scheduler_process(
     # Create a scheduler and run the event loop
     scheduler = None
     try:
+        if uses_shared_embedding:
+            from sglang.srt.model_loader.welm_shared_embedding_weights import (
+                install_welm_shared_embedding_registry,
+            )
+
+            install_welm_shared_embedding_registry(
+                server_args.welm_shared_embedding_manifest_path,
+                gpu_id=gpu_id,
+                gpu_numa_node=shared_embedding_numa_node,
+            )
         scheduler = Scheduler(
             server_args,
             port_args,
@@ -4815,3 +4843,11 @@ def run_scheduler_process(
             # FPM has a background ZMQ publisher thread that needs explicit
             # teardown to flush queued metrics and close the socket cleanly.
             scheduler._shutdown_fpm()
+        scheduler = None
+        if uses_shared_embedding:
+            gc.collect()
+            from sglang.srt.model_loader.welm_shared_embedding_weights import (
+                close_welm_shared_embedding_registry,
+            )
+
+            close_welm_shared_embedding_registry()

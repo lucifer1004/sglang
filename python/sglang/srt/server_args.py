@@ -886,6 +886,9 @@ class ServerArgs:
 
     # For WeLM over encoding / KV mirror local optimizations
     enable_over_encoding: bool = False
+    welm_shared_embedding_policy: str = "disabled"
+    welm_shared_embedding_numa_node: Optional[int] = None
+    welm_shared_embedding_manifest_path: Optional[str] = None
     enable_welm_kv_mirror_opt: bool = False
     # WeLM vocab embedding padding multiple. Default mirrors sglang's
     # DEFAULT_VOCAB_PADDING_SIZE (layers.vocab_parallel_embedding); slime's
@@ -925,6 +928,7 @@ class ServerArgs:
         # short-circuit). The backend check is run later after backends settle.
         self._validate_prefill_only_disable_kv_cache_args()
         self._validate_return_routed_experts_args()
+        self._validate_welm_shared_embedding_args()
 
         if self.model_path.lower() in ["none", "dummy"]:
             # Skip for dummy models
@@ -1062,6 +1066,70 @@ class ServerArgs:
             and self.tokenizer_path != self.model_path
         ):
             ObjectStorageModel.download_and_get_path(self.tokenizer_path)
+
+    def _validate_welm_shared_embedding_args(self) -> None:
+        from sglang.srt.model_loader.welm_shared_embedding_weights import (
+            WeLMSharedEmbeddingPolicy,
+        )
+
+        try:
+            policy = WeLMSharedEmbeddingPolicy(self.welm_shared_embedding_policy)
+        except ValueError as exc:
+            choices = ", ".join(item.value for item in WeLMSharedEmbeddingPolicy)
+            raise ValueError(
+                f"Unknown --welm-shared-embedding-policy "
+                f"{self.welm_shared_embedding_policy!r}; choose from {choices}"
+            ) from exc
+
+        if policy is WeLMSharedEmbeddingPolicy.DISABLED:
+            if self.welm_shared_embedding_numa_node is not None:
+                raise ValueError(
+                    "--welm-shared-embedding-numa-node is only valid with bind policy"
+                )
+            return
+
+        if not self.enable_over_encoding:
+            raise ValueError(
+                "--welm-shared-embedding-policy requires --enable-over-encoding"
+            )
+        if policy is WeLMSharedEmbeddingPolicy.BIND:
+            node = self.welm_shared_embedding_numa_node
+            if node is None:
+                raise ValueError(
+                    "bind policy requires --welm-shared-embedding-numa-node"
+                )
+            if node < 0:
+                raise ValueError(
+                    "--welm-shared-embedding-numa-node must be non-negative"
+                )
+        elif self.welm_shared_embedding_numa_node is not None:
+            raise ValueError(
+                "--welm-shared-embedding-numa-node is only valid with bind policy"
+            )
+
+        incompatible = []
+        if self.cpu_offload_gb > 0:
+            incompatible.append("--cpu-offload-gb")
+        if self.offload_group_size > 0:
+            incompatible.append("--offload-group-size")
+        if self.enable_weights_cpu_backup:
+            incompatible.append("--enable-weights-cpu-backup")
+        if self.enable_draft_weights_cpu_backup:
+            incompatible.append("--enable-draft-weights-cpu-backup")
+        if self.kt_weight_path is not None:
+            incompatible.append("--kt-weight-path")
+        if self.use_ray:
+            incompatible.append("--use-ray")
+        if self.weight_loader_disable_mmap:
+            incompatible.append("--weight-loader-disable-mmap")
+        load_format = getattr(self.load_format, "value", self.load_format)
+        if load_format not in {"auto", "safetensors"}:
+            incompatible.append(f"--load-format={self.load_format}")
+        if incompatible:
+            raise ValueError(
+                "--welm-shared-embedding-policy is incompatible with "
+                + ", ".join(incompatible)
+            )
 
     def _handle_load_balance_method(self):
         if self.disaggregation_mode not in ("null", "prefill", "decode"):
@@ -4303,6 +4371,10 @@ class ServerArgs:
                 self.validate_transfer_engine()
             )
 
+        # Auto-detection above may resolve an initially allowed value to an
+        # unsupported format such as GGUF.
+        self._validate_welm_shared_embedding_args()
+
     def _is_mistral_native_format(self) -> bool:
         """True iff the checkpoint requires load_format=mistral.
 
@@ -7541,6 +7613,22 @@ class ServerArgs:
             "--enable-over-encoding",
             action="store_true",
             help="Enable WeLM over encoding.",
+        )
+        from sglang.srt.model_loader.welm_shared_embedding_weights import (
+            WeLMSharedEmbeddingPolicy,
+        )
+
+        parser.add_argument(
+            "--welm-shared-embedding-policy",
+            choices=[policy.value for policy in WeLMSharedEmbeddingPolicy],
+            default=ServerArgs.welm_shared_embedding_policy,
+            help="Host placement policy for full-vocabulary shared WeLM base/OE embeddings.",
+        )
+        parser.add_argument(
+            "--welm-shared-embedding-numa-node",
+            type=int,
+            default=ServerArgs.welm_shared_embedding_numa_node,
+            help="NUMA node used by --welm-shared-embedding-policy=bind.",
         )
         parser.add_argument(
             "--enable-welm-kv-mirror-opt",

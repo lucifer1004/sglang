@@ -29,7 +29,7 @@ import uuid
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, List, Optional, Tuple, Union
+from typing import Callable, Iterable, List, Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
@@ -1827,6 +1827,31 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             "All ranks are marked as elastic_ep_rejoin."
         )
 
+    def _get_shared_welm_embedding_update_rejection(
+        self, names: Optional[Iterable[str]]
+    ) -> Optional[str]:
+        if (
+            getattr(
+                self.server_args,
+                "welm_shared_embedding_manifest_path",
+                None,
+            )
+            is None
+        ):
+            return None
+        from sglang.srt.model_loader.welm_shared_embedding_weights import (
+            get_welm_shared_embedding_weight_names,
+        )
+
+        if names is not None:
+            shared_names = get_welm_shared_embedding_weight_names()
+            if shared_names.isdisjoint(names):
+                return None
+        return (
+            "shared WeLM host embedding weights are immutable for the process "
+            "lifetime and require a service restart."
+        )
+
     def update_weights_from_disk(
         self,
         model_path: str,
@@ -1835,6 +1860,28 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         recapture_cuda_graph: bool = False,
     ) -> tuple[bool, str]:
         """Update engine weights in-place from the disk."""
+        if weight_name_filter is None:
+            rejection = self._get_shared_welm_embedding_update_rejection(None)
+        else:
+            from sglang.srt.model_loader.welm_shared_embedding_weights import (
+                get_welm_shared_embedding_weight_names,
+            )
+
+            try:
+                selected_shared_names = [
+                    name
+                    for name in get_welm_shared_embedding_weight_names()
+                    if weight_name_filter(name)
+                ]
+            except Exception:
+                selected_shared_names = list(
+                    get_welm_shared_embedding_weight_names()
+                )
+            rejection = self._get_shared_welm_embedding_update_rejection(
+                selected_shared_names
+            )
+        if rejection is not None:
+            return False, rejection
         logger.info(
             f"Update engine weights online from disk begin. "
             f"avail mem={get_available_gpu_memory(self.device, self.gpu_id, empty_cache=False):.2f} GB"
@@ -1852,12 +1899,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         def get_weight_iter(config):
             iter = loader._get_weights_iterator(
-                DefaultModelLoader.Source.init_new(config, self.model)
+                DefaultModelLoader.Source.init_new(config, self.model),
+                weight_name_filter=weight_name_filter,
             )
-            if weight_name_filter is not None:
-                iter = (
-                    (name, weight) for name, weight in iter if weight_name_filter(name)
-                )
 
             return iter
 
@@ -2077,6 +2121,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         the process group with a distinct rank. Mirrors
         ``update_weights_from_distributed`` minus the ``load_weights`` step.
         """
+        rejection = self._get_shared_welm_embedding_update_rejection(names)
+        if rejection is not None:
+            return False, rejection, []
         assert group_name in self._model_update_group, (
             f"Group {group_name} not in {list(self._model_update_group.keys())}. "
             "Please call `init_weights_update_group` first."
@@ -2114,6 +2161,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     def _receive_bucketed_weights_from_distributed(
         self, names, dtypes, shapes, group_name
     ):
+        rejection = self._get_shared_welm_embedding_update_rejection(names)
+        if rejection is not None:
+            return False, rejection, []
         try:
             named_tensors = []
             for name, dtype, shape in zip(names, dtypes, shapes):
@@ -2159,6 +2209,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             shape: the shape of the parameter to be updated.
         """
 
+        rejection = self._get_shared_welm_embedding_update_rejection(names)
+        if rejection is not None:
+            return False, rejection
+
         assert group_name in self._model_update_group, (
             f"Group {group_name} not in {list(self._model_update_group.keys())}. "
             "Please call `init_weights_update_group` first."
@@ -2203,6 +2257,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     def _update_bucketed_weights_from_distributed(
         self, names, dtypes, shapes, group_name
     ):
+        rejection = self._get_shared_welm_embedding_update_rejection(names)
+        if rejection is not None:
+            return False, rejection
         try:
             named_tensors = []
             for name, dtype, shape in zip(names, dtypes, shapes):
@@ -2236,6 +2293,18 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         named_tensors: List[Tuple[str, Union[torch.Tensor, "LocalSerializedTensor"]]],
         load_format: Optional[str] = None,
     ):
+        if load_format == "flattened_bucket":
+            metadata = named_tensors["metadata"]
+            names = [
+                item["name"] if isinstance(item, dict) else item.name
+                for item in metadata
+            ]
+        else:
+            names = [name for name, _tensor in named_tensors]
+        rejection = self._get_shared_welm_embedding_update_rejection(names)
+        if rejection is not None:
+            return False, rejection
+
         monkey_patch_torch_reductions()
         if load_format == "flattened_bucket":
             # Handle flattened bucket format
@@ -2269,6 +2338,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         """Handle flattened bucket format for weight updates"""
         flattened_tensor = flattened_tensor_bucket_dict["flattened_tensor"]
         metadata = flattened_tensor_bucket_dict["metadata"]
+        names = [
+            item["name"] if isinstance(item, dict) else item.name
+            for item in metadata
+        ]
+        rejection = self._get_shared_welm_embedding_update_rejection(names)
+        if rejection is not None:
+            return False, rejection
 
         # Convert metadata dict to our format
         converted_metadata = []
@@ -3829,10 +3905,17 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         ShardedStateLoader.save_model(self.model, path, pattern, max_size)
 
     def check_weights(self, action: str):
+        if action == "reset_tensors":
+            rejection = self._get_shared_welm_embedding_update_rejection(None)
+            if rejection is not None:
+                raise RuntimeError(rejection)
         return self._weight_checker.handle(action=action)
 
     def update_weights_from_ipc(self, recv_req):
         """Update weights from IPC for checkpoint-engine integration."""
+        rejection = self._get_shared_welm_embedding_update_rejection(None)
+        if rejection is not None:
+            return False, rejection
         try:
             from sglang.srt.checkpoint_engine.checkpoint_engine_worker import (
                 SGLangCheckpointEngineWorkerExtensionImpl,

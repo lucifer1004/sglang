@@ -290,23 +290,42 @@ class WeLMV4ModelNextN(nn.Module):
         self.oe_dim = config.oe_dim
         self.oe_grams = config.oe_grams
         self.oe_vocab_sizes = config.oe_vocab_sizes
+        shared_embeddings_enabled = (
+            get_global_server_args().welm_shared_embedding_policy != "disabled"
+        )
         self.fuse_embedding_allreduce = (
             os.environ.get(_MTP_FUSE_EMBEDDING_ALLREDUCE_ENV, "0").strip().lower()
             in _MTP_TRUE_ENV_VALUES
         )
 
         if len(self.oe_vocab_sizes) > 0:
-            self.oe_embed = nn.ModuleList(
-                [
-                    VocabParallelEmbedding(
-                        self.oe_vocab_sizes[i],
-                        self.oe_dim,
-                        use_attn_tp_group=is_dp_attention_enabled(),
-                        padding_size=get_global_server_args().welm_vocab_padding_size,
-                    )
-                    for i in range(len(self.oe_vocab_sizes))
-                ]
-            )
+            if shared_embeddings_enabled and get_pp_group().is_first_rank:
+                from sglang.srt.layers.full_vocab_shared_embedding import (
+                    FullVocabSharedEmbedding,
+                )
+
+                self.oe_embed = nn.ModuleList(
+                    [
+                        FullVocabSharedEmbedding(
+                            key=f"model.oe_embed.{i}.weight",
+                            num_embeddings=self.oe_vocab_sizes[i],
+                            embedding_dim=self.oe_dim,
+                        )
+                        for i in range(len(self.oe_vocab_sizes))
+                    ]
+                )
+            elif not shared_embeddings_enabled:
+                self.oe_embed = nn.ModuleList(
+                    [
+                        VocabParallelEmbedding(
+                            self.oe_vocab_sizes[i],
+                            self.oe_dim,
+                            use_attn_tp_group=is_dp_attention_enabled(),
+                            padding_size=get_global_server_args().welm_vocab_padding_size,
+                        )
+                        for i in range(len(self.oe_vocab_sizes))
+                    ]
+                )
             self.oe_gate_up_proj = ReplicatedLinear(
                 self.oe_dim * len(self.oe_vocab_sizes),
                 config.hidden_size,

@@ -51,6 +51,24 @@ _MK_FUSED_DECODE_GEMM_HANDLE = None
 _MK_FUSED_DECODE_GEMM_NGRAM_SPEC_CACHE = None
 
 
+def _embedding_requires_vocab_reduce(modules: Sequence) -> bool:
+    return any(
+        getattr(
+            module,
+            "requires_vocab_reduce",
+            getattr(module, "tp_size", 1) > 1,
+        )
+        for module in modules
+    )
+
+
+def _uses_full_vocab_shared_embedding(embed_tokens, oe_embed_modules) -> bool:
+    return bool(getattr(embed_tokens, "is_full_vocab_shared", False)) or any(
+        getattr(module, "is_full_vocab_shared", False)
+        for module in (oe_embed_modules or ())
+    )
+
+
 @triton.jit
 def _welm_oe_lookup_concat_prehashed_4x512_kernel(
     hash0_ptr,
@@ -659,6 +677,14 @@ def compute_welm_oe_concat_local_partials(
     """Compute local OE embedding contributions before a single concatenated all-reduce."""
     if not oe_grams:
         return input_ids.new_zeros((input_ids.shape[0], 0), dtype=torch.float32)
+    if input_ids.numel() == 0:
+        width = sum(int(module.weight.shape[1]) for module in oe_embed_modules)
+        dtype = (
+            oe_embed_modules[0].weight.dtype
+            if oe_embed_modules
+            else torch.get_default_dtype()
+        )
+        return torch.empty((0, width), dtype=dtype, device=input_ids.device)
 
     if not _has_welm_oe_hash_inputs(
         input_ids,
@@ -924,6 +950,12 @@ def _try_apply_welm_oe_fused_decode_gemm(
     any precondition (decode mode, low batch, supported shape, ...) is not met
     — in which case the caller falls back to the unfused embedding path.
     """
+    if _uses_full_vocab_shared_embedding(embed_tokens, oe_embed_modules):
+        _warn_welm_oe_fused_disabled_once(
+            "full-vocabulary shared embeddings require the unfused decode path"
+        )
+        return None
+
     # Fast path: cuda_graph_runner pre-built a CUDA-graph-friendly Prepared
     # handle for this batch bucket. The handle owns persistent GPU/host
     # buffers (prefixes, output) whose pointers were baked into the captured
@@ -1306,6 +1338,10 @@ def discover_welm_oe_fused_decode_modules(
             f"oe_embed={oe_embed_modules is not None}, "
             f"oe_gate_up_proj={oe_proj_module is not None})"
         )
+        return None
+
+    if _uses_full_vocab_shared_embedding(embed_tokens, oe_embed_modules):
+        _trace("full-vocabulary shared embeddings require unfused decode")
         return None
 
     # Match the eager path's shape/topology contract.
@@ -1875,6 +1911,8 @@ def compute_welm_oe_embedding(
     """
     if not oe_grams:
         return base_hidden_states
+    if input_ids.numel() == 0:
+        return base_hidden_states
 
     if fuse_base_embedding_allreduce and welm_use_previous_precision():
         raise RuntimeError(
@@ -1945,11 +1983,11 @@ def compute_welm_oe_embedding(
 
     if should_use_welm_oe_post_proj_all_reduce():
         emb_new_local = _apply_oe_proj_no_bias(oe_proj_module, concat_hidden)
-        if any(getattr(module, "tp_size", 1) > 1 for module in oe_embed_modules):
+        if _embedding_requires_vocab_reduce(oe_embed_modules):
             emb_new_local = all_reduce_fn(emb_new_local)
         emb_new = _add_oe_proj_bias(oe_proj_module, emb_new_local)
     else:
-        if any(getattr(module, "tp_size", 1) > 1 for module in oe_embed_modules):
+        if _embedding_requires_vocab_reduce(oe_embed_modules):
             concat_hidden = all_reduce_fn(concat_hidden)
         emb_new = _apply_oe_proj(oe_proj_module, concat_hidden)
 

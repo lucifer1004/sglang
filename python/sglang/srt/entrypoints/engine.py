@@ -115,6 +115,21 @@ logger = logging.getLogger(__name__)
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
 _is_cuda = is_cuda()
+_WELM_ARENA_STARTUP_HANDLES: Dict[int, Any] = {}
+
+
+def _shutdown_welm_arena_handle(arena_handle) -> None:
+    try:
+        kill_process_tree(os.getpid(), include_parent=False, wait_timeout=60)
+    finally:
+        arena_handle.close()
+        _forget_welm_arena_handle(arena_handle)
+
+
+def _forget_welm_arena_handle(arena_handle) -> None:
+    for key, value in tuple(_WELM_ARENA_STARTUP_HANDLES.items()):
+        if value is arena_handle:
+            del _WELM_ARENA_STARTUP_HANDLES[key]
 
 
 @dataclasses.dataclass
@@ -126,6 +141,7 @@ class SchedulerInitResult:
     wait_for_ready: Callable[[], None] = lambda: None
     wait_for_completion: Callable[[], None] = lambda: None
     engine_info_bootstrap_server: Optional[Any] = None
+    welm_embedding_arena_handle: Optional[Any] = None
 
 
 def init_tokenizer_manager(
@@ -223,6 +239,7 @@ class Engine(EngineScoreMixin, EngineBase):
         # Pre-initialize tokenizer_manager so the atexit handler in
         # shutdown() won't hit AttributeError.
         self.tokenizer_manager = None
+        self._welm_embedding_arena_handle = None
 
         # Shutdown the subprocesses automatically when the program exits
         atexit.register(self.shutdown)
@@ -243,8 +260,14 @@ class Engine(EngineScoreMixin, EngineBase):
         self.tokenizer_manager = tokenizer_manager
         self.template_manager = template_manager
         self._scheduler_init_result = scheduler_init_result
+        self._welm_embedding_arena_handle = (
+            scheduler_init_result.welm_embedding_arena_handle
+        )
         if tokenizer_manager is not None:
             tokenizer_manager._subprocess_watchdog = subprocess_watchdog
+            tokenizer_manager._welm_embedding_arena_handle = (
+                self._welm_embedding_arena_handle
+            )
         self.port_args = port_args
         # Access transfer engine info if bootstrap server is started.
         if scheduler_init_result.engine_info_bootstrap_server is not None:
@@ -745,6 +768,38 @@ class Engine(EngineScoreMixin, EngineBase):
         run_scheduler_process_func: Callable,
         run_detokenizer_process_func: Callable,
         port_args: Optional[PortArgs] = None,
+    ):
+        key = id(server_args)
+        try:
+            result = cls._launch_subprocesses_impl(
+                server_args=server_args,
+                init_tokenizer_manager_func=init_tokenizer_manager_func,
+                run_scheduler_process_func=run_scheduler_process_func,
+                run_detokenizer_process_func=run_detokenizer_process_func,
+                port_args=port_args,
+            )
+        except BaseException:
+            arena_handle = _WELM_ARENA_STARTUP_HANDLES.pop(key, None)
+            if arena_handle is not None:
+                try:
+                    kill_process_tree(
+                        os.getpid(), include_parent=False, wait_timeout=60
+                    )
+                finally:
+                    arena_handle.close()
+            raise
+        arena_handle = _WELM_ARENA_STARTUP_HANDLES.get(key)
+        result[3].welm_embedding_arena_handle = arena_handle
+        return result
+
+    @classmethod
+    def _launch_subprocesses_impl(
+        cls,
+        server_args: ServerArgs,
+        init_tokenizer_manager_func: Callable,
+        run_scheduler_process_func: Callable,
+        run_detokenizer_process_func: Callable,
+        port_args: Optional[PortArgs] = None,
     ) -> Tuple[
         TokenizerManager,
         TemplateManager,
@@ -796,6 +851,15 @@ class Engine(EngineScoreMixin, EngineBase):
         ):
             resolve_auto_parsers(server_args)
 
+        from sglang.srt.model_loader.welm_shared_embedding_weights import (
+            launch_welm_embedding_arena_manager,
+        )
+
+        arena_handle = launch_welm_embedding_arena_manager(server_args)
+        if arena_handle is not None:
+            _WELM_ARENA_STARTUP_HANDLES[id(server_args)] = arena_handle
+            atexit.register(_shutdown_welm_arena_handle, arena_handle)
+
         # Launch scheduler processes
         scheduler_init_result, scheduler_procs = cls._launch_scheduler_processes(
             server_args, port_args, run_scheduler_process_func
@@ -803,6 +867,8 @@ class Engine(EngineScoreMixin, EngineBase):
         scheduler_init_result.engine_info_bootstrap_server = (
             engine_info_bootstrap_server
         )
+        if arena_handle is not None:
+            scheduler_init_result.all_child_pids.append(arena_handle.process.pid)
 
         if (
             server_args.enable_elastic_expert_backup
@@ -813,6 +879,13 @@ class Engine(EngineScoreMixin, EngineBase):
         if server_args.node_rank >= 1:
             # In multi-node cases, non-zero rank nodes do not need to run tokenizer or detokenizer,
             # so they can just wait here.
+            arena_watchdog = None
+            if arena_handle is not None:
+                arena_watchdog = SubprocessWatchdog(
+                    processes=[arena_handle.process],
+                    process_names=["welm_embedding_arena"],
+                )
+                arena_watchdog.start()
             scheduler_init_result.wait_for_ready()
 
             if os.getenv("SGLANG_BLOCK_NONZERO_RANK_CHILDREN") == "0":
@@ -822,7 +895,7 @@ class Engine(EngineScoreMixin, EngineBase):
                     None,
                     port_args,
                     scheduler_init_result,
-                    None,
+                    arena_watchdog,
                 )
 
             launch_dummy_health_check_server(
@@ -835,7 +908,7 @@ class Engine(EngineScoreMixin, EngineBase):
                 None,
                 port_args,
                 scheduler_init_result,
-                None,
+                arena_watchdog,
             )
 
         # Launch detokenizer process(es) — optionally fronted by a router when
@@ -870,6 +943,9 @@ class Engine(EngineScoreMixin, EngineBase):
         # Note: RayEngine returns scheduler_procs=None as it uses Ray actors instead of mp.Process
         processes = list(scheduler_procs or [])
         names = [f"scheduler_{i}" for i in range(len(processes))]
+        if arena_handle is not None:
+            processes.append(arena_handle.process)
+            names.append("welm_embedding_arena")
         processes.extend(detoken_procs)
         names.extend(detoken_names)
         subprocess_watchdog = SubprocessWatchdog(
@@ -894,7 +970,13 @@ class Engine(EngineScoreMixin, EngineBase):
             and self.tokenizer_manager._subprocess_watchdog is not None
         ):
             self.tokenizer_manager._subprocess_watchdog.stop()
-        kill_process_tree(os.getpid(), include_parent=False, wait_timeout=60)
+        try:
+            kill_process_tree(os.getpid(), include_parent=False, wait_timeout=60)
+        finally:
+            if self._welm_embedding_arena_handle is not None:
+                self._welm_embedding_arena_handle.close()
+                _forget_welm_arena_handle(self._welm_embedding_arena_handle)
+                self._welm_embedding_arena_handle = None
 
     def __enter__(self):
         return self
@@ -1236,6 +1318,10 @@ class Engine(EngineScoreMixin, EngineBase):
     # score() and async_score() are provided by EngineScoreMixin
 
 
+def _generate_sglang_run_id() -> str:
+    return f"sglang-run-{time.time_ns()}-{random.randint(0, 100000000)}"
+
+
 def _set_envs_and_config(server_args: ServerArgs):
     # Set global environments
     if "NCCL_CUMEM_ENABLE" not in os.environ or server_args.enable_symm_mem:
@@ -1264,9 +1350,7 @@ def _set_envs_and_config(server_args: ServerArgs):
         os.environ["CUTE_DSL_LOG_TO_CONSOLE"] = "1"
 
     # Can also be passed as argument
-    os.environ["SGLANG_RUN_ID"] = (
-        f"sglang-run-{time.time()}-{random.randint(0, 100000000)}"
-    )
+    os.environ["SGLANG_RUN_ID"] = _generate_sglang_run_id()
 
     # Set prometheus env vars
     if server_args.enable_metrics:
@@ -1304,7 +1388,17 @@ def _set_envs_and_config(server_args: ServerArgs):
                 logger.error(
                     "Received sigquit from a child process. It usually means the child failed."
                 )
-                kill_process_tree(os.getpid())
+                arena_handle = _WELM_ARENA_STARTUP_HANDLES.pop(
+                    id(server_args), None
+                )
+                try:
+                    kill_process_tree(
+                        os.getpid(), include_parent=False, wait_timeout=60
+                    )
+                finally:
+                    if arena_handle is not None:
+                        arena_handle.close()
+                raise SystemExit(1)
 
             signal.signal(signal.SIGQUIT, launch_phase_sigquit_handler)
         else:

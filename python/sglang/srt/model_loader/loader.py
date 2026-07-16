@@ -23,6 +23,7 @@ from contextlib import contextmanager, suppress
 from typing import (
     TYPE_CHECKING,
     Any,
+    Callable,
     Dict,
     Generator,
     Iterable,
@@ -500,7 +501,9 @@ class DefaultModelLoader(BaseModelLoader):
         return hf_folder, hf_weights_files, use_safetensors
 
     def _get_weights_iterator(
-        self, source: "Source"
+        self,
+        source: "Source",
+        weight_name_filter: Optional[Callable[[str], bool]] = None,
     ) -> Generator[Tuple[str, torch.Tensor], None, None]:
         """Get an iterator for the model weights based on the load format."""
         extra_config = self.load_config.model_loader_extra_config
@@ -516,6 +519,12 @@ class DefaultModelLoader(BaseModelLoader):
                 "model.safetensors.index.json",
                 source.model_config.hf_config,
             )
+
+        source_weight_name_filter = None
+        if weight_name_filter is not None:
+
+            def source_weight_name_filter(name: str) -> bool:
+                return weight_name_filter(source.prefix + name)
 
         if self.load_config.load_format == LoadFormat.NPCACHE:
             # Currently np_cache only support *.bin checkpoints
@@ -554,6 +563,7 @@ class DefaultModelLoader(BaseModelLoader):
                     prefetch=weight_loader_prefetch,
                     prefetch_num_threads=prefetch_num_threads,
                     drop_cache_after_load=weight_loader_drop_cache_after_load,
+                    weight_name_filter=source_weight_name_filter,
                 )
             else:
                 weights_iterator = safetensors_weights_iterator(
@@ -562,6 +572,7 @@ class DefaultModelLoader(BaseModelLoader):
                     prefetch=weight_loader_prefetch,
                     prefetch_num_threads=prefetch_num_threads,
                     drop_cache_after_load=weight_loader_drop_cache_after_load,
+                    weight_name_filter=source_weight_name_filter,
                 )
 
         else:
@@ -610,14 +621,31 @@ class DefaultModelLoader(BaseModelLoader):
         model: nn.Module,
     ) -> Generator[Tuple[str, torch.Tensor], None, None]:
 
+        external_names_hook = getattr(
+            model, "get_externally_owned_weight_names", None
+        )
+        weight_name_filter = None
+        if external_names_hook is not None:
+            external_names = frozenset(external_names_hook())
+            if any(not isinstance(name, str) or not name for name in external_names):
+                raise ValueError(
+                    "externally owned weight names must be non-empty strings"
+                )
+            if external_names:
+                weight_name_filter = lambda name: name not in external_names
+
         primary_weights = DefaultModelLoader.Source.init_new(model_config, model)
-        yield from self._get_weights_iterator(primary_weights)
+        yield from self._get_weights_iterator(
+            primary_weights, weight_name_filter=weight_name_filter
+        )
 
         secondary_weights = cast(
             Iterable[DefaultModelLoader.Source], getattr(model, "secondary_weights", ())
         )
         for source in secondary_weights:
-            yield from self._get_weights_iterator(source)
+            yield from self._get_weights_iterator(
+                source, weight_name_filter=weight_name_filter
+            )
 
     def download_model(self, model_config: ModelConfig) -> None:
         self._prepare_weights(

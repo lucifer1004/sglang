@@ -126,6 +126,25 @@ class TestWelmV4OEEmbedding(unittest.TestCase):
                 use_triton_preprocess=False,
             )
 
+    def test_empty_input_returns_empty_hidden_without_hash_or_collective(self):
+        base = torch.empty((0, 6), dtype=torch.float32)
+        calls = []
+
+        actual = compute_welm_oe_embedding(
+            input_ids=torch.empty((0,), dtype=torch.int64),
+            forward_batch=SimpleNamespace(oe_context=None),
+            base_hidden_states=base,
+            oe_grams=[2, 3],
+            oe_vocab_sizes=[11, 13],
+            vocab_size=17,
+            oe_embed_modules=[SimpleNamespace(tp_size=2)],
+            oe_proj_module=self.proj_module,
+            all_reduce_fn=lambda tensor: calls.append(tensor),
+        )
+
+        assert actual.shape == (0, 6)
+        assert calls == []
+
     def test_compute_embedding_rejects_legacy_implementation(self):
         with self.assertRaisesRegex(ValueError, "no longer supported"):
             compute_welm_oe_embedding(

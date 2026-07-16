@@ -2978,7 +2978,18 @@ class SignalHandler:
         if self.tokenizer_manager._subprocess_watchdog is not None:
             self.tokenizer_manager._subprocess_watchdog.stop()
         self.tokenizer_manager.dump_requests_before_crash()
-        kill_process_tree(os.getpid())
+        arena_handle = getattr(
+            self.tokenizer_manager, "_welm_embedding_arena_handle", None
+        )
+        try:
+            kill_process_tree(
+                os.getpid(), include_parent=False, wait_timeout=60
+            )
+        finally:
+            if arena_handle is not None:
+                arena_handle.close()
+                self.tokenizer_manager._welm_embedding_arena_handle = None
+        raise SystemExit(1)
 
 
 # Note: request abort handling logic

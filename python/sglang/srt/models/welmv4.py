@@ -3958,19 +3958,45 @@ class Qwen2MoeModel(nn.Module):
         self.oe_grams = config.oe_grams
         self.oe_vocab_sizes = config.oe_vocab_sizes
         self.scale_seq_times = getattr(config, "scale_seq_times", 0)
+        shared_embeddings_enabled = (
+            get_global_server_args().welm_shared_embedding_policy != "disabled"
+        )
+        if shared_embeddings_enabled and self.scale_seq_times > 0:
+            raise ValueError(
+                "shared WeLM host embeddings do not support scale_seq_times > 0"
+            )
 
         if len(self.oe_vocab_sizes) > 0:
-            self.oe_embed = nn.ModuleList(
-                [
-                    VocabParallelEmbedding(
-                        self.oe_vocab_sizes[i],
-                        self.oe_dim,
-                        use_attn_tp_group=is_dp_attention_enabled(),
-                        padding_size=get_global_server_args().welm_vocab_padding_size,
+            if self.pp_group.is_first_rank:
+                if shared_embeddings_enabled:
+                    from sglang.srt.layers.full_vocab_shared_embedding import (
+                        FullVocabSharedEmbedding,
                     )
-                    for i in range(len(self.oe_vocab_sizes))
-                ]
-            )
+
+                    self.oe_embed = nn.ModuleList(
+                        [
+                            FullVocabSharedEmbedding(
+                                key=f"model.oe_embed.{i}.weight",
+                                num_embeddings=self.oe_vocab_sizes[i],
+                                embedding_dim=self.oe_dim,
+                            )
+                            for i in range(len(self.oe_vocab_sizes))
+                        ]
+                    )
+                else:
+                    self.oe_embed = nn.ModuleList(
+                        [
+                            VocabParallelEmbedding(
+                                self.oe_vocab_sizes[i],
+                                self.oe_dim,
+                                use_attn_tp_group=is_dp_attention_enabled(),
+                                padding_size=get_global_server_args().welm_vocab_padding_size,
+                            )
+                            for i in range(len(self.oe_vocab_sizes))
+                        ]
+                    )
+            else:
+                self.oe_embed = PPMissingLayer()
             self.oe_gate_up_proj = ReplicatedLinear(
                 self.oe_dim * len(self.oe_vocab_sizes),
                 config.hidden_size,
@@ -4021,13 +4047,24 @@ class Qwen2MoeModel(nn.Module):
                 )
 
         if self.pp_group.is_first_rank:
-            self.embed_tokens = VocabParallelEmbedding(
-                config.vocab_size,
-                config.hidden_size,
-                use_attn_tp_group=is_dp_attention_enabled(),
-                padding_size=get_global_server_args().welm_vocab_padding_size,
-                prefix=add_prefix("embed_tokens", prefix),
-            )
+            if shared_embeddings_enabled:
+                from sglang.srt.layers.full_vocab_shared_embedding import (
+                    FullVocabSharedEmbedding,
+                )
+
+                self.embed_tokens = FullVocabSharedEmbedding(
+                    key="model.embed_tokens.weight",
+                    num_embeddings=config.vocab_size,
+                    embedding_dim=config.hidden_size,
+                )
+            else:
+                self.embed_tokens = VocabParallelEmbedding(
+                    config.vocab_size,
+                    config.hidden_size,
+                    use_attn_tp_group=is_dp_attention_enabled(),
+                    padding_size=get_global_server_args().welm_vocab_padding_size,
+                    prefix=add_prefix("embed_tokens", prefix),
+                )
         else:
             self.embed_tokens = PPMissingLayer()
 
@@ -4352,6 +4389,15 @@ def welm_nextn_local_to_hf_name(
 class WeLMV4MoeForCausalLM(nn.Module):
     fall_back_to_pt_during_load = False
     supports_attn_cp_prefill_runtime = True
+
+    def get_externally_owned_weight_names(self) -> frozenset[str]:
+        if get_global_server_args().welm_shared_embedding_policy == "disabled":
+            return frozenset()
+        from sglang.srt.model_loader.welm_shared_embedding_weights import (
+            get_welm_shared_embedding_weight_names,
+        )
+
+        return get_welm_shared_embedding_weight_names()
 
     def __init__(
         self,

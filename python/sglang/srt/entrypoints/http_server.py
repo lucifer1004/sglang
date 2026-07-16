@@ -2445,6 +2445,10 @@ def launch_server(
         run_scheduler_process_func=run_scheduler_process_func,
         run_detokenizer_process_func=run_detokenizer_process_func,
     )
+    if tokenizer_manager is not None:
+        tokenizer_manager._welm_embedding_arena_handle = (
+            scheduler_init_result.welm_embedding_arena_handle
+        )
 
     _setup_and_run_http_server(
         server_args,
