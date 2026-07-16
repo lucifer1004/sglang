@@ -851,6 +851,9 @@ class ModelRunnerKVCacheMixin:
                     logical_swa_size=getattr(
                         self, "swa_max_total_num_tokens", self.max_total_num_tokens
                     ),
+                    use_decode_owner_layout=(
+                        self.server_args.disaggregation_mode == "decode"
+                    ),
                 )
 
         else:

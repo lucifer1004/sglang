@@ -406,6 +406,63 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
         return out_indices
 
+    def alloc_contiguous(self, num_pages: int):
+        """Allocate one contiguous physical page run when available.
+
+        Free-page bookkeeping stays on the allocator device. Locate the run
+        with tensor operations so this path never performs a GPU-to-CPU scalar
+        read. Return ``None`` when no run is available; callers may then use the
+        regular batched allocator.
+        """
+        num_pages = int(num_pages)
+        if num_pages <= 0:
+            return torch.empty((0,), dtype=torch.int64, device=self.device)
+        if self.need_sort and num_pages > len(self.free_pages):
+            self.merge_and_sort_free()
+        if num_pages > len(self.free_pages):
+            return None
+
+        free_pages = self.free_pages
+        if num_pages == 1:
+            run_start = torch.zeros((), dtype=torch.long, device=self.device)
+        else:
+            starts = torch.cat(
+                (
+                    torch.zeros(
+                        (1,), dtype=torch.bool, device=self.device
+                    ),
+                    free_pages[1:] != free_pages[:-1] + 1,
+                )
+            ).nonzero(as_tuple=False).flatten()
+            ends = torch.cat(
+                (
+                    starts[1:],
+                    torch.tensor(
+                        [free_pages.numel()], dtype=starts.dtype, device=self.device
+                    ),
+                )
+            )
+            run_lengths = ends - starts
+            matching_runs = (run_lengths >= num_pages).nonzero(
+                as_tuple=False
+            )
+            if matching_runs.numel() == 0:
+                return None
+            run_start = starts[matching_runs[0, 0]]
+
+        free_indices = torch.arange(
+            free_pages.numel(), dtype=torch.long, device=self.device
+        )
+        selected_mask = (free_indices >= run_start) & (
+            free_indices < run_start + num_pages
+        )
+        out_pages = free_pages[selected_mask]
+        self.free_pages = free_pages[~selected_mask]
+        return (
+            out_pages[:, None] * self.page_size
+            + torch.arange(self.page_size, device=self.device)
+        ).reshape(-1)
+
     def alloc_extend(
         self,
         prefix_lens: torch.Tensor,

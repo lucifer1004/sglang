@@ -214,6 +214,16 @@ class SchedulerOutputProcessorMixin:
         result: Union[GenerationBatchResult, EmbeddingBatchResult],
     ):
         skip_stream_req = None
+        completed_split_specs = batch.attn_cp_prefill_split_specs
+        batch.attn_cp_prefill_split_specs = None
+        if completed_split_specs is not None:
+            if len(completed_split_specs) != len(batch.reqs):
+                raise RuntimeError(
+                    "completed prefill split specs are not request-aligned"
+                )
+            for req, completed_spec in zip(batch.reqs, completed_split_specs):
+                if req.attn_cp_prefill_split_spec is completed_spec:
+                    req.attn_cp_prefill_split_spec = None
 
         if self.is_generation:
             if result.copy_done is not None:
@@ -1081,8 +1091,14 @@ class SchedulerOutputProcessorMixin:
             self._initialize_empty_logprob_containers(req)
 
         if req.top_logprobs_num > 0:
-            req.output_top_logprobs_val.append(output.next_token_top_logprobs_val[i])
-            req.output_top_logprobs_idx.append(output.next_token_top_logprobs_idx[i])
+            top_logprobs_val = output.next_token_top_logprobs_val[i]
+            top_logprobs_idx = output.next_token_top_logprobs_idx[i]
+            if isinstance(top_logprobs_val, torch.Tensor):
+                top_logprobs_val = top_logprobs_val.tolist()
+            if isinstance(top_logprobs_idx, torch.Tensor):
+                top_logprobs_idx = top_logprobs_idx.tolist()
+            req.output_top_logprobs_val.append(top_logprobs_val)
+            req.output_top_logprobs_idx.append(top_logprobs_idx)
 
         if (
             req.token_ids_logprob is not None

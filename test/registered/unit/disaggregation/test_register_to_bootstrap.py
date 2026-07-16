@@ -7,11 +7,80 @@ register_cpu_ci(est_time=5, suite="stage-a-test-cpu")
 import unittest
 from unittest.mock import MagicMock, call, patch
 
+import sglang.srt.disaggregation.common.conn as common_conn
+from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.test.test_utils import CustomTestCase
 
 
 class TestRegisterToBootstrap(CustomTestCase):
     """Tests for CommonKVManager.register_to_bootstrap retry/backoff behavior."""
+
+    def test_decode_sharded_kv_transfer_uses_global_tp_and_sharded_cp(self):
+        with (
+            patch.object(common_conn, "get_attention_tp_rank", return_value=1),
+            patch.object(common_conn, "get_attention_tp_size", return_value=2),
+            patch.object(common_conn, "get_attention_cp_rank", return_value=0),
+            patch.object(common_conn, "get_attention_cp_size", return_value=2),
+            patch.object(
+                common_conn, "get_tensor_model_parallel_rank", return_value=3
+            ),
+            patch.object(
+                common_conn,
+                "get_tensor_model_parallel_world_size",
+                return_value=4,
+            ),
+            patch.object(
+                common_conn,
+                "get_sharded_kv_context_model_parallel_rank",
+                return_value=1,
+            ),
+            patch.object(
+                common_conn,
+                "get_sharded_kv_context_model_parallel_world_size",
+                return_value=2,
+            ),
+        ):
+            decode = common_conn._resolve_kv_transfer_parallel_info(
+                DisaggregationMode.DECODE, is_cp_sharded_kv=True
+            )
+            prefill = common_conn._resolve_kv_transfer_parallel_info(
+                DisaggregationMode.PREFILL, is_cp_sharded_kv=True
+            )
+
+        self.assertEqual(
+            (decode.attn_tp_rank, decode.attn_tp_size),
+            (3, 4),
+        )
+        self.assertEqual(
+            (decode.attn_cp_rank, decode.attn_cp_size),
+            (1, 2),
+        )
+        self.assertTrue(decode.attn_tp_rank_includes_cp)
+        self.assertEqual(
+            (prefill.attn_tp_rank, prefill.attn_tp_size),
+            (1, 2),
+        )
+        self.assertEqual(
+            (prefill.attn_cp_rank, prefill.attn_cp_size),
+            (1, 2),
+        )
+        self.assertFalse(prefill.attn_tp_rank_includes_cp)
+
+    def test_sharded_kv_routing_uses_runtime_attention_coordinates(self):
+        from sglang.srt.disaggregation.common.conn import CommonKVManager
+
+        mgr = object.__new__(CommonKVManager)
+        mgr.attn_tp_size = 2
+        mgr.attn_tp_rank = 1
+        mgr.attn_cp_size = 4
+        mgr.attn_cp_rank = 3
+
+        mgr._init_attention_routing_topology()
+
+        self.assertEqual(mgr.routing_attn_tp_size, 2)
+        self.assertEqual(mgr.routing_attn_tp_rank, 1)
+        self.assertEqual(mgr.routing_attn_cp_size, 4)
+        self.assertEqual(mgr.routing_attn_cp_rank, 3)
 
     @patch("sglang.srt.disaggregation.common.conn.time")
     @patch("sglang.srt.disaggregation.common.conn.requests.put")
@@ -171,6 +240,318 @@ class TestRegisterToBootstrap(CustomTestCase):
 
     @patch("sglang.srt.disaggregation.common.conn.time")
     @patch("sglang.srt.disaggregation.common.conn.requests.put")
+    def test_payload_uses_sharded_kv_routing_topology(self, mock_put, mock_time):
+        mock_time.monotonic.return_value = 0.0
+        success_resp = MagicMock()
+        success_resp.status_code = 200
+        mock_put.return_value = success_resp
+
+        mgr = self._make_manager()
+        mgr.attn_tp_size = 2
+        mgr.attn_tp_rank = 1
+        mgr.routing_attn_tp_size = 2
+        mgr.routing_attn_tp_rank = 1
+        mgr.routing_attn_cp_size = 4
+        mgr.routing_attn_cp_rank = 3
+
+        mgr.register_to_bootstrap()
+
+        payload = mock_put.call_args[1]["json"]
+        self.assertEqual(payload["attn_tp_size"], 2)
+        self.assertEqual(payload["attn_tp_rank"], 1)
+        self.assertEqual(payload["attn_cp_size"], 4)
+        self.assertEqual(payload["attn_cp_rank"], 3)
+
+    @patch("sglang.srt.disaggregation.common.conn.time")
+    @patch("sglang.srt.disaggregation.common.conn.requests.put")
+    def test_payload_advertises_all_cp_rank_transfer(self, mock_put, mock_time):
+        mock_time.monotonic.return_value = 0.0
+        success_resp = MagicMock()
+        success_resp.status_code = 200
+        mock_put.return_value = success_resp
+
+        mgr = self._make_manager()
+        mgr.enable_all_cp_ranks_for_transfer = True
+
+        mgr.register_to_bootstrap()
+
+        payload = mock_put.call_args[1]["json"]
+        self.assertIn("all_cp_ranks_transfer", payload)
+        self.assertTrue(payload["all_cp_ranks_transfer"])
+
+    def test_remote_sharded_kv_routes_decode_to_every_owner_rank(self):
+        from sglang.srt.disaggregation.common.conn import (
+            CommonKVManager,
+            PrefillServerInfo,
+        )
+
+        mgr = MagicMock()
+        mgr.attn_tp_size = 4
+        mgr.attn_tp_rank = 0
+        mgr.attn_cp_size = 1
+        mgr.attn_cp_rank = 0
+        mgr.enable_all_cp_ranks_for_transfer = False
+        mgr.is_mla_backend = False
+        mgr.pp_size = 1
+        mgr.pp_rank = 0
+        mgr.kv_args.engine_rank = 0
+
+        info = PrefillServerInfo(
+            attn_tp_size=2,
+            attn_cp_size=2,
+            dp_size=1,
+            pp_size=1,
+            page_size=16,
+            kv_cache_dtype="auto",
+            follow_bootstrap_room=True,
+            all_cp_ranks_transfer=True,
+        )
+
+        CommonKVManager._resolve_rank_mapping(mgr, info)
+
+        self.assertEqual(info.target_cp_ranks, [0, 1])
+        self.assertEqual(info.required_prefill_response_num, 2)
+
+    def test_equal_decode_cp_routes_each_rank_to_every_prefill_owner(self):
+        from sglang.srt.disaggregation.common.conn import (
+            CommonKVManager,
+            PrefillServerInfo,
+        )
+
+        for decode_cp_rank, engine_rank in enumerate((0, 2)):
+            with self.subTest(decode_cp_rank=decode_cp_rank):
+                mgr = MagicMock()
+                mgr.attn_tp_size = 2
+                mgr.attn_tp_rank = 0
+                mgr.attn_cp_size = 2
+                mgr.attn_cp_rank = decode_cp_rank
+                mgr.enable_all_cp_ranks_for_transfer = True
+                mgr.is_cp_sharded_kv = True
+                mgr.is_mla_backend = False
+                mgr.pp_size = 1
+                mgr.pp_rank = 0
+                mgr.kv_args.engine_rank = engine_rank
+
+                info = PrefillServerInfo(
+                    attn_tp_size=2,
+                    attn_cp_size=2,
+                    dp_size=1,
+                    pp_size=1,
+                    page_size=16,
+                    kv_cache_dtype="auto",
+                    follow_bootstrap_room=True,
+                    all_cp_ranks_transfer=True,
+                )
+
+                CommonKVManager._resolve_rank_mapping(mgr, info)
+
+                self.assertEqual(info.target_tp_ranks, [0])
+                self.assertEqual(info.target_cp_ranks, [0, 1])
+                self.assertEqual(info.required_dst_info_num, 2)
+                self.assertEqual(info.required_prefill_response_num, 2)
+
+    def test_tp_prefill_maps_one_replica_to_each_decode_cp_owner(self):
+        from sglang.srt.disaggregation.common.conn import (
+            CommonKVManager,
+            PrefillServerInfo,
+        )
+
+        for engine_rank, (attn_tp_rank, cp_rank, prefill_tp_rank) in enumerate(
+            ((0, 0, 0), (1, 0, 2), (0, 1, 1), (1, 1, 3))
+        ):
+            with self.subTest(engine_rank=engine_rank):
+                mgr = MagicMock()
+                mgr.attn_tp_size = 2
+                mgr.attn_tp_rank = attn_tp_rank
+                mgr.attn_cp_size = 2
+                mgr.attn_cp_rank = cp_rank
+                mgr.enable_all_cp_ranks_for_transfer = True
+                mgr.is_cp_sharded_kv = True
+                mgr.is_mla_backend = False
+                mgr.pp_size = 1
+                mgr.pp_rank = 0
+                mgr.kv_args.engine_rank = attn_tp_rank
+                mgr.kv_args.total_kv_head_num = 2
+                info = PrefillServerInfo(
+                    attn_tp_size=4,
+                    attn_cp_size=1,
+                    dp_size=1,
+                    pp_size=1,
+                    page_size=16,
+                    kv_cache_dtype="auto",
+                    follow_bootstrap_room=True,
+                    all_cp_ranks_transfer=False,
+                )
+
+                CommonKVManager._resolve_rank_mapping(mgr, info)
+
+                self.assertEqual(info.target_tp_rank, prefill_tp_rank)
+                self.assertEqual(info.target_tp_ranks, [prefill_tp_rank])
+                self.assertEqual(info.target_cp_ranks, [0])
+                self.assertEqual(info.required_dst_info_num, 1)
+                self.assertEqual(info.required_prefill_response_num, 1)
+
+    def test_decode_cp_routes_from_every_prefill_cp_owner_in_same_lane(self):
+        from sglang.srt.disaggregation.common.conn import (
+            CommonKVManager,
+            PrefillServerInfo,
+        )
+
+        mgr = MagicMock()
+        mgr.attn_tp_size = 2
+        mgr.attn_tp_rank = 0
+        mgr.attn_cp_size = 2
+        mgr.attn_cp_rank = 0
+        mgr.enable_all_cp_ranks_for_transfer = True
+        mgr.is_cp_sharded_kv = True
+        mgr.is_mla_backend = False
+        mgr.pp_size = 1
+        mgr.pp_rank = 0
+        mgr.kv_args.engine_rank = 3
+        info = PrefillServerInfo(
+            attn_tp_size=2,
+            attn_cp_size=4,
+            dp_size=1,
+            pp_size=1,
+            page_size=16,
+            kv_cache_dtype="auto",
+            follow_bootstrap_room=True,
+            all_cp_ranks_transfer=True,
+        )
+
+        CommonKVManager._resolve_rank_mapping(mgr, info)
+
+        self.assertEqual(info.target_tp_ranks, [0])
+        self.assertEqual(info.target_cp_ranks, [0, 1, 2, 3])
+        self.assertEqual(info.required_dst_info_num, 2)
+        self.assertEqual(info.required_prefill_response_num, 4)
+
+    def test_decode_cp_does_not_collapse_distinct_prefill_kv_shards(self):
+        from sglang.srt.disaggregation.common.conn import (
+            CommonKVManager,
+            PrefillServerInfo,
+        )
+
+        mgr = MagicMock()
+        mgr.attn_tp_size = 2
+        mgr.attn_tp_rank = 0
+        mgr.attn_cp_size = 2
+        mgr.attn_cp_rank = 0
+        mgr.enable_all_cp_ranks_for_transfer = True
+        mgr.is_cp_sharded_kv = True
+        mgr.is_mla_backend = False
+        mgr.pp_size = 1
+        mgr.pp_rank = 0
+        mgr.kv_args.engine_rank = 0
+        mgr.kv_args.total_kv_head_num = 8
+        info = PrefillServerInfo(
+            attn_tp_size=4,
+            attn_cp_size=1,
+            dp_size=1,
+            pp_size=1,
+            page_size=16,
+            kv_cache_dtype="auto",
+            follow_bootstrap_room=True,
+            all_cp_ranks_transfer=False,
+        )
+
+        CommonKVManager._resolve_rank_mapping(mgr, info)
+
+        self.assertEqual(info.target_tp_ranks, [0, 1])
+        self.assertEqual(info.target_cp_ranks, [0])
+        self.assertEqual(info.required_dst_info_num, 2)
+        self.assertEqual(info.required_prefill_response_num, 2)
+
+    def test_phase2_tp8_decode_maps_to_attntp2_cp4_prefill(self):
+        from sglang.srt.disaggregation.common.conn import (
+            CommonKVManager,
+            PrefillServerInfo,
+        )
+
+        for decode_rank in range(8):
+            with self.subTest(decode_rank=decode_rank):
+                mgr = MagicMock()
+                mgr.attn_tp_size = 8
+                mgr.attn_tp_rank = decode_rank
+                mgr.attn_cp_size = 1
+                mgr.attn_cp_rank = 0
+                mgr.enable_all_cp_ranks_for_transfer = False
+                mgr.is_mla_backend = False
+                mgr.pp_size = 1
+                mgr.pp_rank = 0
+                mgr.kv_args.engine_rank = decode_rank
+
+                info = PrefillServerInfo(
+                    attn_tp_size=2,
+                    attn_cp_size=4,
+                    dp_size=1,
+                    pp_size=1,
+                    page_size=16,
+                    kv_cache_dtype="auto",
+                    follow_bootstrap_room=True,
+                    all_cp_ranks_transfer=True,
+                )
+
+                CommonKVManager._resolve_rank_mapping(mgr, info)
+
+                expected_prefill_tp_rank = decode_rank // 4
+                self.assertEqual(info.target_tp_rank, expected_prefill_tp_rank)
+                self.assertEqual(
+                    info.target_tp_ranks, [expected_prefill_tp_rank]
+                )
+                self.assertEqual(info.target_cp_ranks, [0, 1, 2, 3])
+                self.assertEqual(info.required_dst_info_num, 4)
+                self.assertEqual(info.required_prefill_response_num, 4)
+
+    def test_phase2_tp4_decode_cp2_maps_to_attntp2_cp2_prefill(self):
+        from sglang.srt.disaggregation.common.conn import (
+            CommonKVManager,
+            PrefillServerInfo,
+        )
+
+        for decode_rank in range(4):
+            with self.subTest(decode_rank=decode_rank):
+                mgr = MagicMock()
+                mgr.attn_tp_size = 4
+                mgr.attn_tp_rank = decode_rank
+                mgr.attn_cp_size = 2
+                mgr.attn_cp_rank = decode_rank % 2
+                mgr.attn_tp_rank_includes_cp = True
+                mgr.enable_all_cp_ranks_for_transfer = True
+                mgr.is_cp_sharded_kv = True
+                mgr.is_mla_backend = False
+                mgr.pp_size = 1
+                mgr.pp_rank = 0
+                mgr.kv_args.engine_rank = decode_rank
+                mgr.kv_args.total_kv_head_num = 2
+
+                info = PrefillServerInfo(
+                    attn_tp_size=2,
+                    attn_cp_size=2,
+                    dp_size=1,
+                    pp_size=1,
+                    page_size=16,
+                    kv_cache_dtype="auto",
+                    follow_bootstrap_room=True,
+                    all_cp_ranks_transfer=True,
+                )
+
+                CommonKVManager._resolve_rank_mapping(mgr, info)
+
+                expected_prefill_tp_rank = decode_rank // 2
+                self.assertEqual(info.target_tp_rank, expected_prefill_tp_rank)
+                self.assertEqual(
+                    info.target_tp_ranks, [expected_prefill_tp_rank]
+                )
+                self.assertEqual(info.target_cp_ranks, [0, 1])
+                # Decode global TP already contains the CP replica axis: each
+                # Prefill (TP lane, CP owner) receives two Decode destinations,
+                # not another TP-ratio x CP-size Cartesian product.
+                self.assertEqual(info.required_dst_info_num, 2)
+                self.assertEqual(info.required_prefill_response_num, 2)
+
+    @patch("sglang.srt.disaggregation.common.conn.time")
+    @patch("sglang.srt.disaggregation.common.conn.requests.put")
     def test_url_with_dist_init_addr(self, mock_put, mock_time):
         mock_time.monotonic.return_value = 0.0
         success_resp = MagicMock()
@@ -203,6 +584,11 @@ class TestRegisterToBootstrap(CustomTestCase):
         mgr.attn_tp_rank = 0
         mgr.attn_cp_size = 1
         mgr.attn_cp_rank = 0
+        mgr.routing_attn_tp_size = 1
+        mgr.routing_attn_tp_rank = 0
+        mgr.routing_attn_cp_size = 1
+        mgr.routing_attn_cp_rank = 0
+        mgr.enable_all_cp_ranks_for_transfer = False
         mgr.attn_dp_size = 1
         mgr.attn_dp_rank = 0
         mgr.pp_size = 1

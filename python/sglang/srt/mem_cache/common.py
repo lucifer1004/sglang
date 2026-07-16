@@ -51,7 +51,15 @@ def page_align_floor(length: int, page_size: int) -> int:
 def maybe_cache_unfinished_req(req: Req, tree_cache: BasePrefixCache, **kwargs):
     if getattr(req, "skip_radix_cache_insert", False):
         is_chunked_progress = kwargs.get("chunked", False)
-        if not is_chunked_progress or not tree_cache.is_chunk_cache():
+        if not is_chunked_progress:
+            return
+        if not tree_cache.is_chunk_cache():
+            scale = getattr(tree_cache, "scale_seq_factor", 1)
+            kv_indices = tree_cache.req_to_token_pool.req_to_token[
+                req.req_pool_idx, : len(req.fill_ids) * scale
+            ]
+            # Advance the request without inserting or locking a Radix node.
+            req.prefix_indices = kv_indices.to(dtype=torch.int64, copy=True)
             return
         # ChunkCache only advances per-request prefix_indices for chunked
         # prefill; it does not insert into the radix cache.
@@ -348,8 +356,8 @@ def evict_from_tree_cache(tree_cache: BasePrefixCache | None, num_tokens: int):
     unwrapped_allocator = unwrap_cp_sharded_allocator(allocator)
     if isinstance(unwrapped_allocator, SWATokenToKVPoolAllocator):
         # Hybrid allocator
-        full_available_size = allocator.full_available_size()
-        swa_available_size = allocator.swa_available_size()
+        full_available_size = unwrapped_allocator.full_available_size()
+        swa_available_size = unwrapped_allocator.swa_available_size()
 
         if full_available_size < num_tokens or swa_available_size < num_tokens:
             full_num_tokens = max(0, num_tokens - full_available_size)
@@ -361,30 +369,6 @@ def evict_from_tree_cache(tree_cache: BasePrefixCache | None, num_tokens: int):
         # Standard allocator
         if allocator.available_size() < num_tokens:
             tree_cache.evict(EvictParams(num_tokens=num_tokens))
-
-
-def evict_from_tree_cache_for_decode(
-    tree_cache: BasePrefixCache | None, num_tokens: int
-) -> None:
-    if tree_cache is None:
-        return
-
-    allocator = tree_cache.token_to_kv_pool_allocator
-    if (
-        isinstance(allocator, CPShardedKVPoolAllocator)
-        and getattr(tree_cache, "cache_controller", None) is not None
-    ):
-        # Decode must not trigger rank-local Full-KV HiCache migration. Hybrid
-        # SWA pages outside the active window are independent and still need
-        # to be reclaimed so the next decode page can be allocated.
-        unwrapped_allocator = unwrap_cp_sharded_allocator(allocator)
-        if isinstance(unwrapped_allocator, SWATokenToKVPoolAllocator):
-            available = allocator.swa_available_size()
-            if available < num_tokens:
-                tree_cache.evict(EvictParams(swa_num_tokens=num_tokens - available))
-        return
-
-    evict_from_tree_cache(tree_cache, num_tokens)
 
 
 def alloc_paged_token_slots_extend(
@@ -471,6 +455,12 @@ def alloc_for_extend(
         req_pool_indices_device: request pool indices at a device tensor
         req_pool_indices: request pool indices as list
     """
+    allocator = batch.tree_cache.token_to_kv_pool_allocator
+    if isinstance(allocator, CPShardedKVPoolAllocator) and len(batch.reqs) != 1:
+        raise NotImplementedError(
+            "CP sharded-KV prefill currently requires batch_size=1"
+        )
+
     # free out-of-window swa tokens
     batch.maybe_evict_swa()
 
@@ -494,23 +484,43 @@ def alloc_for_extend(
     req_pool_indices_device = req_pool_indices_cpu.to(batch.device, non_blocking=True)
 
     # Allocate KV cache (throws exception on failure)
-    allocator = batch.tree_cache.token_to_kv_pool_allocator
-    if batch.tree_cache.page_size == 1:
-        if isinstance(allocator, CPShardedKVPoolAllocator):
-            positions_cpu = build_extend_positions(
-                prefix_lens_cpu, extend_lens_cpu, device="cpu"
-            )
-            positions = positions_cpu.to(batch.device, non_blocking=True)
-            evict_from_tree_cache(batch.tree_cache, int(positions_cpu.numel()))
-            out_cache_loc = allocator.alloc_for_positions(
-                positions, positions_cpu=positions_cpu
-            )
-            if out_cache_loc is None:
-                raise RuntimeError(
-                    "Prefill out of memory under CP sharded KV allocation."
+    logical_out_cache_loc = None
+    if isinstance(allocator, CPShardedKVPoolAllocator):
+        # PrefillAdder has already made owner-local room while the matched
+        # prefix node is locked. Do not run generic total-token eviction here.
+        owner_rotations_cpu = torch.tensor(
+            [
+                int(getattr(req, "attn_cp_owner_rotation", 0) or 0)
+                for req in batch.reqs
+            ],
+            dtype=torch.int64,
+        )
+        split_specs = getattr(batch, "attn_cp_prefill_split_specs", None)
+        split_spec = split_specs[0] if split_specs is not None else None
+        last_loc = []
+        for t in prefix_tensors:
+            if len(t) > 0:
+                last_loc.append(t[-1:].to(device=batch.device, non_blocking=True))
+            else:
+                last_loc.append(
+                    torch.tensor([-1], dtype=torch.int64, device=batch.device)
                 )
-        else:
-            out_cache_loc = alloc_token_slots(batch.tree_cache, batch.extend_num_tokens)
+        alloc_result = allocator.alloc_extend_with_logical(
+            prefix_lens_device,
+            prefix_lens_cpu,
+            batch.seq_lens,
+            batch.seq_lens_cpu,
+            torch.cat(last_loc),
+            batch.extend_num_tokens,
+            owner_rotations_cpu=owner_rotations_cpu,
+            split_spec=split_spec,
+        )
+        if alloc_result is None:
+            raise RuntimeError("Prefill out of memory under CP sharded KV allocation.")
+        out_cache_loc = alloc_result.physical_write_slots
+        logical_out_cache_loc = alloc_result.logical_slots
+    elif batch.tree_cache.page_size == 1:
+        out_cache_loc = alloc_token_slots(batch.tree_cache, batch.extend_num_tokens)
     else:
         # Paged allocation - build last_loc
         last_loc = [
@@ -529,7 +539,7 @@ def alloc_for_extend(
 
     # Write to req_to_token_pool
     write_cache_indices(
-        out_cache_loc,
+        logical_out_cache_loc if logical_out_cache_loc is not None else out_cache_loc,
         req_pool_indices_device,
         req_pool_indices_cpu,
         prefix_lens_device,
@@ -556,7 +566,7 @@ def alloc_paged_token_slots_decode(
     allocator = tree_cache.token_to_kv_pool_allocator
     # Over estimate the number of tokens: assume each request needs a new page.
     num_tokens = len(seq_lens) * allocator.page_size
-    evict_from_tree_cache_for_decode(tree_cache, num_tokens)
+    evict_from_tree_cache(tree_cache, num_tokens)
 
     out_cache_loc = allocator.alloc_decode(seq_lens, seq_lens_cpu, last_loc)
 
@@ -586,40 +596,38 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
 
     bs = batch.seq_lens.shape[0]
 
-    if batch.tree_cache.page_size == 1:
+    allocator = batch.tree_cache.token_to_kv_pool_allocator
+    logical_out_cache_loc = None
+    if isinstance(allocator, CPShardedKVPoolAllocator):
+        if token_per_req != 1:
+            raise NotImplementedError(
+                "CP sharded logical KV decode currently supports token_per_req=1"
+            )
+        owner_rotations_cpu = torch.tensor(
+            [
+                int(getattr(req, "attn_cp_owner_rotation", 0) or 0)
+                for req in batch.reqs
+            ],
+            dtype=torch.int64,
+        )
+        last_loc = batch.req_to_token_pool.req_to_token[
+            batch.req_pool_indices, batch.seq_lens - 1
+        ]
+        seq_lens_next = batch.seq_lens + token_per_req
+        evict_from_tree_cache(batch.tree_cache, bs * token_per_req)
+        alloc_result = allocator.alloc_decode_with_logical(
+            seq_lens_next,
+            batch.seq_lens_cpu + token_per_req,
+            last_loc=last_loc,
+            owner_rotations_cpu=owner_rotations_cpu,
+        )
+        if alloc_result is None:
+            raise RuntimeError("Decode out of memory under CP sharded KV allocation.")
+        out_cache_loc = alloc_result.physical_write_slots
+        logical_out_cache_loc = alloc_result.logical_slots
+    elif batch.tree_cache.page_size == 1:
         # Non-paged allocation
-        allocator = batch.tree_cache.token_to_kv_pool_allocator
-        if isinstance(allocator, CPShardedKVPoolAllocator):
-            if batch.model_config.is_encoder_decoder:
-                locs = batch.encoder_lens + batch.seq_lens
-                locs_cpu = torch.tensor(
-                    batch.encoder_lens_cpu, dtype=torch.int64
-                ) + batch.seq_lens_cpu.to(dtype=torch.int64)
-            else:
-                locs = batch.seq_lens.clone()
-                locs_cpu = batch.seq_lens_cpu.to(dtype=torch.int64)
-            if token_per_req > 1:
-                offsets = torch.arange(
-                    token_per_req, device=batch.device, dtype=locs.dtype
-                )
-                offsets_cpu = torch.arange(token_per_req, dtype=locs_cpu.dtype)
-                positions = (locs.unsqueeze(1) + offsets).reshape(-1)
-                positions_cpu = (locs_cpu.unsqueeze(1) + offsets_cpu).reshape(-1)
-            else:
-                positions = locs
-                positions_cpu = locs_cpu
-            evict_from_tree_cache_for_decode(
-                batch.tree_cache, int(positions_cpu.numel())
-            )
-            out_cache_loc = allocator.alloc_for_positions(
-                positions, positions_cpu=positions_cpu
-            )
-            if out_cache_loc is None:
-                raise RuntimeError(
-                    "Decode out of memory under CP sharded KV allocation."
-                )
-        else:
-            out_cache_loc = alloc_token_slots(batch.tree_cache, bs * token_per_req)
+        out_cache_loc = alloc_token_slots(batch.tree_cache, bs * token_per_req)
     else:
         # Paged allocation
         last_loc = batch.req_to_token_pool.req_to_token[
@@ -651,11 +659,20 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
         expanded_locs = (locs.unsqueeze(1) + offsets).reshape(-1)
         batch.req_to_token_pool.write(
             (expanded_req_pool_indices, expanded_locs),
-            out_cache_loc.to(torch.int32),
+            (
+                logical_out_cache_loc
+                if logical_out_cache_loc is not None
+                else out_cache_loc
+            ).to(torch.int32),
         )
     else:
         batch.req_to_token_pool.write(
-            (batch.req_pool_indices, locs), out_cache_loc.to(torch.int32)
+            (batch.req_pool_indices, locs),
+            (
+                logical_out_cache_loc
+                if logical_out_cache_loc is not None
+                else out_cache_loc
+            ).to(torch.int32),
         )
 
     return out_cache_loc

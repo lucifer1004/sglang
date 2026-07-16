@@ -485,6 +485,56 @@ def page_indices_to_cp_rank_page_indices(
     return np.asarray(page_indices)[mask]
 
 
+def resolve_cp_sharded_transfer_page_runs(
+    allocator,
+    logical_page_indices: np.ndarray,
+    index_slice: slice,
+) -> List[Tuple[np.ndarray, slice]]:
+    """Resolve owner-local physical pages while preserving destination positions."""
+
+    logical_page_indices = np.asarray(logical_page_indices)
+    if logical_page_indices.ndim != 1:
+        raise ValueError("logical_page_indices must be one-dimensional")
+    start = int(index_slice.start or 0)
+    stop = int(index_slice.stop if index_slice.stop is not None else start)
+    if index_slice.step not in (None, 1):
+        raise ValueError("CP sharded transfer slices must have unit stride")
+    if stop - start != len(logical_page_indices):
+        raise ValueError(
+            "CP sharded transfer slice length must match logical page count"
+        )
+    if logical_page_indices.size == 0:
+        return []
+
+    logical_pages = torch.as_tensor(
+        logical_page_indices,
+        dtype=torch.int64,
+        device=allocator.device,
+    )
+    physical_pages = (
+        allocator.logical_page_table_to_physical(logical_pages)
+        .to("cpu")
+        .numpy()
+        .astype(logical_page_indices.dtype, copy=False)
+    )
+    owned_positions = np.flatnonzero(physical_pages != 0)
+    if owned_positions.size == 0:
+        return []
+
+    split_points = np.flatnonzero(np.diff(owned_positions) != 1) + 1
+    runs = []
+    for positions in np.split(owned_positions, split_points):
+        run_start = int(positions[0])
+        run_stop = int(positions[-1]) + 1
+        runs.append(
+            (
+                physical_pages[run_start:run_stop],
+                slice(start + run_start, start + run_stop),
+            )
+        )
+    return runs
+
+
 def filter_kv_indices_for_cp_rank(
     kv_mgr: CommonKVManager, kv_indices: np.ndarray, index_slice: slice
 ) -> Tuple[np.ndarray, slice]:

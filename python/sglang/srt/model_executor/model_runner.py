@@ -1305,6 +1305,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 duplicate_tp_group=self.server_args.enable_pdmux,
                 enable_symm_mem=self.server_args.enable_symm_mem,
                 recovered_rank=self.server_args.elastic_ep_rejoin,
+                use_decode_sharded_kv_layout=(
+                    self.server_args.attn_cp_mode == "sharded-kv"
+                    and self.server_args.disaggregation_mode == "decode"
+                ),
             )
             initialize_dp_attention(
                 server_args=self.server_args,
@@ -3386,6 +3390,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
     def update_decode_attn_backend(self, stream_idx: int):
         self.decode_attn_backend = self.decode_attn_backend_group[stream_idx]
+
+    @property
+    def supports_attn_cp_prefill_runtime(self) -> bool:
+        return bool(
+            getattr(self.model, "supports_attn_cp_prefill_runtime", False)
+        )
 
     def forward_decode(
         self,

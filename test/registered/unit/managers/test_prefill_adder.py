@@ -1,15 +1,21 @@
 import unittest
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import torch
 
+from sglang.srt.context_parallel import build_cp_prefill_split_spec
+from sglang.srt.managers import schedule_policy
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
-from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefResult,
+    EvictResult,
     IncLockRefResult,
+)
+from sglang.srt.mem_cache.allocator import (
+    PagedTokenToKVPoolAllocator,
+    TokenToKVPoolAllocator,
 )
 from sglang.srt.mem_cache.cp_sharded_allocator import CPShardedKVPoolAllocator
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
@@ -549,19 +555,35 @@ class TestPrefillAdder(CustomTestCase):
         req.set_extend_input_len.assert_called_once_with(200)
         self.assertIn(req, adder.can_run_list)
 
-    def _create_cp_sharded_allocator(self, *, physical_size=1000, logical_size=2000):
-        base = TokenToKVPoolAllocator(
+    def _create_cp_sharded_allocator(
+        self,
+        *,
+        physical_size=1000,
+        logical_size=2000,
+        cp_size=2,
+        page_size=1,
+        cp_kv_chunk_size=4,
+    ):
+        allocator_cls = (
+            TokenToKVPoolAllocator
+            if page_size == 1
+            else PagedTokenToKVPoolAllocator
+        )
+        base_kwargs = dict(
             size=physical_size,
             dtype=torch.float32,
             device="cpu",
             kvcache=None,
             need_sort=False,
         )
+        if page_size > 1:
+            base_kwargs["page_size"] = page_size
+        base = allocator_cls(**base_kwargs)
         return CPShardedKVPoolAllocator(
             base,
             cp_rank=0,
-            cp_size=2,
-            cp_kv_chunk_size=4,
+            cp_size=cp_size,
+            cp_kv_chunk_size=cp_kv_chunk_size,
             logical_size=logical_size,
         )
 
@@ -578,6 +600,7 @@ class TestPrefillAdder(CustomTestCase):
         req.prefix_indices = []
         req.fill_ids = list(range(extend_len))
         req.last_node = MagicMock()
+        req.attn_cp_owner_rotation = None
         req.sampling_params.ignore_eos = False
         req.set_extend_input_len = MagicMock(
             side_effect=lambda value: setattr(req, "extend_input_len", value)
@@ -640,27 +663,405 @@ class TestPrefillAdder(CustomTestCase):
         self.assertEqual(result, AddReqResult.OTHER)
         self.assertEqual(adder.can_run_list, [short_req])
 
-    def test_attncp_hicache_admission_requires_free_physical_cache(self):
-        allocator = self._create_cp_sharded_allocator(physical_size=16, logical_size=32)
-        allocator.base_allocator.alloc(14)
-        tree_cache = self.create_tree_cache(evictable_size=16)
-        tree_cache.cache_controller = object()
+    def test_attncp_owner_rotation_is_assigned_round_robin_once(self):
+        allocator = self._create_cp_sharded_allocator(cp_size=4)
+        adder = self.create_adder(
+            self.create_running_batch(),
+            token_to_kv_pool_allocator=allocator,
+            next_attn_cp_owner_rotation=0,
+        )
+        reqs = [
+            self._create_prefill_req(input_len=8, extend_len=8) for _ in range(5)
+        ]
+
+        rotations = [adder._ensure_cp_sharded_owner_rotation(req) for req in reqs]
+
+        self.assertEqual(rotations, [0, 1, 2, 3, 0])
+        self.assertEqual(adder._ensure_cp_sharded_owner_rotation(reqs[1]), 1)
+        self.assertEqual(adder.next_attn_cp_owner_rotation, 5)
+
+    def test_attncp_phase1_rejects_second_prefill_request(self):
+        allocator = self._create_cp_sharded_allocator()
+        adder = self.create_adder(
+            self.create_running_batch(),
+            token_to_kv_pool_allocator=allocator,
+            rem_chunk_tokens=16,
+        )
+        first = self._create_prefill_req(input_len=8, extend_len=8)
+        second = self._create_prefill_req(input_len=8, extend_len=8)
+
+        first_result = adder.add_one_req(
+            first, has_chunked_req=False, truncation_align_size=None
+        )
+        second_result = adder.add_one_req(
+            second, has_chunked_req=False, truncation_align_size=None
+        )
+
+        self.assertIn(first_result, (AddReqResult.CONTINUE, AddReqResult.OTHER))
+        self.assertEqual(second_result, AddReqResult.OTHER)
+        self.assertEqual(adder.can_run_list, [first])
+        self.assertIsNone(second.attn_cp_owner_rotation)
+        self.assertTrue(adder.prefill_request_limit_reached())
+
+    def test_attncp_chunked_prefill_spec_uses_final_truncated_interval(self):
+        allocator = self._create_cp_sharded_allocator(cp_size=2)
+        adder = self.create_adder(
+            self.create_running_batch(),
+            token_to_kv_pool_allocator=allocator,
+            page_size=4,
+            rem_chunk_tokens=4,
+        )
+        req = self._create_prefill_req(input_len=8, extend_len=8)
+
+        result = adder.add_one_req(
+            req, has_chunked_req=False, truncation_align_size=None
+        )
+
+        self.assertIn(result, (AddReqResult.CONTINUE, AddReqResult.OTHER))
+        spec = req.attn_cp_prefill_split_spec
+        self.assertEqual(spec.extend_start, 0)
+        self.assertEqual(spec.extend_len, 4)
+        self.assertEqual(spec.owner_rotation, req.attn_cp_owner_rotation)
+        self.assertEqual(tuple(block.logical_start for block in spec.blocks), (0,))
+        self.assertEqual(tuple(block.token_count for block in spec.blocks), (4,))
+
+    def test_attncp_page_size_one_keeps_legacy_prefill_without_split_spec(self):
+        allocator = self._create_cp_sharded_allocator(
+            physical_size=32,
+            logical_size=64,
+            cp_size=2,
+            page_size=1,
+            cp_kv_chunk_size=4,
+        )
+        adder = self.create_adder(
+            self.create_running_batch(),
+            token_to_kv_pool_allocator=allocator,
+            page_size=1,
+            rem_chunk_tokens=8,
+        )
+        req = self._create_prefill_req(input_len=8, extend_len=8)
+
+        result = adder.add_one_req(
+            req,
+            has_chunked_req=False,
+            truncation_align_size=None,
+        )
+
+        self.assertIn(result, (AddReqResult.CONTINUE, AddReqResult.OTHER))
+        self.assertIsNone(req.attn_cp_prefill_split_spec)
+
+    def test_attncp_final_chunk_spec_precedes_lock_and_capacity_check(self):
+        allocator = self._create_cp_sharded_allocator(cp_size=2)
+        tree_cache = self.create_tree_cache()
+        adder = self.create_adder(
+            self.create_running_batch(),
+            tree_cache=tree_cache,
+            token_to_kv_pool_allocator=allocator,
+            page_size=4,
+            rem_chunk_tokens=4,
+        )
+        req = self._create_prefill_req(input_len=8, extend_len=8)
+        req.attn_cp_prefill_split_spec = None
+        events = []
+        original_build = schedule_policy.build_cp_prefill_split_spec
+
+        def record_build(**kwargs):
+            events.append(("build", kwargs["extend_start"], kwargs["extend_len"]))
+            return original_build(**kwargs)
+
+        def record_lock(_last_node):
+            events.append(("lock",))
+            return IncLockRefResult()
+
+        def reject_capacity(*_args, **_kwargs):
+            events.append(("capacity",))
+            return False
+
+        tree_cache.inc_lock_ref.side_effect = record_lock
+        with patch.object(
+            schedule_policy,
+            "build_cp_prefill_split_spec",
+            side_effect=record_build,
+        ), patch.object(
+            adder,
+            "_cp_sharded_can_allocate_extend",
+            side_effect=reject_capacity,
+        ):
+            result = adder.add_one_req(
+                req, has_chunked_req=False, truncation_align_size=None
+            )
+
+        self.assertEqual(result, AddReqResult.NO_TOKEN)
+        self.assertEqual(events[0], ("build", 0, 4))
+        self.assertLess(events.index(("build", 0, 4)), events.index(("lock",)))
+        self.assertLess(events.index(("build", 0, 4)), events.index(("capacity",)))
+        self.assertIsNone(req.attn_cp_prefill_split_spec)
+        self.assertEqual(adder.can_run_list, [])
+
+    def test_attncp_chunk_continuation_failure_does_not_retain_spec(self):
+        allocator = self._create_cp_sharded_allocator(cp_size=2)
+        adder = self.create_adder(
+            self.create_running_batch(),
+            token_to_kv_pool_allocator=allocator,
+            page_size=4,
+            rem_chunk_tokens=4,
+        )
+        req = self._create_prefill_req(input_len=12, extend_len=8)
+        req.prefix_indices = list(range(4))
+        req.fill_ids = list(range(12))
+        req.attn_cp_owner_rotation = 1
+        req.attn_cp_prefill_split_spec = object()
+        events = []
+        original_build = schedule_policy.build_cp_prefill_split_spec
+
+        def record_build(**kwargs):
+            events.append(("build", kwargs["extend_start"], kwargs["extend_len"]))
+            return original_build(**kwargs)
+
+        def reject_capacity(*_args, **_kwargs):
+            events.append(("capacity",))
+            return False
+
+        with patch.object(
+            schedule_policy,
+            "build_cp_prefill_split_spec",
+            side_effect=record_build,
+        ), patch.object(
+            adder,
+            "_cp_sharded_can_allocate_extend",
+            side_effect=reject_capacity,
+        ):
+            remaining = adder.add_chunked_req(req)
+
+        self.assertIs(remaining, req)
+        self.assertEqual(events, [("build", 4, 4), ("capacity",)])
+        self.assertIsNone(req.attn_cp_prefill_split_spec)
+        self.assertEqual(adder.can_run_list, [])
+
+    def test_attncp_chunk_continuation_replaces_previous_interval_spec(self):
+        allocator = self._create_cp_sharded_allocator(cp_size=2)
+        adder = self.create_adder(
+            self.create_running_batch(),
+            token_to_kv_pool_allocator=allocator,
+            page_size=4,
+            rem_chunk_tokens=4,
+        )
+        req = self._create_prefill_req(input_len=12, extend_len=8)
+        req.prefix_indices = list(range(4))
+        req.fill_ids = list(range(12))
+        req.attn_cp_owner_rotation = 1
+        req.attn_cp_prefill_split_spec = object()
+
+        remaining = adder.add_chunked_req(req)
+
+        self.assertIs(remaining, req)
+        spec = req.attn_cp_prefill_split_spec
+        self.assertEqual((spec.extend_start, spec.extend_len), (4, 4))
+        self.assertEqual(spec.owner_rotation, 1)
+
+    def test_attncp_unaligned_prefix_fails_before_cache_lock(self):
+        allocator = self._create_cp_sharded_allocator(cp_size=2)
+        tree_cache = self.create_tree_cache()
+        adder = self.create_adder(
+            self.create_running_batch(),
+            tree_cache=tree_cache,
+            token_to_kv_pool_allocator=allocator,
+            page_size=4,
+            rem_chunk_tokens=None,
+        )
+        req = self._create_prefill_req(input_len=6, extend_len=4)
+        req.prefix_indices = list(range(2))
+        req.fill_ids = list(range(6))
+
+        with self.assertRaisesRegex(ValueError, "recorded leading-page owner"):
+            adder.add_one_req(
+                req, has_chunked_req=False, truncation_align_size=None
+            )
+
+        tree_cache.inc_lock_ref.assert_not_called()
+        self.assertEqual(adder.can_run_list, [])
+
+    def test_attncp_partial_prefix_uses_recorded_leading_page_owner(self):
+        allocator = self._create_cp_sharded_allocator(
+            physical_size=32,
+            logical_size=64,
+            cp_size=2,
+            page_size=4,
+            cp_kv_chunk_size=8,
+        )
+        prefix_spec = build_cp_prefill_split_spec(
+            extend_start=0,
+            extend_len=6,
+            cp_size=2,
+            page_size=4,
+            owner_rotation=0,
+        )
+        prefix = allocator.alloc_extend_with_logical(
+            prefix_lens=torch.tensor([0], dtype=torch.int64),
+            prefix_lens_cpu=torch.tensor([0], dtype=torch.int64),
+            seq_lens=torch.tensor([6], dtype=torch.int64),
+            seq_lens_cpu=torch.tensor([6], dtype=torch.int64),
+            last_loc=torch.tensor([-1], dtype=torch.int64),
+            extend_num_tokens=6,
+            split_spec=prefix_spec,
+        )
+        tree_cache = self.create_tree_cache()
+        adder = self.create_adder(
+            self.create_running_batch(),
+            tree_cache=tree_cache,
+            token_to_kv_pool_allocator=allocator,
+            page_size=4,
+            rem_chunk_tokens=None,
+        )
+        req = self._create_prefill_req(input_len=8, extend_len=2)
+        req.prefix_indices = prefix.logical_slots
+        req.fill_ids = list(range(8))
+        req.attn_cp_owner_rotation = 1
+
+        result = adder.add_one_req(
+            req,
+            has_chunked_req=False,
+            truncation_align_size=None,
+        )
+
+        self.assertIn(result, (AddReqResult.CONTINUE, AddReqResult.OTHER))
+        spec = req.attn_cp_prefill_split_spec
+        self.assertEqual((spec.extend_start, spec.extend_len), (6, 2))
+        self.assertEqual(len(spec.blocks), 1)
+        self.assertEqual(spec.blocks[0].owner_rank, 1)
+        self.assertEqual(spec.page_demand(4), (0, 0))
+        self.assertEqual(adder.cp_sharded_token_offsets, [0, 0])
+
+    def test_attncp_hicache_hit_fails_before_lock_or_load_back(self):
+        allocator = self._create_cp_sharded_allocator(cp_size=2)
+        tree_cache = self.create_tree_cache()
+        tree_cache.init_load_back.return_value = (torch.arange(4), MagicMock())
+        adder = self.create_adder(
+            self.create_running_batch(),
+            tree_cache=tree_cache,
+            token_to_kv_pool_allocator=allocator,
+            page_size=4,
+            rem_chunk_tokens=None,
+        )
+        req = self._create_prefill_req(input_len=8, extend_len=8)
+        req.prefix_indices = torch.empty((0,), dtype=torch.int64)
+        req.host_hit_length = 4
+        req.best_match_node = MagicMock()
+        req.attn_cp_prefill_split_spec = None
+
+        with self.assertRaisesRegex(ValueError, "HiCache"):
+            adder.add_one_req(
+                req, has_chunked_req=False, truncation_align_size=None
+            )
+
+        tree_cache.inc_lock_ref.assert_not_called()
+        tree_cache.init_load_back.assert_not_called()
+        self.assertIsNone(req.attn_cp_prefill_split_spec)
+        self.assertEqual(adder.can_run_list, [])
+
+    def test_attncp_hicache_hit_fails_before_ignore_eos_dispatch(self):
+        allocator = self._create_cp_sharded_allocator(cp_size=2)
+        tree_cache = self.create_tree_cache()
+        tree_cache.disable = True
+        adder = self.create_adder(
+            self.create_running_batch(),
+            tree_cache=tree_cache,
+            token_to_kv_pool_allocator=allocator,
+            page_size=4,
+            rem_chunk_tokens=None,
+        )
+        req = self._create_prefill_req(input_len=8, extend_len=8)
+        req.host_hit_length = 4
+        req.sampling_params.ignore_eos = True
+        req.attn_cp_prefill_split_spec = None
+
+        with patch.object(adder, "add_one_req_ignore_eos") as add_ignore_eos:
+            with self.assertRaisesRegex(ValueError, "HiCache"):
+                adder.add_one_req(
+                    req, has_chunked_req=False, truncation_align_size=None
+                )
+
+        add_ignore_eos.assert_not_called()
+        self.assertIsNone(req.attn_cp_prefill_split_spec)
+
+    def test_attncp_admission_evicts_for_deficient_owner_without_collective(self):
+        allocator = self._create_cp_sharded_allocator(
+            physical_size=4,
+            logical_size=8,
+        )
+        cached = allocator.alloc_for_positions_with_logical(
+            torch.arange(0, 4, dtype=torch.int64)
+        )
+        tree_cache = self.create_tree_cache(evictable_size=4)
+
+        def evict(_params):
+            allocator.free(cached.logical_slots)
+            return EvictResult(num_tokens_evicted=4)
+
+        tree_cache.evict.side_effect = evict
         adder = self.create_adder(
             self.create_running_batch(),
             tree_cache=tree_cache,
             token_to_kv_pool_allocator=allocator,
         )
+        req = self._create_prefill_req(input_len=4, extend_len=4)
 
-        self.assertFalse(adder._cp_sharded_can_allocate_extend(0, 8))
+        with patch.object(torch.distributed, "all_reduce") as all_reduce:
+            result = adder.add_one_req(
+                req,
+                has_chunked_req=False,
+                truncation_align_size=None,
+            )
 
-    def test_attncp_uses_synchronized_swa_admission_budget(self):
-        self.mock_token_allocator.swa_available_size.return_value = 100
-        adder = self.create_adder(self.create_running_batch())
-        adder.is_hybrid_swa = True
-        adder.cp_sharded_swa_available_and_evictable_override = 40
-        adder.rem_swa_token_offset = 8
+        self.assertIn(result, (AddReqResult.CONTINUE, AddReqResult.OTHER))
+        self.assertEqual(adder.can_run_list, [req])
+        tree_cache.evict.assert_called_once()
+        all_reduce.assert_not_called()
 
-        self.assertEqual(adder.rem_swa_tokens, 32)
+    def test_attncp_admission_uses_explicit_split_page_demand(self):
+        allocator = self._create_cp_sharded_allocator(
+            physical_size=8,
+            logical_size=32,
+            cp_size=2,
+            page_size=4,
+            cp_kv_chunk_size=8,
+        )
+        cached = allocator.alloc_for_positions_with_logical(
+            torch.arange(0, 8, dtype=torch.int64)
+        )
+        self.assertEqual(
+            allocator.physical_load_snapshot().allocated_tokens,
+            (8, 0),
+        )
+        tree_cache = self.create_tree_cache(evictable_size=8)
+
+        def evict(_params):
+            allocator.free(cached.logical_slots)
+            return EvictResult(num_tokens_evicted=8)
+
+        tree_cache.evict.side_effect = evict
+        adder = self.create_adder(
+            self.create_running_batch(),
+            tree_cache=tree_cache,
+            token_to_kv_pool_allocator=allocator,
+            page_size=4,
+            rem_chunk_tokens=8,
+        )
+        req = self._create_prefill_req(input_len=8, extend_len=8)
+        req.attn_cp_owner_rotation = 1
+
+        with patch.object(torch.distributed, "all_reduce") as all_reduce:
+            result = adder.add_one_req(
+                req,
+                has_chunked_req=False,
+                truncation_align_size=None,
+            )
+
+        self.assertIn(result, (AddReqResult.CONTINUE, AddReqResult.OTHER))
+        self.assertEqual(req.attn_cp_prefill_split_spec.page_demand(4), (1, 1))
+        self.assertEqual(adder.cp_sharded_token_offsets, [4, 4])
+        tree_cache.evict.assert_called_once()
+        all_reduce.assert_not_called()
 
 
 if __name__ == "__main__":

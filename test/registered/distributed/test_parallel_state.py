@@ -156,8 +156,7 @@ def test_parallel_group_construction_tp8_attn_cp2():
 
 def test_parallel_group_construction_tp8_sharded_kv_cp4():
     """
-    Sharded-KV uses a logical (attn_tp, cp) layout independent from the default
-    SGLang attention CP groups.
+    Sharded-KV groups CP ranks within the same attention-TP lane.
     """
     world_size = 8
 
@@ -208,7 +207,10 @@ def test_parallel_group_construction_tp8_sharded_kv_cp4():
                 [0, 2, 4, 6],
                 [1, 3, 5, 7],
             ]
-            assert created_groups["sharded_kv_cp"] == [[0, 1, 2, 3], [4, 5, 6, 7]]
+            assert created_groups["sharded_kv_cp"] == [
+                [0, 2, 4, 6],
+                [1, 3, 5, 7],
+            ]
 
             parallel_state.destroy_model_parallel()
 

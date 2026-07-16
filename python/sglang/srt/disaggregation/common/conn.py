@@ -26,7 +26,14 @@ from sglang.srt.disaggregation.base.conn import (
     KVTransferMetric,
 )
 from sglang.srt.disaggregation.utils import DisaggregationMode
-from sglang.srt.distributed import get_pp_group, get_world_group
+from sglang.srt.distributed import (
+    get_pp_group,
+    get_sharded_kv_context_model_parallel_rank,
+    get_sharded_kv_context_model_parallel_world_size,
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+    get_world_group,
+)
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
     get_attention_cp_rank,
@@ -46,6 +53,46 @@ from sglang.srt.utils.network import (
 logger = logging.getLogger(__name__)
 
 
+@dataclasses.dataclass(frozen=True)
+class KVTransferParallelInfo:
+    attn_tp_rank: int
+    attn_tp_size: int
+    attn_cp_rank: int
+    attn_cp_size: int
+    attn_tp_rank_includes_cp: bool
+
+
+def _resolve_kv_transfer_parallel_info(
+    disaggregation_mode: DisaggregationMode,
+    *,
+    is_cp_sharded_kv: bool,
+) -> KVTransferParallelInfo:
+    if is_cp_sharded_kv and disaggregation_mode == DisaggregationMode.DECODE:
+        attn_tp_rank = get_tensor_model_parallel_rank()
+        attn_tp_size = get_tensor_model_parallel_world_size()
+    else:
+        attn_tp_rank = get_attention_tp_rank()
+        attn_tp_size = get_attention_tp_size()
+
+    if is_cp_sharded_kv:
+        attn_cp_rank = get_sharded_kv_context_model_parallel_rank()
+        attn_cp_size = get_sharded_kv_context_model_parallel_world_size()
+    else:
+        attn_cp_rank = get_attention_cp_rank()
+        attn_cp_size = get_attention_cp_size()
+
+    return KVTransferParallelInfo(
+        attn_tp_rank=attn_tp_rank,
+        attn_tp_size=attn_tp_size,
+        attn_cp_rank=attn_cp_rank,
+        attn_cp_size=attn_cp_size,
+        attn_tp_rank_includes_cp=(
+            is_cp_sharded_kv
+            and disaggregation_mode == DisaggregationMode.DECODE
+        ),
+    )
+
+
 @dataclasses.dataclass
 class PrefillServerInfo:
     # Topology fields (fetched from bootstrap server)
@@ -56,6 +103,7 @@ class PrefillServerInfo:
     page_size: Optional[int]
     kv_cache_dtype: Optional[str]
     follow_bootstrap_room: bool
+    all_cp_ranks_transfer: bool = False
 
     # Pre-computed rank mapping (set by try_ensure_parallel_info on decode side)
     target_tp_rank: Optional[int] = None
@@ -75,6 +123,7 @@ class PrefillServerInfo:
             str(self.kv_cache_dtype) if self.kv_cache_dtype is not None else None
         )
         self.follow_bootstrap_room = bool(self.follow_bootstrap_room)
+        self.all_cp_ranks_transfer = bool(self.all_cp_ranks_transfer)
 
 
 @dataclasses.dataclass
@@ -88,6 +137,53 @@ class PrefillRankInfo:
 
 
 class CommonKVManager(BaseKVManager):
+    def _init_attention_routing_topology(self) -> None:
+        # The runtime groups are the authoritative (DP, CP, AttnTP) layout.
+        # Re-splitting AttnTP here corrupts sharded-KV routing once attention
+        # projections use a real AttnTP subgroup.
+        self.routing_attn_tp_size = self.attn_tp_size
+        self.routing_attn_tp_rank = self.attn_tp_rank
+        self.routing_attn_cp_size = self.attn_cp_size
+        self.routing_attn_cp_rank = self.attn_cp_rank
+
+    def _map_prefill_kv_replica_to_decode_cp_owner(
+        self, info: PrefillServerInfo
+    ) -> Optional[int]:
+        """Return the unique Prefill TP replica for this Decode CP rank.
+
+        When Prefill TP exceeds the number of KV heads, adjacent TP ranks hold
+        identical KV-head shards. Decode CP creates another replication axis for
+        those same shards. If the replica counts match exactly, pair the two
+        axes one-to-one instead of transferring every Prefill replica to every
+        Decode owner.
+        """
+        if self.is_mla_backend or self.attn_cp_size <= 1:
+            return None
+
+        total_kv_heads = getattr(self.kv_args, "total_kv_head_num", 0)
+        if not isinstance(total_kv_heads, int) or total_kv_heads <= 0:
+            return None
+
+        prefill_tp_size = info.attn_tp_size
+        decode_tp_size = self.attn_tp_size
+        if (
+            prefill_tp_size < total_kv_heads
+            or decode_tp_size < total_kv_heads
+            or prefill_tp_size % total_kv_heads != 0
+            or decode_tp_size % total_kv_heads != 0
+        ):
+            return None
+
+        prefill_replicas = prefill_tp_size // total_kv_heads
+        decode_replicas = decode_tp_size // total_kv_heads
+        if prefill_replicas != decode_replicas * self.attn_cp_size:
+            return None
+
+        decode_head = self.attn_tp_rank // decode_replicas
+        decode_replica = self.attn_tp_rank % decode_replicas
+        prefill_replica = decode_replica * self.attn_cp_size + self.attn_cp_rank
+        return decode_head * prefill_replicas + prefill_replica
+
     def __init__(
         self,
         args: KVArgs,
@@ -105,12 +201,21 @@ class CommonKVManager(BaseKVManager):
         self.bootstrap_host = server_args.host
         self.bootstrap_port = server_args.disaggregation_bootstrap_port
         self.dist_init_addr = server_args.dist_init_addr
-        self.attn_tp_size = get_attention_tp_size()
-        self.attn_tp_rank = get_attention_tp_rank()
-        self.attn_cp_size = get_attention_cp_size()
-        self.attn_cp_rank = get_attention_cp_rank()
+        self.is_cp_sharded_kv = server_args.attn_cp_mode == "sharded-kv"
+        parallel_info = _resolve_kv_transfer_parallel_info(
+            disaggregation_mode,
+            is_cp_sharded_kv=self.is_cp_sharded_kv,
+        )
+        self.attn_tp_size = parallel_info.attn_tp_size
+        self.attn_tp_rank = parallel_info.attn_tp_rank
+        self.attn_cp_size = parallel_info.attn_cp_size
+        self.attn_cp_rank = parallel_info.attn_cp_rank
+        self.attn_tp_rank_includes_cp = (
+            parallel_info.attn_tp_rank_includes_cp
+        )
         self.attn_dp_size = get_attention_dp_size()
         self.attn_dp_rank = get_attention_dp_rank()
+        self._init_attention_routing_topology()
         self.system_dp_size = (
             1 if server_args.enable_dp_attention else server_args.dp_size
         )
@@ -122,6 +227,7 @@ class CommonKVManager(BaseKVManager):
         self.local_ip = get_local_ip_auto()
         self.enable_all_cp_ranks_for_transfer = (
             envs.SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER.get()
+            or self.is_cp_sharded_kv
         )
 
         # bind zmq socket
@@ -140,8 +246,8 @@ class CommonKVManager(BaseKVManager):
             # participate in KV transfer; Otherwise only CP rank 0 sends.
             self.is_dummy_cp_rank = (
                 not self.enable_all_cp_ranks_for_transfer
-                and self.attn_cp_size > 1
-                and self.attn_cp_rank != 0
+                and self.routing_attn_cp_size > 1
+                and self.routing_attn_cp_rank != 0
             )
             # Sync the leader's bootstrap port to every rank before
             # registering: in multi-node prefill, registration targets
@@ -267,9 +373,32 @@ class CommonKVManager(BaseKVManager):
     def _resolve_rank_mapping(self, info: PrefillServerInfo) -> None:
         """Compute TP/CP/PP rank mapping and store on the PrefillServerInfo object.
         Deterministic for a given (bootstrap_addr, decode engine) pair."""
+        decode_cp_enabled = self.attn_cp_size > 1
+        if decode_cp_enabled:
+            if not self.is_cp_sharded_kv:
+                raise RuntimeError(
+                    "Decode CP disaggregation requires sharded-KV attention CP"
+                )
+            if info.attn_cp_size > 1 and not info.all_cp_ranks_transfer:
+                raise RuntimeError(
+                    "Decode sharded-KV CP requires every Prefill CP owner rank to "
+                    "participate in KV transfer"
+                )
+
+        replicated_prefill_tp_rank = (
+            CommonKVManager._map_prefill_kv_replica_to_decode_cp_owner(self, info)
+            if decode_cp_enabled
+            else None
+        )
+
         # TP rank mapping
-        if self.attn_tp_size == info.attn_tp_size:
-            target_tp_rank = self.kv_args.engine_rank % self.attn_tp_size
+        if replicated_prefill_tp_rank is not None:
+            target_tp_rank = replicated_prefill_tp_rank
+            target_tp_ranks = [target_tp_rank]
+            required_dst_info_num = 1
+            required_prefill_response_num = 1
+        elif self.attn_tp_size == info.attn_tp_size:
+            target_tp_rank = self.attn_tp_rank
             required_dst_info_num = 1
             required_prefill_response_num = 1
             target_tp_ranks = [target_tp_rank]
@@ -278,7 +407,7 @@ class CommonKVManager(BaseKVManager):
                 logger.warning_once(
                     "Performance is NOT guaranteed when using different TP sizes for non-MLA models. "
                 )
-            target_tp_rank = (self.kv_args.engine_rank % self.attn_tp_size) // (
+            target_tp_rank = self.attn_tp_rank // (
                 self.attn_tp_size // info.attn_tp_size
             )
             required_dst_info_num = self.attn_tp_size // info.attn_tp_size
@@ -292,9 +421,9 @@ class CommonKVManager(BaseKVManager):
             # For non-MLA models, one decode rank needs to retrieve KVCache from multiple prefill ranks
             target_tp_ranks = list(
                 range(
-                    (self.kv_args.engine_rank % self.attn_tp_size)
+                    self.attn_tp_rank
                     * (info.attn_tp_size // self.attn_tp_size),
-                    (self.kv_args.engine_rank % self.attn_tp_size + 1)
+                    (self.attn_tp_rank + 1)
                     * (info.attn_tp_size // self.attn_tp_size),
                 )
             )
@@ -308,18 +437,28 @@ class CommonKVManager(BaseKVManager):
             else:
                 required_prefill_response_num = info.attn_tp_size // self.attn_tp_size
 
-        # CP rank mapping — decode cp size should be equal to 1
-        assert self.attn_cp_size == 1, (
-            f"Decode cp size ({self.attn_cp_size}) should be equal to 1",
-        )
-        if self.attn_cp_size == info.attn_cp_size:
+        # Prefill and Decode own independent token-owner layouts. Every Prefill
+        # CP owner is needed for owner remapping, but exact TP replicas are paired
+        # one-to-one with Decode CP owners above.
+        if decode_cp_enabled:
+            target_cp_ranks = list(range(info.attn_cp_size))
+            if (
+                replicated_prefill_tp_rank is None
+                and getattr(self, "attn_tp_rank_includes_cp", False) is not True
+            ):
+                required_dst_info_num *= self.attn_cp_size
+            required_prefill_response_num *= info.attn_cp_size
+        elif self.attn_cp_size == info.attn_cp_size:
             assert info.attn_cp_size == 1, (
                 f"When prefill cp size is 1, attn cp size should be 1, but got {self.attn_cp_size}",
             )
             target_cp_ranks = [self.attn_cp_rank]
         else:
             target_cp_ranks = list(range(info.attn_cp_size))
-            if not self.enable_all_cp_ranks_for_transfer:
+            if not (
+                self.enable_all_cp_ranks_for_transfer
+                or info.all_cp_ranks_transfer
+            ):
                 # Only retrieve from prefill CP rank 0 when not using all ranks
                 target_cp_ranks = target_cp_ranks[:1]
                 required_prefill_response_num *= 1
@@ -385,10 +524,10 @@ class CommonKVManager(BaseKVManager):
         bootstrap_na = NetworkAddress(host, self.bootstrap_port)
         url = f"{bootstrap_na.to_url()}/route"
         payload = {
-            "attn_tp_size": self.attn_tp_size,
-            "attn_tp_rank": self.attn_tp_rank,
-            "attn_cp_size": self.attn_cp_size,
-            "attn_cp_rank": self.attn_cp_rank,
+            "attn_tp_size": self.routing_attn_tp_size,
+            "attn_tp_rank": self.routing_attn_tp_rank,
+            "attn_cp_size": self.routing_attn_cp_size,
+            "attn_cp_rank": self.routing_attn_cp_rank,
             "attn_dp_size": self.attn_dp_size,
             "attn_dp_rank": self.attn_dp_rank,
             "pp_size": self.pp_size,
@@ -400,6 +539,7 @@ class CommonKVManager(BaseKVManager):
             "page_size": self.kv_args.page_size,
             "kv_cache_dtype": self.server_args.kv_cache_dtype,
             "load_balance_method": self.server_args.load_balance_method,
+            "all_cp_ranks_transfer": self.enable_all_cp_ranks_for_transfer,
         }
 
         max_retries, initial_delay, max_delay = 5, 1.0, 30.0
@@ -946,6 +1086,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         self.page_size = None
         self.kv_cache_dtype: Optional[str] = None
         self.follow_bootstrap_room: Optional[bool] = None
+        self.all_cp_ranks_transfer: Optional[bool] = None
         self.prefill_port_table: Dict[
             int, Dict[int, Dict[int, Dict[int, PrefillRankInfo]]]
         ] = {}
@@ -1012,6 +1153,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         rank_port = int(data["rank_port"])
         page_size = int(data["page_size"])
         kv_cache_dtype = data["kv_cache_dtype"]
+        all_cp_ranks_transfer = bool(data.get("all_cp_ranks_transfer", False))
 
         if self.attn_tp_size is None:
             self.attn_tp_size = attn_tp_size
@@ -1036,6 +1178,9 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                 "load_balance_method", "follow_bootstrap_room"
             )
             self.follow_bootstrap_room = load_balance_method == "follow_bootstrap_room"
+
+        if self.all_cp_ranks_transfer is None:
+            self.all_cp_ranks_transfer = all_cp_ranks_transfer
 
         if system_dp_size == 1:
             dp_group = attn_dp_rank
@@ -1099,6 +1244,11 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                     self.follow_bootstrap_room
                     if self.follow_bootstrap_room is not None
                     else True
+                ),
+                all_cp_ranks_transfer=(
+                    self.all_cp_ranks_transfer
+                    if self.all_cp_ranks_transfer is not None
+                    else False
                 ),
             )
             return web.json_response(dataclasses.asdict(info), status=200)

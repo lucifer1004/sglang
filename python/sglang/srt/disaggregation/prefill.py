@@ -55,6 +55,7 @@ from sglang.srt.mem_cache.common import (
     maybe_cache_unfinished_req,
     release_kv_cache,
 )
+from sglang.srt.mem_cache.cp_sharded_allocator import CPShardedKVPoolAllocator
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.hicache_storage import (
     hicache_gib_per_s,
@@ -210,6 +211,9 @@ class PrefillBootstrapQueue:
             DisaggregationMode.PREFILL,
             self.scheduler.server_args,
             self.is_mla_backend,
+        )
+        kv_manager.token_to_kv_pool_allocator = (
+            self.scheduler.token_to_kv_pool_allocator
         )
         # Pass KV pool tensor refs to the manager for GPU gather (staging mode)
         if (
@@ -892,6 +896,12 @@ class SchedulerDisaggregationPrefillMixin:
                 window_kv_indices_full = self.req_to_token_pool.req_to_token[
                     req.req_pool_idx, window_start:seq_len
                 ]
+                if isinstance(
+                    self.token_to_kv_pool_allocator, CPShardedKVPoolAllocator
+                ):
+                    return kv_to_page_indices(
+                        window_kv_indices_full.cpu().numpy(), page_size
+                    )
                 window_kv_indices_swa = (
                     self.token_to_kv_pool_allocator.translate_loc_from_full_to_swa(
                         window_kv_indices_full

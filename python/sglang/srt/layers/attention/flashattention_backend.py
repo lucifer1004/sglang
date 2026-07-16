@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
@@ -21,11 +22,21 @@ from sglang.srt.layers.attention.attncp_fused_ops import (
     attncp_sharded_kv_local_cap,
 )
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.layers.attention.cp_sharded_kv import (
+    CPShardedKVPageTableResolver,
+    CPShardedKVPrefillPlan,
+    build_cp_prefill_swa_gather_plan,
+    build_cp_sharded_kv_prefill_plan,
+    gather_cp_prefill_kv,
+    gather_cp_prefill_swa_kv,
+)
+from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.layers.utils.cp_utils import (
     cp_allgather_and_save_kv_cache,
     cp_attn_forward_extend,
     is_cp_kv_sharded,
+    is_decode_cp_kv_sharded,
 )
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
@@ -72,6 +83,8 @@ _ATTNCP_DECODE_CP2_FUSED_MERGE_ENV = "SGLANG_ATTNCP_DECODE_CP2_FUSED_MERGE"
 _ATTNCP_DEBUG_METADATA_CHECKS_ENV = "SGLANG_ATTNCP_DEBUG_METADATA_CHECKS"
 _ATTNCP_DECODE_CP2_FUSED_Q_FA_MIN_SEQ_CAP = 16384
 
+logger = logging.getLogger(__name__)
+
 
 def _env_flag_enabled(name: str, default: bool) -> bool:
     value = os.getenv(name)
@@ -94,6 +107,32 @@ def _is_welm_v4_model(model_config) -> bool:
     )
     return bool(
         architectures and any(arch in _WELM_V4_ARCHITECTURES for arch in architectures)
+    )
+
+
+def _should_use_prefill_cp_kv_ipc(model_runner) -> bool:
+    server_args = model_runner.server_args
+    return (
+        _is_welm_v4_model(model_runner.model_config)
+        and model_runner.attn_cp_size == 4
+        and server_args.attn_cp_mode == "sharded-kv"
+        and getattr(server_args, "disaggregation_mode", "null") != "decode"
+    )
+
+
+def _attncp_decode_fused_q_fa_active(server_args) -> bool:
+    return bool(getattr(server_args, "attn_cp_decode_fused_q_fa", False)) and (
+        getattr(server_args, "disaggregation_mode", "null") != "prefill"
+    )
+
+
+def _get_local_attention_head_counts(
+    model_config, tp_size: Optional[int] = None
+) -> tuple[int, int]:
+    tp_size = get_attention_tp_size() if tp_size is None else tp_size
+    return (
+        model_config.hf_text_config.num_attention_heads // tp_size,
+        model_config.get_num_kv_heads(tp_size),
     )
 
 
@@ -162,6 +201,8 @@ class FlashAttentionMetadata:
     cp_swa_local_page_table: torch.Tensor = None
     cp_swa_local_page_start_offsets: torch.Tensor = None
     cp_swa_local_page_token_counts: torch.Tensor = None
+    cp_sharded_kv_prefill_plan: Optional[CPShardedKVPrefillPlan] = None
+    cp_sharded_kv_prefill_plan_initialized: bool = False
     requires_exact_logprob: bool = False
     has_empty_cp_shard: bool = False
 
@@ -207,6 +248,7 @@ class FlashAttentionBackend(AttentionBackend):
         fa_impl_ver=3,
     ):
         super().__init__()
+        server_args = model_runner.server_args
 
         assert not (
             model_runner.sliding_window_size is not None
@@ -222,6 +264,10 @@ class FlashAttentionBackend(AttentionBackend):
         self.decode_cuda_graph_metadata = {}
         self.target_verify_metadata = {}
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
+        self.token_to_kv_pool_allocator = model_runner.token_to_kv_pool_allocator
+        self.cp_sharded_page_table_resolver = CPShardedKVPageTableResolver(
+            self.token_to_kv_pool_allocator
+        )
         self.kv_cache_dtype = model_runner.kv_cache_dtype
         self.kv_cache_dtype_str = model_runner.server_args.kv_cache_dtype
         self.page_size = model_runner.page_size
@@ -252,6 +298,17 @@ class FlashAttentionBackend(AttentionBackend):
                 "attn_cp_decode_fused_q_fa",
                 False,
             )
+        )
+        if (
+            attn_cp_decode_fused_q_fa_requested
+            and not _attncp_decode_fused_q_fa_active(model_runner.server_args)
+        ):
+            logger.info_once(
+                "Ignoring decode-only --attn-cp-decode-fused-q-fa on the "
+                "disaggregated Prefill role."
+            )
+        attn_cp_decode_fused_q_fa_requested = (
+            _attncp_decode_fused_q_fa_active(model_runner.server_args)
         )
         self.enable_attn_cp_decode_cp2_q_p2p = (
             self.enable_attn_cp_decode_local_merge
@@ -386,13 +443,90 @@ class FlashAttentionBackend(AttentionBackend):
 
         # Store head info for precomputing FA3 scheduler metadata
         self.head_dim = model_runner.model_config.head_dim
-        self.num_attention_heads = (
-            model_runner.model_config.hf_text_config.num_attention_heads
-            // model_runner.tp_size
-        )
-        self.num_kv_heads = model_runner.model_config.get_num_kv_heads(
+        projection_tp_size = (
             model_runner.tp_size
+            if is_decode_cp_kv_sharded(model_runner.server_args)
+            else get_attention_tp_size()
         )
+        self.num_attention_heads, self.num_kv_heads = (
+            _get_local_attention_head_counts(
+                model_runner.model_config, tp_size=projection_tp_size
+            )
+        )
+        self.prefill_cp_kv_ipc_transport = None
+        use_prefill_cp_kv_ipc = _should_use_prefill_cp_kv_ipc(model_runner)
+        if use_prefill_cp_kv_ipc:
+            if not self.is_attn_cp_sharded_kv:
+                raise RuntimeError(
+                    "Automatic Prefill CP K/V IPC was selected outside "
+                    "sharded-KV AttnCP"
+                )
+            if getattr(server_args, "nnodes", 1) != 1:
+                raise RuntimeError(
+                    "Automatic Prefill CP K/V IPC requires single-node serving"
+                )
+            if getattr(server_args, "enable_two_batch_overlap", False) or getattr(
+                server_args, "enable_pdmux", False
+            ):
+                raise RuntimeError(
+                    "Automatic Prefill CP K/V IPC requires one model forward "
+                    "stream and does not support TBO or PD multiplexing"
+                )
+            if torch.device(model_runner.device).type != "cuda":
+                raise RuntimeError("Automatic Prefill CP K/V IPC requires CUDA")
+            if self.kv_cache_dtype != torch.bfloat16:
+                raise RuntimeError(
+                    "Automatic Prefill CP K/V IPC requires the resolved KV dtype BF16"
+                )
+            v_head_dim = (
+                getattr(model_runner.model_config, "v_head_dim", None)
+                or self.head_dim
+            )
+            k_row_width = self.num_kv_heads * self.head_dim
+            v_row_width = self.num_kv_heads * v_head_dim
+            if k_row_width != 256 or v_row_width != 256:
+                raise RuntimeError(
+                    "Automatic Prefill CP K/V IPC requires one local "
+                    "256-element K/V row"
+                )
+            transport = getattr(
+                model_runner, "_prefill_cp_kv_ipc_transport", None
+            )
+            if transport is None:
+                from sglang.srt.layers.attention.prefill_cp_kv_ipc import (
+                    CPKVIPCSourcePushTransport,
+                )
+
+                transport = CPKVIPCSourcePushTransport(
+                    cp_group=get_sharded_kv_cp_group(),
+                    device=model_runner.device,
+                    max_rows=self.max_context_len,
+                    row_width=k_row_width,
+                )
+                model_runner._prefill_cp_kv_ipc_transport = transport
+                logger.info(
+                    "Using automatic Prefill CP K/V IPC source-push: CP4, BF16, "
+                    "row_width=256, arena_bytes=%d",
+                    transport.layout.arena_bytes,
+                )
+            elif (
+                transport.layout.max_rows != self.max_context_len
+                or transport.layout.row_width != k_row_width
+            ):
+                raise RuntimeError(
+                    "Prefill CP K/V IPC transport shape differs across "
+                    "attention backends"
+                )
+            self.prefill_cp_kv_ipc_transport = transport
+        if (
+            self.enable_attn_cp_decode_cp2_fused_q_fa
+            and model_runner.server_args.disaggregation_mode != "prefill"
+        ):
+            self._require_attncp_fused_q_fa_shape(
+                local_q_heads=self.num_attention_heads,
+                local_kv_heads=self.num_kv_heads,
+                cp_world_size=self.attn_cp_size,
+            )
         _softcapping = getattr(
             model_runner.model_config.hf_text_config, "attn_logit_softcapping", None
         )
@@ -419,7 +553,6 @@ class FlashAttentionBackend(AttentionBackend):
         # guard wraps both set_kv_buffer and set_mla_kv_buffer. Without this
         # gate, MLA + is_embedding would skip the write but still read stale
         # cache via get_key_buffer in the absorbed-MLA path.
-        server_args = model_runner.server_args
         self.fa_skip_kv_cache = (
             server_args.is_embedding
             and server_args.chunked_prefill_size == -1
@@ -435,6 +568,18 @@ class FlashAttentionBackend(AttentionBackend):
         # unset uses the existing per-layer metadata path.
         self._disable_scheduler_metadata_precompute = bool(
             getattr(server_args, "enable_dp_attention", False)
+        )
+
+    def _translate_sharded_logical_page_table(
+        self, page_table: torch.Tensor
+    ) -> torch.Tensor:
+        return self.cp_sharded_page_table_resolver.resolve_full(page_table)
+
+    def _resolve_sharded_logical_swa_page_table(
+        self, logical_full_pages: torch.Tensor
+    ) -> torch.Tensor:
+        return self.cp_sharded_page_table_resolver.resolve_swa_pages(
+            logical_full_pages
         )
 
     def _compute_scheduler_metadata(
@@ -472,11 +617,15 @@ class FlashAttentionBackend(AttentionBackend):
         cache_seqlens: torch.Tensor,
         key_cache: torch.Tensor,
         value_cache: torch.Tensor,
+        *,
+        page_table_is_physical: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Reconstruct a temporary dense full-KV table from sharded KV slots."""
         if page_table is None:
             raise RuntimeError("CP sharded-KV gathered attention missing page_table")
 
+        if not page_table_is_physical:
+            page_table = self._translate_sharded_logical_page_table(page_table)
         slots = page_table.to(dtype=torch.long)
         batch_size = slots.shape[0]
         if self.page_size == 1:
@@ -543,6 +692,53 @@ class FlashAttentionBackend(AttentionBackend):
         # dense K/V pages above. Keeping the original page size avoids changing
         # FA3 scheduling and numerics in the correctness fallback.
         return full_k, full_v, dense_page_table
+
+    def _set_sharded_kv_prefill_plan(
+        self,
+        metadata: FlashAttentionMetadata,
+        forward_batch: ForwardBatch,
+    ) -> None:
+        if metadata.cp_sharded_kv_prefill_plan_initialized:
+            return
+        metadata.cp_sharded_kv_prefill_plan = build_cp_sharded_kv_prefill_plan(
+            logical_page_table=metadata.page_table,
+            cache_seqlens=metadata.cache_seqlens_int32,
+            prefix_lens=forward_batch.extend_prefix_lens_cpu,
+            seq_lens=forward_batch.seq_lens_cpu,
+            page_size=self.page_size,
+        )
+        metadata.cp_sharded_kv_prefill_plan_initialized = True
+
+    def _gather_sharded_kv_dense_prefill_split(
+        self,
+        plan: Optional[CPShardedKVPrefillPlan],
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+    ) -> Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]:
+        """Gather prefix and extend KV separately for sharded-KV prefill."""
+        if plan is None:
+            return None
+
+        prefix_k, prefix_v, _ = self._gather_sharded_kv_dense(
+            plan.prefix.logical_page_table,
+            plan.prefix.cache_seqlens,
+            key_cache,
+            value_cache,
+        )
+        extend_k, extend_v, _ = self._gather_sharded_kv_dense(
+            plan.extend.logical_page_table,
+            plan.extend.cache_seqlens,
+            key_cache,
+            value_cache,
+        )
+        dense_k = torch.cat((prefix_k, extend_k), dim=1).contiguous()
+        dense_v = torch.cat((prefix_v, extend_v), dim=1).contiguous()
+        dense_page_table = torch.arange(
+            plan.total_page_columns,
+            dtype=torch.int32,
+            device=plan.prefix.logical_page_table.device,
+        ).view(1, plan.total_page_columns)
+        return dense_k, dense_v, dense_page_table, plan.full_cache_seqlens
 
     @staticmethod
     def _attncp_forward_batch_requires_exact_logprob(
@@ -622,18 +818,27 @@ class FlashAttentionBackend(AttentionBackend):
         key_cache: torch.Tensor,
         value_cache: torch.Tensor,
         window_left: int,
+        *,
+        page_table_is_physical: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Reconstruct compact K/V while preserving full logical positions."""
         if page_table is None:
             raise RuntimeError("CP sharded-KV gathered attention missing page_table")
 
+        raw_page_table = page_table
+        if not page_table_is_physical:
+            page_table = self._translate_sharded_logical_page_table(page_table)
         slots = page_table.to(dtype=torch.long)
         batch_size, max_pages = slots.shape
         max_seq_len = max_pages * self.page_size
         window_tokens = int(window_left) + 1
         if window_tokens <= 0 or window_tokens >= max_seq_len:
             full_k, full_v, dense_page_table = self._gather_sharded_kv_dense(
-                page_table, cache_seqlens, key_cache, value_cache
+                raw_page_table,
+                cache_seqlens,
+                key_cache,
+                value_cache,
+                page_table_is_physical=page_table_is_physical,
             )
             return full_k, full_v, dense_page_table, cache_seqlens
 
@@ -753,6 +958,7 @@ class FlashAttentionBackend(AttentionBackend):
         if page_table is None:
             raise RuntimeError("CP sharded-KV decode missing page_table")
 
+        page_table = self._translate_sharded_logical_page_table(page_table)
         slots = page_table.to(dtype=torch.int32)
         max_pages = slots.shape[1]
         max_seq_len = max_pages * self.page_size
@@ -824,7 +1030,9 @@ class FlashAttentionBackend(AttentionBackend):
             return None
         return window_tokens
 
-    def _is_swa_kv_pool_layer(self, layer: RadixAttention, token_to_kv_pool) -> bool:
+    def _is_swa_kv_pool_layer(
+        self, layer: RadixAttention, token_to_kv_pool
+    ) -> bool:
         if self.use_sliding_window_kv_pool:
             is_swa_layer = getattr(token_to_kv_pool, "is_swa_layer", None)
             if not callable(is_swa_layer):
@@ -832,7 +1040,10 @@ class FlashAttentionBackend(AttentionBackend):
                     "Hybrid SWA KV pool must expose is_swa_layer(layer_id)"
                 )
             return bool(is_swa_layer(layer.layer_id))
-        return layer.sliding_window_size is not None and layer.sliding_window_size > -1
+        return (
+            layer.sliding_window_size is not None
+            and layer.sliding_window_size > -1
+        )
 
     def _set_decode_swa_metadata(
         self,
@@ -892,9 +1103,9 @@ class FlashAttentionBackend(AttentionBackend):
         cache_lens_long = cache_seqlens.to(torch.long)
         window_start = torch.clamp(cache_lens_long - window_tokens, min=0)
         first_page = torch.div(window_start, self.page_size, rounding_mode="floor")
-        relative_cache_seqlens = (cache_lens_long - first_page * self.page_size).to(
-            torch.int32
-        )
+        relative_cache_seqlens = (
+            cache_lens_long - first_page * self.page_size
+        ).to(torch.int32)
 
         if compact_cap > 0:
             page_offsets = torch.arange(
@@ -902,7 +1113,9 @@ class FlashAttentionBackend(AttentionBackend):
             ).unsqueeze(0)
             page_cols = first_page.unsqueeze(1) + page_offsets
             valid = page_cols < table_len
-            valid = valid & (page_cols * self.page_size < cache_lens_long.unsqueeze(1))
+            valid = valid & (
+                page_cols * self.page_size < cache_lens_long.unsqueeze(1)
+            )
             safe_cols = torch.where(valid, page_cols, torch.zeros_like(page_cols))
             row_indices = torch.arange(
                 batch_size, device=slots.device, dtype=torch.long
@@ -943,7 +1156,7 @@ class FlashAttentionBackend(AttentionBackend):
         out_page_start_offsets: Optional[torch.Tensor] = None,
         out_page_token_counts: Optional[torch.Tensor] = None,
     ) -> None:
-        """Compact local CP-owned KV slots inside the global SWA decode window."""
+        """Compact physical SWA pages inside the global CP decode window."""
         window_tokens = self._attncp_swa_window_tokens()
         if window_tokens is None:
             return
@@ -1038,7 +1251,9 @@ class FlashAttentionBackend(AttentionBackend):
             ).unsqueeze(0)
             cache_lens_long = cache_seqlens.to(torch.long)
             window_start = torch.clamp(cache_lens_long - window_tokens, min=0)
-            first_page = torch.div(window_start, self.page_size, rounding_mode="floor")
+            first_page = torch.div(
+                window_start, self.page_size, rounding_mode="floor"
+            )
             page_cols = first_page.unsqueeze(1) + page_offsets
             valid_page = page_cols < table_len
             page_token_start = page_cols * self.page_size
@@ -1143,43 +1358,24 @@ class FlashAttentionBackend(AttentionBackend):
         local_page_table = (
             page_table if page_table is not None else metadata.swa_page_table
         )
-
-        # The captured kernel keeps the capture bucket's table width. Clear the
-        # full replay buffers so a narrower request cannot observe stale pages.
-        self.decode_cuda_graph_metadata["cp_swa_local_page_table"][:bs].zero_()
-        if "cp_swa_local_page_start_offsets" in self.decode_cuda_graph_metadata:
-            self.decode_cuda_graph_metadata["cp_swa_local_page_start_offsets"][
-                :bs
-            ].zero_()
-        if "cp_swa_local_page_token_counts" in self.decode_cuda_graph_metadata:
-            self.decode_cuda_graph_metadata["cp_swa_local_page_token_counts"][
-                :bs
-            ].zero_()
-
         self._set_sharded_kv_decode_swa_metadata(
             metadata,
             local_page_table,
             metadata.cache_seqlens_int32,
-            out_page_table=self.decode_cuda_graph_metadata["cp_swa_local_page_table"][
-                :bs
-            ],
+            out_page_table=self.decode_cuda_graph_metadata["cp_swa_local_page_table"][:bs],
             out_cache_seqlens=self.decode_cuda_graph_metadata[
                 "cp_swa_local_cache_seqlens"
             ][:bs],
-            out_page_start_offsets=(
-                self.decode_cuda_graph_metadata.get("cp_swa_local_page_start_offsets")[
-                    :bs
-                ]
-                if "cp_swa_local_page_start_offsets" in self.decode_cuda_graph_metadata
-                else None
-            ),
-            out_page_token_counts=(
-                self.decode_cuda_graph_metadata.get("cp_swa_local_page_token_counts")[
-                    :bs
-                ]
-                if "cp_swa_local_page_token_counts" in self.decode_cuda_graph_metadata
-                else None
-            ),
+            out_page_start_offsets=self.decode_cuda_graph_metadata.get(
+                "cp_swa_local_page_start_offsets"
+            )[:bs]
+            if "cp_swa_local_page_start_offsets" in self.decode_cuda_graph_metadata
+            else None,
+            out_page_token_counts=self.decode_cuda_graph_metadata.get(
+                "cp_swa_local_page_token_counts"
+            )[:bs]
+            if "cp_swa_local_page_token_counts" in self.decode_cuda_graph_metadata
+            else None,
         )
 
     def _build_attn_cp_local_merge_workspace(
@@ -1269,7 +1465,9 @@ class FlashAttentionBackend(AttentionBackend):
             )
 
         if self.enable_attn_cp_decode_cp2_fused_q_fa:
-            max_splits = attncp_cp2_fused_q_fa_max_splits(self.cuda_graph_max_seq_len)
+            max_splits = attncp_cp2_fused_q_fa_max_splits(
+                self.cuda_graph_max_seq_len
+            )
             local_merge_workspace["fused_q_fa_split_o"] = torch.empty(
                 max_splits,
                 max_bs,
@@ -1381,9 +1579,31 @@ class FlashAttentionBackend(AttentionBackend):
         head_dim = q_local.shape[2]
         q_gather = q_gather[: cp_group.world_size * batch_size]
         cp_group.all_gather_into_tensor(q_gather, q_local.contiguous())
-        q_view = q_gather.view(cp_group.world_size, batch_size, local_q_heads, head_dim)
+        q_view = q_gather.view(
+            cp_group.world_size, batch_size, local_q_heads, head_dim
+        )
         q_peer.copy_(q_view[peer_rank])
         return q_peer
+
+    @staticmethod
+    def _require_attncp_fused_q_fa_shape(
+        *,
+        local_q_heads: int,
+        local_kv_heads: int,
+        cp_world_size: int,
+    ) -> None:
+        if attncp_cp2_fused_q_fa_supports_shape(
+            local_q_heads,
+            local_kv_heads,
+            cp_world_size=cp_world_size,
+        ):
+            return
+        raise RuntimeError(
+            "Requested --attn-cp-decode-fused-q-fa does not support the "
+            "runtime attention head shape: "
+            f"local_q_heads={local_q_heads}, "
+            f"local_kv_heads={local_kv_heads}, cp_size={cp_world_size}."
+        )
 
     def _attncp_try_fused_q_fa_decode(
         self,
@@ -1421,8 +1641,11 @@ class FlashAttentionBackend(AttentionBackend):
         ):
             return None
         cp_group = get_sharded_kv_cp_group()
-        if cp_group.world_size != 2:
-            return None
+        self._require_attncp_fused_q_fa_shape(
+            local_q_heads=local_q_heads,
+            local_kv_heads=int(key_cache.shape[2]),
+            cp_world_size=cp_group.world_size,
+        )
         has_page_mask = (
             local_page_start_offsets is not None or local_page_token_counts is not None
         )
@@ -1432,12 +1655,6 @@ class FlashAttentionBackend(AttentionBackend):
             self.page_size != 16
             or local_page_start_offsets is None
             or local_page_token_counts is None
-        ):
-            return None
-        if not attncp_cp2_fused_q_fa_supports_shape(
-            local_q_heads,
-            int(key_cache.shape[2]),
-            cp_world_size=cp_group.world_size,
         ):
             return None
         if metadata.max_seq_len_q != 1:
@@ -1520,16 +1737,18 @@ class FlashAttentionBackend(AttentionBackend):
                 head_start = cp_rank * local_q_heads
                 peer_head_start = peer_rank * local_q_heads
                 q_peer = bufs["q_peer"][:batch_size, :local_q_heads, :]
-                q_full = bufs["q_full"][:batch_size, : local_q_heads * cp_world_size, :]
+                q_full = bufs["q_full"][
+                    :batch_size, : local_q_heads * cp_world_size, :
+                ]
                 with pynccl_comm.change_state(enable=True):
                     pynccl_comm.group_start()
                     pynccl_comm.recv(q_peer, peer_rank)
                     pynccl_comm.send(q_local, peer_rank)
                     pynccl_comm.group_end()
                 q_full[:, head_start : head_start + local_q_heads, :].copy_(q_local)
-                q_full[:, peer_head_start : peer_head_start + local_q_heads, :].copy_(
-                    q_peer
-                )
+                q_full[
+                    :, peer_head_start : peer_head_start + local_q_heads, :
+                ].copy_(q_peer)
                 return q_full
 
         q_gather = bufs["q_gather"][: cp_world_size * batch_size]
@@ -1800,9 +2019,7 @@ class FlashAttentionBackend(AttentionBackend):
             local_cache_seqlens = metadata.cp_local_cache_seqlens_int32
         if local_page_table is None or local_cache_seqlens is None:
             raise RuntimeError("CP sharded-KV decode missing local shard metadata")
-        attn_window_size = (
-            window_size if local_window_size is None else local_window_size
-        )
+        attn_window_size = window_size if local_window_size is None else local_window_size
 
         cp_group = get_sharded_kv_cp_group()
         cp_world_size = cp_group.world_size
@@ -1898,7 +2115,9 @@ class FlashAttentionBackend(AttentionBackend):
         )
 
         o_gather = bufs["o_gather"][: cp_world_size * batch_size, :full_q_heads, :]
-        lse_gather = bufs["lse_gather"][: cp_world_size * batch_size, :full_q_heads]
+        lse_gather = bufs["lse_gather"][
+            : cp_world_size * batch_size, :full_q_heads
+        ]
         cp2_exchange = self._attncp_exchange_cp2_local_head_slice(
             bufs,
             local_o_full,
@@ -1953,6 +2172,8 @@ class FlashAttentionBackend(AttentionBackend):
         cu_seqlens_k: Optional[torch.Tensor] = None,
         out: Optional[torch.Tensor] = None,
         scheduler_metadata: Optional[torch.Tensor] = None,
+        prefill_plan: Optional[CPShardedKVPrefillPlan] = None,
+        page_table_is_physical: bool = False,
     ) -> torch.Tensor:
         window_left = window_size[0] if window_size is not None else -1
         if (
@@ -1967,16 +2188,37 @@ class FlashAttentionBackend(AttentionBackend):
                     key_cache,
                     value_cache,
                     window_left,
+                    page_table_is_physical=page_table_is_physical,
                 )
             )
         else:
-            dense_k, dense_v, dense_page_table = self._gather_sharded_kv_dense(
-                page_table,
-                cache_seqlens,
-                key_cache,
-                value_cache,
-            )
-            dense_cache_seqlens = cache_seqlens
+            split_gather = None
+            if (
+                cu_seqlens_k is not None
+                and (window_size is None or window_left < 0)
+                and prefill_plan is not None
+            ):
+                split_gather = self._gather_sharded_kv_dense_prefill_split(
+                    prefill_plan,
+                    key_cache,
+                    value_cache,
+                )
+            if split_gather is None:
+                dense_k, dense_v, dense_page_table = self._gather_sharded_kv_dense(
+                    page_table,
+                    cache_seqlens,
+                    key_cache,
+                    value_cache,
+                    page_table_is_physical=page_table_is_physical,
+                )
+                dense_cache_seqlens = cache_seqlens
+            else:
+                (
+                    dense_k,
+                    dense_v,
+                    dense_page_table,
+                    dense_cache_seqlens,
+                ) = split_gather
 
         dense_page_size = self.page_size if dense_k.dim() == 5 else 1
         if dense_page_size != self.page_size:
@@ -2057,9 +2299,7 @@ class FlashAttentionBackend(AttentionBackend):
             local_cache_seqlens = metadata.cp_local_cache_seqlens_int32
         if local_page_table is None or local_cache_seqlens is None:
             raise RuntimeError("CP sharded-KV decode missing local shard metadata")
-        attn_window_size = (
-            window_size if local_window_size is None else local_window_size
-        )
+        attn_window_size = window_size if local_window_size is None else local_window_size
 
         cp_group = get_sharded_kv_cp_group()
         cp_world_size = cp_group.world_size
@@ -2174,6 +2414,7 @@ class FlashAttentionBackend(AttentionBackend):
         out: Optional[torch.Tensor] = None,
         scheduler_metadata: Optional[torch.Tensor] = None,
         page_table: Optional[torch.Tensor] = None,
+        page_table_is_physical: bool = False,
     ) -> torch.Tensor:
         """Run sharded-KV decode without materializing full KV."""
         q_local = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
@@ -2203,6 +2444,7 @@ class FlashAttentionBackend(AttentionBackend):
                 kwargs=kwargs,
                 out=out,
                 scheduler_metadata=scheduler_metadata,
+                page_table_is_physical=page_table_is_physical,
             )
 
         local_page_table = metadata.cp_local_page_table
@@ -2296,11 +2538,14 @@ class FlashAttentionBackend(AttentionBackend):
             kwargs=kwargs,
             out=out,
             scheduler_metadata=scheduler_metadata,
+            page_table_is_physical=page_table_is_physical,
         )
 
     def _forward_extend_sharded_kv(
         self,
         q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
         layer: RadixAttention,
         forward_batch: ForwardBatch,
         metadata: FlashAttentionMetadata,
@@ -2324,16 +2569,37 @@ class FlashAttentionBackend(AttentionBackend):
                 "CP sharded-KV prefill does not support cross attention"
             )
 
+        runtime_layout = getattr(
+            forward_batch, "attn_cp_prefill_runtime_layout", None
+        )
+        if runtime_layout is not None:
+            return self._forward_extend_sharded_kv_compact(
+                q,
+                k,
+                v,
+                layer,
+                forward_batch,
+                key_cache,
+                value_cache,
+                use_welm_custom_last_q=use_welm_custom_last_q,
+                window_size=window_size,
+                causal=causal,
+                kwargs=kwargs,
+            )
+
         q_local = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
         if q_local.shape[0] == 0:
             return q.new_empty((0, layer.tp_q_head_num * layer.v_head_dim))
 
         page_table = metadata.page_table if page_table is None else page_table
+        if page_table.shape[0] != 1:
+            raise NotImplementedError(
+                "CP sharded-KV prefill currently requires batch_size=1"
+            )
         cache_seqlens = metadata.cache_seqlens_int32
         cu_seqlens_q = metadata.cu_seqlens_q
         cu_seqlens_k = metadata.cu_seqlens_k
         max_seqlen_q = metadata.max_seq_len_q
-
         if use_welm_custom_last_q:
             cu_seqlens_q = metadata.mirror_cu_seqlens_q
             max_seqlen_q = metadata.mirror_max_seq_len_q
@@ -2344,15 +2610,7 @@ class FlashAttentionBackend(AttentionBackend):
                 active_indices is not None
                 and active_indices.numel() != metadata.page_table.shape[0]
             ):
-                if page_table.shape[0] == metadata.page_table.shape[0]:
-                    page_table = page_table[active_indices]
-                elif page_table.shape[0] != active_indices.numel():
-                    raise RuntimeError(
-                        "CP sharded-KV prefill has inconsistent KV-mirror rows: "
-                        f"page_table_rows={page_table.shape[0]}, "
-                        f"full_rows={metadata.page_table.shape[0]}, "
-                        f"active_rows={active_indices.numel()}"
-                    )
+                page_table = page_table[active_indices]
                 cache_seqlens = cache_seqlens[active_indices]
                 cu_seqlens_k = torch.nn.functional.pad(
                     torch.cumsum(cache_seqlens, dim=0, dtype=torch.int32), (1, 0)
@@ -2379,10 +2637,432 @@ class FlashAttentionBackend(AttentionBackend):
             causal=causal,
             kwargs=kwargs,
             cu_seqlens_k=cu_seqlens_k,
+            prefill_plan=metadata.cp_sharded_kv_prefill_plan,
         )
+
+    @staticmethod
+    def _get_cp_prefill_swa_gather_plan(
+        forward_batch: ForwardBatch,
+        gather_plan,
+        runtime_layout,
+        *,
+        window_left: int,
+    ):
+        cache = getattr(
+            forward_batch, "attn_cp_prefill_swa_kv_gather_plans", None
+        )
+        if cache is None:
+            cache = {}
+            forward_batch.attn_cp_prefill_swa_kv_gather_plans = cache
+        cache_key = (
+            int(window_left),
+            bool(runtime_layout.q_is_contracted),
+            tuple(runtime_layout.active_per_rank_tokens),
+        )
+        plan = cache.get(cache_key)
+        if plan is None:
+            plan = build_cp_prefill_swa_gather_plan(
+                plan=gather_plan,
+                runtime_layout=runtime_layout,
+                window_left=window_left,
+            )
+            cache[cache_key] = plan
+        return plan
+
+    @staticmethod
+    def _read_cp_prefill_prefix_kv(
+        physical_slots: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        page_size: int,
+        *,
+        zero_dummy_slots: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        slots = physical_slots.to(device=key_cache.device, dtype=torch.int64)
+        if zero_dummy_slots and slots.numel() != 0:
+            key_cache[0, 0].zero_()
+            value_cache[0, 0].zero_()
+        pages = torch.div(slots, page_size, rounding_mode="floor")
+        offsets = slots % page_size
+        key = key_cache[pages, offsets].contiguous()
+        value = value_cache[pages, offsets].contiguous()
+        return key, value
+
+    def _forward_extend_sharded_kv_swa_compact(
+        self,
+        q_local: torch.Tensor,
+        k_local: torch.Tensor,
+        v_local: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        runtime_layout,
+        gather_plan,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        *,
+        window_size: tuple[int, int],
+        kwargs: dict,
+    ) -> torch.Tensor:
+        window_left, window_right = window_size
+        if window_left <= 0 or window_right != 0:
+            raise NotImplementedError(
+                "Phase 2 SWA compact gather requires a positive left-only window"
+            )
+        swa_plan = self._get_cp_prefill_swa_gather_plan(
+            forward_batch,
+            gather_plan,
+            runtime_layout,
+            window_left=window_left,
+        )
+
+        prefix_send_indices = swa_plan.prefix.local_send_indices
+        prefix_slots = gather_plan.prefix.local_physical_slots.index_select(
+            0, prefix_send_indices
+        )
+        if prefix_slots.numel() != 0:
+            prefix_slots = self.cp_sharded_page_table_resolver.resolve_swa_slots(
+                prefix_slots
+            )
+            no_dummy = torch.all(prefix_slots != 0)
+            if prefix_slots.device.type == "cpu":
+                if not bool(no_dummy):
+                    raise RuntimeError(
+                        "Phase 2 SWA compact gather selected a missing prefix slot"
+                    )
+            else:
+                torch._assert_async(
+                    no_dummy,
+                    "Phase 2 SWA compact gather selected a missing prefix slot",
+                )
+        packed_prefix_k, packed_prefix_v = self._read_cp_prefill_prefix_kv(
+            prefix_slots,
+            key_cache,
+            value_cache,
+            self.page_size,
+        )
+
+        extend_send_indices = swa_plan.extend.local_send_indices
+        packed_extend_k = k_local.index_select(0, extend_send_indices)
+        packed_extend_v = v_local.index_select(0, extend_send_indices)
+        compact_k, compact_v = gather_cp_prefill_swa_kv(
+            plan=swa_plan,
+            packed_prefix_k=packed_prefix_k,
+            packed_prefix_v=packed_prefix_v,
+            packed_extend_k=packed_extend_k,
+            packed_extend_v=packed_extend_v,
+            cp_group=get_sharded_kv_cp_group(),
+        )
+
+        if runtime_layout.active_local_tokens == 0:
+            if compact_k is not None or compact_v is not None:
+                raise RuntimeError(
+                    "empty-Q CP rank unexpectedly received compact SWA K/V"
+                )
+            return q_local.new_empty(
+                (0, layer.tp_q_head_num * layer.v_head_dim)
+            )
+        if compact_k is None or compact_v is None:
+            raise RuntimeError("active-Q CP rank is missing compact SWA K/V")
+        if (
+            compact_k.shape[0] != swa_plan.compact_token_count
+            or compact_v.shape[0] != swa_plan.compact_token_count
+        ):
+            raise RuntimeError(
+                "Phase 2 SWA compact gather returned an unexpected row count"
+            )
+
+        output = q_local.new_empty(
+            (q_local.shape[0], layer.tp_q_head_num, layer.v_head_dim)
+        )
+        compact_offset = 0
+        for block_index, block in enumerate(runtime_layout.q_blocks):
+            k_count = swa_plan.block_k_lengths[block_index]
+            q_block = q_local.narrow(0, block.local_start, block.token_count)
+            k_block = compact_k.narrow(0, compact_offset, k_count)
+            v_block = compact_v.narrow(0, compact_offset, k_count)
+            out_block = output.narrow(0, block.local_start, block.token_count)
+            block_output = flash_attn_varlen_func(
+                q=q_block,
+                k=k_block,
+                v=v_block,
+                cu_seqlens_q=block.cu_seqlens_q,
+                cu_seqlens_k=swa_plan.block_cu_seqlens_k[block_index],
+                max_seqlen_q=block.token_count,
+                # Preserve FA3 auto-split scheduling and bf16 reduction order.
+                max_seqlen_k=block.visible_kv_end,
+                softmax_scale=layer.scaling,
+                causal=True,
+                window_size=window_size,
+                softcap=layer.logit_cap,
+                num_splits=self.num_splits,
+                ver=self.fa_impl_ver,
+                out=out_block,
+                **kwargs,
+            )
+            if block_output is not out_block:
+                out_block.copy_(block_output)
+            compact_offset += k_count
+        if compact_offset != swa_plan.compact_token_count:
+            raise RuntimeError(
+                "Phase 2 SWA attention did not consume all compact K/V rows"
+            )
+        return output.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+
+    def _forward_extend_sharded_kv_compact(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        *,
+        use_welm_custom_last_q: bool,
+        window_size: tuple[int, int],
+        causal: bool,
+        kwargs: dict,
+    ) -> torch.Tensor:
+        runtime_layout = forward_batch.attn_cp_prefill_runtime_layout
+        gather_plan = getattr(
+            forward_batch, "attn_cp_prefill_kv_gather_plan", None
+        )
+        if gather_plan is None:
+            raise RuntimeError(
+                "Phase 2 sharded-KV prefill is missing its compact gather plan; "
+                "dense fallback is disabled"
+            )
+        if use_welm_custom_last_q and not getattr(
+            runtime_layout, "q_is_contracted", False
+        ):
+            raise RuntimeError(
+                "Phase 2 custom-last-Q attention requires a contracted Q runtime"
+            )
+        if not causal:
+            raise NotImplementedError(
+                "Phase 2 sharded-KV prefill currently requires causal attention"
+            )
+        if self.kv_cache_dtype_str != "auto":
+            raise NotImplementedError(
+                "Phase 2 sharded-KV prefill requires an unquantized KV cache"
+            )
+        if k is None or v is None:
+            raise RuntimeError("Phase 2 sharded-KV prefill requires projected K/V")
+
+        q_local = q.contiguous().view(
+            -1, layer.tp_q_head_num, layer.head_dim
+        )
+        k_local = k.contiguous().view(
+            -1, layer.tp_k_head_num, layer.head_dim
+        )
+        v_local = v.contiguous().view(
+            -1, layer.tp_v_head_num, layer.v_head_dim
+        )
+        expected_q_rows = runtime_layout.active_local_tokens
+        expected_kv_rows = runtime_layout.kv_local_tokens
+        if q_local.shape[0] != expected_q_rows:
+            raise RuntimeError(
+                "Phase 2 Q rows do not match the CP-local runtime layout"
+            )
+        if k_local.shape[0] != expected_kv_rows or v_local.shape[0] != expected_kv_rows:
+            raise RuntimeError(
+                "Phase 2 K/V rows do not match the owner-local runtime layout"
+            )
+
+        if window_size != (-1, -1):
+            return self._forward_extend_sharded_kv_swa_compact(
+                q_local,
+                k_local,
+                v_local,
+                layer,
+                forward_batch,
+                runtime_layout,
+                gather_plan,
+                key_cache,
+                value_cache,
+                window_size=window_size,
+                kwargs=kwargs,
+            )
+
+        destination_ranks = tuple(
+            rank
+            for rank, count in enumerate(
+                runtime_layout.active_tokens_per_cp_rank()
+            )
+            if count != 0
+        )
+        ipc_lease = None
+        prefill_cp_kv_ipc_transport = getattr(
+            self, "prefill_cp_kv_ipc_transport", None
+        )
+        source_push_plan = getattr(
+            forward_batch,
+            "attn_cp_prefill_kv_source_push_plan",
+            None,
+        )
+        if source_push_plan is not None:
+            if prefill_cp_kv_ipc_transport is None:
+                raise RuntimeError(
+                    "Prefill CP K/V IPC source-push plan is missing its transport; "
+                    "NCCL gather fallback is disabled"
+                )
+            expected_kv_rows = (
+                runtime_layout.spec.extend_start + runtime_layout.spec.extend_len
+            )
+            if source_push_plan.logical_token_count != expected_kv_rows:
+                raise RuntimeError(
+                    "Prefill CP K/V IPC source-push plan does not cover the "
+                    "logical attention sequence"
+                )
+            k_row_width = layer.tp_k_head_num * layer.head_dim
+            v_row_width = layer.tp_v_head_num * layer.v_head_dim
+            if k_row_width != v_row_width:
+                raise RuntimeError(
+                    "Prefill CP K/V IPC requires equal K/V row widths"
+                )
+            if not key_cache.is_contiguous() or not value_cache.is_contiguous():
+                raise RuntimeError(
+                    "Prefill CP K/V IPC requires contiguous paged K/V cache"
+                )
+            ipc_lease = prefill_cp_kv_ipc_transport.push(
+                plan=source_push_plan,
+                prefix_key_rows=key_cache.view(-1, k_row_width),
+                prefix_value_rows=value_cache.view(-1, v_row_width),
+                extend_key_rows=k_local.view(-1, k_row_width),
+                extend_value_rows=v_local.view(-1, v_row_width),
+                destination_ranks=destination_ranks,
+            )
+            if ipc_lease is None:
+                full_k = None
+                full_v = None
+            else:
+                full_k = ipc_lease.key.view(
+                    -1, layer.tp_k_head_num, layer.head_dim
+                )
+                full_v = ipc_lease.value.view(
+                    -1, layer.tp_v_head_num, layer.v_head_dim
+                )
+        elif prefill_cp_kv_ipc_transport is not None:
+            raise RuntimeError(
+                "Prefill CP K/V IPC is missing its source-push plan; "
+                "NCCL gather fallback is disabled"
+            )
+        else:
+            prefix_slots = gather_plan.prefix.local_physical_slots
+            local_prefix_k, local_prefix_v = self._read_cp_prefill_prefix_kv(
+                prefix_slots,
+                key_cache,
+                value_cache,
+                self.page_size,
+            )
+            full_k, full_v = gather_cp_prefill_kv(
+                plan=gather_plan,
+                local_prefix_k=local_prefix_k,
+                local_prefix_v=local_prefix_v,
+                local_extend_k=k_local,
+                local_extend_v=v_local,
+                cp_group=get_sharded_kv_cp_group(),
+                destination_ranks=destination_ranks,
+            )
+        try:
+            if runtime_layout.active_local_tokens == 0:
+                if full_k is not None or full_v is not None:
+                    raise RuntimeError(
+                        "empty-Q CP rank unexpectedly received gathered K/V"
+                    )
+                return q_local.new_empty(
+                    (0, layer.tp_q_head_num * layer.v_head_dim)
+                )
+            if full_k is None or full_v is None:
+                raise RuntimeError("active-Q CP rank is missing gathered K/V")
+            expected_kv_rows = (
+                runtime_layout.spec.extend_start + runtime_layout.spec.extend_len
+            )
+            if (
+                full_k.shape[0] != expected_kv_rows
+                or full_v.shape[0] != expected_kv_rows
+            ):
+                raise RuntimeError(
+                    "Phase 2 compact KV gather did not reconstruct the logical sequence"
+                )
+
+            output = q_local.new_empty(
+                (q_local.shape[0], layer.tp_q_head_num, layer.v_head_dim)
+            )
+            for block in runtime_layout.q_blocks:
+                q_block = q_local.narrow(
+                    0, block.local_start, block.token_count
+                )
+                out_block = output.narrow(
+                    0, block.local_start, block.token_count
+                )
+                block_output = flash_attn_varlen_func(
+                    q=q_block,
+                    k=full_k[: block.visible_kv_end],
+                    v=full_v[: block.visible_kv_end],
+                    cu_seqlens_q=block.cu_seqlens_q,
+                    cu_seqlens_k=block.cu_seqlens_k,
+                    max_seqlen_q=block.token_count,
+                    max_seqlen_k=block.visible_kv_end,
+                    softmax_scale=layer.scaling,
+                    causal=True,
+                    window_size=window_size,
+                    softcap=layer.logit_cap,
+                    num_splits=self.num_splits,
+                    ver=self.fa_impl_ver,
+                    out=out_block,
+                    **kwargs,
+                )
+                if block_output is not out_block:
+                    out_block.copy_(block_output)
+            return output.view(
+                -1, layer.tp_q_head_num * layer.v_head_dim
+            )
+        finally:
+            if ipc_lease is not None:
+                ipc_lease.release()
+
+    @staticmethod
+    def _validate_cp_prefill_runtime(forward_batch: ForwardBatch) -> None:
+        if forward_batch.forward_mode != ForwardMode.EXTEND:
+            return
+        split_specs = getattr(
+            forward_batch, "attn_cp_prefill_split_specs", None
+        )
+        phase2_expected = split_specs is not None and any(
+            spec is not None for spec in split_specs
+        )
+        if phase2_expected and getattr(
+            forward_batch, "attn_cp_prefill_runtime_layout", None
+        ) is None:
+            raise RuntimeError(
+                "Phase 2 split spec reached FA3 without a CP-local runtime layout; "
+                "refusing dense fallback"
+            )
+
+    @staticmethod
+    def _validate_cp_prefill_kv_write_mode(
+        runtime_layout,
+        gather_plan,
+        *,
+        save_kv_cache: bool,
+    ) -> None:
+        if save_kv_cache:
+            return
+        prefix_send_only = (
+            runtime_layout.active_local_tokens == 0
+            and getattr(runtime_layout, "kv_local_tokens", 0) == 0
+            and gather_plan.prefix.local_physical_slots.numel() != 0
+        )
+        if not prefix_send_only:
+            raise RuntimeError(
+                "Phase 2 save_kv_cache=False is valid only for a "
+                "prefix-send-only CP rank"
+            )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Initialize forward metadata hence all layers in the forward pass can reuse it."""
+        self._validate_cp_prefill_runtime(forward_batch)
         metadata = FlashAttentionMetadata()
         metadata.requires_exact_logprob = (
             self._attncp_forward_batch_requires_exact_logprob(forward_batch)
@@ -2677,7 +3357,17 @@ class FlashAttentionBackend(AttentionBackend):
                 ),
             ]
 
-        if self.use_sliding_window_kv_pool:
+        uses_compact_cp_prefill = (
+            self.is_attn_cp_sharded_kv
+            and getattr(
+                forward_batch, "attn_cp_prefill_runtime_layout", None
+            )
+            is not None
+        )
+        needs_swa_page_table = (
+            self.use_sliding_window_kv_pool and not uses_compact_cp_prefill
+        )
+        if needs_swa_page_table and not self.is_attn_cp_sharded_kv:
             metadata.swa_page_table = (
                 self.token_to_kv_pool.translate_loc_from_full_to_swa(
                     metadata.page_table
@@ -2690,7 +3380,7 @@ class FlashAttentionBackend(AttentionBackend):
                 0, metadata.page_table.shape[1], self.page_size, device=self.device
             )
 
-            if self.use_sliding_window_kv_pool:
+            if metadata.swa_page_table is not None:
                 metadata.swa_page_table = (
                     metadata.swa_page_table[:, self.strided_indices] // self.page_size
                 )
@@ -2736,6 +3426,22 @@ class FlashAttentionBackend(AttentionBackend):
                     page_size=self.page_size,
                 )
                 self.forward_metadata_spec_decode_expand.page_table = expand_page_table
+
+        if needs_swa_page_table and self.is_attn_cp_sharded_kv:
+            metadata.swa_page_table = self._resolve_sharded_logical_swa_page_table(
+                metadata.page_table
+            )
+
+        if (
+            self.is_attn_cp_sharded_kv
+            and forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed(
+                include_draft_extend_v2=True
+            )
+            and getattr(
+                forward_batch, "attn_cp_prefill_runtime_layout", None
+            ) is None
+        ):
+            self._set_sharded_kv_prefill_plan(metadata, forward_batch)
 
         if (
             self.use_sliding_window_kv_pool
@@ -2823,7 +3529,9 @@ class FlashAttentionBackend(AttentionBackend):
             kwargs["sinks"] = sinks.repeat(sf)
 
         sliding = layer.sliding_window_size
-        window_size = (sliding, 0) if sliding is not None and sliding > 0 else (-1, -1)
+        window_size = (
+            (sliding, 0) if sliding is not None and sliding > 0 else (-1, -1)
+        )
         o = flash_attn_with_kvcache(
             q=q_fold,
             k_cache=key_cache_fold,
@@ -2892,7 +3600,9 @@ class FlashAttentionBackend(AttentionBackend):
             kwargs["sinks"] = sinks
 
         sliding = layer.sliding_window_size
-        window_size = (sliding, 0) if sliding is not None and sliding > 0 else (-1, -1)
+        window_size = (
+            (sliding, 0) if sliding is not None and sliding > 0 else (-1, -1)
+        )
         o = flash_attn_with_kvcache(
             q=q.contiguous().view(-1, n_q_heads, head_dim),
             k_cache=key_cache,
@@ -2911,9 +3621,7 @@ class FlashAttentionBackend(AttentionBackend):
         return o.view(-1, n_q_heads * v_head_dim)
 
     @staticmethod
-    def _is_scp_suffix_layer(
-        layer: RadixAttention, forward_batch: ForwardBatch
-    ) -> bool:
+    def _is_scp_suffix_layer(layer: RadixAttention, forward_batch: ForwardBatch) -> bool:
         if getattr(layer, "scale_seq_attn_per_suffix", False) and getattr(
             layer, "suffix_parallel", False
         ):
@@ -2936,6 +3644,32 @@ class FlashAttentionBackend(AttentionBackend):
         k_rope: Optional[torch.Tensor] = None,
         sinks: Optional[torch.Tensor] = None,
     ):
+        runtime_layout = getattr(
+            forward_batch, "attn_cp_prefill_runtime_layout", None
+        )
+        if runtime_layout is not None:
+            if layer.is_cross_attention:
+                raise NotImplementedError(
+                    "Phase 2 sharded-KV prefill does not support cross attention"
+                )
+            gather_plan = getattr(
+                forward_batch, "attn_cp_prefill_kv_gather_plan", None
+            )
+            if gather_plan is None:
+                raise RuntimeError(
+                    "Phase 2 sharded-KV prefill is missing its compact gather plan; "
+                    "dense fallback is disabled"
+                )
+            self._validate_cp_prefill_kv_write_mode(
+                runtime_layout,
+                gather_plan,
+                save_kv_cache=save_kv_cache,
+            )
+            if self._is_scp_suffix_layer(layer, forward_batch):
+                raise NotImplementedError(
+                    "Phase 2 sharded-KV prefill does not support suffix parallel"
+                )
+
         if self._is_scp_suffix_layer(layer, forward_batch):
             return self._per_suffix_scp_attn_compute(
                 q=q,
@@ -2961,7 +3695,9 @@ class FlashAttentionBackend(AttentionBackend):
 
             if save_kv_cache and not is_cp_mode and not self.fa_skip_kv_cache:
                 cache_loc = (
-                    forward_batch.out_cache_loc
+                    runtime_layout.local_out_cache_loc
+                    if runtime_layout is not None
+                    else forward_batch.out_cache_loc
                     if not layer.is_cross_attention
                     else forward_batch.encoder_out_cache_loc
                 )
@@ -3038,7 +3774,9 @@ class FlashAttentionBackend(AttentionBackend):
         # Calculate window size (can be moved to metadata if layer properties don't change)
         # we don't do layer.sliding_window_size - 1 since in model.get_attention_sliding_window_size() we already - 1
         # here is two side inclusive
-        is_swa_layer = self._is_swa_kv_pool_layer(layer, forward_batch.token_to_kv_pool)
+        is_swa_layer = self._is_swa_kv_pool_layer(
+            layer, forward_batch.token_to_kv_pool
+        )
         window_size = (layer.sliding_window_size, 0) if is_swa_layer else (-1, -1)
         k_descale, v_descale = None, None
         # only use kv scaling if: 1) fp8 kv is explicitly enabled, 2) RadixAttention
@@ -3152,7 +3890,11 @@ class FlashAttentionBackend(AttentionBackend):
             cu_seqlens_k = swa_spec_metadata.cu_seqlens_k
         elif use_welm_custom_last_q:
             page_table = metadata.page_table
-            if is_swa_layer and self.use_sliding_window_kv_pool:
+            if (
+                is_swa_layer
+                and self.use_sliding_window_kv_pool
+                and runtime_layout is None
+            ):
                 if metadata.swa_page_table is None:
                     raise RuntimeError(
                         "Hybrid SWA prefill is missing its translated page table"
@@ -3176,7 +3918,11 @@ class FlashAttentionBackend(AttentionBackend):
                 )
         else:
             page_table = metadata.page_table
-            if is_swa_layer and self.use_sliding_window_kv_pool:
+            if (
+                is_swa_layer
+                and self.use_sliding_window_kv_pool
+                and runtime_layout is None
+            ):
                 if metadata.swa_page_table is None:
                     raise RuntimeError(
                         "Hybrid SWA prefill is missing its translated page table"
@@ -3266,6 +4012,8 @@ class FlashAttentionBackend(AttentionBackend):
                     )
                 result = self._forward_extend_sharded_kv(
                     q,
+                    k,
+                    v,
                     layer,
                     forward_batch,
                     metadata,
@@ -3621,7 +4369,9 @@ class FlashAttentionBackend(AttentionBackend):
         # Calculate window size (can be moved to metadata if layer properties don't change)
         # we don't do layer.sliding_window_size - 1 since in model.get_attention_sliding_window_size() we already - 1
         # here is two side inclusive
-        is_swa_layer = self._is_swa_kv_pool_layer(layer, forward_batch.token_to_kv_pool)
+        is_swa_layer = self._is_swa_kv_pool_layer(
+            layer, forward_batch.token_to_kv_pool
+        )
         window_size = (layer.sliding_window_size, 0) if is_swa_layer else (-1, -1)
 
         causal = True
@@ -3692,23 +4442,18 @@ class FlashAttentionBackend(AttentionBackend):
                         "CP sharded-KV decode does not support FP8 KV descaling"
                     )
 
-                uses_swa_kv_pool = (
-                    is_swa_layer
-                    and int(layer.sliding_window_size) < int(self.max_context_len)
-                    and self.use_sliding_window_kv_pool
-                )
                 page_table = metadata.page_table
-                if uses_swa_kv_pool:
-                    if metadata.swa_page_table is not None:
-                        page_table = metadata.swa_page_table
-                    else:
-                        page_table = (
-                            self.token_to_kv_pool.translate_loc_from_full_to_swa(
-                                metadata.page_table
-                            )
+                page_table_is_physical = False
+                if is_swa_layer and self.use_sliding_window_kv_pool:
+                    if metadata.swa_page_table is None:
+                        raise RuntimeError(
+                            "CP sharded-KV Decode is missing its resolved physical "
+                            "SWA page table"
                         )
+                    page_table = metadata.swa_page_table
+                    page_table_is_physical = True
                 sched_meta = None
-                if metadata.scheduler_metadata is not None and not uses_swa_kv_pool:
+                if metadata.scheduler_metadata is not None and not is_swa_layer:
                     sched_meta = metadata.scheduler_metadata
                 o = self._forward_decode_sharded_kv(
                     q,
@@ -3722,6 +4467,7 @@ class FlashAttentionBackend(AttentionBackend):
                     out=_fa_out,
                     scheduler_metadata=sched_meta,
                     page_table=page_table,
+                    page_table_is_physical=page_table_is_physical,
                 )
             elif layer.is_cross_attention:
                 # Always use non-chunked logic for cross-attention
@@ -4029,11 +4775,13 @@ class FlashAttentionBackend(AttentionBackend):
                         max_num_pages,
                         (window_tokens + 2 * self.page_size - 2) // self.page_size,
                     )
-                self.decode_cuda_graph_metadata["swa_compact_page_table"] = torch.zeros(
-                    max_bs,
-                    compact_cap,
-                    dtype=torch.int32,
-                    device=self.device,
+                self.decode_cuda_graph_metadata["swa_compact_page_table"] = (
+                    torch.zeros(
+                        max_bs,
+                        compact_cap,
+                        dtype=torch.int32,
+                        device=self.device,
+                    )
                 )
                 self.decode_cuda_graph_metadata["swa_cache_seqlens"] = torch.zeros(
                     max_bs, dtype=torch.int32, device=self.device
@@ -4049,13 +4797,13 @@ class FlashAttentionBackend(AttentionBackend):
                 self.decode_cuda_graph_metadata["attncp_dense_window_rows"] = (
                     torch.arange(max_bs, dtype=torch.long, device=self.device)
                 )
-                self.decode_cuda_graph_metadata["attncp_dense_window_compact_slots"] = (
-                    torch.arange(
-                        max_bs * swa_window_tokens,
-                        dtype=torch.int32,
-                        device=self.device,
-                    ).view(max_bs, swa_window_tokens)
-                )
+                self.decode_cuda_graph_metadata[
+                    "attncp_dense_window_compact_slots"
+                ] = torch.arange(
+                    max_bs * swa_window_tokens,
+                    dtype=torch.int32,
+                    device=self.device,
+                ).view(max_bs, swa_window_tokens)
         if is_cp_kv_sharded() and self.enable_attn_cp_decode_local_merge:
             self.decode_cuda_graph_metadata["cp_local_cache_seqlens"] = torch.zeros(
                 max_bs, dtype=torch.int32, device=self.device
@@ -4080,13 +4828,11 @@ class FlashAttentionBackend(AttentionBackend):
                 self.decode_cuda_graph_metadata["cp_swa_local_cache_seqlens"] = (
                     torch.zeros(max_bs, dtype=torch.int32, device=self.device)
                 )
-                self.decode_cuda_graph_metadata["cp_swa_local_page_table"] = (
-                    torch.zeros(
-                        max_bs,
-                        swa_local_table_cap,
-                        dtype=torch.int32,
-                        device=self.device,
-                    )
+                self.decode_cuda_graph_metadata["cp_swa_local_page_table"] = torch.zeros(
+                    max_bs,
+                    swa_local_table_cap,
+                    dtype=torch.int32,
+                    device=self.device,
                 )
                 if self.page_size != 1:
                     self.decode_cuda_graph_metadata[
@@ -4480,7 +5226,9 @@ class FlashAttentionBackend(AttentionBackend):
                         "swa_page_table"
                     ][:bs, :]
                     if is_cp_kv_sharded():
-                        metadata.swa_page_table = full_swa_page_table[:, :max_seq_pages]
+                        metadata.swa_page_table = full_swa_page_table[
+                            :, :max_seq_pages
+                        ]
                     else:
                         self._set_decode_swa_metadata(
                             metadata,
@@ -4523,7 +5271,8 @@ class FlashAttentionBackend(AttentionBackend):
                     )
                     if (
                         self.enable_attn_cp_decode_local_merge_swa
-                        and self.use_sliding_window_kv_pool
+                        and
+                        self.use_sliding_window_kv_pool
                         and metadata.swa_page_table is not None
                     ):
                         self._set_cuda_graph_sharded_kv_decode_swa_metadata(
@@ -4796,8 +5545,20 @@ class FlashAttentionBackend(AttentionBackend):
                     0,
                     self.page_size,
                     full_swa_page_table,
-                    self.token_to_kv_pool if self.use_sliding_window_kv_pool else None,
+                    (
+                        self.token_to_kv_pool
+                        if self.use_sliding_window_kv_pool
+                        and not is_cp_kv_sharded()
+                        else None
+                    ),
                 )
+
+                if self.use_sliding_window_kv_pool and is_cp_kv_sharded():
+                    full_swa_page_table[:, :max_seq_pages].copy_(
+                        self._resolve_sharded_logical_swa_page_table(
+                            metadata.page_table[:, :max_seq_pages]
+                        )
+                    )
 
                 if self.use_sliding_window_kv_pool and not is_cp_kv_sharded():
                     self._set_decode_swa_metadata(
@@ -4825,7 +5586,8 @@ class FlashAttentionBackend(AttentionBackend):
                     )
                     if (
                         self.enable_attn_cp_decode_local_merge_swa
-                        and self.use_sliding_window_kv_pool
+                        and
+                        self.use_sliding_window_kv_pool
                         and metadata.swa_page_table is not None
                     ):
                         self._set_cuda_graph_sharded_kv_decode_swa_metadata(

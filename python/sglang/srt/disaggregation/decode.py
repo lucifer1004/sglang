@@ -35,7 +35,11 @@ from sglang.srt.configs.mamba_utils import Mamba2CacheParams
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.base.conn import StateType
-from sglang.srt.disaggregation.common.conn import CommonKVManager, CommonKVReceiver
+from sglang.srt.disaggregation.common.conn import (
+    CommonKVManager,
+    CommonKVReceiver,
+    _resolve_kv_transfer_parallel_info,
+)
 from sglang.srt.disaggregation.utils import (
     FAKE_BOOTSTRAP_HOST,
     DisaggregationMode,
@@ -46,12 +50,12 @@ from sglang.srt.disaggregation.utils import (
     get_kv_class,
     is_mla_backend,
     poll_and_all_reduce,
+    poll_and_all_reduce_attn_cp_tp_group,
     poll_and_all_reduce_with_staging,
     prepare_abort,
     setup_state_kv_args,
 )
 from sglang.srt.environ import envs
-from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, ScheduleBatch
 from sglang.srt.managers.schedule_policy import match_prefix_for_req
 from sglang.srt.managers.utils import GenerationBatchResult
@@ -63,6 +67,9 @@ from sglang.srt.mem_cache.common import (
     release_kv_cache,
 )
 from sglang.srt.mem_cache.cp_sharded_allocator import CPShardedKVPoolAllocator
+from sglang.srt.mem_cache.cp_sharded_capacity import (
+    ensure_cp_sharded_kv_capacity,
+)
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.hicache_storage import (
     hicache_timing_enabled,
@@ -296,6 +303,13 @@ class DecodePreallocQueue:
     ):
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
+        if (
+            isinstance(token_to_kv_pool_allocator, CPShardedKVPoolAllocator)
+            and not token_to_kv_pool_allocator.use_decode_owner_layout
+        ):
+            raise RuntimeError(
+                "Decode owner layout is not enabled for the CP-sharded KV allocator"
+            )
         self.token_to_kv_pool = token_to_kv_pool_allocator.get_kvcache()
         self.draft_token_to_kv_pool = draft_token_to_kv_pool
         self.welm_mtp_kv_mirror_state_buffers = welm_mtp_kv_mirror_state_buffers
@@ -347,6 +361,9 @@ class DecodePreallocQueue:
     def _uses_swa_tail_prealloc(self) -> bool:
         return (
             isinstance(self.token_to_kv_pool, (SWAKVPool, DeepSeekV4TokenToKVPool))
+            and not isinstance(
+                self.token_to_kv_pool_allocator, CPShardedKVPoolAllocator
+            )
             and self.token_to_kv_pool_allocator.page_size > 1
             and hasattr(self.token_to_kv_pool_allocator, "alloc_extend_swa_tail")
         )
@@ -382,12 +399,34 @@ class DecodePreallocQueue:
             swa_len + self.num_reserved_decode_tokens,
         )
 
+    def _ensure_cp_sharded_prompt_capacity(
+        self, *, prefix_len: int, fill_len: int
+    ) -> bool:
+        allocator = self.token_to_kv_pool_allocator
+        if not isinstance(allocator, CPShardedKVPoolAllocator):
+            return True
+
+        demand = allocator.alloc_size_per_rank_for_range(
+            prefix_len, fill_len - prefix_len
+        )
+        return ensure_cp_sharded_kv_capacity(
+            allocator=allocator,
+            tree_cache=self.tree_cache,
+            demand_tokens=demand,
+        )
+
     def _init_kv_manager(self) -> CommonKVManager:
         kv_args_class = get_kv_class(self.transfer_backend, KVClassType.KVARGS)
         kv_args = kv_args_class()
 
-        attn_tp_size = get_attention_tp_size()
-        kv_args.engine_rank = self.tp_rank % (attn_tp_size)
+        parallel_info = _resolve_kv_transfer_parallel_info(
+            DisaggregationMode.DECODE,
+            is_cp_sharded_kv=(
+                self.scheduler.server_args.attn_cp_mode == "sharded-kv"
+            ),
+        )
+        attn_tp_size = parallel_info.attn_tp_size
+        kv_args.engine_rank = parallel_info.attn_tp_rank
 
         kv_args.pp_rank = self.pp_rank
         kv_args.system_dp_rank = self.scheduler.dp_rank
@@ -414,6 +453,10 @@ class DecodePreallocQueue:
         kv_args.kv_data_ptrs = kv_data_ptrs
         kv_args.kv_data_lens = kv_data_lens
         kv_args.kv_item_lens = kv_item_lens
+        if not self.is_mla_backend:
+            kv_args.total_kv_head_num = (
+                self.scheduler.model_config.get_total_num_kv_heads()
+            )
         # HiSparse Host pool has page_size=1; use it when hisparse is enabled
         kv_args.page_size = (
             1 if self.scheduler.enable_hisparse else self.token_to_kv_pool.page_size
@@ -596,6 +639,11 @@ class DecodePreallocQueue:
                 break
             if uses_swa_tail_prealloc and swa_required > swa_allocatable_tokens:
                 break
+            full_len, _ = self._prealloc_kv_lens(req)
+            if not self._ensure_cp_sharded_prompt_capacity(
+                prefix_len=0, fill_len=full_len
+            ):
+                break
 
             resumed_reqs.append(req)
             indices_to_remove.add(i)
@@ -630,6 +678,15 @@ class DecodePreallocQueue:
             for decode_req in self.queue
         ):
             polls = [decode_req.kv_receiver.poll() for decode_req in self.queue]
+        elif isinstance(
+            self.scheduler.token_to_kv_pool_allocator,
+            CPShardedKVPoolAllocator,
+        ):
+            polls = poll_and_all_reduce_attn_cp_tp_group(
+                [decode_req.kv_receiver for decode_req in self.queue],
+                self.scheduler.attn_cp_cpu_group,
+                self.scheduler.attn_tp_cpu_group,
+            )
         else:
             polls = poll_and_all_reduce(
                 [decode_req.kv_receiver for decode_req in self.queue], self.gloo_group
@@ -841,6 +898,9 @@ class DecodePreallocQueue:
             # Memory estimation: don't add if the projected memory cannot be met
             # TODO: add new_token ratio
             origin_input_len = len(decode_req.req.origin_input_ids)
+            fill_len = origin_input_len + max(
+                len(decode_req.req.output_ids) - 1, 0
+            )
             if self.scheduler.server_args.disaggregation_decode_enable_radix_cache:
                 # Match prefix against decode's radix cache.
                 prefix_indices, prefix_len = self._match_prefix_and_lock(decode_req.req)
@@ -851,7 +911,6 @@ class DecodePreallocQueue:
                     prefix_len = page_align_floor(prefix_len, page_size)
                     prefix_indices = prefix_indices[:prefix_len]
 
-                fill_len = origin_input_len + max(len(decode_req.req.output_ids) - 1, 0)
                 required_alloc_tokens = self._required_alloc_tokens(
                     fill_len=fill_len, prefix_len=prefix_len
                 )
@@ -911,6 +970,13 @@ class DecodePreallocQueue:
                         self.tree_cache.dec_lock_ref(decode_req.req.last_node)
                     break
 
+            if not self._ensure_cp_sharded_prompt_capacity(
+                prefix_len=prefix_len, fill_len=fill_len
+            ):
+                if prefix_len > 0:
+                    self.tree_cache.dec_lock_ref(decode_req.req.last_node)
+                break
+
             dst_kv_indices = self._pre_alloc(decode_req.req, prefix_indices, prefix_len)
             hisparse_req_budget -= 1
             # Recompute from actual pool state for the next queue entry.
@@ -942,13 +1008,24 @@ class DecodePreallocQueue:
                     page_size = 1  # host pool page_size
                 else:
                     # Only send delta indices (beyond prefix) to prefill.
-                    kv_indices = (
-                        self.req_to_token_pool.req_to_token[decode_req.req.req_pool_idx][
-                            prefix_len:origin_input_len
-                        ]
-                        .cpu()
-                        .numpy()
-                    )
+                    if isinstance(
+                        self.token_to_kv_pool_allocator,
+                        CPShardedKVPoolAllocator,
+                    ):
+                        kv_indices = (
+                            dst_kv_indices[: origin_input_len - prefix_len]
+                            .cpu()
+                            .numpy()
+                            .astype(np.int32, copy=False)
+                        )
+                    else:
+                        kv_indices = (
+                            self.req_to_token_pool.req_to_token[
+                                decode_req.req.req_pool_idx
+                            ][prefix_len:origin_input_len]
+                            .cpu()
+                            .numpy()
+                        )
 
                 seq_len = len(decode_req.req.origin_input_ids)
 
@@ -968,6 +1045,23 @@ class DecodePreallocQueue:
                     window_kv_indices_full = self.req_to_token_pool.req_to_token[
                         decode_req.req.req_pool_idx, window_start:seq_len
                     ]
+                    if isinstance(
+                        self.token_to_kv_pool_allocator,
+                        CPShardedKVPoolAllocator,
+                    ):
+                        logical_pages = torch.div(
+                            window_kv_indices_full[::page_size].to(torch.int64),
+                            page_size,
+                            rounding_mode="floor",
+                        )
+                        return (
+                            self.token_to_kv_pool_allocator.logical_swa_page_table_to_physical(
+                                logical_pages
+                            )
+                            .cpu()
+                            .numpy()
+                            .astype(np.int32, copy=False)
+                        )
                     window_kv_indices_swa = (
                         self.token_to_kv_pool_allocator.translate_loc_from_full_to_swa(
                             window_kv_indices_full
@@ -988,9 +1082,23 @@ class DecodePreallocQueue:
                     )
 
                 def _welm_mtp_mirror_payload():
-                    return self.req_to_token_pool.req_to_token[
+                    kv_indices_full = self.req_to_token_pool.req_to_token[
                         decode_req.req.req_pool_idx, :seq_len
-                    ].cpu().numpy()
+                    ]
+                    if isinstance(
+                        self.token_to_kv_pool_allocator,
+                        CPShardedKVPoolAllocator,
+                    ):
+                        kv_indices_full = (
+                            self.token_to_kv_pool_allocator.logical_slots_to_physical(
+                                kv_indices_full.to(torch.int64)
+                            )
+                        )
+                    return (
+                        kv_indices_full.cpu()
+                        .numpy()
+                        .astype(np.int32, copy=False)
+                    )
 
                 state_types = self.kv_manager.kv_args.state_types
                 state_indices = []
@@ -1273,6 +1381,13 @@ class DecodePreallocQueue:
             fill_len=fill_len, prefix_len=prefix_len
         )
 
+        device = self.token_to_kv_pool_allocator.device
+
+        def device_i64_scalar(value: int) -> torch.Tensor:
+            out = torch.empty((1,), dtype=torch.int64, device=device)
+            out.fill_(int(value))
+            return out
+
         # Evict cached entries if the pool doesn't have enough free pages.
         if (
             self.scheduler.server_args.disaggregation_decode_enable_radix_cache
@@ -1294,6 +1409,7 @@ class DecodePreallocQueue:
                     f"req={req.rid}"
                 )
 
+        logical_kv_loc = None
         if self.scheduler.enable_hisparse:
             # HiSparse is incompatible with decode-side L1 radix cache. Keep
             # this path on the upstream full-allocation semantics.
@@ -1320,27 +1436,34 @@ class DecodePreallocQueue:
                 )
             host_indices = host_indices.to(device=coordinator.device)
             coordinator.req_to_host_pool[req.req_pool_idx, :fill_len] = host_indices
-        elif self.token_to_kv_pool_allocator.page_size == 1:
-            kv_loc = self.token_to_kv_pool_allocator.alloc(delta_len)
-        else:
-            device = self.token_to_kv_pool_allocator.device
-            is_cp_sharded_paged = isinstance(
-                self.token_to_kv_pool_allocator, CPShardedKVPoolAllocator
-            )
-
-            def device_i64_scalar(value: int) -> torch.Tensor:
-                out = torch.empty((1,), dtype=torch.int64, device=device)
-                out.fill_(int(value))
-                return out
-
+        elif isinstance(
+            self.token_to_kv_pool_allocator, CPShardedKVPoolAllocator
+        ):
             last_loc = (
                 prefix_indices[-1:].to(dtype=torch.int64, device=device)
                 if prefix_len > 0
-                else (
-                    torch.tensor([-1], dtype=torch.int64)
-                    if is_cp_sharded_paged
-                    else device_i64_scalar(-1)
-                )
+                else device_i64_scalar(-1)
+            )
+            allocation = self.token_to_kv_pool_allocator.alloc_extend_with_logical(
+                prefix_lens=device_i64_scalar(prefix_len),
+                prefix_lens_cpu=torch.tensor([prefix_len], dtype=torch.int64),
+                seq_lens=device_i64_scalar(fill_len),
+                seq_lens_cpu=torch.tensor([fill_len], dtype=torch.int64),
+                last_loc=last_loc,
+                extend_num_tokens=delta_len,
+            )
+            if allocation is not None:
+                kv_loc = allocation.physical_write_slots
+                logical_kv_loc = allocation.logical_slots
+            else:
+                kv_loc = None
+        elif self.token_to_kv_pool_allocator.page_size == 1:
+            kv_loc = self.token_to_kv_pool_allocator.alloc(delta_len)
+        else:
+            last_loc = (
+                prefix_indices[-1:].to(dtype=torch.int64, device=device)
+                if prefix_len > 0
+                else device_i64_scalar(-1)
             )
             if self._uses_swa_tail_prealloc() and prefix_len == 0:
                 # Tail-only SWA allocation: only valid when prefix_len == 0.
@@ -1378,7 +1501,8 @@ class DecodePreallocQueue:
         )
 
         self.req_to_token_pool.write(
-            (req.req_pool_idx, slice(prefix_len, prefix_len + len(kv_loc))), kv_loc
+            (req.req_pool_idx, slice(prefix_len, prefix_len + len(kv_loc))),
+            logical_kv_loc if logical_kv_loc is not None else kv_loc,
         )
 
         # Truncate fill_ids to kv_committed_len so cache_unfinished_req only
@@ -1563,6 +1687,15 @@ class DecodeTransferQueue:
             polls = [decode_req.kv_receiver.poll() for decode_req in self.queue]
         elif self.enable_staging:
             polls = self._poll_with_staging()
+        elif isinstance(
+            self.scheduler.token_to_kv_pool_allocator,
+            CPShardedKVPoolAllocator,
+        ):
+            polls = poll_and_all_reduce_attn_cp_tp_group(
+                [dr.kv_receiver for dr in self.queue],
+                self.scheduler.attn_cp_cpu_group,
+                self.scheduler.attn_tp_cpu_group,
+            )
         else:
             polls = poll_and_all_reduce(
                 [dr.kv_receiver for dr in self.queue], self.gloo_group

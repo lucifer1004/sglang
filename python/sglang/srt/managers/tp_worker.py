@@ -61,6 +61,26 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _phase2_no_q_prefill_token_ids(logits_output, forward_batch):
+    runtime_layout = getattr(
+        forward_batch, "attn_cp_prefill_runtime_layout", None
+    )
+    has_global_q = getattr(
+        forward_batch, "welm_cp_prefill_kv_mirror_has_global_q", True
+    )
+    if runtime_layout is None or has_global_q:
+        return None
+
+    next_token_logits = logits_output.next_token_logits
+    if next_token_logits is None or next_token_logits.shape[0] != 0:
+        raise RuntimeError("Phase 2 no-Q prefill produced logits")
+    return torch.zeros(
+        forward_batch.batch_size,
+        dtype=torch.long,
+        device=forward_batch.input_ids.device,
+    )
+
+
 class BaseTpWorker(ABC):
     @abstractmethod
     def forward_batch_generation(self, forward_batch: ForwardBatch):
@@ -524,6 +544,16 @@ class TpModelWorker(BaseTpWorker):
 
             if is_verify:
                 # Skip sampling and return logits for target forward
+                return batch_result
+
+            no_q_token_ids = _phase2_no_q_prefill_token_ids(
+                logits_output, forward_batch
+            )
+            if no_q_token_ids is not None:
+                # Chunked prefill output processing discards this placeholder.
+                # It only keeps the overlap future buffer request-aligned while
+                # KV mirror intentionally skips Q, logits, and sampling.
+                batch_result.next_token_ids = no_q_token_ids
                 return batch_result
 
             if (

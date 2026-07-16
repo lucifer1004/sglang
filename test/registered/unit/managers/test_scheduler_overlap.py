@@ -188,6 +188,16 @@ class TestSchedulerOverlap(unittest.TestCase):
                 )
             )
 
+    def test_attncp_sharded_kv_serializes_consecutive_prefills(self):
+        scheduler = _scheduler(last_batch=_batch(is_extend=True))
+
+        with envs.SGLANG_DISABLE_CONSECUTIVE_PREFILL_OVERLAP.override(False):
+            self.assertTrue(
+                Scheduler.is_disable_overlap_for_batch(
+                    scheduler, _batch(is_extend=True)
+                )
+            )
+
     def test_attncp_sharded_kv_keeps_decode_decode_overlap(self):
         scheduler = _scheduler(last_batch=_batch(is_extend=False))
 

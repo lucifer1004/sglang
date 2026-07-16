@@ -13,6 +13,7 @@ from typing import List, Optional, Tuple
 
 import numpy as np
 import numpy.typing as npt
+import torch
 
 from sglang.srt.disaggregation.base.conn import KVArgs, KVPoll, StateType
 from sglang.srt.disaggregation.common.conn import (
@@ -39,13 +40,25 @@ from sglang.srt.disaggregation.mooncake.utils import (
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
     filter_kv_indices_for_cp_rank,
+    resolve_cp_sharded_transfer_page_runs,
 )
 from sglang.srt.distributed.parallel_state import get_mooncake_transfer_engine
 from sglang.srt.environ import envs
+from sglang.srt.mem_cache.cp_sharded_allocator import CPShardedKVPoolAllocator
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.network import NetworkAddress
 
 logger = logging.getLogger(__name__)
+
+
+def validate_mooncake_staging_configuration(
+    *, enable_staging: bool, is_cp_sharded_kv: bool
+) -> None:
+    if enable_staging and is_cp_sharded_kv:
+        raise ValueError(
+            "Mooncake staging is not supported with attn-cp-mode='sharded-kv': "
+            "the staging protocol does not preserve owner-run ordering."
+        )
 
 
 class KVTransferError(Exception):
@@ -67,6 +80,7 @@ class TransferKVChunk:
     is_last_chunk: bool
     prefill_aux_index: Optional[int]
     state_indices: Optional[List]
+    state_index_positions: Optional[List]
 
 
 # decode
@@ -82,6 +96,7 @@ class TransferInfo:
     required_dst_info_num: int
     is_dummy: bool
     decode_prefix_len: Optional[int] = None
+    dst_is_cp_sharded_kv: bool = False
     # Note: always put the optional staging field at the final (it will be set through 'STAGING_RSP' pkg when needed)
     staging: Optional[StagingTransferInfo] = None
 
@@ -109,6 +124,9 @@ class TransferInfo:
             is_dummy=is_dummy,
             decode_prefix_len=(
                 int(msg[8].decode("ascii")) if len(msg) > 8 and msg[8] != b"" else None
+            ),
+            dst_is_cp_sharded_kv=(
+                msg[9].decode("ascii") == "1" if len(msg) > 9 else False
             ),
         )
 
@@ -191,10 +209,15 @@ class MooncakeKVManager(CommonKVManager):
         server_args: ServerArgs,
         is_mla_backend: Optional[bool] = False,
     ):
+        enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
+        validate_mooncake_staging_configuration(
+            enable_staging=enable_staging,
+            is_cp_sharded_kv=server_args.attn_cp_mode == "sharded-kv",
+        )
         super().__init__(args, disaggregation_mode, server_args, is_mla_backend)
+        self.enable_staging = enable_staging
         self.init_engine()
         self.register_buffer_to_engine()
-        self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self.start_prefill_thread()
             self.session_failures = defaultdict(int)
@@ -963,12 +986,104 @@ class MooncakeKVManager(CommonKVManager):
             f"Received AUX_DATA for bootstrap_room {room} with length:{len(data)}"
         )
 
+    def _kv_head_span(self, tp_rank: int, tp_size: int) -> Tuple[int, int]:
+        total_kv_heads = getattr(self.kv_args, "total_kv_head_num", 0)
+        if not isinstance(total_kv_heads, int) or total_kv_heads <= 0:
+            raise RuntimeError(
+                "Cannot resolve KV-head ownership without total_kv_head_num"
+            )
+
+        tp_rank %= tp_size
+        if total_kv_heads >= tp_size:
+            if total_kv_heads % tp_size != 0:
+                raise RuntimeError(
+                    "KV head count must be divisible by attention TP size, got "
+                    f"heads={total_kv_heads}, tp={tp_size}"
+                )
+            heads_per_rank = total_kv_heads // tp_size
+            start = tp_rank * heads_per_rank
+            return start, start + heads_per_rank
+
+        if tp_size % total_kv_heads != 0:
+            raise RuntimeError(
+                "Attention TP size must be divisible by KV head count, got "
+                f"tp={tp_size}, heads={total_kv_heads}"
+            )
+        replicas_per_head = tp_size // total_kv_heads
+        head = tp_rank // replicas_per_head
+        return head, head + 1
+
+    def _is_direct_kv_replica_target(
+        self, target_rank_registration_info: KVArgsRegisterInfo
+    ) -> bool:
+        src_item_len = self.kv_args.kv_item_lens[0]
+        if src_item_len != target_rank_registration_info.dst_kv_item_len:
+            return False
+
+        src_span = self._kv_head_span(
+            self.attn_tp_rank, self.attn_tp_size
+        )
+        dst_span = self._kv_head_span(
+            target_rank_registration_info.dst_tp_rank,
+            target_rank_registration_info.dst_attn_tp_size,
+        )
+        if src_span != dst_span:
+            raise RuntimeError(
+                "PD KV replica target is routed to KV-head shard "
+                f"{dst_span}, but sender owns {src_span}"
+            )
+        return True
+
+    def _validate_equal_item_state_replication(
+        self,
+        state_type: StateType,
+        src_data_ptrs: List[int],
+        src_item_lens: List[int],
+        src_dim_per_tensor: List[int],
+        dst_data_ptrs: List[int],
+        dst_item_lens: List[int],
+        dst_dim_per_tensor: List[int],
+        dst_tp_rank: int,
+        dst_attn_tp_size: int,
+    ) -> None:
+        if state_type not in (StateType.SWA, StateType.WELM_MTP_MIRROR):
+            raise RuntimeError(
+                "PD Disaggregation does NOT support PD different TP sizes for "
+                f"non-MLA {state_type.upper()} hybrid models yet."
+            )
+
+        src_attn_tp_size = self.attn_tp_size
+        src_tp_rank = self.attn_tp_rank
+        src_span = self._kv_head_span(src_tp_rank, src_attn_tp_size)
+        dst_span = self._kv_head_span(dst_tp_rank, dst_attn_tp_size)
+        if src_span != dst_span:
+            raise RuntimeError(
+                f"PD {state_type.upper()} state target is routed to KV-head "
+                f"shard {dst_span}, but sender owns {src_span}."
+            )
+
+        if (
+            len(src_data_ptrs) != len(dst_data_ptrs)
+            or list(src_item_lens) != list(dst_item_lens)
+            or list(src_dim_per_tensor) != list(dst_dim_per_tensor)
+        ):
+            raise RuntimeError(
+                f"PD {state_type.upper()} state item layout is not replication "
+                "compatible: "
+                f"src_tensors={len(src_data_ptrs)}, dst_tensors={len(dst_data_ptrs)}, "
+                f"src_item_lens={list(src_item_lens)}, "
+                f"dst_item_lens={list(dst_item_lens)}, "
+                f"src_dims={list(src_dim_per_tensor)}, "
+                f"dst_dims={list(dst_dim_per_tensor)}."
+            )
+
     def maybe_send_extra(
         self,
         req: TransferInfo,
         prefill_state_indices: List,
         executor: concurrent.futures.ThreadPoolExecutor,
         target_rank_registration_info: Optional[KVArgsRegisterInfo] = None,
+        state_index_positions: Optional[List] = None,
     ):
         rc = 0
         state_types = getattr(self.kv_args, "state_types", [])
@@ -1006,6 +1121,24 @@ class MooncakeKVManager(CommonKVManager):
             dst_indices = (
                 req.dst_state_indices[i] if i < len(req.dst_state_indices) else []
             )
+            positions = (
+                state_index_positions[i]
+                if state_index_positions is not None
+                and i < len(state_index_positions)
+                else None
+            )
+            if positions is not None:
+                positions = np.asarray(positions, dtype=np.int64)
+                dst_indices_array = np.asarray(dst_indices)
+                if positions.size > 0 and int(positions.max()) >= len(
+                    dst_indices_array
+                ):
+                    raise RuntimeError(
+                        f"CP sharded state destination is too short for {st}: "
+                        f"max_position={int(positions.max())}, "
+                        f"dst_len={len(dst_indices_array)}"
+                    )
+                dst_indices = dst_indices_array[positions].tolist()
 
             if st == StateType.MAMBA:
                 if (
@@ -1048,11 +1181,33 @@ class MooncakeKVManager(CommonKVManager):
                     and self.attn_tp_size
                     != target_rank_registration_info.dst_attn_tp_size
                 ):
-                    raise RuntimeError(
-                        f"PD Disaggregation does NOT support PD different TP sizes for non-MLA {st.upper()} hybrid models yet."
+                    self._validate_equal_item_state_replication(
+                        st,
+                        src_data_ptrs,
+                        src_item_lens,
+                        src_dim_per_tensor,
+                        dst_data_ptrs,
+                        dst_item_lens,
+                        dst_dim_per_tensor,
+                        target_rank_registration_info.dst_tp_rank,
+                        target_rank_registration_info.dst_attn_tp_size,
                     )
-                src_indices = list(indices)
-                dst_indices_local = list(dst_indices)
+                src_indices = np.asarray(indices, dtype=np.int32)
+                dst_indices_local = np.asarray(dst_indices, dtype=np.int32)
+                if self.is_cp_sharded_kv or getattr(
+                    req, "dst_is_cp_sharded_kv", False
+                ):
+                    if len(src_indices) != len(dst_indices_local):
+                        raise RuntimeError(
+                            "CP owner-remap state source/destination count mismatch "
+                            f"for {st}: src={len(src_indices)}, "
+                            f"dst={len(dst_indices_local)}"
+                        )
+                    dst_owner_mask = dst_indices_local != 0
+                    src_indices = src_indices[dst_owner_mask]
+                    dst_indices_local = dst_indices_local[dst_owner_mask]
+                    if len(src_indices) == 0:
+                        continue
                 if len(src_indices) > len(dst_indices_local):
                     logger.warning(
                         f"len(prefill_state_indices) = {len(src_indices)}, len(dst_state_indices) = {len(dst_indices_local)}"
@@ -1069,8 +1224,8 @@ class MooncakeKVManager(CommonKVManager):
                         src_data_ptrs=src_data_ptrs,
                         dst_data_ptrs=dst_data_ptrs,
                         item_lens=src_item_lens,
-                        prefill_data_indices=np.array(src_indices, dtype=np.int32),
-                        dst_data_indices=np.array(dst_indices_local, dtype=np.int32),
+                        prefill_data_indices=np.asarray(src_indices, dtype=np.int32),
+                        dst_data_indices=np.asarray(dst_indices_local, dtype=np.int32),
                         executor=executor,
                     )
                     or rc
@@ -1220,9 +1375,10 @@ class MooncakeKVManager(CommonKVManager):
                 dst_ranks_infos = []
                 # Unique id per prefill sender so decode's response set size matches expected_response_num.
                 prefill_unique_rank = (
-                    self.attn_tp_rank * (self.pp_size * self.attn_cp_size)
-                    + self.pp_rank * self.attn_cp_size
-                    + self.attn_cp_rank
+                    self.routing_attn_tp_rank
+                    * (self.pp_size * self.routing_attn_cp_size)
+                    + self.pp_rank * self.routing_attn_cp_size
+                    + self.routing_attn_cp_rank
                 )
                 # When staging transfer is not yet ready (watermark/allocation pending),
                 # the chunk is re-enqueued and we break out of the req loop to retry later.
@@ -1247,32 +1403,66 @@ class MooncakeKVManager(CommonKVManager):
                                 break
 
                         chunked_dst_kv_indice = req.dst_kv_indices[kv_chunk.index_slice]
-
-                        # NOTE: This is temporarily a workaround to deal with the case where the prefill_kv_indices
-                        # is mismatched with the dst_kv_indices when page size > 1, this should never happen.
-                        if len(chunked_dst_kv_indice) < len(
-                            kv_chunk.prefill_kv_indices
-                        ):
-                            logger.warning(
-                                f"len(chunked_dst_kv_indice) = {len(chunked_dst_kv_indice)}, len(kv_chunk.prefill_kv_indices) = {len(kv_chunk.prefill_kv_indices)}"
-                            )
-                            kv_chunk.prefill_kv_indices = kv_chunk.prefill_kv_indices[
-                                : len(chunked_dst_kv_indice)
-                            ]
-
+                        prefill_kv_indices = kv_chunk.prefill_kv_indices
                         target_rank_registration_info: KVArgsRegisterInfo = (
                             self.decode_kv_args_table[req.mooncake_session_id]
                         )
-                        if len(kv_chunk.prefill_kv_indices) == 0:
+
+                        owner_remap = self.is_cp_sharded_kv or getattr(
+                            req, "dst_is_cp_sharded_kv", False
+                        )
+                        if owner_remap:
+                            if len(chunked_dst_kv_indice) != len(
+                                prefill_kv_indices
+                            ):
+                                raise RuntimeError(
+                                    "CP owner-remap source/destination page count "
+                                    "mismatch: "
+                                    f"src={len(prefill_kv_indices)}, "
+                                    f"dst={len(chunked_dst_kv_indice)}, "
+                                    f"slice={kv_chunk.index_slice}"
+                                )
+                            dst_owner_mask = chunked_dst_kv_indice != 0
+                            prefill_kv_indices = prefill_kv_indices[dst_owner_mask]
+                            chunked_dst_kv_indice = chunked_dst_kv_indice[
+                                dst_owner_mask
+                            ]
+                        # NOTE: This is temporarily a workaround to deal with the case where the prefill_kv_indices
+                        # is mismatched with the dst_kv_indices when page size > 1, this should never happen.
+                        elif len(chunked_dst_kv_indice) < len(prefill_kv_indices):
+                            logger.warning(
+                                f"len(chunked_dst_kv_indice) = {len(chunked_dst_kv_indice)}, len(prefill_kv_indices) = {len(prefill_kv_indices)}"
+                            )
+                            prefill_kv_indices = prefill_kv_indices[
+                                : len(chunked_dst_kv_indice)
+                            ]
+
+                        direct_kv_replica = False
+                        if (
+                            len(prefill_kv_indices) > 0
+                            and not self.is_mla_backend
+                            and self.attn_tp_size
+                            != target_rank_registration_info.dst_attn_tp_size
+                        ):
+                            direct_kv_replica = self._is_direct_kv_replica_target(
+                                target_rank_registration_info
+                            )
+
+                        if len(prefill_kv_indices) == 0:
                             ret = 0
                         elif self.is_mla_backend or (
                             self.attn_tp_size
                             == target_rank_registration_info.dst_attn_tp_size
-                        ):
+                        ) or direct_kv_replica:
                             if target_rank_registration_info.enable_hisparse:
+                                if getattr(req, "dst_is_cp_sharded_kv", False):
+                                    raise RuntimeError(
+                                        "HiSparse transfer to Decode CP owner layout "
+                                        "is not supported"
+                                    )
                                 ret = self.send_kvcache_hisparse(
                                     req.mooncake_session_id,
-                                    kv_chunk.prefill_kv_indices,
+                                    prefill_kv_indices,
                                     target_rank_registration_info.dst_kv_ptrs,
                                     req.dst_kv_indices,
                                     kv_chunk.index_slice,
@@ -1281,7 +1471,7 @@ class MooncakeKVManager(CommonKVManager):
                             else:
                                 ret = self.send_kvcache(
                                     req.mooncake_session_id,
-                                    kv_chunk.prefill_kv_indices,
+                                    prefill_kv_indices,
                                     target_rank_registration_info.dst_kv_ptrs,
                                     chunked_dst_kv_indice,
                                     executor,
@@ -1308,7 +1498,7 @@ class MooncakeKVManager(CommonKVManager):
                         else:
                             ret = self.send_kvcache_slice(
                                 req.mooncake_session_id,
-                                kv_chunk.prefill_kv_indices,
+                                prefill_kv_indices,
                                 target_rank_registration_info.dst_kv_ptrs,
                                 chunked_dst_kv_indice,
                                 target_rank_registration_info.dst_tp_rank,
@@ -1341,21 +1531,23 @@ class MooncakeKVManager(CommonKVManager):
                             break
 
                         if kv_chunk.is_last_chunk:
+                            state_ret = 0
                             if kv_chunk.state_indices:
-                                self.maybe_send_extra(
+                                state_ret = self.maybe_send_extra(
                                     req,
                                     kv_chunk.state_indices,
                                     executor,
                                     target_rank_registration_info,
+                                    kv_chunk.state_index_positions,
                                 )
 
                             # Only the last chunk we need to send the aux data
-                            ret = self.send_aux(
+                            aux_ret = self.send_aux(
                                 req,
                                 kv_chunk.prefill_aux_index,
                                 target_rank_registration_info.dst_aux_ptrs,
                             )
-                            polls.append(True if ret == 0 else False)
+                            polls.append(state_ret == 0 and aux_ret == 0)
                             dst_ranks_infos.append(
                                 (req.endpoint, req.dst_port, req.room)
                             )
@@ -1582,6 +1774,7 @@ class MooncakeKVManager(CommonKVManager):
         is_last_chunk: bool,
         aux_index: Optional[int] = None,
         state_indices: Optional[List] = None,
+        state_index_positions: Optional[List] = None,
     ):
         assert self.disaggregation_mode == DisaggregationMode.PREFILL
         assert not is_last_chunk or (is_last_chunk and aux_index is not None)
@@ -1616,6 +1809,7 @@ class MooncakeKVManager(CommonKVManager):
                 is_last_chunk=is_last_chunk,
                 prefill_aux_index=aux_index,
                 state_indices=state_indices,
+                state_index_positions=state_index_positions,
             )
         )
 
@@ -1674,6 +1868,46 @@ class MooncakeKVSender(CommonKVSender):
     def should_send_kv_chunk(self, num_pages: int, last_chunk: bool) -> bool:
         return num_pages > 0 or last_chunk
 
+    def _resolve_cp_sharded_state_indices(self, state_indices):
+        allocator = self.kv_mgr.token_to_kv_pool_allocator
+        resolved_indices = []
+        index_positions = []
+        for state_type, logical_indices in zip(
+            self.kv_mgr.kv_args.state_types, state_indices
+        ):
+            if logical_indices is None:
+                resolved_indices.append(None)
+                index_positions.append(None)
+                continue
+
+            logical_indices = np.asarray(logical_indices)
+            logical_tensor = torch.as_tensor(
+                logical_indices,
+                dtype=torch.int64,
+                device=allocator.device,
+            )
+            if state_type == StateType.SWA:
+                physical_tensor = allocator.logical_swa_page_table_to_physical(
+                    logical_tensor
+                )
+            elif state_type == StateType.WELM_MTP_MIRROR:
+                physical_tensor = allocator.logical_slots_to_physical(logical_tensor)
+            else:
+                raise NotImplementedError(
+                    "CP sharded-KV disaggregation does not support state type "
+                    f"{state_type}"
+                )
+
+            physical_indices = (
+                physical_tensor.to("cpu")
+                .numpy()
+                .astype(logical_indices.dtype, copy=False)
+            )
+            positions = np.flatnonzero(physical_indices != 0)
+            resolved_indices.append(physical_indices[positions])
+            index_positions.append(positions)
+        return resolved_indices, index_positions
+
     def send(
         self,
         kv_indices: npt.NDArray[np.int32],
@@ -1682,6 +1916,60 @@ class MooncakeKVSender(CommonKVSender):
         index_slice = slice(self.curr_idx, self.curr_idx + len(kv_indices))
         self.curr_idx += len(kv_indices)
         is_last_chunk = self.curr_idx == self.num_kv_indices
+
+        allocator = getattr(
+            self.kv_mgr, "token_to_kv_pool_allocator", None
+        )
+        if isinstance(allocator, CPShardedKVPoolAllocator):
+            runs = resolve_cp_sharded_transfer_page_runs(
+                allocator, kv_indices, index_slice
+            )
+            resolved_state_indices = None
+            state_index_positions = None
+            if is_last_chunk and state_indices is not None:
+                (
+                    resolved_state_indices,
+                    state_index_positions,
+                ) = self._resolve_cp_sharded_state_indices(state_indices)
+
+            if not runs:
+                if is_last_chunk:
+                    self.kv_mgr.add_transfer_request(
+                        self.bootstrap_room,
+                        kv_indices[:0],
+                        slice(index_slice.start, index_slice.start),
+                        True,
+                        aux_index=self.aux_index,
+                        state_indices=resolved_state_indices,
+                        state_index_positions=state_index_positions,
+                    )
+            else:
+                for run_idx, (physical_pages, dst_slice) in enumerate(runs):
+                    run_is_last = is_last_chunk and run_idx == len(runs) - 1
+                    self.kv_mgr.add_transfer_request(
+                        self.bootstrap_room,
+                        physical_pages,
+                        dst_slice,
+                        run_is_last,
+                        aux_index=self.aux_index if run_is_last else None,
+                        state_indices=(
+                            resolved_state_indices if run_is_last else None
+                        ),
+                        state_index_positions=(
+                            state_index_positions if run_is_last else None
+                        ),
+                    )
+
+            owned_pages = (
+                np.concatenate([physical_pages for physical_pages, _ in runs])
+                if runs
+                else kv_indices[:0]
+            )
+            self._record_transfer_indices(
+                owned_pages,
+                resolved_state_indices if is_last_chunk else None,
+            )
+            return
 
         # Special handling for cp
         if self.kv_mgr.enable_all_cp_ranks_for_transfer:
@@ -1784,7 +2072,7 @@ class MooncakeKVReceiver(CommonKVReceiver):
                 getattr(self.kv_mgr.kv_args, "state_dim_per_tensor", []) or [], "I"
             )
             # Note(shangming): No need to add pp rank here since decode pp size should be equal to prefill pp size or 1
-            tp_rank = self.kv_mgr.kv_args.engine_rank
+            tp_rank = self.kv_mgr.attn_tp_rank
             kv_item_len = self.kv_mgr.kv_args.kv_item_lens[0]
             dst_tp_rank = str(tp_rank).encode("ascii")
             dst_attn_tp_size = str(self.kv_mgr.attn_tp_size).encode("ascii")
@@ -1874,6 +2162,7 @@ class MooncakeKVReceiver(CommonKVReceiver):
                         ),
                         str(self.required_dst_info_num).encode("ascii"),
                         str(decode_prefix_len or 0).encode("ascii"),
+                        b"1" if self.kv_mgr.is_cp_sharded_kv else b"0",
                     ]
                 )
         self.init_time = time.time()

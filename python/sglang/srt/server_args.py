@@ -3144,8 +3144,19 @@ class ServerArgs:
             )
         if self.attn_cp_size <= 1:
             raise ValueError("--attn-cp-mode sharded-kv requires --attn-cp-size > 1")
+        if self.pp_size != 1:
+            raise ValueError(
+                "--attn-cp-mode sharded-kv Phase 2 does not support "
+                "pipeline parallelism"
+            )
 
         self.enable_prefill_context_parallel = True
+        if self.prefill_max_requests != 1:
+            logger.warning(
+                "Sharded-KV context parallelism currently supports prefill "
+                "batch_size=1; forcing --prefill-max-requests=1."
+            )
+            self.prefill_max_requests = 1
 
         # The tp_size is the world size, not the real tensor parallel size.
         assert (
@@ -3172,55 +3183,19 @@ class ServerArgs:
             raise ValueError(
                 "--attn-cp-mode sharded-kv currently requires --kv-cache-dtype auto"
             )
-        if self.cpu_offload_gb > 0:
+        if self.cpu_offload_gb > 0 or self.enable_hierarchical_cache:
             raise ValueError(
-                "--attn-cp-mode sharded-kv currently does not support CPU KV offload"
+                "--attn-cp-mode sharded-kv currently does not support CPU KV "
+                "offload or hierarchical cache"
             )
-        if self.disaggregation_decode_enable_radix_cache:
+        if (
+            self.disaggregation_mode == "decode"
+            and self.disaggregation_transfer_backend != "mooncake"
+        ):
             raise ValueError(
-                "--attn-cp-mode sharded-kv currently does not support "
-                "decode-side radix cache; disable "
-                "--disaggregation-decode-enable-radix-cache"
+                "Decode sharded-KV CP disaggregation currently requires "
+                "--disaggregation-transfer-backend mooncake"
             )
-        if self.enable_hierarchical_cache:
-            if not self.disable_overlap_schedule:
-                raise ValueError(
-                    "AttnCP sharded-KV + HiCache requires --disable-overlap-schedule"
-                )
-            if self.schedule_policy != "fcfs":
-                logger.warning(
-                    "FCFS scheduling is required for AttnCP sharded-KV + "
-                    "HiCache because cache residency is rank-local."
-                )
-                self.schedule_policy = "fcfs"
-            if self.disaggregation_mode == "decode":
-                raise ValueError(
-                    "--attn-cp-mode sharded-kv + hierarchical cache supports "
-                    "HiCache only on prefill or non-PD processes; disable "
-                    "--enable-hierarchical-cache on PD decode servers"
-                )
-            if self.hicache_storage_backend is not None:
-                raise ValueError(
-                    "--attn-cp-mode sharded-kv + hierarchical cache currently "
-                    "supports only CPU L2 HiCache; L3 storage backends are not supported"
-                )
-            if self.enable_lmcache:
-                raise ValueError(
-                    "--attn-cp-mode sharded-kv + hierarchical cache currently "
-                    "does not support LMCache"
-                )
-            if self.disaggregation_decode_enable_offload_kvcache:
-                raise ValueError(
-                    "--attn-cp-mode sharded-kv + hierarchical cache currently "
-                    "does not support decode KV offload"
-                )
-        elif not self.disable_radix_cache:
-            logger.warning(
-                "Radix cache is disabled because --attn-cp-mode sharded-kv "
-                "uses DUMMY slots and sharded logical capacity accounting."
-            )
-            self.disable_radix_cache = True
-
         prefill_backend, decode_backend = self.get_attention_backends()
         if prefill_backend != "fa3" or decode_backend != "fa3":
             raise ValueError(
@@ -3246,10 +3221,11 @@ class ServerArgs:
                 f"total_num_kv_heads={total_kv_heads}. "
                 "Models outside this layout need a custom KV projection shard."
             )
-        if total_q_heads % self.tp_size != 0:
+        if total_q_heads % attn_tp_size != 0:
             raise ValueError(
                 "--attn-cp-mode sharded-kv requires total Q heads divisible "
-                f"by tp_size, got total_q_heads={total_q_heads}, tp_size={self.tp_size}"
+                "by attention_tp_size, got "
+                f"total_q_heads={total_q_heads}, attention_tp_size={attn_tp_size}"
             )
 
         gqa_group_size = total_q_heads // total_kv_heads
@@ -3684,17 +3660,6 @@ class ServerArgs:
             or self.disaggregation_decode_enable_offload_kvcache
         ):
             return
-
-        if (
-            self.enable_hierarchical_cache
-            and self.attn_cp_mode == "sharded-kv"
-            and self.hicache_io_backend == "kernel"
-        ):
-            self.hicache_io_backend = "direct"
-            logger.warning(
-                "AttnCP sharded-KV + HiCache requires FA3; switching HiCache "
-                "to direct I/O so backend normalization keeps FA3 decode."
-            )
 
         # Step 1: Initial layout-io compatibility normalization.
         self._resolve_layout_io_compatibility()

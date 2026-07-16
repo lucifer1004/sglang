@@ -53,17 +53,33 @@ def is_cp_kv_sharded():
         return False
 
 
+def is_decode_cp_kv_sharded(server_args=None):
+    if server_args is None:
+        try:
+            server_args = get_global_server_args()
+        except ValueError:
+            return False
+    return (
+        server_args.attn_cp_mode == "sharded-kv"
+        and server_args.disaggregation_mode == "decode"
+    )
+
+
 def can_cp_split(seq_len: int, cp_size: int, forward_batch):
     # CP metadata (zigzag split) only supports batch=1 for now.
-    cur_cp_seq_len = seq_len // (cp_size * 2)
-    return (
-        cur_cp_seq_len != 0
-        and cp_size > 1
+    common_requirements = (
+        cp_size > 1
         and forward_batch.forward_mode.is_context_parallel_extend()
         and is_prefill_context_parallel_enabled()
-        and not is_cp_kv_sharded()
         and forward_batch.seq_lens_cpu.shape[0] == 1
     )
+    if is_cp_kv_sharded():
+        return common_requirements and getattr(
+            forward_batch, "attn_cp_prefill_runtime_layout", None
+        ) is not None
+
+    cur_cp_seq_len = seq_len // (cp_size * 2)
+    return common_requirements and cur_cp_seq_len != 0
 
 
 def cp_split_and_rebuild_data(forward_batch, input_: torch.Tensor):
@@ -360,15 +376,37 @@ def cp_attn_forward_extend(
     attn_fn: Callable[[torch.Tensor, torch.Tensor, torch.Tensor, int], torch.Tensor],
 ) -> torch.Tensor:
     """
-    Split q into prev/next zigzag halves based on CP metadata, call the
-    backend-specific attention function twice with appropriate per-half
-    metadata, and concatenate the results.
+    Run attention over explicit Phase 2 query blocks when present. Legacy CP
+    keeps its historical two-half zigzag behavior.
 
     attn_fn signature:
         attn_fn(q, cu_seqlens_q, cache_seqlens, max_seqlen_q) -> result
     where only these four CP-varying parameters differ between halves.
     All other backend-specific args should be captured in the closure.
     """
+    runtime_layout = getattr(
+        forward_batch, "attn_cp_prefill_runtime_layout", None
+    )
+    if runtime_layout is not None:
+        if q.shape[0] != runtime_layout.active_local_tokens:
+            raise ValueError(
+                "Phase 2 local Q rows do not match the prefill runtime layout"
+            )
+        results = []
+        for block in runtime_layout.q_blocks:
+            q_block = q.narrow(0, block.local_start, block.token_count)
+            results.append(
+                attn_fn(
+                    q_block,
+                    block.cu_seqlens_q,
+                    block.cu_seqlens_k[1:],
+                    block.token_count,
+                )
+            )
+        if not results:
+            return q.new_empty(q.shape)
+        return torch.cat(results, dim=0)
+
     cp_meta = forward_batch.attn_cp_metadata
 
     q_prev, q_next = torch.chunk(q, 2, dim=0)

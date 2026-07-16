@@ -14,6 +14,7 @@ maybe_stub_sgl_kernel()
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.mem_cache.chunk_cache import ChunkCache
+from sglang.srt.mem_cache.common import maybe_cache_unfinished_req
 
 register_cpu_ci(est_time=6, suite="stage-a-test-cpu")
 
@@ -155,6 +156,30 @@ class TestStashGatePreservesPrefixIndices(CustomTestCase):
 
         Scheduler.get_next_batch_to_run(s)
         self.assertIsNone(s.chunked_req)
+
+    def test_fake_chunked_req_advances_without_radix_insert(self):
+        pool = _make_req_to_token_pool(self.NUM_SLOTS, self.MAX_CONTEXT)
+        req = _make_req(
+            req_pool_idx=self.POOL_IDX,
+            fill_ids=list(range(self.POST_RESET_FILL_LEN)),
+            prefix_indices=pool.req_to_token[self.POOL_IDX, :0],
+            extend_input_len=self.POST_RESET_FILL_LEN,
+        )
+        req.skip_radix_cache_insert = True
+        tree_cache = SimpleNamespace(
+            is_chunk_cache=lambda: False,
+            req_to_token_pool=pool,
+            cache_unfinished_req=MagicMock(),
+        )
+
+        maybe_cache_unfinished_req(req, tree_cache, chunked=True)
+
+        expected = pool.req_to_token[
+            self.POOL_IDX, : self.POST_RESET_FILL_LEN
+        ].to(dtype=torch.int64)
+        self.assertTrue(torch.equal(req.prefix_indices, expected))
+        self.assertEqual(req.cache_protected_len, 0)
+        tree_cache.cache_unfinished_req.assert_not_called()
 
 
 if __name__ == "__main__":

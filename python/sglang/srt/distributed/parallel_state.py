@@ -792,30 +792,50 @@ class GroupCoordinator:
         sizes: Optional[List[int]] = None,
     ) -> torch.Tensor:
         world_size = self.world_size
-        pynccl_comm = self.pynccl_comm
-
-        with pynccl_comm.change_state(enable=True):
-            assert (
-                pynccl_comm is not None and not pynccl_comm.disabled
-            ), "pynccl is required for reduce_scatterv"
-
-            if sizes is not None:
-                assert len(sizes) == world_size
-                assert input_.shape[0] == sum(sizes)
-                chunk_size = sizes[self.rank_in_group]
-            else:
-                assert input_.shape[0] % world_size == 0
-                chunk_size = input_.shape[0] // world_size
-            output_shape = (chunk_size,) + input_.shape[1:]
-
-            if output is None:
-                output = torch.empty(
-                    output_shape, dtype=input_.dtype, device=input_.device
+        collective_sizes = sizes
+        if sizes is not None:
+            sizes = [int(size) for size in sizes]
+            if len(sizes) != world_size or any(size < 0 for size in sizes):
+                raise ValueError(
+                    "reduce_scatterv sizes must be non-negative per-rank counts"
                 )
-            else:
-                assert output.shape == output_shape
+            if input_.shape[0] != sum(sizes):
+                raise ValueError("reduce_scatterv input rows do not match sizes")
+            chunk_size = sizes[self.rank_in_group]
+            collective_sizes = (
+                None if all(size == sizes[0] for size in sizes) else sizes
+            )
+        else:
+            if input_.shape[0] % world_size != 0:
+                raise ValueError(
+                    "reduce_scatterv input rows must be divisible by world size"
+                )
+            chunk_size = input_.shape[0] // world_size
+        output_shape = (chunk_size,) + input_.shape[1:]
 
-            pynccl_comm.reduce_scatter(output, input_, sizes=sizes)
+        if world_size == 1:
+            if output is None:
+                return input_
+            if output.shape != output_shape:
+                raise ValueError("reduce_scatterv output shape does not match sizes")
+            output.copy_(input_)
+            return output
+
+        if output is None:
+            output = torch.empty(
+                output_shape, dtype=input_.dtype, device=input_.device
+            )
+        elif output.shape != output_shape:
+            raise ValueError("reduce_scatterv output shape does not match sizes")
+
+        if input_.shape[0] == 0:
+            return output
+
+        pynccl_comm = self.pynccl_comm
+        if pynccl_comm is None or not getattr(pynccl_comm, "available", True):
+            raise RuntimeError("an available pynccl communicator is required")
+        with pynccl_comm.change_state(enable=True):
+            pynccl_comm.reduce_scatter(output, input_, sizes=collective_sizes)
             return output
 
     def _all_gather_into_tensor(self, output: torch.Tensor, input: torch.Tensor):
@@ -959,49 +979,241 @@ class GroupCoordinator:
         `sizes`: a list of len(world_size) with the number of items per rank to gather.
         """
         world_size = self.world_size
+        inputs = [input_] if isinstance(input_, torch.Tensor) else input_
+        if sizes is not None:
+            sizes = [int(size) for size in sizes]
+            if len(sizes) != world_size or any(size < 0 for size in sizes):
+                raise ValueError("all_gatherv sizes must be non-negative per-rank counts")
+            local_size = sizes[self.rank_in_group]
+            if any(inp.shape[0] != local_size for inp in inputs):
+                raise ValueError("all_gatherv input rows do not match the local size")
+
+        if world_size == 1:
+            return inputs
+        if not inputs:
+            return []
+
+        if sizes is not None and sum(sizes) == 0:
+            return [inp.new_empty((0, *inp.shape[1:])) for inp in inputs]
+        if sizes is None and all(inp.shape[0] == 0 for inp in inputs):
+            return [inp.new_empty((0, *inp.shape[1:])) for inp in inputs]
+
         pynccl_comm = self.pynccl_comm
+        if pynccl_comm is None or not getattr(pynccl_comm, "available", True):
+            raise RuntimeError("an available pynccl communicator is required")
 
         with pynccl_comm.change_state(enable=True):
-            assert (
-                pynccl_comm is not None and not pynccl_comm.disabled
-            ), "pynccl is required for all_gatherv"
 
             def _all_gather_allocate_output(
-                input_: torch.Tensor, sizes: Optional[List[int]] = None
+                inp: torch.Tensor, gather_sizes: Optional[List[int]] = None
             ):
-                input_size = input_.size()
-                if sizes is not None:
-                    assert len(sizes) == world_size
-                    assert input_.shape[0] == sizes[self.rank_in_group]
-                    output_size = (sum(sizes),) + input_size[1:]
-                    # 'sizes' is not needed if all inputs in the same group have the same shape
-                    if all(s == sizes[0] for s in sizes):
-                        sizes = None
+                input_size = inp.size()
+                if gather_sizes is not None:
+                    output_size = (sum(gather_sizes),) + input_size[1:]
+                    if all(size == gather_sizes[0] for size in gather_sizes):
+                        gather_sizes = None
                 else:
                     output_size = (input_size[0] * world_size,) + input_size[1:]
-                # Allocate output tensor.
-                with self.use_symmetric_memory(self, disabled=sizes is not None):
+                with self.use_symmetric_memory(
+                    self, disabled=gather_sizes is not None
+                ):
                     output_tensor = torch.empty(
-                        output_size, dtype=input_.dtype, device=input_.device
+                        output_size, dtype=inp.dtype, device=inp.device
                     )
-                return output_tensor, sizes
-
-            if isinstance(input_, torch.Tensor):
-                input_ = [input_]
+                return output_tensor, gather_sizes
 
             output_list = []
             size_list = []
-            for inp in input_:
-                output_tensor, s = _all_gather_allocate_output(inp, sizes=sizes)
+            for inp in inputs:
+                output_tensor, gather_sizes = _all_gather_allocate_output(
+                    inp, gather_sizes=sizes
+                )
                 output_list.append(output_tensor)
-                size_list.append(s)
+                size_list.append(gather_sizes)
 
             pynccl_comm.group_start()
-            for i, inp in enumerate(input_):
-                pynccl_comm.all_gather(output_list[i], inp, sizes=size_list[i])
+            for index, inp in enumerate(inputs):
+                pynccl_comm.all_gather(
+                    output_list[index], inp, sizes=size_list[index]
+                )
             pynccl_comm.group_end()
 
             return output_list
+
+    def gatherv_to_ranks(
+        self,
+        input_: Union[torch.Tensor, List[torch.Tensor]],
+        sizes: List[int],
+        dst_ranks: List[int],
+    ) -> Optional[List[torch.Tensor]]:
+        """Gather rank-packed rows only on selected destination ranks."""
+        world_size = self.world_size
+        inputs = [input_] if isinstance(input_, torch.Tensor) else input_
+        sizes = [int(size) for size in sizes]
+        if len(sizes) != world_size or any(size < 0 for size in sizes):
+            raise ValueError(
+                "gatherv_to_ranks sizes must be non-negative per-rank counts"
+            )
+
+        destinations = tuple(sorted(int(rank) for rank in dst_ranks))
+        if (
+            len(set(destinations)) != len(destinations)
+            or any(rank < 0 or rank >= world_size for rank in destinations)
+        ):
+            raise ValueError("gatherv_to_ranks destinations must be unique group ranks")
+
+        local_size = sizes[self.rank_in_group]
+        if any(inp.shape[0] != local_size for inp in inputs):
+            raise ValueError("gatherv_to_ranks input rows do not match the local size")
+        is_destination = self.rank_in_group in destinations
+        if not destinations:
+            return None
+        if not inputs:
+            return [] if is_destination else None
+
+        total_size = sum(sizes)
+        outputs = None
+        if is_destination:
+            outputs = [
+                inp.new_empty((total_size, *inp.shape[1:])) for inp in inputs
+            ]
+            if local_size != 0:
+                local_offset = sum(sizes[: self.rank_in_group])
+                for output, inp in zip(outputs, inputs):
+                    output.narrow(0, local_offset, local_size).copy_(inp)
+
+        remote_sources = (
+            tuple(
+                rank
+                for rank, size in enumerate(sizes)
+                if size != 0 and rank != self.rank_in_group
+            )
+            if is_destination
+            else ()
+        )
+        remote_destinations = (
+            tuple(rank for rank in destinations if rank != self.rank_in_group)
+            if local_size != 0
+            else ()
+        )
+        if not remote_sources and not remote_destinations:
+            return outputs
+
+        pynccl_comm = self.pynccl_comm
+        if pynccl_comm is None or not getattr(pynccl_comm, "available", True):
+            raise RuntimeError(
+                "gatherv_to_ranks requires an available pynccl communicator"
+            )
+
+        source_offsets = [0]
+        for size in sizes:
+            source_offsets.append(source_offsets[-1] + size)
+
+        with pynccl_comm.change_state(enable=True):
+            pynccl_comm.group_start()
+            for index, inp in enumerate(inputs):
+                if is_destination:
+                    output = outputs[index]
+                    for source in remote_sources:
+                        pynccl_comm.recv(
+                            output.narrow(
+                                0, source_offsets[source], sizes[source]
+                            ),
+                            source,
+                        )
+                for destination in remote_destinations:
+                    pynccl_comm.send(inp, destination)
+            pynccl_comm.group_end()
+        return outputs
+
+    def all_to_allv(
+        self,
+        input_: Union[torch.Tensor, List[torch.Tensor]],
+        send_sizes: List[int],
+        recv_sizes: List[int],
+    ) -> List[torch.Tensor]:
+        """Exchange destination-packed rows and return source-packed rows."""
+        world_size = self.world_size
+        inputs = [input_] if isinstance(input_, torch.Tensor) else input_
+
+        def validate_sizes(sizes: List[int], name: str) -> List[int]:
+            sizes = [int(size) for size in sizes]
+            if len(sizes) != world_size or any(size < 0 for size in sizes):
+                raise ValueError(
+                    f"all_to_allv {name} must be non-negative per-rank counts"
+                )
+            return sizes
+
+        send_sizes = validate_sizes(send_sizes, "send_sizes")
+        recv_sizes = validate_sizes(recv_sizes, "recv_sizes")
+        send_rows = sum(send_sizes)
+        recv_rows = sum(recv_sizes)
+        if any(inp.shape[0] != send_rows for inp in inputs):
+            raise ValueError("all_to_allv input rows do not match send_sizes")
+        if send_sizes[self.rank_in_group] != recv_sizes[self.rank_in_group]:
+            raise ValueError("all_to_allv self send and receive sizes must match")
+        if not inputs:
+            if send_rows or recv_rows:
+                raise ValueError("all_to_allv requires inputs for non-empty exchange")
+            return []
+
+        outputs = [
+            inp.new_empty((recv_rows, *inp.shape[1:])) for inp in inputs
+        ]
+        send_offsets = [0]
+        recv_offsets = [0]
+        for send_size, recv_size in zip(send_sizes, recv_sizes):
+            send_offsets.append(send_offsets[-1] + send_size)
+            recv_offsets.append(recv_offsets[-1] + recv_size)
+
+        rank = self.rank_in_group
+        self_size = send_sizes[rank]
+        if self_size:
+            for output, inp in zip(outputs, inputs):
+                output.narrow(0, recv_offsets[rank], self_size).copy_(
+                    inp.narrow(0, send_offsets[rank], self_size)
+                )
+
+        remote_sources = tuple(
+            source
+            for source, size in enumerate(recv_sizes)
+            if source != rank and size != 0
+        )
+        remote_destinations = tuple(
+            destination
+            for destination, size in enumerate(send_sizes)
+            if destination != rank and size != 0
+        )
+        if not remote_sources and not remote_destinations:
+            return outputs
+
+        pynccl_comm = self.pynccl_comm
+        if pynccl_comm is None or not getattr(pynccl_comm, "available", True):
+            raise RuntimeError(
+                "all_to_allv requires an available pynccl communicator"
+            )
+
+        with pynccl_comm.change_state(enable=True):
+            pynccl_comm.group_start()
+            for output, inp in zip(outputs, inputs):
+                for source in remote_sources:
+                    pynccl_comm.recv(
+                        output.narrow(
+                            0, recv_offsets[source], recv_sizes[source]
+                        ),
+                        source,
+                    )
+                for destination in remote_destinations:
+                    pynccl_comm.send(
+                        inp.narrow(
+                            0,
+                            send_offsets[destination],
+                            send_sizes[destination],
+                        ),
+                        destination,
+                    )
+            pynccl_comm.group_end()
+        return outputs
 
     def gather(
         self, input_: torch.Tensor, dst: int = 0, dim: int = -1
@@ -1819,6 +2031,7 @@ def compute_sharded_kv_cp_group_ranks(
     attention_context_model_parallel_size: int,
     attention_data_parallel_size: int,
     num_tensor_model_parallel_groups: int,
+    use_decode_layout: bool = False,
 ) -> list[list[int]]:
     """Build sharded-KV CP group ranks."""
     if attention_context_model_parallel_size <= 0:
@@ -1847,10 +2060,28 @@ def compute_sharded_kv_cp_group_ranks(
         for dp_idx in range(attention_data_parallel_size):
             dp_base = tp_base + dp_idx * per_attn_dp_size
             for sharded_attn_tp_idx in range(sharded_attn_tp_size):
-                st = dp_base + sharded_attn_tp_idx * cp_size
-                sharded_kv_cp_group_ranks.append(list(range(st, st + cp_size)))
+                if use_decode_layout:
+                    start = dp_base + sharded_attn_tp_idx * cp_size
+                    ranks = list(range(start, start + cp_size))
+                else:
+                    ranks = [
+                        dp_base
+                        + cp_idx * sharded_attn_tp_size
+                        + sharded_attn_tp_idx
+                        for cp_idx in range(cp_size)
+                    ]
+                sharded_kv_cp_group_ranks.append(ranks)
 
     return sharded_kv_cp_group_ranks
+
+
+def should_enable_attn_tp_pynccl(
+    *,
+    attn_cp_size: int,
+    sync_token_ids: bool,
+    enable_symm_mem: bool,
+) -> bool:
+    return bool(sync_token_ids or enable_symm_mem or attn_cp_size > 1)
 
 
 def initialize_model_parallel(
@@ -1865,6 +2096,7 @@ def initialize_model_parallel(
     duplicate_tp_group: bool = False,
     enable_symm_mem: bool = False,
     recovered_rank: bool = False,
+    use_decode_sharded_kv_layout: bool = False,
 ) -> None:
     """
     Initialize model parallel groups.
@@ -1882,6 +2114,8 @@ def initialize_model_parallel(
             parallelism.
         moe_data_model_parallel_size: number of GPUs used for moe data
             parallelism.
+        use_decode_sharded_kv_layout: group contiguous global-TP ranks for the
+            mainline Decode CP KV-head replication layout.
 
     Let's say we have a total of 8 GPUs denoted by g0 ... g7 and we
     use 2 GPUs to parallelize the model tensor, and 4 GPUs to parallelize
@@ -2053,7 +2287,11 @@ def initialize_model_parallel(
             group_ranks,
             get_world_group().local_rank,
             backend,
-            use_pynccl=SYNC_TOKEN_IDS_ACROSS_TP or enable_symm_mem,
+            use_pynccl=should_enable_attn_tp_pynccl(
+                attn_cp_size=attn_cp_size,
+                sync_token_ids=SYNC_TOKEN_IDS_ACROSS_TP,
+                enable_symm_mem=enable_symm_mem,
+            ),
             use_mscclpp_allreduce=False,
             use_custom_allreduce=False,
             use_torch_symm_mem_allreduce=False,
@@ -2108,6 +2346,7 @@ def initialize_model_parallel(
         attn_cp_size,
         attn_dp_size,
         num_tensor_model_parallel_groups,
+        use_decode_layout=use_decode_sharded_kv_layout,
     )
     if attn_cp_size == 1:
         _SHARDED_KV_CP = _ATTN_CP

@@ -61,6 +61,7 @@ import numpy as np
 import torch
 
 from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
+from sglang.srt.context_parallel import CPPrefillSplitSpec
 from sglang.srt.disaggregation.base import BaseKVSender
 from sglang.srt.disaggregation.decode_schedule_batch_mixin import (
     ScheduleBatchDisaggregationDecodeMixin,
@@ -1109,6 +1110,10 @@ class Req(ReqDllmMixin):
         # Prefix info
         # The indices to kv cache for the shared prefix.
         self.prefix_indices: torch.Tensor = torch.empty((0,), dtype=torch.int64)
+        # Stable per-request owner phase for sharded-KV context parallelism.
+        self.attn_cp_owner_rotation: Optional[int] = None
+        # Immutable ownership plan for the currently scheduled prefill interval.
+        self.attn_cp_prefill_split_spec: Optional[CPPrefillSplitSpec] = None
         # Number of tokens to run prefill.
         self.extend_input_len = 0
         # The relative logprob_start_len in an extend batch
@@ -1367,6 +1372,7 @@ class Req(ReqDllmMixin):
         tree_cache: Optional[BasePrefixCache] = None,
         cow_mamba: Optional[bool] = None,
     ):
+        self.attn_cp_prefill_split_spec = None
         if self.is_dllm():
             self._init_fill_ids_for_dllm()
             self.determine_dllm_phase()
@@ -1632,6 +1638,7 @@ class Req(ReqDllmMixin):
         self.retraction_count += 1
 
         self.prefix_indices = torch.empty((0,), dtype=torch.int64)
+        self.attn_cp_prefill_split_spec = None
         self.routed_experts = None
         self.indexer_topk = None
         self.last_node = None
@@ -1715,6 +1722,7 @@ class Req(ReqDllmMixin):
         # - logprob_start_len: Absolute position in full sequence where logprob computation begins
         # - extend_logprob_start_len: Relative position within current extend batch where logprob computation begins
         # - extend_input_len: Number of tokens that need to be processed in this extend batch
+        self.attn_cp_prefill_split_spec = None
         self.extend_input_len = extend_input_len
         scale = getattr(self, "_scale_seq_factor", 1) or 1
         prefix_len = len(self.prefix_indices) // scale
@@ -1847,6 +1855,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     extend_num_tokens: Optional[int] = None
     decoding_reqs: List[Req] = None
     extend_logprob_start_lens: List[int] = None
+    attn_cp_prefill_split_specs: Optional[
+        Tuple[Optional[CPPrefillSplitSpec], ...]
+    ] = None
     # It comes empty list if logprob is not required.
     extend_input_logprob_token_ids: Optional[torch.Tensor] = None
 
@@ -1946,6 +1957,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         ):
             is_hybrid_swa = True
 
+        attn_cp_prefill_split_specs = tuple(
+            req.attn_cp_prefill_split_spec for req in reqs
+        )
+        if not any(spec is not None for spec in attn_cp_prefill_split_specs):
+            attn_cp_prefill_split_specs = None
+
         batch = cls(
             reqs=reqs,
             req_to_token_pool=req_to_token_pool,
@@ -1965,6 +1982,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             is_prefill_only=all(req.is_prefill_only for req in reqs),
             chunked_req=chunked_req,
             dllm_config=dllm_config,
+            attn_cp_prefill_split_specs=attn_cp_prefill_split_specs,
         )
         return batch
 
@@ -2114,6 +2132,15 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     def prepare_for_extend(self):
         self.forward_mode = ForwardMode.EXTEND
+
+        self._refresh_attn_cp_prefill_split_specs()
+        if (
+            self.attn_cp_prefill_split_specs is not None
+            and self.model_config.is_encoder_decoder
+        ):
+            raise ValueError(
+                "Phase 2 sharded-KV prefill does not support encoder-decoder batches"
+            )
 
         if self.is_dllm():
             # For DLLM, we use a separate forward mode
@@ -2766,6 +2793,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     def prepare_for_idle(self):
         self.forward_mode = ForwardMode.IDLE
+        self._clear_attn_cp_prefill_split_specs(clear_reqs=True)
         self.input_ids = torch.empty(0, dtype=torch.int64, device=self.device)
         self.seq_lens = torch.empty(0, dtype=torch.int64, device=self.device)
         self.seq_lens_cpu = torch.empty(0, dtype=torch.int64)
@@ -2795,6 +2823,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # Decode embeds the last output token via embed_tokens; clear the stale
         # prefill-time tensor so it doesn't leak into ForwardBatch.
         self.input_embeds = None
+        self._clear_attn_cp_prefill_split_specs(clear_reqs=True)
 
         # Clear context parallel metadata - CP is only for prefill, not decode
         if hasattr(self, "attn_cp_metadata") and self.attn_cp_metadata is not None:
@@ -3020,10 +3049,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             # Filter out all requests
             self.reqs = []
             self.spec_info = None
+            self.attn_cp_prefill_split_specs = None
             return
 
         if len(keep_indices) == len(self.reqs):
             # No need to filter
+            self._refresh_attn_cp_prefill_split_specs()
             return
 
         keep_indices_device = torch.tensor(
@@ -3037,6 +3068,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.encoder_lens_cpu = [self.encoder_lens_cpu[i] for i in keep_indices]
 
         self.reqs = [self.reqs[i] for i in keep_indices]
+        self._refresh_attn_cp_prefill_split_specs()
         if self.multimodal_inputs is not None:
             self.multimodal_inputs = [self.multimodal_inputs[i] for i in keep_indices]
         self.req_pool_indices = self.req_pool_indices[keep_indices_device]
@@ -3119,6 +3151,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.top_logprobs_nums = [0] * len(self.reqs) + other.top_logprobs_nums
             self.token_ids_logprobs = [None] * len(self.reqs) + other.token_ids_logprobs
         self.reqs.extend(other.reqs)
+        self._refresh_attn_cp_prefill_split_specs()
         if self.multimodal_inputs is not None:
             self.multimodal_inputs.extend(other.multimodal_inputs)
 
@@ -3197,6 +3230,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             extend_seq_lens=extend_seq_lens,
             extend_prefix_lens=extend_prefix_lens,
             extend_logprob_start_lens=extend_logprob_start_lens,
+            attn_cp_prefill_split_specs=self._current_attn_cp_prefill_split_specs(),
             welm_kv_mirror_last_q_indices=welm_kv_mirror_last_q_indices,
             welm_kv_mirror_active_batch_indices=welm_kv_mirror_active_batch_indices,
             welm_kv_mirror_output_size=welm_kv_mirror_output_size,
@@ -3297,6 +3331,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             is_prefill_only=self.is_prefill_only,
             router_replay_topk_ids=self.router_replay_topk_ids,
             router_replay_mask=self.router_replay_mask,
+            attn_cp_prefill_split_specs=self._current_attn_cp_prefill_split_specs(),
             seq_lens_cpu=self.seq_lens_cpu,
             enable_overlap=self.enable_overlap,
             mamba_track_indices=self.mamba_track_indices,
@@ -3306,6 +3341,23 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             prefill_stats=self.prefill_stats,
             fpm_start_time=self.fpm_start_time,
             forward_iter=self.forward_iter,
+        )
+
+    def _clear_attn_cp_prefill_split_specs(self, *, clear_reqs: bool) -> None:
+        self.attn_cp_prefill_split_specs = None
+        if clear_reqs:
+            for req in self.reqs:
+                req.attn_cp_prefill_split_spec = None
+
+    def _current_attn_cp_prefill_split_specs(
+        self,
+    ) -> Optional[Tuple[Optional[CPPrefillSplitSpec], ...]]:
+        specs = tuple(req.attn_cp_prefill_split_spec for req in self.reqs)
+        return specs if any(spec is not None for spec in specs) else None
+
+    def _refresh_attn_cp_prefill_split_specs(self) -> None:
+        self.attn_cp_prefill_split_specs = (
+            self._current_attn_cp_prefill_split_specs()
         )
 
     def maybe_evict_swa(self):
@@ -3449,6 +3501,9 @@ class ModelWorkerBatch:
     extend_seq_lens: Optional[List[int]]
     extend_prefix_lens: Optional[List[int]]
     extend_logprob_start_lens: Optional[List[int]]
+    attn_cp_prefill_split_specs: Optional[
+        Tuple[Optional[CPPrefillSplitSpec], ...]
+    ]
     welm_kv_mirror_last_q_indices: Optional[List[int]]
     welm_kv_mirror_active_batch_indices: Optional[List[int]]
     welm_kv_mirror_output_size: Optional[int]

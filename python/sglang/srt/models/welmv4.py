@@ -20,8 +20,9 @@ import logging
 import math
 import os
 import re
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
@@ -29,6 +30,7 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from sglang.srt.batch_overlap.two_batch_overlap import model_forward_maybe_tbo
+from sglang.srt.context_parallel import contract_cp_prefill_runtime_to_last_q
 from sglang.srt.distributed import (
     divide,
     get_pp_group,
@@ -48,6 +50,9 @@ from sglang.srt.layers.communicator import (
     LayerCommunicator,
     LayerScatterModes,
     ScatterMode,
+)
+from sglang.srt.layers.communicator_prefill_cp import (
+    PrefillCPLayerCommunicator,
 )
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
@@ -70,10 +75,16 @@ from sglang.srt.layers.linear import (
     ReplicatedLinear,
     RowParallelLinear,
 )
-from sglang.srt.layers.logits_processor import LogitsProcessor
+from sglang.srt.layers.logits_processor import (
+    LogitsMetadata,
+    LogitsProcessor,
+    LogitsProcessorOutput,
+)
+from sglang.srt.layers.moe import MoeRunnerBackend, get_moe_a2a_backend
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
-from sglang.srt.layers.moe.topk import TopK
+from sglang.srt.layers.moe.topk import StandardTopKOutput, TopK
+from sglang.srt.layers.prefill_cp_logits import route_cp_prefill_hidden_states
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import (
@@ -83,7 +94,7 @@ from sglang.srt.layers.rotary_embedding import (
     yarn_get_mscale,
 )
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
-from sglang.srt.layers.utils.cp_utils import is_cp_kv_sharded
+from sglang.srt.layers.utils.cp_utils import is_decode_cp_kv_sharded
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -111,6 +122,7 @@ from sglang.srt.models.welm_perf_opt import (
     welm_embeddings,
 )
 from sglang.srt.server_args import get_global_server_args
+from sglang.srt.state_capturer.routed_experts import get_global_experts_capturer
 
 # from sglang.srt.two_batch_overlap import model_forward_maybe_tbo
 from sglang.srt.utils import (
@@ -122,6 +134,7 @@ from sglang.srt.utils import (
 )
 
 logger = logging.getLogger(__name__)
+_WELM_CP_FUSED_NORM_FALLBACK_WARNED = False
 
 _is_cuda = is_cuda()
 if _is_cuda:
@@ -397,8 +410,15 @@ def _set_welm_custom_last_prefill_cache_loc(forward_batch: ForwardBatch) -> None
         custom_last_index = torch.cumsum(forward_batch.extend_seq_lens, dim=0) - 1
         forward_batch.custom_last_index = custom_last_index
 
+    runtime_layout = getattr(
+        forward_batch, "attn_cp_prefill_runtime_layout", None
+    )
     out_cache_loc = getattr(forward_batch, "out_cache_loc", None)
-    if out_cache_loc is not None:
+    if runtime_layout is not None:
+        forward_batch.custom_last_cache_loc = (
+            runtime_layout.local_out_cache_loc.index_select(0, custom_last_index)
+        )
+    elif out_cache_loc is not None:
         if out_cache_loc.numel() == custom_last_index.numel():
             forward_batch.custom_last_cache_loc = out_cache_loc
         else:
@@ -478,13 +498,20 @@ def _set_welm_kv_mirror_states(
     forward_batch.model_specific_states = model_specific_states
 
 
+def _get_welm_attention_tp_rank_and_size() -> Tuple[int, int]:
+    if is_decode_cp_kv_sharded():
+        return (
+            get_tensor_model_parallel_rank(),
+            get_tensor_model_parallel_world_size(),
+        )
+    return get_attention_tp_rank(), get_attention_tp_size()
+
+
 def _get_welm_head_shard_start(param_numel: int, module: Optional[nn.Module]) -> int:
     if module is not None and hasattr(module, "attn_tp_rank"):
         tp_rank = int(module.attn_tp_rank)
-    elif is_cp_kv_sharded():
-        tp_rank = get_tensor_model_parallel_rank()
     else:
-        tp_rank = get_attention_tp_rank()
+        tp_rank, _ = _get_welm_attention_tp_rank_and_size()
     return tp_rank * int(param_numel)
 
 
@@ -617,31 +644,420 @@ def _welm_needs_empty_dp_collectives(
     )
 
 
+def _welm_cp_prefill_prefix_send_only(
+    row_count: int,
+    forward_batch: ForwardBatch,
+) -> bool:
+    if (
+        row_count != 0
+        or getattr(forward_batch, "attn_cp_prefill_runtime_layout", None) is None
+    ):
+        return False
+
+    runtime_layout = forward_batch.attn_cp_prefill_runtime_layout
+    if getattr(
+        runtime_layout,
+        "kv_local_tokens",
+        getattr(runtime_layout, "active_local_tokens", 0),
+    ) != 0:
+        return False
+
+    gather_plan = getattr(
+        forward_batch, "attn_cp_prefill_kv_gather_plan", None
+    )
+    if gather_plan is None:
+        raise RuntimeError(
+            "Phase 2 empty-Q attention is missing its KV participation plan; "
+            "refusing implicit collective participation"
+        )
+    return gather_plan.prefix.local_physical_slots.numel() != 0
+
+
+def _welm_should_dispatch_attention(
+    row_count: int,
+    forward_batch: ForwardBatch,
+    needs_empty_dp_collectives: bool,
+) -> bool:
+    runtime_layout = getattr(
+        forward_batch, "attn_cp_prefill_runtime_layout", None
+    )
+    has_local_kv = (
+        runtime_layout is not None
+        and getattr(
+            runtime_layout,
+            "kv_local_tokens",
+            getattr(runtime_layout, "active_local_tokens", 0),
+        )
+        != 0
+    )
+    return (
+        row_count != 0
+        or needs_empty_dp_collectives
+        or has_local_kv
+        or _welm_cp_prefill_prefix_send_only(row_count, forward_batch)
+    )
+
+
+def _welm_select_layer_communicator(layer, forward_batch: ForwardBatch):
+    if getattr(forward_batch, "attn_cp_prefill_runtime_layout", None) is not None:
+        return layer.prefill_cp_communicator, True
+    return layer.layer_communicator, False
+
+
+def _welm_localize_cp_prefill_rows(
+    hidden_states: torch.Tensor,
+    positions: torch.Tensor,
+    forward_batch: ForwardBatch,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    layout = getattr(forward_batch, "attn_cp_prefill_runtime_layout", None)
+    if layout is None:
+        return hidden_states, positions
+    if hidden_states.shape[0] == layout.spec.extend_len:
+        hidden_states = hidden_states.index_select(
+            0, layout.local_extend_indices
+        )
+    elif hidden_states.shape[0] != layout.active_local_tokens:
+        raise RuntimeError(
+            "WeLM Phase 2 hidden rows are neither global extend nor CP-local rows"
+        )
+    return hidden_states, layout.local_positions
+
+
+@dataclass
+class _WelmPreparedLogits:
+    hidden_states: torch.Tensor
+    aux_hidden_states: Optional[List[torch.Tensor]]
+    logits_metadata: Union[LogitsMetadata, ForwardBatch]
+    chunk_states_loader: Optional[Callable[[int, int], torch.Tensor]] = None
+    hidden_states_to_store: Optional[torch.Tensor] = None
+
+
+def _welm_prepare_cp_prefill_logits_states(
+    hidden_states: torch.Tensor,
+    aux_hidden_states: Optional[List[torch.Tensor]],
+    forward_batch: ForwardBatch,
+) -> _WelmPreparedLogits:
+    runtime_layout = getattr(
+        forward_batch, "attn_cp_prefill_runtime_layout", None
+    )
+    if runtime_layout is None:
+        return _WelmPreparedLogits(
+            hidden_states=hidden_states,
+            aux_hidden_states=aux_hidden_states,
+            logits_metadata=forward_batch,
+        )
+
+    logits_metadata = LogitsMetadata.from_forward_batch(forward_batch)
+    if getattr(forward_batch, "multi_item_delimiter_indices", None) is not None:
+        raise NotImplementedError(
+            "WeLM Phase 2 prefill CP does not support multi-item scoring"
+        )
+    if logits_metadata.capture_hidden_mode.is_full():
+        raise NotImplementedError(
+            "WeLM Phase 2 prefill CP does not support full hidden-state capture"
+        )
+
+    if logits_metadata.extend_return_logprob:
+        if runtime_layout.q_is_contracted:
+            raise RuntimeError(
+                "WeLM Phase 2 prompt logprobs require uncontracted CP hidden rows"
+        )
+        extend_lens = logits_metadata.extend_seq_lens_cpu
+        start_lens = logits_metadata.extend_logprob_start_lens_cpu
+        if (
+            extend_lens is None
+            or start_lens is None
+            or len(extend_lens) != 1
+            or len(start_lens) != 1
+        ):
+            raise RuntimeError(
+                "WeLM Phase 2 prompt logprobs require prefill batch size 1"
+            )
+        extend_len = int(extend_lens[0])
+        start_len = int(start_lens[0])
+        if extend_len != runtime_layout.spec.extend_len:
+            raise RuntimeError(
+                "WeLM Phase 2 prompt-logprob length does not match CP layout"
+            )
+        if start_len < 0 or start_len >= extend_len:
+            raise RuntimeError(
+                "WeLM Phase 2 prompt-logprob start is outside the extend"
+            )
+        if hidden_states.shape[0] != runtime_layout.active_local_tokens:
+            raise RuntimeError(
+                "WeLM Phase 2 prompt-logprob hidden rows do not match CP layout"
+            )
+
+        pruned_token_count = extend_len - start_len
+
+        def load_chunk(start_idx: int, end_idx: int) -> torch.Tensor:
+            if start_idx < 0 or end_idx <= start_idx or end_idx > pruned_token_count:
+                raise ValueError("WeLM Phase 2 logits chunk is outside pruned rows")
+            return route_cp_prefill_hidden_states(
+                hidden_states,
+                runtime_layout,
+                logical_start=(
+                    runtime_layout.spec.extend_start + start_len + start_idx
+                ),
+                token_count=end_idx - start_idx,
+            )
+
+        hidden_states_to_store = None
+        if logits_metadata.capture_hidden_mode.need_capture():
+            final_logical = (
+                runtime_layout.spec.extend_start
+                + runtime_layout.spec.extend_len
+                - 1
+            )
+            if aux_hidden_states is not None:
+                hidden_states_to_store = torch.cat(
+                    [
+                        route_cp_prefill_hidden_states(
+                            hidden,
+                            runtime_layout,
+                            logical_start=final_logical,
+                            token_count=1,
+                        )
+                        for hidden in aux_hidden_states
+                    ],
+                    dim=-1,
+                )
+            else:
+                hidden_states_to_store = route_cp_prefill_hidden_states(
+                    hidden_states,
+                    runtime_layout,
+                    logical_start=final_logical,
+                    token_count=1,
+                )
+
+        return _WelmPreparedLogits(
+            hidden_states=hidden_states.new_empty((extend_len, 0)),
+            aux_hidden_states=None,
+            logits_metadata=logits_metadata,
+            chunk_states_loader=load_chunk,
+            hidden_states_to_store=hidden_states_to_store,
+        )
+
+    active_counts = runtime_layout.active_tokens_per_cp_rank()
+    if sum(active_counts) == 0:
+        if hidden_states.shape[0] != 0:
+            raise RuntimeError(
+                "WeLM Phase 2 no-Q chunk unexpectedly retained final hidden rows"
+            )
+        routed_hidden_states = hidden_states
+        routed_aux_hidden_states = aux_hidden_states
+    else:
+        final_logical = (
+            runtime_layout.spec.extend_start
+            + runtime_layout.spec.extend_len
+            - 1
+        )
+        routed_hidden_states = route_cp_prefill_hidden_states(
+            hidden_states,
+            runtime_layout,
+            logical_start=final_logical,
+            token_count=1,
+        )
+        routed_aux_hidden_states = (
+            [
+                route_cp_prefill_hidden_states(
+                    hidden,
+                    runtime_layout,
+                    logical_start=final_logical,
+                    token_count=1,
+                )
+                for hidden in aux_hidden_states
+            ]
+            if aux_hidden_states is not None
+            else None
+        )
+    logits_metadata.prefill_cp_pruned = True
+    return _WelmPreparedLogits(
+        hidden_states=routed_hidden_states,
+        aux_hidden_states=routed_aux_hidden_states,
+        logits_metadata=logits_metadata,
+    )
+
+
+def _welm_has_cp_prefill_split_spec(forward_batch: ForwardBatch) -> bool:
+    split_specs = getattr(forward_batch, "attn_cp_prefill_split_specs", None)
+    return split_specs is not None and any(spec is not None for spec in split_specs)
+
+
+def _welm_compute_logits_output(
+    logits_processor,
+    input_ids: torch.Tensor,
+    lm_head,
+    prepared_logits: _WelmPreparedLogits,
+    *,
+    vocab_size: int,
+):
+    hidden_states = prepared_logits.hidden_states
+    logits_metadata = prepared_logits.logits_metadata
+    aux_hidden_states = prepared_logits.aux_hidden_states
+    if prepared_logits.chunk_states_loader is not None:
+        return logits_processor.forward_input_logprobs_by_chunk_loader(
+            hidden_states,
+            lm_head,
+            logits_metadata,
+            chunk_states_loader=prepared_logits.chunk_states_loader,
+            hidden_states_to_store=prepared_logits.hidden_states_to_store,
+        )
+    if (
+        getattr(logits_metadata, "prefill_cp_pruned", False)
+        and hidden_states.shape[0] == 0
+    ):
+        hidden_states_to_store = None
+        if logits_metadata.capture_hidden_mode.need_capture():
+            hidden_states_to_store = (
+                torch.cat(aux_hidden_states, dim=-1)
+                if aux_hidden_states
+                else hidden_states
+            )
+        return LogitsProcessorOutput(
+            next_token_logits=hidden_states.new_empty(
+                (0, vocab_size), dtype=torch.float32
+            ),
+            hidden_states=hidden_states_to_store,
+            mm_input_embeds=logits_metadata.mm_input_embeds,
+        )
+    return logits_processor(
+        input_ids,
+        hidden_states,
+        lm_head,
+        logits_metadata,
+        aux_hidden_states,
+    )
+
+
+def _welm_should_use_mmq_norm_after_attn(
+    *,
+    use_previous_precision: bool,
+    residual_after_layernorm: bool,
+    use_o_norm: bool,
+    o_norm_needs_attn_tp_reduce: bool,
+    use_prefill_cp_communicator: bool,
+) -> bool:
+    use_fused_norm = (
+        not use_previous_precision
+        and residual_after_layernorm
+        and use_o_norm
+        and not o_norm_needs_attn_tp_reduce
+    )
+    if not use_fused_norm or not use_prefill_cp_communicator:
+        return use_fused_norm
+
+    global _WELM_CP_FUSED_NORM_FALLBACK_WARNED
+    if not _WELM_CP_FUSED_NORM_FALLBACK_WARNED:
+        logger.warning(
+            "WeLM Phase 2 prefill CP is falling back to the unfused norm path "
+            "because mmq_style_norm_after_attn does not support the CP-local "
+            "participation contract; a dedicated fused kernel is required"
+        )
+        _WELM_CP_FUSED_NORM_FALLBACK_WARNED = True
+    return False
+
+
 def _welm_init_kv_mirror_last_q_indices(forward_batch: ForwardBatch) -> bool:
     forward_batch.welm_kv_mirror_contracted = True
     if getattr(forward_batch, "kv_mirror_output_size", None) is not None:
         return False
 
-    last_q_indices = getattr(forward_batch, "welm_kv_mirror_last_q_indices", None)
-    if last_q_indices is None:
-        last_q_indices = getattr(forward_batch, "custom_last_index", None)
-        if last_q_indices is None:
-            last_q_indices = torch.cumsum(forward_batch.extend_seq_lens, dim=0) - 1
+    runtime_layout = getattr(
+        forward_batch, "attn_cp_prefill_runtime_layout", None
+    )
+    if runtime_layout is not None:
+        scheduler_indices = getattr(
+            forward_batch, "welm_kv_mirror_last_q_indices", None
+        )
+        if scheduler_indices is not None and scheduler_indices.numel() > 1:
+            raise RuntimeError(
+                "Phase 2 KV mirror requires at most one scheduler last-Q index"
+            )
+        has_global_q = scheduler_indices is None or scheduler_indices.numel() == 1
+        last_logical = (
+            runtime_layout.spec.extend_start
+            + runtime_layout.spec.extend_len
+            - 1
+        )
+        local_index = (
+            runtime_layout.local_index_for_logical(last_logical)
+            if has_global_q
+            else None
+        )
+        if local_index is None:
+            last_q_indices = torch.empty(
+                (0,), dtype=torch.long, device=runtime_layout.local_positions.device
+            )
+        else:
+            last_q_indices = torch.tensor(
+                [local_index],
+                dtype=torch.long,
+                device=runtime_layout.local_positions.device,
+            )
         active_batch_indices = torch.arange(
             last_q_indices.numel(),
             dtype=torch.long,
             device=last_q_indices.device,
         )
         output_size = int(last_q_indices.numel())
+        forward_batch.welm_cp_prefill_kv_mirror_has_global_q = has_global_q
     else:
-        active_batch_indices = forward_batch.welm_kv_mirror_active_batch_indices
-        output_size = forward_batch.welm_kv_mirror_output_size
+        last_q_indices = getattr(
+            forward_batch, "welm_kv_mirror_last_q_indices", None
+        )
+        if last_q_indices is None:
+            last_q_indices = getattr(forward_batch, "custom_last_index", None)
+            if last_q_indices is None:
+                last_q_indices = torch.cumsum(forward_batch.extend_seq_lens, dim=0) - 1
+            active_batch_indices = torch.arange(
+                last_q_indices.numel(),
+                dtype=torch.long,
+                device=last_q_indices.device,
+            )
+            output_size = int(last_q_indices.numel())
+        else:
+            active_batch_indices = forward_batch.welm_kv_mirror_active_batch_indices
+            output_size = forward_batch.welm_kv_mirror_output_size
 
     forward_batch.custom_last_index = last_q_indices
     forward_batch.kv_mirror_active_batch_indices = active_batch_indices
     forward_batch.kv_mirror_output_size = output_size
     _set_welm_custom_last_prefill_cache_loc(forward_batch)
     return True
+
+
+def _welm_contract_cp_prefill_kv_mirror_layout(forward_batch: ForwardBatch):
+    runtime_layout = getattr(
+        forward_batch, "attn_cp_prefill_runtime_layout", None
+    )
+    if runtime_layout is None or runtime_layout.q_is_contracted:
+        return runtime_layout
+    contracted = contract_cp_prefill_runtime_to_last_q(
+        runtime_layout,
+        has_active_q=bool(
+            getattr(
+                forward_batch,
+                "welm_cp_prefill_kv_mirror_has_global_q",
+                True,
+            )
+        ),
+    )
+    forward_batch.attn_cp_prefill_runtime_layout = contracted
+    context_forward_batch = get_current_forward_batch()
+    if context_forward_batch is not None and context_forward_batch is not forward_batch:
+        context_forward_batch.attn_cp_prefill_runtime_layout = contracted
+    return contracted
+
+
+def _welm_prepare_cp_prefill_kv_mirror_layout(forward_batch: ForwardBatch):
+    runtime_layout = getattr(
+        forward_batch, "attn_cp_prefill_runtime_layout", None
+    )
+    if runtime_layout is None:
+        return None
+    _welm_init_kv_mirror_last_q_indices(forward_batch)
+    return _welm_contract_cp_prefill_kv_mirror_layout(forward_batch)
 
 
 def _welm_select_kv_mirror_rows(
@@ -1621,7 +2037,27 @@ class MirrorQProjection(BaseWelmQkvProjection):
         project_hidden_states = hidden_states
         if _welm_should_contract_kv_mirror(forward_batch):
             _welm_init_kv_mirror_last_q_indices(forward_batch)
-            if _welm_kv_mirror_has_no_active_q(forward_batch):
+            runtime_layout = getattr(
+                forward_batch, "attn_cp_prefill_runtime_layout", None
+            )
+            if runtime_layout is not None:
+                if not runtime_layout.q_is_contracted:
+                    raise RuntimeError(
+                        "Phase 2 KV mirror runtime must contract before Q projection"
+                    )
+                if hidden_states.shape[0] != runtime_layout.active_local_tokens:
+                    project_hidden_states = _welm_select_kv_mirror_rows(
+                        hidden_states, forward_batch, first_contract=True
+                    )
+                if (
+                    project_hidden_states.shape[0]
+                    != runtime_layout.active_local_tokens
+                ):
+                    raise RuntimeError(
+                        "Phase 2 KV mirror Q rows do not match the contracted runtime"
+                    )
+                forward_batch.welm_kv_mirror_full_q_attention = False
+            elif _welm_kv_mirror_has_no_active_q(forward_batch):
                 project_hidden_states = hidden_states.new_empty(
                     (0, hidden_states.shape[-1])
                 )
@@ -1670,6 +2106,10 @@ class NextnMirrorQProjection(BaseWelmQkvProjection):
         forward_batch: ForwardBatch,
         kv_mirror_states: Dict[int, Tuple[torch.Tensor, torch.Tensor]],
     ) -> WelmQkvProjectionOutput:
+        if getattr(forward_batch, "attn_cp_prefill_runtime_layout", None) is not None:
+            raise NotImplementedError(
+                "WeLM Phase 2 prefill CP does not support NextN KV mirror"
+            )
         if forward_batch.forward_mode.is_idle() and not getattr(
             forward_batch, "welm_mtp_merge_kv_fill_draft", False
         ):
@@ -1842,6 +2282,12 @@ class Qwen2MoeMLP(nn.Module):
         return x
 
 
+def _welm_shared_expert_parallel_kwargs() -> dict[str, int]:
+    if get_moe_a2a_backend().is_none():
+        return {}
+    return {"tp_rank": 0, "tp_size": 1}
+
+
 def expert_bias_routing(
     hidden_states: torch.Tensor,
     gating_output: torch.Tensor,
@@ -1996,6 +2442,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 reduce_results=False,
                 prefix=add_prefix("shared_expert", prefix),
                 swiglu_clamp_limit=shared_clamp_limit,
+                **_welm_shared_expert_parallel_kwargs(),
             )
         else:
             self.shared_expert = None
@@ -2010,11 +2457,12 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        hidden_states_fp32: torch.Tensor,
+        hidden_states_fp32: Optional[torch.Tensor],
         forward_batch: Optional[ForwardBatch] = None,
         use_reduce_scatter: bool = False,
         return_components: bool = False,
         skip_component_output: bool = False,
+        prefill_cp_router_context=None,
     ) -> torch.Tensor:
         dump_this_layer = _WELM_DUMP_ENABLED and _welm_should_dump_layer(self.layer_id)
         if dump_this_layer:
@@ -2022,8 +2470,31 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
         if dump_this_layer:
+            if hidden_states_fp32 is None:
+                raise RuntimeError("WeLM tensor dump requires FP32 router input")
             _welm_dump_tensor(f"{dump_prefix}.router.input", hidden_states)
             _welm_dump_tensor(f"{dump_prefix}.router.input_fp32", hidden_states_fp32)
+        router_hidden_states = hidden_states
+        router_hidden_states_fp32 = hidden_states_fp32
+        if prefill_cp_router_context is not None:
+            if dump_this_layer:
+                raise RuntimeError(
+                    "WeLM tensor dump does not support owner-local prefill CP routing"
+                )
+            if get_global_experts_capturer() is not None:
+                raise RuntimeError(
+                    "routed-expert capture does not support owner-local prefill CP routing"
+                )
+            if get_global_expert_distribution_recorder().recording:
+                raise RuntimeError(
+                    "expert distribution recording does not support owner-local "
+                    "prefill CP routing"
+                )
+            router_hidden_states = prefill_cp_router_context.local_rows(hidden_states)
+            if hidden_states_fp32 is not None:
+                router_hidden_states_fp32 = prefill_cp_router_context.local_rows(
+                    hidden_states_fp32
+                )
         shared_output = None
         if self.shared_expert is not None:
             shared_output = self.shared_expert(hidden_states)
@@ -2031,10 +2502,31 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 shared_output = (
                     F.sigmoid(self.shared_expert_gate(hidden_states)) * shared_output
                 )
-        if welm_use_previous_precision():
-            router_logits = F.linear(hidden_states_fp32, self.gate.weight)
+
+        if router_hidden_states.shape[0] == 0:
+            top_k = self.topk.topk_config.top_k
+            router_logits = hidden_states.new_empty(
+                (0, self.gate.weight.shape[0]), dtype=torch.float32
+            )
+            topk_output = StandardTopKOutput(
+                topk_weights=router_logits.new_empty((0, top_k)),
+                topk_ids=torch.empty(
+                    (0, top_k), dtype=torch.int64, device=hidden_states.device
+                ),
+                router_logits=router_logits,
+            )
+        elif welm_use_previous_precision():
+            if router_hidden_states_fp32 is None:
+                raise RuntimeError("previous-precision Router requires FP32 hidden")
+            router_logits = F.linear(
+                router_hidden_states_fp32, self.gate.weight
+            )
+            topk_output = self.topk(router_hidden_states, router_logits)
         else:
-            router_logits = mmq_style_router_linear(hidden_states, self.gate.weight)
+            router_logits = mmq_style_router_linear(
+                router_hidden_states, self.gate.weight
+            )
+            topk_output = self.topk(router_hidden_states, router_logits)
         if dump_this_layer:
             _welm_dump_tensor(f"{dump_prefix}.router.logits", router_logits)
             if self.router_score_func == "softmax":
@@ -2044,7 +2536,21 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             else:
                 router_scores = torch.sigmoid(router_logits).type_as(router_logits)
             _welm_dump_tensor(f"{dump_prefix}.router.scores", router_scores)
-        topk_output = self.topk(hidden_states, router_logits)
+        if prefill_cp_router_context is not None:
+            if not isinstance(topk_output, StandardTopKOutput):
+                raise RuntimeError(
+                    "owner-local prefill CP routing requires Standard TopK output"
+                )
+            full_weights, full_ids = (
+                prefill_cp_router_context.gather_routing_metadata(
+                    topk_output.topk_weights, topk_output.topk_ids
+                )
+            )
+            topk_output = StandardTopKOutput(
+                topk_weights=full_weights,
+                topk_ids=full_ids,
+                router_logits=router_logits.new_empty((num_tokens, 0)),
+            )
         if dump_this_layer and hasattr(topk_output, "topk_weights"):
             _welm_dump_tensor(
                 f"{dump_prefix}.router.topk_scores", topk_output.topk_weights
@@ -2085,6 +2591,18 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 ),
             )
         return final_hidden_states
+
+    def validate_prefill_cp_local_router(self) -> None:
+        quant_method = getattr(self.experts, "quant_method", None)
+        runner = getattr(quant_method, "runner", None)
+        backend = getattr(runner, "runner_backend", None)
+        if backend not in (MoeRunnerBackend.TRITON, MoeRunnerBackend.DEEP_GEMM):
+            backend_name = getattr(backend, "value", repr(backend))
+            raise NotImplementedError(
+                "owner-local prefill CP routing requires a MoE runner that does "
+                "not consume full router logits; supported runners are triton and "
+                f"deep_gemm, got {backend_name}"
+            )
 
 
 class LinearScalingRotaryEmbedding(WelmV4InplaceRotaryEmbedding):
@@ -2387,12 +2905,7 @@ class Qwen2MoeAttention(nn.Module):
         super().__init__()
         self.hidden_size = hidden_size
 
-        if is_cp_kv_sharded():
-            attn_tp_rank = get_tensor_model_parallel_rank()
-            attn_tp_size = get_tensor_model_parallel_world_size()
-        else:
-            attn_tp_rank = get_attention_tp_rank()
-            attn_tp_size = get_attention_tp_size()
+        attn_tp_rank, attn_tp_size = _get_welm_attention_tp_rank_and_size()
         self.attn_tp_size = attn_tp_size
         self.attn_tp_rank = attn_tp_rank
 
@@ -2528,6 +3041,9 @@ class Qwen2MoeAttention(nn.Module):
             tp_size=attn_tp_size,
             reduce_results=(
                 not is_dp_attention_enabled() and not self.o_proj_suffix_parallel_reduce
+            ),
+            use_attention_tp_reduce=(
+                attn_tp_size > 1 and attn_tp_size < global_tp_size
             ),
             prefix=add_prefix("o_proj", prefix),
         )
@@ -2679,6 +3195,24 @@ class Qwen2MoeAttention(nn.Module):
                     f"{dump_prefix}.req_pool_indices",
                     forward_batch.req_pool_indices,
                 )
+        if _welm_cp_prefill_prefix_send_only(
+            hidden_states.shape[0], forward_batch
+        ):
+            if scp_per_suffix:
+                raise NotImplementedError(
+                    "Phase 2 prefix-only K/V send does not support suffix parallel"
+                )
+            q = hidden_states.new_empty(
+                (0, self.attn.tp_q_head_num * self.attn.head_dim)
+            )
+            k = hidden_states.new_empty(
+                (0, self.attn.tp_k_head_num * self.attn.qk_head_dim)
+            )
+            v = hidden_states.new_empty(
+                (0, self.attn.tp_v_head_num * self.attn.v_head_dim)
+            )
+            self.attn(q, k, v, forward_batch, save_kv_cache=False)
+            return hidden_states.new_empty((0, self.hidden_size))
         q, k, v, hidden_states = self.qkv_proj.forward(
             self, hidden_states, forward_batch, kv_mirror_states
         )
@@ -2824,7 +3358,7 @@ class Qwen2MoeAttention(nn.Module):
         attn_kwargs = {}
         if self.attn_sink is not None:
             attn_kwargs["sinks"] = self.attn_sink
-        if q.shape[0] == 0:
+        if not _welm_should_dispatch_attention(q.shape[0], forward_batch, False):
             if has_kv:
                 _welm_write_kv_cache_only(self.attn, k, v, forward_batch)
             attn_output = q.new_empty((0, self.num_heads * self.head_dim))
@@ -3069,6 +3603,11 @@ class Qwen2MoeDecoderLayer(nn.Module):
             post_attention_layernorm=self.post_attention_layernorm,
             allow_reduce_scatter=True,
         )
+        self.prefill_cp_communicator = PrefillCPLayerCommunicator(
+            input_layernorm=self.input_layernorm,
+            post_attention_layernorm=self.post_attention_layernorm,
+        )
+        self._prefill_cp_mlp_validated = False
 
     def forward(
         self,
@@ -3081,6 +3620,16 @@ class Qwen2MoeDecoderLayer(nn.Module):
         torch.Tensor, torch.Tensor, Dict[int, Tuple[torch.Tensor, torch.Tensor]]
     ]:
         use_previous_precision = welm_use_previous_precision()
+        layer_communicator, use_prefill_cp_communicator = (
+            _welm_select_layer_communicator(self, forward_batch)
+        )
+        if use_prefill_cp_communicator and not self._prefill_cp_mlp_validated:
+            layer_communicator.validate_mlp(self.mlp)
+            self._prefill_cp_mlp_validated = True
+        if use_prefill_cp_communicator and use_previous_precision:
+            raise NotImplementedError(
+                "WeLM Phase 2 prefill CP does not support previous-precision mode"
+            )
         dump_this_layer = _WELM_DUMP_ENABLED and _welm_should_dump_layer(self.layer_id)
         if dump_this_layer:
             _welm_dump_tensor(
@@ -3090,8 +3639,11 @@ class Qwen2MoeDecoderLayer(nn.Module):
             self.ppln and self.config_layer_id not in self.prenorm_layer_idx
         )
         use_dp_layer_communicator = is_dp_attention_enabled()
+        use_layer_communicator = (
+            use_dp_layer_communicator or use_prefill_cp_communicator
+        )
         use_fp32_ppln_residual = (
-            residual_after_layernorm and not use_dp_layer_communicator
+            residual_after_layernorm and not use_layer_communicator
         )
         if use_previous_precision:
             hidden_states, residual = self.input_layernorm(
@@ -3103,8 +3655,15 @@ class Qwen2MoeDecoderLayer(nn.Module):
                 residual = hidden_states.clone().to(
                     dtype=hidden_states.dtype, device=hidden_states.device
                 )
+        elif use_prefill_cp_communicator:
+            hidden_states, residual = layer_communicator.prepare_attn(
+                hidden_states,
+                residual,
+                forward_batch,
+                residual_after_layernorm=residual_after_layernorm,
+            )
         elif use_dp_layer_communicator:
-            hidden_states, residual = self.layer_communicator.prepare_attn(
+            hidden_states, residual = layer_communicator.prepare_attn(
                 hidden_states, residual, forward_batch
             )
             if residual_after_layernorm:
@@ -3144,24 +3703,37 @@ class Qwen2MoeDecoderLayer(nn.Module):
         if (
             residual_after_layernorm
             and not use_fp32_ppln_residual
-            and not use_dp_layer_communicator
+            and not use_layer_communicator
             and not use_previous_precision
         ):
             residual = hidden_states.clone().to(
                 dtype=hidden_states.dtype, device=hidden_states.device
             )
-        use_mmq_norm_after_attn = (
-            not use_previous_precision
-            and residual_after_layernorm
-            and self.self_attn.use_o_norm
-            # The fused path would run o_norm on attn-TP partial sums.
-            and not self.self_attn.o_norm_needs_attn_tp_reduce
+        use_mmq_norm_after_attn = _welm_should_use_mmq_norm_after_attn(
+            use_previous_precision=use_previous_precision,
+            residual_after_layernorm=residual_after_layernorm,
+            use_o_norm=self.self_attn.use_o_norm,
+            o_norm_needs_attn_tp_reduce=(
+                self.self_attn.o_norm_needs_attn_tp_reduce
+            ),
+            use_prefill_cp_communicator=use_prefill_cp_communicator,
         )
         needs_empty_dp_collectives = _welm_needs_empty_dp_collectives(
             forward_batch,
             is_nextn=self.is_nextn,
         )
-        if hidden_states.shape[0] != 0 or needs_empty_dp_collectives:
+        is_kv_mirror_layer = (
+            self.self_attn.kv_mirror_layer_idx in self.kv_mirror_layers
+        )
+        if (
+            use_prefill_cp_communicator
+            and is_kv_mirror_layer
+            and _welm_should_contract_kv_mirror(forward_batch)
+        ):
+            _welm_prepare_cp_prefill_kv_mirror_layout(forward_batch)
+        if _welm_should_dispatch_attention(
+            hidden_states.shape[0], forward_batch, needs_empty_dp_collectives
+        ):
             hidden_states = self.self_attn(
                 positions=positions,
                 hidden_states=hidden_states,
@@ -3169,7 +3741,6 @@ class Qwen2MoeDecoderLayer(nn.Module):
                 kv_mirror_states=kv_mirror_states,
                 skip_o_norm=use_mmq_norm_after_attn,
             )
-        is_kv_mirror_layer = self.self_attn.kv_mirror_layer_idx in self.kv_mirror_layers
         if (
             _welm_should_sync_kv_mirror_dp_metadata(forward_batch)
             and is_kv_mirror_layer
@@ -3229,11 +3800,15 @@ class Qwen2MoeDecoderLayer(nn.Module):
                     dp_gather_partial(hidden_states, local_hidden_states, forward_batch)
                     hidden_states_fp32 = hidden_states.to(torch.float32)
         else:
-            if use_dp_layer_communicator and not use_previous_precision:
-                hidden_states, residual = self.layer_communicator.prepare_mlp(
+            if use_layer_communicator and not use_previous_precision:
+                hidden_states, residual = layer_communicator.prepare_mlp(
                     hidden_states, residual, forward_batch
                 )
-                hidden_states_fp32 = hidden_states.to(torch.float32)
+                hidden_states_fp32 = (
+                    hidden_states.to(torch.float32)
+                    if dump_this_layer or not use_prefill_cp_communicator
+                    else None
+                )
             else:
                 (
                     hidden_states,
@@ -3256,9 +3831,13 @@ class Qwen2MoeDecoderLayer(nn.Module):
                 )
         # For DP with padding, reduce scatter can be used instead of all-reduce.
         use_reduce_scatter = (
-            forward_batch.dp_padding_mode is not None
-            and not is_suffix_parallel_enabled()
-            and self.layer_communicator.should_use_reduce_scatter(forward_batch)
+            use_prefill_cp_communicator
+            or (
+                use_dp_layer_communicator
+                and forward_batch.dp_padding_mode is not None
+                and not is_suffix_parallel_enabled()
+                and layer_communicator.should_use_reduce_scatter(forward_batch)
+            )
         )
         can_use_final_components = (
             not use_previous_precision
@@ -3266,20 +3845,45 @@ class Qwen2MoeDecoderLayer(nn.Module):
             and residual is not None
             and getattr(self.mlp, "tp_size", 1) == 1
             and not is_dp_attention_enabled()
+            and not use_prefill_cp_communicator
         )
         return_mlp_components = (
             dump_this_layer
             if use_previous_precision
             else dump_this_layer or can_use_final_components
         )
-        mlp_output = self.mlp(
-            hidden_states,
-            hidden_states_fp32,
-            forward_batch,
-            use_reduce_scatter,
-            return_components=return_mlp_components,
-            skip_component_output=(can_use_final_components and not dump_this_layer),
+        skip_empty_cp_mlp = (
+            use_prefill_cp_communicator
+            and not layer_communicator.has_active_mlp_tokens(forward_batch)
         )
+        prefill_cp_router_context = None
+        if (
+            use_prefill_cp_communicator
+            and not layer_communicator.use_ep_dispatch
+            and not skip_empty_cp_mlp
+        ):
+            prefill_cp_router_context = layer_communicator.build_router_context(
+                forward_batch
+            )
+        if skip_empty_cp_mlp:
+            mlp_output = hidden_states
+        else:
+            local_router_kwargs = (
+                {"prefill_cp_router_context": prefill_cp_router_context}
+                if prefill_cp_router_context is not None
+                else {}
+            )
+            mlp_output = self.mlp(
+                hidden_states,
+                hidden_states_fp32,
+                forward_batch,
+                use_reduce_scatter,
+                return_components=return_mlp_components,
+                skip_component_output=(
+                    can_use_final_components and not dump_this_layer
+                ),
+                **local_router_kwargs,
+            )
         experts_output = None
         shared_output = None
         if isinstance(mlp_output, tuple):
@@ -3287,8 +3891,8 @@ class Qwen2MoeDecoderLayer(nn.Module):
         else:
             hidden_states = mlp_output
 
-        if use_dp_layer_communicator and not use_previous_precision:
-            hidden_states, residual = self.layer_communicator.postprocess_layer(
+        if use_layer_communicator and not use_previous_precision:
+            hidden_states, residual = layer_communicator.postprocess_layer(
                 hidden_states, residual, forward_batch
             )
 
@@ -3557,6 +4161,10 @@ class Qwen2MoeModel(nn.Module):
             hidden_states = pp_proxy_tensors["hidden_states"]
             residual = pp_proxy_tensors.tensors.get("residual", None)
             kv_mirror_states = _unpack_welm_kv_mirror_states(pp_proxy_tensors)
+        if getattr(forward_batch, "attn_cp_prefill_runtime_layout", None) is not None:
+            hidden_states, positions = _welm_localize_cp_prefill_rows(
+                hidden_states, positions, forward_batch
+            )
         mtp_kv_mirror_states = None
 
         aux_hidden_states = []
@@ -3743,6 +4351,7 @@ def welm_nextn_local_to_hf_name(
 
 class WeLMV4MoeForCausalLM(nn.Module):
     fall_back_to_pt_during_load = False
+    supports_attn_cp_prefill_runtime = True
 
     def __init__(
         self,
@@ -3852,8 +4461,15 @@ class WeLMV4MoeForCausalLM(nn.Module):
                     )
                 )
 
-            logits_output = self.logits_processor(
-                input_ids, hidden_states, self.lm_head, forward_batch, aux_hidden_states
+            prepared_logits = _welm_prepare_cp_prefill_logits_states(
+                hidden_states, aux_hidden_states, forward_batch
+            )
+            logits_output = _welm_compute_logits_output(
+                self.logits_processor,
+                input_ids,
+                self.lm_head,
+                prepared_logits,
+                vocab_size=self.config.vocab_size,
             )
             logits_output.model_specific_states = forward_batch.model_specific_states
             return logits_output
@@ -3869,6 +4485,13 @@ class WeLMV4MoeForCausalLM(nn.Module):
         split_interval: Tuple[int, int],  # [start, end) 0-based
         input_embeds: torch.Tensor = None,
     ):
+        if (
+            getattr(forward_batch, "attn_cp_prefill_runtime_layout", None) is not None
+            or _welm_has_cp_prefill_split_spec(forward_batch)
+        ):
+            raise NotImplementedError(
+                "WeLM Phase 2 prefill CP does not support split-prefill execution"
+            )
         start, end = split_interval
         # embed
         if start == 0:

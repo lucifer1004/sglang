@@ -15,7 +15,7 @@
 
 import dataclasses
 import logging
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import torch
 import triton
@@ -120,6 +120,7 @@ class LogitsMetadata:
     forward_mode: ForwardMode
     capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.NULL
     next_token_logits_buffer: Optional[torch.Tensor] = None
+    prefill_cp_pruned: bool = False
 
     extend_return_logprob: bool = False
     extend_return_top_logprob: bool = False
@@ -446,6 +447,64 @@ class LogitsProcessor(nn.Module):
             mm_input_embeds=logits_metadata.mm_input_embeds,
         )
 
+    def forward_input_logprobs_by_chunk_loader(
+        self,
+        hidden_states_marker: torch.Tensor,
+        lm_head: VocabParallelEmbedding,
+        logits_metadata: LogitsMetadata,
+        *,
+        chunk_states_loader: Callable[[int, int], torch.Tensor],
+        hidden_states_to_store: Optional[torch.Tensor] = None,
+    ) -> LogitsProcessorOutput:
+        """Process prompt logprobs without materializing all hidden rows."""
+        if not logits_metadata.extend_return_logprob:
+            raise ValueError("chunk-loaded logits require input logprobs")
+        if hidden_states_marker.ndim != 2 or hidden_states_marker.shape[1] != 0:
+            raise ValueError("chunk-loaded logits require a zero-width row marker")
+
+        (
+            pruned_states_marker,
+            _,
+            _,
+            sample_indices,
+            input_logprob_indices,
+            token_to_seq_idx,
+        ) = self._get_pruned_states(
+            hidden_states_marker,
+            None,
+            None,
+            logits_metadata,
+        )
+        if sample_indices is None or input_logprob_indices is None:
+            raise RuntimeError("chunk-loaded logits did not build prefill indices")
+
+        self._expand_metadata_for_logprobs(
+            logits_metadata, pruned_states_marker.device
+        )
+        logprobs_result, sampled_logits = self.process_input_logprobs_by_chunk(
+            pruned_states_marker,
+            sample_indices,
+            input_logprob_indices,
+            token_to_seq_idx,
+            lm_head,
+            logits_metadata,
+            chunk_states_loader=chunk_states_loader,
+        )
+        return LogitsProcessorOutput(
+            next_token_logits=sampled_logits,
+            hidden_states=hidden_states_to_store,
+            input_token_logprobs=logprobs_result.input_token_logprobs,
+            input_top_logprobs_val=logprobs_result.input_top_logprobs_val,
+            input_top_logprobs_idx=logprobs_result.input_top_logprobs_idx,
+            input_token_ids_logprobs_val=(
+                logprobs_result.input_token_ids_logprobs_val
+            ),
+            input_token_ids_logprobs_idx=(
+                logprobs_result.input_token_ids_logprobs_idx
+            ),
+            mm_input_embeds=logits_metadata.mm_input_embeds,
+        )
+
     def _get_pruned_states(
         self,
         hidden_states: torch.Tensor,
@@ -457,12 +516,14 @@ class LogitsProcessor(nn.Module):
         aux_pruned_states = None
         token_to_seq_idx = []
         kv_mirror_pruned = logits_metadata.welm_kv_mirror_contracted
+        prefill_cp_pruned = logits_metadata.prefill_cp_pruned
 
         if (
             logits_metadata.forward_mode.is_decode_or_idle()
             or logits_metadata.forward_mode.is_target_verify()
             or logits_metadata.forward_mode.is_draft_extend_v2()
             or kv_mirror_pruned
+            or prefill_cp_pruned
         ):
             pruned_states = hidden_states
             pruned_states_before_norm = hidden_states_before_norm
@@ -717,6 +778,8 @@ class LogitsProcessor(nn.Module):
         token_to_seq_idx: list[int],
         lm_head: VocabParallelEmbedding,
         logits_metadata: LogitsMetadata,
+        *,
+        chunk_states_loader: Optional[Callable[[int, int], torch.Tensor]] = None,
     ) -> Tuple[InputLogprobsResult, torch.Tensor]:
         """
         compute logprobs for the output token from the hidden states.
@@ -773,7 +836,18 @@ class LogitsProcessor(nn.Module):
             mask_indices = torch.nonzero(chunk_mask, as_tuple=True)[0]
 
             # Get the logits for this chunk
-            chunk_states = pruned_states[start_idx:end_idx]
+            chunk_states = (
+                pruned_states[start_idx:end_idx]
+                if chunk_states_loader is None
+                else chunk_states_loader(start_idx, end_idx)
+            )
+            if (
+                not isinstance(chunk_states, torch.Tensor)
+                or chunk_states.shape[0] != end_idx - start_idx
+            ):
+                raise RuntimeError(
+                    "logits chunk loader returned the wrong hidden-row count"
+                )
             chunk_logits = self._get_logits(chunk_states, lm_head, logits_metadata)
 
             # Initialize sampled_logits on first chunk
@@ -795,10 +869,12 @@ class LogitsProcessor(nn.Module):
 
             # If there are no input logprobs in this chunk, skip the rest
             if chunk_indices.numel() == 0:
+                del chunk_logits, chunk_states
                 continue
 
             # Compute the logprobs of the chunk
             chunk_input_logprobs = chunk_logits[chunk_indices]
+            del chunk_logits
             # Only index per-token arrays when the corresponding feature is active.
             # Otherwise these tensors can be per-sequence (or scalars), which can
             # cause out-of-bounds indexing on GPU.
@@ -865,6 +941,7 @@ class LogitsProcessor(nn.Module):
                 logits_metadata.extend_input_logprob_token_ids_gpu[mask_indices],
             ]
             input_token_logprobs.append(chunk_input_token_logprobs)
+            del chunk_input_logprobs, chunk_states
 
         # Restore the full-pruned lm_head batch_info after chunk iteration.
         if hasattr(lm_head, "reset_lm_head_pass"):

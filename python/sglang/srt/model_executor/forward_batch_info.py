@@ -38,6 +38,11 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.context_parallel import (
+    CPPrefillRuntimeLayout,
+    CPPrefillSplitSpec,
+    materialize_cp_prefill_runtime_layout,
+)
 from sglang.srt.distributed.parallel_state import (
     get_moe_expert_parallel_world_size,
     get_tensor_model_parallel_world_size,
@@ -50,6 +55,13 @@ from sglang.srt.layers.dp_attention import (
     get_attention_tp_size,
     set_dp_buffer_len,
     set_is_extend_in_batch,
+)
+from sglang.srt.layers.attention.cp_sharded_kv import (
+    CPPrefillKVGatherPlan,
+    CPPrefillKVSourcePushPlan,
+    CPPrefillSWAKVGatherPlan,
+    build_cp_prefill_kv_gather_plan,
+    build_cp_prefill_kv_source_push_plan,
 )
 from sglang.srt.layers.utils.cp_utils import ContextParallelMetadata
 from sglang.srt.model_executor.forward_batch_deepseek_mha_mixin import (
@@ -333,6 +345,17 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     extend_prefix_lens_cpu: Optional[List[int]] = None
     extend_seq_lens_cpu: Optional[List[int]] = None
     extend_logprob_start_lens_cpu: Optional[List[int]] = None
+    attn_cp_prefill_split_specs: Optional[
+        Tuple[Optional[CPPrefillSplitSpec], ...]
+    ] = None
+    attn_cp_prefill_runtime_layout: Optional[CPPrefillRuntimeLayout] = None
+    attn_cp_prefill_kv_gather_plan: Optional[CPPrefillKVGatherPlan] = None
+    attn_cp_prefill_kv_source_push_plan: Optional[
+        CPPrefillKVSourcePushPlan
+    ] = None
+    attn_cp_prefill_swa_kv_gather_plans: Optional[
+        Dict[tuple, CPPrefillSWAKVGatherPlan]
+    ] = None
     extend_input_logprob_token_ids_gpu: Optional[torch.Tensor] = None
     welm_kv_mirror_last_q_indices: Optional[torch.Tensor] = None
     welm_kv_mirror_active_batch_indices: Optional[torch.Tensor] = None
@@ -484,6 +507,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             return_logprob=batch.return_logprob,
             top_logprobs_nums=batch.top_logprobs_nums,
             token_ids_logprobs=batch.token_ids_logprobs,
+            attn_cp_prefill_split_specs=batch.attn_cp_prefill_split_specs,
             is_extend_in_batch=batch.is_extend_in_batch,
             all_extend_in_batch=batch.all_extend_in_batch,
             can_run_dp_cuda_graph=batch.can_run_dp_cuda_graph,
@@ -644,6 +668,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             else:
                 ret._compute_mrope_positions(model_runner, batch)
 
+        ret._materialize_attn_cp_prefill_runtime(model_runner)
+
         # Precompute SWA cache location once for all SWA layers
         if model_runner.is_hybrid_swa and ret.out_cache_loc is not None:
             ret.out_cache_loc_swa = (
@@ -662,6 +688,67 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             model_runner.lora_manager.prepare_lora_batch(ret)
 
         return ret
+
+    def _materialize_attn_cp_prefill_runtime(self, model_runner: ModelRunner) -> None:
+        if self.forward_mode != ForwardMode.EXTEND:
+            return
+        if not getattr(model_runner, "supports_attn_cp_prefill_runtime", False):
+            return
+        allocator = model_runner.token_to_kv_pool_allocator
+        cp_rank = getattr(allocator, "cp_rank", None)
+        cp_size = getattr(allocator, "cp_size", None)
+        if cp_rank is None:
+            return
+        split_specs = self.attn_cp_prefill_split_specs
+        if split_specs is None:
+            raise NotImplementedError(
+                "Phase 2 sharded-KV prefill requires a paged split spec; "
+                "refusing dense fallback"
+            )
+        if self.batch_size != 1 or len(split_specs) != 1 or split_specs[0] is None:
+            raise ValueError(
+                "Phase 2 sharded-KV prefill runtime requires one split-planned request"
+            )
+        if model_runner.server_args.attention_backend != "fa3":
+            raise NotImplementedError(
+                "Phase 2 sharded-KV prefill runtime currently requires FA3"
+            )
+        if self.scale_seq_factor != 1:
+            raise NotImplementedError(
+                "Phase 2 sharded-KV prefill runtime does not support scale-seq"
+            )
+
+        spec = split_specs[0]
+        if cp_size != len(spec.per_rank_tokens):
+            raise ValueError(
+                "Phase 2 sharded-KV prefill runtime requires the matching CP allocator"
+            )
+        runtime_layout = materialize_cp_prefill_runtime_layout(
+            spec=spec,
+            cp_rank=cp_rank,
+            input_ids=self.input_ids,
+            positions=self.positions,
+            out_cache_loc=self.out_cache_loc,
+        )
+        self.attn_cp_prefill_runtime_layout = runtime_layout
+
+        prefix_len = self.extend_prefix_lens_cpu[0]
+        prefix_table = self.req_to_token_pool.req_to_token[:, :prefix_len]
+        prefix_logical_slots = prefix_table.index_select(
+            0, self.req_pool_indices.to(dtype=torch.int64)
+        ).reshape(-1)
+        self.attn_cp_prefill_kv_gather_plan = build_cp_prefill_kv_gather_plan(
+            prefix_logical_slots=prefix_logical_slots,
+            runtime_layout=runtime_layout,
+            allocator=allocator,
+        )
+        if getattr(model_runner, "_prefill_cp_kv_ipc_transport", None) is not None:
+            self.attn_cp_prefill_kv_source_push_plan = (
+                build_cp_prefill_kv_source_push_plan(
+                    gather_plan=self.attn_cp_prefill_kv_gather_plan,
+                    cp_rank=cp_rank,
+                )
+            )
 
     def adjust_num_token_non_padded_for_attn_tp(self, server_args) -> None:
         """Make num_token_non_padded local to this attention-TP rank."""

@@ -33,6 +33,10 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Set, Union
 
 import torch
 
+from sglang.srt.context_parallel import (
+    CPPrefillSplitSpec,
+    build_cp_prefill_split_spec,
+)
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.layers.attention.nsa.utils import is_nsa_prefill_cp_in_seq_split
 from sglang.srt.layers.utils.cp_utils import (
@@ -50,6 +54,9 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 from sglang.srt.mem_cache.cp_sharded_allocator import (
     CPShardedKVPoolAllocator,
     unwrap_cp_sharded_allocator,
+)
+from sglang.srt.mem_cache.cp_sharded_capacity import (
+    ensure_cp_sharded_kv_capacity,
 )
 from sglang.srt.mem_cache.hisparse_memory_pool import (
     DeepSeekV4HiSparseTokenToKVPoolAllocator,
@@ -432,6 +439,7 @@ class PrefillAdder:
         prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor] = None,
         dllm_config: Optional[DllmConfig] = None,
         waiting_queue_len: int = 0,
+        next_attn_cp_owner_rotation: int = 0,
     ):
         self.page_size = page_size
         self.tree_cache = tree_cache
@@ -481,19 +489,20 @@ class PrefillAdder:
             if isinstance(self.token_to_kv_pool_allocator, CPShardedKVPoolAllocator)
             else None
         )
-        self.cp_sharded_local_token_offset = 0
-        self.cp_sharded_available_and_evictable_override: Optional[int] = None
-        self.cp_sharded_swa_available_and_evictable_override: Optional[int] = None
-        self.cp_sharded_physical_available_override: Optional[int] = None
+        self.cp_sharded_token_offsets = (
+            [0] * self.cp_sharded_allocator.cp_size
+            if self.cp_sharded_allocator is not None
+            else []
+        )
+        self.next_attn_cp_owner_rotation = int(next_attn_cp_owner_rotation)
 
         self.priority_scheduling_preemption_threshold = (
             priority_scheduling_preemption_threshold
         )
         self.nsa_prefill_cp_in_seq_split = is_nsa_prefill_cp_in_seq_split()
         self.max_running_requests = max_running_requests
-        # The legacy prefill-CP path only supports one request per prefill batch.
-        # Sharded-KV AttnCP keeps Q full-sequence and only shards KV residency, so
-        # it can keep normal scheduler batching semantics.
+        # The legacy prefill-CP and persistent-token sharded-KV paths both run
+        # one request per prefill batch. The latter is guarded explicitly below.
         self.prefill_context_parallel_enabled = (
             is_prefill_context_parallel_enabled() and not is_cp_kv_sharded()
         )
@@ -503,6 +512,96 @@ class PrefillAdder:
         # Snapshot of scheduler waiting_queue length at the start of this
         # prefill pass. Used by PrefillDelayer's queue-based trigger.
         self.waiting_queue_len = waiting_queue_len
+
+    def _ensure_cp_sharded_owner_rotation(self, req: Req) -> int:
+        if self.cp_sharded_allocator is None:
+            return 0
+        rotation = getattr(req, "attn_cp_owner_rotation", None)
+        if rotation is None:
+            period = self.cp_sharded_allocator.owner_period()
+            rotation = self.next_attn_cp_owner_rotation % period
+            req.attn_cp_owner_rotation = rotation
+            self.next_attn_cp_owner_rotation += 1
+        return int(rotation)
+
+    def _resolve_cp_sharded_leading_page_owner(
+        self,
+        prefix_indices,
+        prefix_len: int,
+    ) -> Optional[int]:
+        if self.cp_sharded_allocator is None or prefix_len % self.page_size == 0:
+            return None
+        if prefix_len <= 0 or prefix_indices is None or len(prefix_indices) == 0:
+            raise ValueError(
+                "Phase 2 sharded-KV partial prefix has no recorded leading-page owner"
+            )
+
+        last_logical_slot = torch.as_tensor(
+            prefix_indices[-1:],
+            dtype=torch.int64,
+            device=self.cp_sharded_allocator.device,
+        ).reshape(-1)
+        logical_page = torch.div(
+            last_logical_slot,
+            self.page_size,
+            rounding_mode="floor",
+        )
+        owner_rank = (
+            self.cp_sharded_allocator.residency_ledger.owner_ranks_for_logical_units(
+                logical_page
+            )
+        )
+        last_slot_cpu, owner_cpu = (
+            torch.cat((last_logical_slot, owner_rank)).detach().cpu().tolist()
+        )
+        if (
+            last_slot_cpu <= 0
+            or last_slot_cpu % self.page_size
+            != (prefix_len - 1) % self.page_size
+            or owner_cpu < 0
+            or owner_cpu >= self.cp_sharded_allocator.cp_size
+        ):
+            raise ValueError(
+                "Phase 2 sharded-KV partial prefix has no recorded leading-page owner"
+            )
+        return int(owner_cpu)
+
+    def _build_cp_prefill_split_spec(
+        self,
+        *,
+        prefix_len: int,
+        extend_len: int,
+        owner_rotation: int,
+        leading_page_owner: Optional[int] = None,
+    ) -> Optional[CPPrefillSplitSpec]:
+        if self.cp_sharded_allocator is None or self.page_size == 1:
+            return None
+
+        return build_cp_prefill_split_spec(
+            extend_start=prefix_len,
+            extend_len=extend_len,
+            cp_size=self.cp_sharded_allocator.cp_size,
+            page_size=self.page_size,
+            owner_rotation=owner_rotation,
+            leading_page_owner=leading_page_owner,
+        )
+
+    def prefill_request_limit_reached(self) -> bool:
+        if (
+            self.prefill_max_requests is not None
+            and len(self.can_run_list) >= self.prefill_max_requests
+        ):
+            return True
+        if (
+            len(self.can_run_list) > 0
+            and (
+                self.cp_sharded_allocator is not None
+                or self.nsa_prefill_cp_in_seq_split
+                or self.prefill_context_parallel_enabled
+            )
+        ):
+            return True
+        return False
 
     def _init_dllm_meta(self, dllm_config: DllmConfig):
         self.dllm_block_size = dllm_config.block_size
@@ -567,12 +666,6 @@ class PrefillAdder:
         )
 
     def _available_and_evictable_tokens(self) -> int:
-        if (
-            self.cp_sharded_allocator is not None
-            and self.cp_sharded_available_and_evictable_override is not None
-        ):
-            return self.cp_sharded_available_and_evictable_override
-
         if self.is_hybrid_swa:
             return (
                 self.token_to_kv_pool_allocator.full_available_size()
@@ -601,13 +694,11 @@ class PrefillAdder:
 
     @property
     def rem_swa_tokens(self):
-        available_and_evictable = (
-            self.cp_sharded_swa_available_and_evictable_override
-            if self.cp_sharded_swa_available_and_evictable_override is not None
-            else self.token_to_kv_pool_allocator.swa_available_size()
+        return (
+            self.token_to_kv_pool_allocator.swa_available_size()
             + self.tree_cache.swa_evictable_size()
+            - self.rem_swa_token_offset
         )
-        return available_and_evictable - self.rem_swa_token_offset
 
     @property
     def cur_rem_tokens(self):
@@ -617,24 +708,51 @@ class PrefillAdder:
             - self._cp_sharded_admission_reserve_tokens()
         )
 
-    def _cp_sharded_extend_local_budget(self, start_pos: int, extend_len: int) -> int:
+    def _cp_sharded_extend_budget(
+        self,
+        start_pos: int,
+        extend_len: int,
+        owner_rotation: int = 0,
+        split_spec: Optional[CPPrefillSplitSpec] = None,
+    ) -> tuple[int, ...]:
         if self.cp_sharded_allocator is None:
-            return 0
-        return self.cp_sharded_allocator.max_local_alloc_size_for_range(
-            start_pos, self.ceil_paged_tokens(extend_len)
+            return ()
+        if split_spec is not None:
+            if split_spec.extend_start != int(start_pos):
+                raise ValueError("CP prefill split start does not match admission")
+            if split_spec.extend_len != int(extend_len):
+                raise ValueError("CP prefill split length does not match admission")
+            return tuple(
+                page_count * self.page_size
+                for page_count in split_spec.page_demand(self.page_size)
+            )
+        return self.cp_sharded_allocator.alloc_size_per_rank_for_range(
+            start_pos, extend_len, owner_rotation
         )
 
-    def _cp_sharded_can_allocate_extend(self, start_pos: int, extend_len: int) -> bool:
+    def _cp_sharded_can_allocate_extend(
+        self,
+        start_pos: int,
+        extend_len: int,
+        owner_rotation: int = 0,
+        split_spec: Optional[CPPrefillSplitSpec] = None,
+    ) -> bool:
         if self.cp_sharded_allocator is None:
             return True
-        needed = self._cp_sharded_extend_local_budget(start_pos, extend_len)
-        physical_available = (
-            self.cp_sharded_physical_available_override
-            if self.cp_sharded_physical_available_override is not None
-            else self.cp_sharded_allocator.physical_available_size()
+        needed = self._cp_sharded_extend_budget(
+            start_pos, extend_len, owner_rotation, split_spec
         )
-        available = physical_available - self.cp_sharded_local_token_offset
-        return needed <= available
+        demand = tuple(
+            required + reserved
+            for required, reserved in zip(
+                needed, self.cp_sharded_token_offsets
+            )
+        )
+        return ensure_cp_sharded_kv_capacity(
+            allocator=self.cp_sharded_allocator,
+            tree_cache=self.tree_cache,
+            demand_tokens=demand,
+        )
 
     def _swa_budget_for_req(self, extend_input_len: int) -> int:
         """SWA pool budget per request. Only valid when is_hybrid_swa is True.
@@ -682,8 +800,11 @@ class PrefillAdder:
         max_new_tokens: int,
         *,
         cp_start_pos: Optional[int] = None,
+        cp_owner_rotation: int = 0,
+        cp_split_spec: Optional[CPPrefillSplitSpec] = None,
     ):
         # TODO(lsyin): check this workaround logic, which only ensures the prefill will not out of memory, and may be too conservative
+        cp_extend_input_len = extend_input_len
         extend_input_len = self.ceil_paged_tokens(extend_input_len)
 
         # alloc_extend reserves an extra page_size per request to make sure the budget doesn't over-commit
@@ -693,9 +814,18 @@ class PrefillAdder:
         self.rem_input_tokens -= extend_input_len
         if self.cp_sharded_allocator is not None:
             start_pos = prefix_len if cp_start_pos is None else cp_start_pos
-            self.cp_sharded_local_token_offset += self._cp_sharded_extend_local_budget(
-                start_pos, extend_input_len
+            needed = self._cp_sharded_extend_budget(
+                start_pos,
+                cp_extend_input_len,
+                cp_owner_rotation,
+                cp_split_spec,
             )
+            self.cp_sharded_token_offsets = [
+                reserved + required
+                for reserved, required in zip(
+                    self.cp_sharded_token_offsets, needed
+                )
+            ]
 
         if self.is_hybrid_swa:
             self.rem_swa_token_offset += self._swa_budget_for_req(extend_input_len)
@@ -729,6 +859,7 @@ class PrefillAdder:
             * self.page_size
         )
 
+        req.attn_cp_prefill_split_spec = None
         req.extend_input_len = trunc_len
         req.fill_ids = req.fill_ids[: prefix_len + trunc_len]
 
@@ -749,6 +880,7 @@ class PrefillAdder:
             return AddReqResult.NO_TOKEN
 
         # Truncate input length to available tokens and update request metadata
+        req.attn_cp_prefill_split_spec = None
         truncated = req.extend_input_len > _rem_tokens
         req.extend_input_len = min(req.extend_input_len, _rem_tokens)
         req.fill_ids = req.fill_ids[: len(req.prefix_indices) + req.extend_input_len]
@@ -770,6 +902,7 @@ class PrefillAdder:
         )
 
     def add_chunked_req(self, req: Req):
+        req.attn_cp_prefill_split_spec = None
         if self.dllm_config is not None:
             _rem_tokens = self._get_dllm_remain_tokens()
         else:
@@ -793,11 +926,24 @@ class PrefillAdder:
         truncated = req.extend_input_len > _rem_tokens
         new_extend_len = min(req.extend_input_len, _rem_tokens)
         start_pos = len(req.prefix_indices)
-        if not self._cp_sharded_can_allocate_extend(start_pos, new_extend_len):
+        leading_page_owner = self._resolve_cp_sharded_leading_page_owner(
+            req.prefix_indices, start_pos
+        )
+        owner_rotation = self._ensure_cp_sharded_owner_rotation(req)
+        split_spec = self._build_cp_prefill_split_spec(
+            prefix_len=start_pos,
+            extend_len=new_extend_len,
+            owner_rotation=owner_rotation,
+            leading_page_owner=leading_page_owner,
+        )
+        if not self._cp_sharded_can_allocate_extend(
+            start_pos, new_extend_len, owner_rotation, split_spec
+        ):
             return req
 
         req.set_extend_input_len(new_extend_len)
         req.fill_ids = req.fill_ids[: len(req.prefix_indices) + req.extend_input_len]
+        req.attn_cp_prefill_split_spec = split_spec
         self.can_run_list.append(req)
         self._update_prefill_budget(
             0,
@@ -808,6 +954,8 @@ class PrefillAdder:
                 else 0
             ),
             cp_start_pos=start_pos,
+            cp_owner_rotation=owner_rotation,
+            cp_split_spec=split_spec,
         )
 
         # Return if chunked prefill not finished
@@ -835,7 +983,30 @@ class PrefillAdder:
         if paged_input > min(self.cur_rem_tokens, self._rem_total_tokens(req)):
             return AddReqResult.NO_TOKEN
         start_pos = self._len_or_zero(getattr(req, "prefix_indices", None))
-        if not self._cp_sharded_can_allocate_extend(start_pos, req.extend_input_len):
+        leading_page_owner = self._resolve_cp_sharded_leading_page_owner(
+            getattr(req, "prefix_indices", None), start_pos
+        )
+        owner_rotation = self._ensure_cp_sharded_owner_rotation(req)
+        final_extend_len = req.extend_input_len
+        if (
+            self.dllm_config is None
+            and self.rem_chunk_tokens is not None
+            and req.extend_input_len > self.rem_chunk_tokens
+        ):
+            final_extend_len = self.rem_chunk_tokens
+        split_spec = (
+            self._build_cp_prefill_split_spec(
+                prefix_len=start_pos,
+                extend_len=final_extend_len,
+                owner_rotation=owner_rotation,
+                leading_page_owner=leading_page_owner,
+            )
+            if self.dllm_config is None
+            else None
+        )
+        if not self._cp_sharded_can_allocate_extend(
+            start_pos, final_extend_len, owner_rotation, split_spec
+        ):
             return AddReqResult.NO_TOKEN
         if self.is_hybrid_swa:
             if self._swa_budget_for_req(req.extend_input_len) > self.rem_swa_tokens:
@@ -907,12 +1078,15 @@ class PrefillAdder:
             or req.extend_input_len <= self.rem_chunk_tokens  # it is the last chunk
         ):
             # Non-chunked prefill
+            req.attn_cp_prefill_split_spec = split_spec
             self.can_run_list.append(req)
             self._update_prefill_budget(
                 0,
                 req.extend_input_len,
                 min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS),
                 cp_start_pos=start_pos,
+                cp_owner_rotation=owner_rotation,
+                cp_split_spec=split_spec,
             )
         else:
             if self.rem_chunk_tokens <= 0:
@@ -923,15 +1097,28 @@ class PrefillAdder:
 
             req.set_extend_input_len(trunc_len)
             req.fill_ids = req.fill_ids[:trunc_len]
+            req.attn_cp_prefill_split_spec = split_spec
             self.can_run_list.append(req)
             self.new_chunked_req = req
-            self._update_prefill_budget(0, trunc_len, 0, cp_start_pos=start_pos)
+            self._update_prefill_budget(
+                0,
+                trunc_len,
+                0,
+                cp_start_pos=start_pos,
+                cp_owner_rotation=owner_rotation,
+                cp_split_spec=split_spec,
+            )
 
         return self.budget_state()
 
     def add_one_req(
         self, req: Req, has_chunked_req: bool, truncation_align_size: Optional[int]
     ):
+        req.attn_cp_prefill_split_spec = None
+        if self.cp_sharded_allocator is not None and req.host_hit_length > 0:
+            raise ValueError(
+                "Phase 2 sharded-KV prefill does not support HiCache load-back"
+            )
         if (self.prefill_delayer_single_pass is not None) and (
             not self.prefill_delayer_single_pass.negotiate_should_allow_prefill(
                 local_prefillable=True,
@@ -942,15 +1129,9 @@ class PrefillAdder:
             )
         ):
             return AddReqResult.OTHER
-        # TODO support cp with multiple requests
-        # Enabling context parallelism currently presents precision issues;
-        # therefore, the prefill-batch setting is temporarily set to 1.
-        if (
-            self.nsa_prefill_cp_in_seq_split or self.prefill_context_parallel_enabled
-        ) and len(self.can_run_list) >= 1:
-            return AddReqResult.OTHER
-
-        if (x := self.prefill_max_requests) is not None and len(self.can_run_list) >= x:
+        # Phase 2 sharded-KV supports one prefill request per batch. Keep this
+        # scheduler guard even though lower layers also fail fast on batch_size>1.
+        if self.prefill_request_limit_reached():
             return AddReqResult.OTHER
 
         if req.sampling_params.ignore_eos and getattr(self.tree_cache, "disable", True):
@@ -982,6 +1163,45 @@ class PrefillAdder:
 
         if real_input_tokens >= self.rem_input_tokens and len(self.can_run_list) != 0:
             return AddReqResult.OTHER
+
+        owner_rotation = 0
+        split_spec = None
+        cp_final_extend_len = None
+        if self.cp_sharded_allocator is not None and self.dllm_config is None:
+            cp_input_tokens = self.ceil_paged_tokens(req.extend_input_len)
+            if (
+                self.rem_chunk_tokens is None
+                or cp_input_tokens <= self.rem_chunk_tokens
+            ):
+                cp_final_extend_len = req.extend_input_len
+            else:
+                cp_final_extend_len = (
+                    self.rem_chunk_tokens // self.page_size * self.page_size
+                )
+                if cp_final_extend_len <= 0:
+                    return AddReqResult.OTHER
+                if truncation_align_size is not None:
+                    if cp_final_extend_len < truncation_align_size:
+                        return AddReqResult.OTHER
+                    cp_final_extend_len = truncation_align_size * (
+                        cp_final_extend_len // truncation_align_size
+                    )
+                now_input_len = cp_final_extend_len + len(req.prefix_indices)
+                now_input_len = now_input_len // self.page_size * self.page_size
+                cp_final_extend_len = now_input_len - len(req.prefix_indices)
+                if cp_final_extend_len <= 0:
+                    return AddReqResult.OTHER
+
+            leading_page_owner = self._resolve_cp_sharded_leading_page_owner(
+                req.prefix_indices, prefix_len
+            )
+            owner_rotation = self._ensure_cp_sharded_owner_rotation(req)
+            split_spec = self._build_cp_prefill_split_spec(
+                prefix_len=prefix_len,
+                extend_len=cp_final_extend_len,
+                owner_rotation=owner_rotation,
+                leading_page_owner=leading_page_owner,
+            )
 
         with self._lock_node(req.last_node):
             # self.rem_total_tokens may decrease after the lock acquisition
@@ -1023,59 +1243,84 @@ class PrefillAdder:
                 self._req_inc_lock_ref(req)
             elif self.rem_chunk_tokens is None or input_tokens <= self.rem_chunk_tokens:
                 # Non-chunked prefill
-                if not self._cp_sharded_can_allocate_extend(prefix_len, input_tokens):
+                if self.cp_sharded_allocator is None:
+                    owner_rotation = self._ensure_cp_sharded_owner_rotation(req)
+                if not self._cp_sharded_can_allocate_extend(
+                    prefix_len,
+                    req.extend_input_len,
+                    owner_rotation,
+                    split_spec,
+                ):
                     return AddReqResult.NO_TOKEN
 
+                req.attn_cp_prefill_split_spec = split_spec
                 self.can_run_list.append(req)
 
                 self._req_inc_lock_ref(req)
                 self._update_prefill_budget(
                     prefix_len,
-                    input_tokens,
+                    req.extend_input_len,
                     min(
                         req.sampling_params.max_new_tokens,
                         CLIP_MAX_NEW_TOKENS,
                     ),
                     cp_start_pos=prefix_len,
+                    cp_owner_rotation=owner_rotation,
+                    cp_split_spec=split_spec,
                 )
             else:
-                # Make sure at least one page is available
-                trunc_len = self.rem_chunk_tokens // self.page_size * self.page_size
+                if self.cp_sharded_allocator is not None:
+                    trunc_len = cp_final_extend_len
+                else:
+                    # Make sure at least one page is available
+                    trunc_len = self.rem_chunk_tokens // self.page_size * self.page_size
 
-                if trunc_len <= 0:
-                    return AddReqResult.OTHER
-
-                # When truncation align size is set, we want to assert that the prefill prefix length is multiple of truncation align size
-                # A typical use case is when deterministic inference is enabled with flashinfer attention backend,
-                # we need the prefill prefix length to be multiple of attention split size
-                if truncation_align_size is not None:
-                    if trunc_len < truncation_align_size:
+                    if trunc_len <= 0:
                         return AddReqResult.OTHER
-                    else:
+
+                    # When truncation align size is set, we want to assert that the prefill prefix length is multiple of truncation align size
+                    # A typical use case is when deterministic inference is enabled with flashinfer attention backend,
+                    # we need the prefill prefix length to be multiple of attention split size
+                    if truncation_align_size is not None:
+                        if trunc_len < truncation_align_size:
+                            return AddReqResult.OTHER
                         trunc_len = truncation_align_size * (
                             trunc_len // truncation_align_size
                         )
 
-                now_input_len = trunc_len + len(req.prefix_indices)
-                now_input_len = now_input_len // self.page_size * self.page_size
-                trunc_len = now_input_len - len(req.prefix_indices)
+                    now_input_len = trunc_len + len(req.prefix_indices)
+                    now_input_len = now_input_len // self.page_size * self.page_size
+                    trunc_len = now_input_len - len(req.prefix_indices)
 
-                if trunc_len <= 0:
-                    return AddReqResult.OTHER
+                    if trunc_len <= 0:
+                        return AddReqResult.OTHER
 
                 # Chunked prefill
-                if not self._cp_sharded_can_allocate_extend(prefix_len, trunc_len):
+                if self.cp_sharded_allocator is None:
+                    owner_rotation = self._ensure_cp_sharded_owner_rotation(req)
+                if not self._cp_sharded_can_allocate_extend(
+                    prefix_len,
+                    trunc_len,
+                    owner_rotation,
+                    split_spec,
+                ):
                     return AddReqResult.NO_TOKEN
 
                 req.set_extend_input_len(trunc_len)
                 req.fill_ids = req.fill_ids[: len(req.prefix_indices) + trunc_len]
+                req.attn_cp_prefill_split_spec = split_spec
 
                 self.can_run_list.append(req)
                 self.new_chunked_req = req
 
                 self._req_inc_lock_ref(req)
                 self._update_prefill_budget(
-                    prefix_len, trunc_len, 0, cp_start_pos=prefix_len
+                    prefix_len,
+                    trunc_len,
+                    0,
+                    cp_start_pos=prefix_len,
+                    cp_owner_rotation=owner_rotation,
+                    cp_split_spec=split_spec,
                 )
 
         return self.budget_state()

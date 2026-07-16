@@ -77,7 +77,6 @@ from sglang.srt.layers.dp_attention import (
     get_attention_tp_group,
 )
 from sglang.srt.layers.moe import initialize_moe_config
-from sglang.srt.layers.moe.utils import get_moe_runner_backend
 from sglang.srt.layers.quantization.fp4_utils import initialize_fp4_gemm_config
 from sglang.srt.layers.quantization.fp8_utils import initialize_fp8_gemm_config
 from sglang.srt.lora.lora_drainer import LoRADrainer
@@ -118,7 +117,6 @@ from sglang.srt.managers.io_struct import (
     InitWeightsSendGroupForRemoteInstanceReqInput,
     InitWeightsSendGroupForRemoteInstanceReqOutput,
     InitWeightsUpdateGroupReqInput,
-    InstallShardTransferPlanReqInput,
     ListExternalCorporaReqInput,
     ListExternalCorporaReqOutput,
     LoadLoRAAdapterFromTensorsReqInput,
@@ -127,12 +125,10 @@ from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterReqOutput,
     OpenSessionReqInput,
     PauseGenerationReqInput,
-    PostProcessWeightsReqInput,
     ProfileReq,
     ReleaseMemoryOccupationReqInput,
     RemoveExternalCorpusReqInput,
     RemoveExternalCorpusReqOutput,
-    ReportShardTransferTargetReqInput,
     ResumeMemoryOccupationReqInput,
     RpcReqInput,
     RpcReqOutput,
@@ -149,8 +145,11 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromIPCReqInput,
-    UpdateWeightsFromShardTransferReqInput,
     UpdateWeightsFromTensorReqInput,
+    PostProcessWeightsReqInput,
+    ReportShardTransferTargetReqInput,
+    InstallShardTransferPlanReqInput,
+    UpdateWeightsFromShardTransferReqInput,
 )
 from sglang.srt.managers.mm_utils import (
     has_shm_features,
@@ -163,11 +162,6 @@ from sglang.srt.managers.prefill_delayer import (
     PrefillDelayer,
     PrefillDelayerSinglePassExecutor,
 )
-from sglang.srt.managers.routed_experts_store import (
-    create_routed_experts_store,
-    decode_remote_routed_experts_tensor,
-    is_remote_routed_experts_ref,
-)
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
     ModelWorkerBatch,
@@ -176,8 +170,14 @@ from sglang.srt.managers.schedule_batch import (
     ScheduleBatch,
     validate_router_replay_experts,
 )
+from sglang.srt.managers.routed_experts_store import (
+    create_routed_experts_store,
+    decode_remote_routed_experts_tensor,
+    is_remote_routed_experts_ref,
+)
 from sglang.srt.managers.schedule_policy import (
     AddReqResult,
+    CacheAwarePolicy,
     PrefillAdder,
     SchedulePolicy,
 )
@@ -199,11 +199,13 @@ from sglang.srt.managers.scheduler_update_weights_mixin import (
 from sglang.srt.managers.utils import GenerationBatchResult, validate_input_length
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.common import (
-    evict_from_tree_cache,
     maybe_cache_unfinished_req,
     release_kv_cache,
 )
 from sglang.srt.mem_cache.cp_sharded_allocator import CPShardedKVPoolAllocator
+from sglang.srt.mem_cache.cp_sharded_capacity import (
+    ensure_cp_sharded_kv_capacity,
+)
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
 from sglang.srt.model_loader.utils import get_resolved_model_impl
@@ -400,6 +402,7 @@ class Scheduler(
         self.pp_rank = pp_rank
         self.attn_cp_rank = attn_cp_rank
         self.attn_cp_size = server_args.attn_cp_size
+        self.next_attn_cp_owner_rotation = 0
         self.moe_dp_rank = moe_dp_rank
         self.moe_dp_size = server_args.moe_dp_size
         self.dp_rank = dp_rank
@@ -983,23 +986,13 @@ class Scheduler(
 
                 self.tree_cache = SWAChunkCache(params)
         else:
-            use_cp_hicache_unified_radix = (
-                self.enable_hierarchical_cache
-                and server_args.attn_cp_mode == "sharded-kv"
-            )
-            if (
-                envs.SGLANG_EXPERIMENTAL_CPP_RADIX_TREE.get()
-                and not use_cp_hicache_unified_radix
-            ):
+            if envs.SGLANG_EXPERIMENTAL_CPP_RADIX_TREE.get():
                 # lazy import to avoid JIT overhead
                 from sglang.srt.mem_cache.radix_cache_cpp import RadixCacheCpp
 
                 logger.info("Using experimental C++ radix tree implementation.")
                 self.tree_cache = RadixCacheCpp(params=params, server_args=server_args)
-            elif (
-                envs.SGLANG_ENABLE_UNIFIED_RADIX_TREE.get()
-                or use_cp_hicache_unified_radix
-            ):
+            elif envs.SGLANG_ENABLE_UNIFIED_RADIX_TREE.get():
                 from sglang.srt.mem_cache.unified_cache_components import (
                     ComponentType,
                 )
@@ -1810,7 +1803,10 @@ class Scheduler(
 
             # Process the last batch
             if self.last_batch:
-                if not processed_last_before_schedule and not disable_overlap_for_batch:
+                if (
+                    not processed_last_before_schedule
+                    and not disable_overlap_for_batch
+                ):
                     pop_and_process()
             elif batch is None:
                 # When the server is idle, do self-check and re-init some states
@@ -1899,8 +1895,8 @@ class Scheduler(
         """
         if not self._routed_replay_pending:
             return []
-        import mmap as _mmap
         import os as _os
+        import mmap as _mmap
         import uuid as _uuid
 
         ready: List["TokenizedGenerateReqInput"] = []
@@ -1912,7 +1908,9 @@ class Scheduler(
             try:
                 tensor = future.result().to(dtype=torch.int32).contiguous()
                 arr = tensor.numpy()
-                shm_path = f"/dev/shm/sglang_replay_{_uuid.uuid4().hex[:24]}"
+                shm_path = (
+                    f"/dev/shm/sglang_replay_{_uuid.uuid4().hex[:24]}"
+                )
                 # O_EXCL guards against accidental reuse / collisions.
                 fd = _os.open(
                     shm_path,
@@ -2023,7 +2021,9 @@ class Scheduler(
         if self.routed_experts_store is None:
             return recv_reqs
         immediate: List["TokenizedGenerateReqInput"] = []
-        from sglang.srt.managers.io_struct import TokenizedGenerateReqInput as _TGen
+        from sglang.srt.managers.io_struct import (
+            TokenizedGenerateReqInput as _TGen,
+        )
 
         for recv_req in recv_reqs:
             payload = (
@@ -2467,7 +2467,9 @@ class Scheduler(
             # with the saved error string (sentinel attached on the
             # leader side; non-leader ranks won't see it but they also
             # won't see the dict — they always get the broadcast tensor).
-            fetch_error = getattr(recv_req, "_routed_replay_fetch_error", None)
+            fetch_error = getattr(
+                recv_req, "_routed_replay_fetch_error", None
+            )
             if fetch_error is not None:
                 raise ValueError(fetch_error)
             # PERF: leader scheduler resolves remote refs in a background
@@ -2485,10 +2487,7 @@ class Scheduler(
             #     converted
             #   * List[List[List[int]]] — legacy inline list payload
             replay_payload = recv_req.router_replay_experts
-            if (
-                isinstance(replay_payload, dict)
-                and replay_payload.get("format") == "shm"
-            ):
+            if isinstance(replay_payload, dict) and replay_payload.get("format") == "shm":
                 # Open the leader-created /dev/shm file read-only and wrap
                 # a zero-copy tensor over the mmap. We close the fd right
                 # after mmap (Linux semantics: the mapping keeps its own
@@ -2497,8 +2496,8 @@ class Scheduler(
                 # tensor is garbage-collected, the mmap is closed; the
                 # file may be unlinked any time before that — Linux keeps
                 # the content alive until every mapping is dropped.
-                import mmap as _mmap
                 import os as _os
+                import mmap as _mmap
 
                 shape = tuple(replay_payload["shape"])
                 dtype_np = np.dtype(replay_payload["dtype"])
@@ -2841,8 +2840,7 @@ class Scheduler(
         if self.disaggregation_mode == DisaggregationMode.NULL:
             if self._abort_on_queued_limit(req):
                 return
-            if not (is_retracted and self._use_cp_sharded_hicache()):
-                self._prefetch_kvcache(req)
+            self._prefetch_kvcache(req)
             self.waiting_queue.append(req)
             req.time_stats.set_wait_queue_entry_time()
         elif self.disaggregation_mode == DisaggregationMode.PREFILL:
@@ -3252,8 +3250,7 @@ class Scheduler(
             for req in ready_grammar_requests:
                 self._add_request_to_queue(req)
 
-        use_cp_sharded_hicache = self._use_cp_sharded_hicache()
-        if self.enable_hierarchical_cache and not use_cp_sharded_hicache:
+        if self.enable_hierarchical_cache:
             self.tree_cache.check_hicache_events()
 
         if self.enable_priority_preemption or self.is_hybrid_swa:
@@ -3280,8 +3277,7 @@ class Scheduler(
             self.running_batch.batch_is_full = True
             return None
 
-        if use_cp_sharded_hicache:
-            self.tree_cache.check_hicache_events()
+        self._validate_cp_sharded_prefill_compatibility()
 
         # Get priority queue
         self.policy.calc_priority(self.waiting_queue, self.running_batch)
@@ -3317,9 +3313,8 @@ class Scheduler(
             prefill_delayer_single_pass=prefill_delayer_single_pass,
             dllm_config=self.dllm_config,
             waiting_queue_len=len(self.waiting_queue),
+            next_attn_cp_owner_rotation=self.next_attn_cp_owner_rotation,
         )
-        self._sync_cp_sharded_prefill_admission_budget(adder)
-
         if self.chunked_req is not None:
             self.chunked_req.init_next_round_input()
             self.chunked_req = adder.add_chunked_req(self.chunked_req)
@@ -3340,6 +3335,13 @@ class Scheduler(
 
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
+            if self._attn_cp_prefill_bs_limit_reached(adder):
+                break
+            # Check the request-count limit before init_next_round_input() calls
+            # radix match/split. Rejected requests must not mutate radix state.
+            if adder.prefill_request_limit_reached():
+                break
+
             if self.enable_lora and not self._can_schedule_lora_req(req, running_loras):
                 continue
 
@@ -3369,12 +3371,7 @@ class Scheduler(
                     req.rid
                 )
 
-            if req.is_retracted and self._use_cp_sharded_hicache():
-                req.init_next_round_input(None)
-                self._reset_cp_sharded_hicache_match(req)
-            else:
-                req.init_next_round_input(self.tree_cache)
-                self._sync_cp_sharded_hicache_match(req)
+            req.init_next_round_input(self.tree_cache)
             res = adder.add_one_req(
                 req,
                 has_chunked_req=(self.chunked_req is not None),
@@ -3411,25 +3408,8 @@ class Scheduler(
 
         # Update waiting queue
         can_run_list: List[Req] = adder.can_run_list
+        self.next_attn_cp_owner_rotation = adder.next_attn_cp_owner_rotation
         if len(can_run_list) == 0:
-            # Running requests keep their radix nodes locked, so reclaiming
-            # evictable host-backed pages is safe during continuous batching.
-            if (
-                self.enable_hierarchical_cache
-                and (self.waiting_queue or self.chunked_req is not None)
-                and isinstance(
-                    self.token_to_kv_pool_allocator, CPShardedKVPoolAllocator
-                )
-            ):
-                allocator = self.token_to_kv_pool_allocator
-                evict_from_tree_cache(
-                    self.tree_cache,
-                    max(
-                        self.tree_cache.full_evictable_size(),
-                        (chunked_prefill_size or 0)
-                        + allocator.cp_size * allocator.cp_kv_chunk_size,
-                    ),
-                )
             return None
 
         can_run_set = set(can_run_list)
@@ -3518,100 +3498,44 @@ class Scheduler(
 
         return new_batch
 
-    def _sync_cp_sharded_prefill_admission_budget(self, adder: PrefillAdder) -> None:
-        if (
-            self.attn_cp_size <= 1
-            or self.server_args.attn_cp_mode != "sharded-kv"
-            or adder.cp_sharded_allocator is None
-            or self.tp_size <= 1
-        ):
-            return
-
-        budgets = torch.tensor(
-            [
-                int(adder._available_and_evictable_tokens()),
-                int(
-                    adder.token_to_kv_pool_allocator.swa_available_size()
-                    + adder.tree_cache.swa_evictable_size()
-                    if adder.is_hybrid_swa
-                    else adder._available_and_evictable_tokens()
-                ),
-                int(adder.cp_sharded_allocator.physical_available_size()),
-            ],
-            dtype=torch.int64,
-        )
-        torch.distributed.all_reduce(
-            budgets,
-            op=torch.distributed.ReduceOp.MIN,
-            group=self.tp_cpu_group,
-        )
-        adder.cp_sharded_available_and_evictable_override = int(budgets[0].item())
-        adder.cp_sharded_swa_available_and_evictable_override = int(budgets[1].item())
-        adder.cp_sharded_physical_available_override = int(budgets[2].item())
-
-    def _use_cp_sharded_hicache(self) -> bool:
+    @staticmethod
+    def _attn_cp_prefill_bs_limit_reached(adder: PrefillAdder) -> bool:
         return (
-            self.enable_hierarchical_cache
-            and self.attn_cp_size > 1
-            and self.server_args.attn_cp_mode == "sharded-kv"
-            and isinstance(self.token_to_kv_pool_allocator, CPShardedKVPoolAllocator)
+            adder.cp_sharded_allocator is not None
+            and len(adder.can_run_list) > 0
         )
 
-    def _reset_cp_sharded_hicache_match(self, req: Req) -> None:
-        req.prefix_indices = req.prefix_indices[:0]
-        req.last_node = self.tree_cache.root_node
-        req.last_host_node = self.tree_cache.root_node
-        req.best_match_node = self.tree_cache.root_node
-        req.host_hit_length = 0
-        req.storage_hit_length = 0
-        req.cache_protected_len = 0
-        req.swa_uuid_for_lock = None
-        req.swa_prefix_lock_released = False
-        req.set_extend_input_len(len(req.fill_ids))
+    def _is_cp_sharded_prefill_enabled(self) -> bool:
+        return (
+            self.attn_cp_size > 1
+            and self.server_args.attn_cp_mode == "sharded-kv"
+        )
 
-    def _sync_cp_sharded_hicache_match(self, req: Req) -> None:
-        if not self._use_cp_sharded_hicache():
+    def _validate_cp_sharded_prefill_compatibility(self) -> None:
+        if not self._is_cp_sharded_prefill_enabled():
             return
 
-        signature = torch.tensor(
-            [
-                len(req.prefix_indices),
-                int(req.host_hit_length or 0),
-                int(req.storage_hit_length or 0),
-                int(req.cache_protected_len or 0),
-            ],
-            dtype=torch.int64,
-        )
-        bounds = torch.cat((signature, -signature))
-        torch.distributed.all_reduce(
-            bounds,
-            op=torch.distributed.ReduceOp.MIN,
-            group=self.tp_cpu_group,
-        )
-
-        size = signature.numel()
-        if not torch.equal(bounds[:size], -bounds[size:]):
-            # Radix/HiCache residency is rank-local. A mismatched prefix would
-            # split chunked prefill at different positions across CP ranks.
-            self._reset_cp_sharded_hicache_match(req)
-
-    def _sync_cp_sharded_decode_int(self, value: int, op: torch.distributed.ReduceOp):
-        if (
-            self.tp_size <= 1
-            or not torch.distributed.is_available()
-            or not torch.distributed.is_initialized()
-        ):
-            return int(value)
-
-        tensor = torch.tensor([int(value)], dtype=torch.int64)
-        torch.distributed.all_reduce(tensor, op=op, group=self.tp_cpu_group)
-        return int(tensor.item())
+        if isinstance(getattr(self.policy, "policy", None), CacheAwarePolicy):
+            raise ValueError(
+                "CP-sharded prefill does not support cache-aware scheduling "
+                "policies (lpm/dfs-weight); use a cache-agnostic policy."
+            )
+        if self.model_config.is_encoder_decoder:
+            raise ValueError(
+                "CP-sharded prefill does not support encoder-decoder models."
+            )
+        if self.enable_hierarchical_cache or self.enable_hicache_storage:
+            raise ValueError(
+                "CP-sharded prefill does not support hierarchical cache or HiCache storage."
+            )
 
     def _use_cp_sharded_decode_mem_check(self, batch: ScheduleBatch) -> bool:
         return (
             self.attn_cp_size > 1
             and self.server_args.attn_cp_mode == "sharded-kv"
-            and isinstance(batch.token_to_kv_pool_allocator, CPShardedKVPoolAllocator)
+            and isinstance(
+                batch.token_to_kv_pool_allocator, CPShardedKVPoolAllocator
+            )
             and batch.spec_algorithm.is_none()
         )
 
@@ -3630,25 +3554,24 @@ class Scheduler(
             if selected_indices is None
             else [batch.reqs[i] for i in selected_indices]
         )
-        needed_local = sum(
-            allocator.local_alloc_size_for_range(req.kv_committed_len, scale)
-            for req in requests
-        )
-        needed_global = self._sync_cp_sharded_decode_int(
-            needed_local, torch.distributed.ReduceOp.MAX
-        )
+        demand = [0] * allocator.cp_size
+        for req in requests:
+            req_demand = allocator.alloc_size_per_rank_for_range(
+                req.kv_committed_len,
+                scale,
+                int(getattr(req, "attn_cp_owner_rotation", 0) or 0),
+            )
+            for cp_rank, token_count in enumerate(req_demand):
+                demand[cp_rank] += int(token_count)
 
-        logical_needed = batch.new_tokens_required_next_decode(selected_indices)
-        evict_from_tree_cache(
-            batch.tree_cache,
-            max(logical_needed, needed_global * allocator.cp_size),
-        )
+        if not any(demand):
+            return True
 
-        available_local = allocator.physical_available_size()
-        available_global = -self._sync_cp_sharded_decode_int(
-            -available_local, torch.distributed.ReduceOp.MAX
+        return ensure_cp_sharded_kv_capacity(
+            allocator=allocator,
+            tree_cache=batch.tree_cache,
+            demand_tokens=tuple(demand),
         )
-        return available_global >= needed_global
 
     def _retract_mem_snapshot(self) -> Dict[str, int]:
         allocator = self.token_to_kv_pool_allocator
@@ -3667,7 +3590,9 @@ class Scheduler(
             )
             base_allocator = allocator.base_allocator
             if hasattr(base_allocator, "full_available_size"):
-                snapshot["full_physical"] = int(base_allocator.full_available_size())
+                snapshot["full_physical"] = int(
+                    base_allocator.full_available_size()
+                )
             if hasattr(base_allocator, "swa_available_size"):
                 snapshot["swa_physical"] = int(base_allocator.swa_available_size())
 
@@ -3692,7 +3617,9 @@ class Scheduler(
             parts.append(f"{key}:{old_value}->{new_value}(+{new_value - old_value})")
 
         if "cp_rank" in new_snapshot:
-            parts.append(f"cp_rank:{new_snapshot['cp_rank']}/{new_snapshot['cp_size']}")
+            parts.append(
+                f"cp_rank:{new_snapshot['cp_rank']}/{new_snapshot['cp_size']}"
+            )
         return ",".join(parts)
 
     def _can_schedule_lora_req(
@@ -3734,9 +3661,7 @@ class Scheduler(
 
         # Eagerly release lock_ref on completed write-through nodes so they
         # become evictable, improving batch scheduling headroom.
-        if self.enable_hierarchical_cache and not (
-            self.attn_cp_size > 1 and self.server_args.attn_cp_mode == "sharded-kv"
-        ):
+        if self.enable_hierarchical_cache:
             self.tree_cache.flush_write_through_acks()
 
         def check_decode_mem(selected_indices: Optional[List[int]] = None) -> bool:
@@ -3793,7 +3718,9 @@ class Scheduler(
                 else "Testing retraction. "
             )
             msg_details = f"#retracted_reqs: {len(retracted_reqs)}, #new_tokens_gained: {new_token_gained}"
-            msg_details += f", mem: {self._format_retract_mem_delta(old_retract_mem_snapshot, new_retract_mem_snapshot)}"
+            msg_details += (
+                f", mem: {self._format_retract_mem_delta(old_retract_mem_snapshot, new_retract_mem_snapshot)}"
+            )
             if mamba_num_gained is not None:
                 msg_details += f", #mamba_num_gained: {mamba_num_gained}"
             if kv_full_retract_flag:
@@ -3894,7 +3821,9 @@ class Scheduler(
                     # Spec-v2 keeps draft continuation state local to the
                     # scheduler/draft worker path. It is not part of the public
                     # generation result.
-                    draft_continuation_state = batch_result.draft_continuation_state
+                    draft_continuation_state = (
+                        batch_result.draft_continuation_state
+                    )
                     assert draft_continuation_state is not None
 
                     batch.spec_info = draft_continuation_state.draft_input
@@ -4173,7 +4102,7 @@ class Scheduler(
             # destructive operations like attach/detach/flush_cache.
             if self.enable_hierarchical_cache:
                 tc = self.tree_cache
-                if tc.tp_world_size == 1 or self._use_cp_sharded_hicache():
+                if tc.tp_world_size == 1:
                     tc.poll_storage_work()
                 idle &= not tc.has_pending_storage_work()
 

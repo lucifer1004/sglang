@@ -397,20 +397,14 @@ def is_allocation_symmetric() -> bool:
 
 
 def get_attention_tp_group() -> GroupCoordinator:
-    if _is_sharded_kv_context_parallel():
-        return get_tp_group()
     return get_attn_tp_group()
 
 
 def get_attention_tp_rank() -> int:
-    if _is_sharded_kv_context_parallel():
-        return get_tensor_model_parallel_rank()
     return get_attn_tensor_model_parallel_rank()
 
 
 def get_attention_tp_size() -> int:
-    if _is_sharded_kv_context_parallel():
-        return get_tensor_model_parallel_world_size()
     return get_attn_tensor_model_parallel_world_size()
 
 

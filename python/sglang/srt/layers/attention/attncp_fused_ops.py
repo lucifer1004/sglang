@@ -21,7 +21,7 @@ def attncp_sharded_kv_local_cap(
     cp_size: int,
     chunk_size: int,
 ) -> int:
-    """Return the compact local KV page-table capacity for a global seq cap."""
+    """Return a rotation-safe local KV capacity for a global sequence cap."""
     max_seq_len = int(max_seq_len)
     cp_rank = int(cp_rank)
     cp_size = int(cp_size)
@@ -34,14 +34,20 @@ def attncp_sharded_kv_local_cap(
         return max(0, max_seq_len)
 
     full_chunks, tail_tokens = divmod(max_seq_len, chunk_size)
-    owned_full_chunks = full_chunks // cp_size
-    if cp_rank < full_chunks % cp_size:
-        owned_full_chunks += 1
+    owner_tokens = [0] * cp_size
+    period = cp_size * 2
+    for chunk_idx in range(full_chunks):
+        phase = chunk_idx % period
+        owner = phase if phase < cp_size else period - phase - 1
+        owner_tokens[owner] += chunk_size
+    if tail_tokens > 0:
+        phase = full_chunks % period
+        owner = phase if phase < cp_size else period - phase - 1
+        owner_tokens[owner] += tail_tokens
 
-    local_cap = owned_full_chunks * chunk_size
-    if full_chunks % cp_size == cp_rank:
-        local_cap += tail_tokens
-    return max(1, local_cap)
+    # Request rotation permutes physical rank labels. Every rank therefore needs
+    # the maximum capacity of any unrotated owner.
+    return max(1, max(owner_tokens))
 
 
 def attncp_cp2_fused_q_fa_supports_shape(
