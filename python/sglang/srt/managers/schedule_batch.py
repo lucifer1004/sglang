@@ -393,14 +393,16 @@ class FINISH_MATCHED_STR(BaseFinishReason):
 
 
 class FINISHED_MATCHED_REGEX(BaseFinishReason):
-    def __init__(self, matched: str):
+    def __init__(self, matched: str, matched_text: Optional[str] = None):
         super().__init__()
         self.matched = matched
+        self.matched_text = matched_text
 
     def to_json(self):
         return {
             "type": "stop",  # to match OpenAI API's return value
             "matched": self.matched,
+            "matched_text": self.matched_text,
         }
 
 
@@ -1576,9 +1578,11 @@ class Req(ReqDllmMixin):
             # Check stop regex
             if len(self.sampling_params.stop_regex_strs) > 0:
                 for stop_regex_str in self.sampling_params.stop_regex_strs:
-                    if re.search(stop_regex_str, tail_str):
+                    match = re.search(stop_regex_str, tail_str)
+                    if match:
                         self.finished_reason = FINISHED_MATCHED_REGEX(
-                            matched=stop_regex_str
+                            matched=stop_regex_str,
+                            matched_text=match.group(0),
                         )
                         return True
 

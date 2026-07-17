@@ -159,7 +159,9 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
         if no_stop_trim or not finished_reason:
             return output
 
-        matched = finished_reason.get("matched", None)
+        matched = finished_reason.get("matched_text") or finished_reason.get(
+            "matched", None
+        )
         if not matched:
             return output
 

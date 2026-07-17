@@ -40,6 +40,7 @@ from sglang.srt.function_call.utils import (
     _get_tool_schema_defs,
     get_json_schema_constraint,
 )
+from sglang.srt.function_call.welm_v4_detector import WelmV4ToolDetector
 
 logger = logging.getLogger(__name__)
 
@@ -81,6 +82,7 @@ class FunctionCallParser:
         "hunyuan": HunyuanDetector,
         "gigachat3": GigaChat3Detector,
         "gemma4": Gemma4Detector,
+        "welm-v4": WelmV4ToolDetector,
     }
 
     def __init__(self, tools: List[Tool], tool_call_parser: str):
@@ -94,7 +96,75 @@ class FunctionCallParser:
         self.tools = tools
         self.tool_strict_level = envs.SGLANG_TOOL_STRICT_LEVEL.get()
 
-    def has_tool_call(self, text: str) -> bool:
+    @classmethod
+    def accepts_token_ids_for(cls, tool_call_parser: Optional[str]) -> bool:
+        detector_class = cls.ToolCallParserEnum.get(tool_call_parser or "")
+        return bool(getattr(detector_class, "accepts_token_ids", False))
+
+    @classmethod
+    def trim_token_id_output(
+        cls,
+        tool_call_parser: Optional[str],
+        output,
+        finish_reason: Optional[dict],
+        no_stop_trim: bool,
+    ):
+        detector_class = cls.ToolCallParserEnum.get(tool_call_parser or "")
+        trim = getattr(detector_class, "trim_matched_stop", None)
+        return trim(output, finish_reason, no_stop_trim) if trim else output
+
+    @classmethod
+    def filter_id_based_stream_stop(
+        cls,
+        parser_name: Optional[str],
+        request,
+        tokenizer,
+        model_config,
+        delta: str,
+        delta_ids: Optional[List[int]],
+        choice_logprobs: Optional[dict],
+        finish_reason: Optional[dict],
+        skip_special_tokens: bool,
+        spaces_between_special_tokens: bool,
+    ):
+        detector_class = cls.ToolCallParserEnum.get(parser_name or "")
+        filter_stop = getattr(detector_class, "filter_id_based_stream_stop", None)
+        if filter_stop is None:
+            return delta, delta_ids, choice_logprobs
+        return filter_stop(
+            request,
+            tokenizer,
+            model_config,
+            delta,
+            delta_ids,
+            choice_logprobs,
+            finish_reason,
+            skip_special_tokens,
+            spaces_between_special_tokens,
+        )
+
+    @property
+    def accepts_token_ids(self) -> bool:
+        return bool(getattr(self.detector, "accepts_token_ids", False))
+
+    def configure_tokenizer(
+        self,
+        tokenizer,
+        skip_special_tokens: bool = True,
+        spaces_between_special_tokens: bool = True,
+    ) -> None:
+        configure = getattr(self.detector, "configure_tokenizer", None)
+        if configure is not None:
+            configure(
+                tokenizer,
+                skip_special_tokens=skip_special_tokens,
+                spaces_between_special_tokens=spaces_between_special_tokens,
+            )
+
+    def _detector_args(self, token_ids: Optional[List[int]]) -> tuple:
+        return (token_ids,) if self.accepts_token_ids else ()
+
+    def has_tool_call(self, text: str, token_ids: Optional[List[int]] = None) -> bool:
         """
         Check if the given text contains a tool call in the format supported by this parser.
         This delegates to the detector's implementation.
@@ -107,9 +177,11 @@ class FunctionCallParser:
         """
         if not self.tools:
             return False
-        return self.detector.has_tool_call(text)
+        return self.detector.has_tool_call(text, *self._detector_args(token_ids))
 
-    def parse_non_stream(self, full_text: str) -> Tuple[str, list[ToolCallItem]]:
+    def parse_non_stream(
+        self, full_text: str, token_ids: Optional[List[int]] = None
+    ) -> Tuple[str, list[ToolCallItem]]:
         """
         One-time parsing of the full text to extract tool calls.
 
@@ -123,14 +195,18 @@ class FunctionCallParser:
         """
         if not self.tools:
             return full_text, []
-        parsed_result = self.detector.detect_and_parse(full_text, self.tools)
+        parsed_result = self.detector.detect_and_parse(
+            full_text, self.tools, *self._detector_args(token_ids)
+        )
         tool_call_list = parsed_result.calls
         if tool_call_list:
             return parsed_result.normal_text, tool_call_list
         else:
             return full_text, []
 
-    def parse_stream_chunk(self, chunk_text: str) -> Tuple[str, list[ToolCallItem]]:
+    def parse_stream_chunk(
+        self, chunk_text: str, token_ids: Optional[List[int]] = None
+    ) -> Tuple[str, list[ToolCallItem]]:
         """
         Streaming incremental parsing of chunks of text as they arrive.
 
@@ -147,7 +223,9 @@ class FunctionCallParser:
         final_normal_text = ""
         final_calls = []
 
-        sp_result = self.detector.parse_streaming_increment(chunk_text, self.tools)
+        sp_result = self.detector.parse_streaming_increment(
+            chunk_text, self.tools, *self._detector_args(token_ids)
+        )
         if sp_result.normal_text:
             final_normal_text = sp_result.normal_text
         if sp_result.calls:

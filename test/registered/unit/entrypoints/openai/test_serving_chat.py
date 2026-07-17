@@ -27,7 +27,9 @@ from sglang.srt.entrypoints.openai.serving_chat import (
     OpenAIServingChat,
     normalize_tool_content,
 )
+from sglang.srt.managers.detokenizer_manager import DetokenizerManager
 from sglang.srt.managers.io_struct import GenerateReqInput
+from sglang.srt.managers.schedule_batch import FINISHED_MATCHED_REGEX
 from sglang.srt.managers.template_detection import ReasoningToggleConfig
 from sglang.srt.utils import get_or_create_event_loop
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -91,6 +93,38 @@ class _MockTemplateManager:
         self.force_reasoning = False
 
 
+class _FakeWelmTokenizer:
+    CONTROL = {
+        "<think>": 1001,
+        "</think>": 1002,
+        "<|im_end|>": 1009,
+    }
+    eos_token_id = CONTROL["<|im_end|>"]
+    additional_stop_token_ids = []
+    unk_token_id = 0
+
+    def __init__(self):
+        self._id_to_token = {
+            token_id: token for token, token_id in self.CONTROL.items()
+        }
+        self.chat_template = None
+        self.bos_token_id = 1
+
+    def convert_tokens_to_ids(self, token):
+        return self.CONTROL.get(token, self.unk_token_id)
+
+    def decode(
+        self, token_ids, skip_special_tokens=True, spaces_between_special_tokens=True
+    ):
+        del spaces_between_special_tokens
+        parts = []
+        for token_id in token_ids:
+            if skip_special_tokens and token_id == self.eos_token_id:
+                continue
+            parts.append(self._id_to_token.get(token_id, chr(token_id)))
+        return "".join(parts)
+
+
 class ServingChatTestCase(unittest.TestCase):
     # ------------- common fixtures -------------
     def setUp(self):
@@ -116,6 +150,31 @@ class ServingChatTestCase(unittest.TestCase):
 
         self.fastapi_request = Mock(spec=Request)
         self.fastapi_request.headers = {}
+
+    def _welm_chat(self):
+        self.tm.server_args.incremental_streaming_output = True
+        self.tm.server_args.reasoning_parser = "welm-v4"
+        self.tm.server_args.tool_call_parser = None
+        self.tm.tokenizer = _FakeWelmTokenizer()
+        self.tm.model_config.hf_eos_token_id = {self.tm.tokenizer.eos_token_id}
+        return OpenAIServingChat(self.tm, self.template_manager)
+
+    def _run_chat_stream(self, chat, request):
+        async def collect():
+            return [
+                chunk
+                async for chunk in chat._generate_chat_stream(
+                    Mock(spec=GenerateReqInput), request, self.fastapi_request
+                )
+            ]
+
+        return get_or_create_event_loop().run_until_complete(collect())
+
+    @staticmethod
+    def _stream_choices(output):
+        for chunk in output:
+            if chunk.startswith("data: ") and chunk.strip() != "data: [DONE]":
+                yield json.loads(chunk[len("data: ") :])["choices"][0]
 
     # ------------- conversion tests -------------
     def test_convert_to_internal_request_single(self):
@@ -176,7 +235,7 @@ class ServingChatTestCase(unittest.TestCase):
 
         self.chat._process_messages(req, is_multimodal=False)
 
-        expected_tools = [tool.model_dump() for tool in req.tools]
+        expected_tools = [tool.model_dump(exclude_unset=True) for tool in req.tools]
         kwargs = self.tm.tokenizer.apply_chat_template.call_args.kwargs
         self.assertEqual(kwargs["tools"], expected_tools)
 
@@ -220,9 +279,13 @@ class ServingChatTestCase(unittest.TestCase):
         second_tools = self.tm.tokenizer.apply_chat_template.call_args_list[1].kwargs[
             "tools"
         ]
-        self.assertEqual(first_tools, [tool.model_dump() for tool in req.tools])
         self.assertEqual(
-            second_tools, [tool.function.model_dump() for tool in req.tools]
+            first_tools,
+            [tool.model_dump(exclude_unset=True) for tool in req.tools],
+        )
+        self.assertEqual(
+            second_tools,
+            [tool.function.model_dump(exclude_unset=True) for tool in req.tools],
         )
 
     def test_stop_str_isolation_between_requests(self):
@@ -284,6 +347,7 @@ class ServingChatTestCase(unittest.TestCase):
         # Mock FunctionCallParser with detector that has partial tool call data
         mock_parser = Mock()
         mock_detector = Mock()
+        mock_detector.skip_unstreamed_arg_backfill = False
 
         # Simulate a tool call that was partially streamed
         mock_detector.prev_tool_call_arr = [
@@ -887,6 +951,43 @@ class ServingChatTestCase(unittest.TestCase):
         )
         self.assertIn("<｜Assistant｜>", out)
 
+    def test_streaming_parser_value_error_yields_error_and_done(self):
+        error_message = "malformed committed tool call"
+
+        async def _raise_parser_error(*args, **kwargs):
+            del args, kwargs
+            raise ValueError(error_message)
+            yield  # pragma: no cover - make this an async generator
+
+        self.chat._process_tool_call_stream = _raise_parser_error
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Use the tool"}],
+            tools=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "get_weather",
+                        "description": "Get weather",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"city": {"type": "string"}},
+                        },
+                    },
+                }
+            ],
+            stream=True,
+        )
+
+        chunks = self._run_chat_stream(self.chat, req)
+
+        self.assertEqual(len(chunks), 3)
+        role_chunk = json.loads(chunks[0][len("data: ") :])
+        self.assertEqual(role_chunk["choices"][0]["delta"]["role"], "assistant")
+        error_chunk = json.loads(chunks[1][len("data: ") :])
+        self.assertEqual(error_chunk["error"]["message"], error_message)
+        self.assertEqual(chunks[2], "data: [DONE]\n\n")
+
     def test_streaming_abort_yields_error(self):
         """Test that an abort finish reason during streaming correctly yields an error and stops."""
         err_msg = "Aborted by scheduler"
@@ -1170,6 +1271,102 @@ class ServingChatTestCase(unittest.TestCase):
             joined,
             "I am a large language model.",
             f"Streaming deltas produced broken text: {deltas!r}",
+        )
+
+    def test_welm_incremental_ids_and_logprobs_split(self):
+        chat = self._welm_chat()
+        eos_id = self.tm.tokenizer.eos_token_id
+
+        output_ids = [
+            self.tm.tokenizer.CONTROL["<think>"],
+            ord("r"),
+            self.tm.tokenizer.CONTROL["</think>"],
+            ord("a"),
+            eos_id,
+        ]
+
+        async def _mock_generate_incremental():
+            frames = [
+                (
+                    "<think>",
+                    output_ids[:1],
+                    [(-0.1, output_ids[0], "<think>")],
+                    None,
+                ),
+                (
+                    "r</think>a<|im_end|>",
+                    output_ids[1:],
+                    [
+                        (-0.2, output_ids[1], "r"),
+                        (-0.3, output_ids[2], "</think>"),
+                        (-0.4, output_ids[3], "a"),
+                        (-0.5, output_ids[4], "<|im_end|>"),
+                    ],
+                    {"type": "stop", "matched": eos_id},
+                ),
+            ]
+            for frame_index, (text, frame_ids, logprobs, finish_reason) in enumerate(
+                frames
+            ):
+                yield {
+                    "text": text,
+                    "output_ids": frame_ids,
+                    "meta_info": {
+                        "id": "chatcmpl-welm-logprobs",
+                        "prompt_tokens": 1,
+                        "completion_tokens": 5,
+                        "reasoning_tokens": 3,
+                        "cached_tokens": 0,
+                        "finish_reason": finish_reason,
+                        "output_token_logprobs": logprobs,
+                        "output_token_logprobs_length": 1 if frame_index == 0 else 5,
+                        "output_top_logprobs": [],
+                    },
+                    "index": 0,
+                }
+
+        self.tm.generate_request.return_value = _mock_generate_incremental()
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            stream=True,
+            stream_reasoning=True,
+            logprobs=True,
+        )
+
+        reasoning_parts, content_parts = [], []
+        reasoning_logprobs, content_logprobs = [], []
+        for choice in self._stream_choices(self._run_chat_stream(chat, req)):
+            delta = choice["delta"]
+            tokens = [
+                item["token"]
+                for item in (choice.get("logprobs") or {}).get("content", [])
+            ]
+            if delta.get("reasoning_content"):
+                reasoning_parts.append(delta["reasoning_content"])
+                reasoning_logprobs.extend(tokens)
+            if delta.get("content"):
+                content_parts.append(delta["content"])
+                content_logprobs.extend(tokens)
+
+        self.assertEqual("".join(reasoning_parts), "r")
+        self.assertEqual("".join(content_parts), "a")
+        self.assertEqual(reasoning_logprobs, ["<think>", "r", "</think>"])
+        self.assertEqual(content_logprobs, ["a", "<|im_end|>"])
+
+    def test_regex_finish_reason_trims_actual_match_not_pattern(self):
+        finish_reason = FINISHED_MATCHED_REGEX(r"\d+", "123").to_json()
+        self.assertEqual(finish_reason["matched"], r"\d+")
+        self.assertEqual(finish_reason["matched_text"], "123")
+
+        legacy_finish_reason = FINISHED_MATCHED_REGEX(r"\d+").to_json()
+        self.assertEqual(legacy_finish_reason["matched"], r"\d+")
+        self.assertIsNone(legacy_finish_reason["matched_text"])
+
+        manager = DetokenizerManager.__new__(DetokenizerManager)
+        self.assertEqual(
+            manager.trim_matched_stop("hello123tail", finish_reason, False),
+            "hello",
         )
 
     # ------------- X-Data-Parallel-Rank header tests -------------
