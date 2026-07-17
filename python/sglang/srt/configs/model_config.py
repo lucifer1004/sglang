@@ -1221,7 +1221,23 @@ class ModelConfig:
 
             # Verify quantization configurations.
             if self.quantization is None:
-                self.quantization = quant_method
+                # A checkpoint whose weights are stored UNQUANTIZED (bf16) may ship a
+                # quantization_config that only declares an ONLINE-quant recipe
+                # ("is_checkpoint_fp8_serialized": false). Do not auto-enable it:
+                # serving BF16 must stay the default so the same checkpoint runs
+                # unquantized and on hardware without fp8/mxfp8 support. It is
+                # quantized only when the user opts in via the `--quantization` arg.
+                # Serialized/pre-quantized checkpoints (key absent or true) keep
+                # auto-detecting as before.
+                if quant_cfg.get("is_checkpoint_fp8_serialized", True) is False:
+                    logger.info(
+                        f"Checkpoint declares an online-quant recipe "
+                        f"(quant_method={quant_method}, is_checkpoint_fp8_serialized="
+                        f"false); serving BF16 by default. Pass --quantization "
+                        f"{quant_method} to enable online quantization."
+                    )
+                else:
+                    self.quantization = quant_method
             elif self.quantization != quant_method:
                 # Check if the CLI-specified quantization is compatible with HF config's quant_method
                 is_compatible = (

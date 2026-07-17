@@ -141,11 +141,9 @@ def mmq_style_router_linear_kernel(  # pylint: disable=too-many-arguments,too-ma
         tl.store(c_ptrs, c, mask=c_mask)
 
 
-def mmq_style_router_linear(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
-    assert x.dim() == 2
-    assert weight.dim() == 2
-    assert x.shape[1] == weight.shape[1]
-    assert x.dtype in (torch.bfloat16, torch.float16)
+def _mmq_style_router_linear_triton(
+    x: torch.Tensor, weight: torch.Tensor
+) -> torch.Tensor:
     weight = weight.to(x.dtype)
     weight_t = weight.t()
     output = torch.empty(
@@ -173,6 +171,30 @@ def mmq_style_router_linear(x: torch.Tensor, weight: torch.Tensor) -> torch.Tens
         NUM_SMS=num_sms,
     )
     return output
+
+
+def _mmq_style_router_linear_cublas(
+    x: torch.Tensor, weight: torch.Tensor
+) -> torch.Tensor:
+    if x.dtype == torch.bfloat16 and x.is_cuda:
+        from sglang.jit_kernel.deepseek_v4 import linear_bf16_fp32
+
+        return linear_bf16_fp32(x, weight.to(torch.bfloat16))
+    return torch.matmul(x.float(), weight.float().t())
+
+
+def mmq_style_router_linear(
+    x: torch.Tensor, weight: torch.Tensor, *, use_mxfp8: bool = False
+) -> torch.Tensor:
+    assert x.dim() == 2
+    assert weight.dim() == 2
+    assert x.shape[1] == weight.shape[1]
+    assert x.dtype in (torch.bfloat16, torch.float16)
+    if use_mxfp8:
+        return _mmq_style_router_linear_cublas(x, weight)
+    if not x.is_cuda:
+        return torch.matmul(x.float(), weight.float().t())
+    return _mmq_style_router_linear_triton(x, weight)
 
 
 @triton.jit

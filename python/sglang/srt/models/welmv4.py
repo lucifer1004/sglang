@@ -21,6 +21,7 @@ import math
 import os
 import re
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Union
 
@@ -2295,6 +2296,7 @@ def expert_bias_routing(
     expert_bias: torch.Tensor,
     renormalize: bool = False,
     score_func: str = "sigmoid",
+    use_mxfp8: bool = False,
 ):
     assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
     if score_func == "softmax":
@@ -2314,6 +2316,10 @@ def expert_bias_routing(
         _, indices = torch.topk(scores_for_routing, topk, dim=-1)
         topk_scores = torch.gather(scores, dim=1, index=indices).type_as(scores)
 
+    # Cutlass MXFP8 grouped GEMM requires int32. Keep BF16 aligned with the
+    # perf implementation, where torch.topk and the MMQ kernel return int64.
+    if use_mxfp8:
+        indices = indices.to(torch.int32)
     return topk_scores, indices
 
 
@@ -2323,6 +2329,7 @@ def sigmoid_routing_function(
     topk: int,
     renormalize: bool,
     correction_bias: Optional[torch.Tensor] = None,
+    use_mxfp8: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     # if softmax, then use qwen3 moe's routing function
     scores = torch.sigmoid(gating_output).type_as(gating_output)
@@ -2331,6 +2338,8 @@ def sigmoid_routing_function(
         scores += correction_bias
     _, indices = torch.topk(scores, topk, dim=-1)
     topk_scores = torch.gather(scores, dim=1, index=indices).type_as(scores)
+    if use_mxfp8:
+        indices = indices.to(torch.int32)
     return topk_scores, indices
 
 
@@ -2352,6 +2361,13 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         self.layer_id = layer_id
         self.config_layer_id = layer_id if config_layer_id is None else config_layer_id
         self.alt_stream = alt_stream
+        self.use_mxfp8 = bool(getattr(quant_config, "use_mxfp8", False))
+        if self.layer_id == 0:
+            logger.info(
+                "WeLM router mode: backend=%s topk_ids_dtype=%s",
+                "cublas" if self.use_mxfp8 else "triton",
+                "int32" if self.use_mxfp8 else "int64",
+            )
         if self.tp_size > config.num_experts:
             raise ValueError(
                 f"Tensor parallel size {self.tp_size} is greater than "
@@ -2387,19 +2403,20 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             else "softmax"
         )
         if config.moe_routing_type == "expert_bias":
-            from functools import partial
-
             custom_routing_function = partial(
                 expert_bias_routing,
                 expert_bias=self.expert_bias,
                 score_func=self.router_score_func,
+                use_mxfp8=self.use_mxfp8,
             )
             self.custom_routing_function = custom_routing_function
         else:
             if self.router_score_func == "softmax":
                 self.custom_routing_function = None
             elif self.router_score_func == "sigmoid":
-                self.custom_routing_function = sigmoid_routing_function
+                self.custom_routing_function = partial(
+                    sigmoid_routing_function, use_mxfp8=self.use_mxfp8
+                )
             else:
                 raise ValueError(f"Unknown router_score_func: {self.router_score_func}")
 
@@ -2511,7 +2528,9 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             topk_output = StandardTopKOutput(
                 topk_weights=router_logits.new_empty((0, top_k)),
                 topk_ids=torch.empty(
-                    (0, top_k), dtype=torch.int64, device=hidden_states.device
+                    (0, top_k),
+                    dtype=torch.int32 if self.use_mxfp8 else torch.int64,
+                    device=hidden_states.device,
                 ),
                 router_logits=router_logits,
             )
@@ -2524,7 +2543,9 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             topk_output = self.topk(router_hidden_states, router_logits)
         else:
             router_logits = mmq_style_router_linear(
-                router_hidden_states, self.gate.weight
+                router_hidden_states,
+                self.gate.weight,
+                use_mxfp8=self.use_mxfp8,
             )
             topk_output = self.topk(router_hidden_states, router_logits)
         if dump_this_layer:

@@ -202,7 +202,17 @@ class Fp8Config(QuantizationConfig):
     def from_config(cls, config: Dict[str, Any]) -> Fp8Config:
         quant_method = cls.get_from_keys(config, ["quant_method"])
         use_mxfp8 = "mxfp8" in quant_method
-        is_checkpoint_fp8_serialized = ("fp8" in quant_method) or use_mxfp8
+        # An fp8/mxfp8 quant_method normally implies the checkpoint already holds
+        # serialized fp8 weights (+scales). A bf16 checkpoint may instead ship an
+        # ONLINE-quant recipe by setting "is_checkpoint_fp8_serialized": false in
+        # its quantization_config -- weights load as bf16 and are quantized at
+        # load. Backward compatible: absent key keeps the historical behavior for
+        # every existing fp8/mxfp8 checkpoint.
+        is_checkpoint_fp8_serialized = cls.get_from_keys_or(
+            config,
+            ["is_checkpoint_fp8_serialized"],
+            ("fp8" in quant_method) or use_mxfp8,
+        )
         activation_scheme = cls.get_from_keys(config, ["activation_scheme"])
         packed_modules_mapping = (
             cls.get_from_keys_or(config, ["packed_modules_mapping"], {}) or {}
