@@ -324,6 +324,26 @@ uv pip install --python "${VENV_PATH}/bin/python" \
     --force-reinstall
 BASH
 
+# MK compiles CUDA kernels at runtime. Keep its source tree in the image so the
+# editable package can resolve the JIT headers under csrcs/include.
+COPY 3rdparty/mk/pyproject.toml 3rdparty/mk/README.md /sgl-workspace/3rdparty/mk/
+COPY 3rdparty/mk/mk /sgl-workspace/3rdparty/mk/mk
+COPY 3rdparty/mk/csrcs /sgl-workspace/3rdparty/mk/csrcs
+
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv pip install --python "${VENV_PATH}/bin/python" \
+        -e /sgl-workspace/3rdparty/mk && \
+    "${VENV_PATH}/bin/python" - <<'PY'
+import mk
+from mk.jit.compiler import REPO_ROOT
+
+jit_header = REPO_ROOT / "csrcs/include/mk/context_impl.cuh"
+if not jit_header.is_file():
+    raise SystemExit(f"MK JIT header not found: {jit_header}")
+print(f"mk_module={mk.__file__}")
+print(f"mk_jit_header={jit_header}")
+PY
+
 COPY sgl-model-gateway /sgl-workspace/sgl-model-gateway
 
 RUN --mount=type=cache,target=/root/.cache/uv \
