@@ -10,3 +10,6 @@
 [submodule "3rdparty/remote-exec"]
 	path = 3rdparty/remote-exec
 	url = https://git.woa.com/wxg-odyssey/rl-infra/remote-exec.git
+[submodule "3rdparty/mk"]
+	path = 3rdparty/mk
+	url = https://git.woa.com/wxg-odyssey/rl-infra/mk.git

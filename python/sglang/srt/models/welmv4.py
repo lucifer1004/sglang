@@ -2471,6 +2471,13 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         if has_shared_expert_gate:
             self.shared_expert_gate = torch.nn.Linear(config.hidden_size, 1, bias=False)
 
+        self._mk_moe_router = None
+        self._mk_moe_router_slot_id = -1
+
+    def set_mk_moe_router(self, adapter, slot_id: int) -> None:
+        self._mk_moe_router = adapter
+        self._mk_moe_router_slot_id = slot_id
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -2534,20 +2541,35 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 ),
                 router_logits=router_logits,
             )
-        elif welm_use_previous_precision():
-            if router_hidden_states_fp32 is None:
-                raise RuntimeError("previous-precision Router requires FP32 hidden")
-            router_logits = F.linear(
-                router_hidden_states_fp32, self.gate.weight
-            )
-            topk_output = self.topk(router_hidden_states, router_logits)
         else:
-            router_logits = mmq_style_router_linear(
-                router_hidden_states,
-                self.gate.weight,
-                use_mxfp8=self.use_mxfp8,
+            mk_topk_output = (
+                self._mk_moe_router.route(
+                    slot_id=self._mk_moe_router_slot_id,
+                    hidden_states=router_hidden_states,
+                    gate_weight=self.gate.weight,
+                    expert_bias=self.expert_bias,
+                )
+                if self._mk_moe_router is not None
+                and prefill_cp_router_context is None
+                else None
             )
-            topk_output = self.topk(router_hidden_states, router_logits)
+            if mk_topk_output is not None:
+                topk_output = mk_topk_output
+                router_logits = topk_output.router_logits
+            elif welm_use_previous_precision():
+                if router_hidden_states_fp32 is None:
+                    raise RuntimeError("previous-precision Router requires FP32 hidden")
+                router_logits = F.linear(
+                    router_hidden_states_fp32, self.gate.weight
+                )
+                topk_output = self.topk(router_hidden_states, router_logits)
+            else:
+                router_logits = mmq_style_router_linear(
+                    router_hidden_states,
+                    self.gate.weight,
+                    use_mxfp8=self.use_mxfp8,
+                )
+                topk_output = self.topk(router_hidden_states, router_logits)
         if dump_this_layer:
             _welm_dump_tensor(f"{dump_prefix}.router.logits", router_logits)
             if self.router_score_func == "softmax":
@@ -4104,6 +4126,30 @@ class Qwen2MoeModel(nn.Module):
             pp_size=self.pp_group.world_size,
             prefix=add_prefix("layers", prefix),
         )
+        self.mk_moe_router = None
+        server_args = get_global_server_args()
+        if server_args.enable_welm_v45_80a3_mk_moe_router:
+            local_moe_blocks = [
+                self.layers[layer_id].mlp
+                for layer_id in range(self.start_layer, self.end_layer)
+                if isinstance(
+                    getattr(self.layers[layer_id], "mlp", None),
+                    Qwen2MoeSparseMoeBlock,
+                )
+            ]
+            from sglang.srt.layers.moe.mk_moe_router import (
+                WelmV45_80A3MkMoeRouterAdapter,
+            )
+
+            self.mk_moe_router = WelmV45_80A3MkMoeRouterAdapter(
+                config=config,
+                server_args=server_args,
+                slot_count=len(local_moe_blocks),
+                use_previous_precision=welm_use_previous_precision(),
+                use_mxfp8=any(block.use_mxfp8 for block in local_moe_blocks),
+            )
+            for slot_id, block in enumerate(local_moe_blocks):
+                block.set_mk_moe_router(self.mk_moe_router, slot_id)
         if self.pp_group.is_last_rank:
             self.norm = (
                 RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -4222,6 +4268,12 @@ class Qwen2MoeModel(nn.Module):
         if getattr(forward_batch, "attn_cp_prefill_runtime_layout", None) is not None:
             hidden_states, positions = _welm_localize_cp_prefill_rows(
                 hidden_states, positions, forward_batch
+            )
+        if self.mk_moe_router is not None:
+            self.mk_moe_router.begin_forward(
+                forward_batch=forward_batch,
+                num_tokens=hidden_states.shape[0],
+                allow_fused_router=not _WELM_DUMP_ENABLED,
             )
         mtp_kv_mirror_states = None
 
