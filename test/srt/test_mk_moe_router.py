@@ -6,7 +6,10 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from sglang.srt.layers.moe.mk_moe_router import WelmV45_80A3MkMoeRouterAdapter
+from sglang.srt.layers.moe.mk_moe_router import (
+    MkMoeRouterMode,
+    WelmV45_80A3MkMoeRouterAdapter,
+)
 from sglang.srt.layers.welmv4_op import (
     mmq_style_expert_bias_topk,
     mmq_style_router_linear,
@@ -39,7 +42,11 @@ def _mk_api():
     )
 
 
-def _inputs(m: int, seed: int):
+def _inputs(
+    m: int,
+    seed: int,
+    gate_weight_dtype: torch.dtype = torch.float32,
+):
     generator = torch.Generator(device="cuda").manual_seed(seed)
     hidden_states = torch.randn(
         (m, 2048), device="cuda", dtype=torch.bfloat16, generator=generator
@@ -47,7 +54,7 @@ def _inputs(m: int, seed: int):
     gate_weight = (
         (torch.randn((512, 2048), device="cuda", generator=generator) * 0.02)
         .to(torch.bfloat16)
-        .float()
+        .to(gate_weight_dtype)
     )
     expert_bias = (
         torch.randn((512,), device="cuda", dtype=torch.float32, generator=generator)
@@ -126,6 +133,69 @@ def test_native_kernel_cuda_graph_replay_matches_sglang():
         )
 
 
+@pytest.mark.parametrize("mode", [MkMoeRouterMode.TF32, MkMoeRouterMode.BF16])
+def test_adapter_dispatches_selected_kernel(mode: MkMoeRouterMode):
+    config = SimpleNamespace(
+        hidden_size=2048,
+        num_experts=512,
+        num_experts_per_tok=10,
+        router_score_func="sigmoid",
+        moe_routing_type="expert_bias",
+        norm_topk_prob=False,
+        scale_seq_times=0,
+    )
+    server_args = SimpleNamespace(
+        ep_size=1,
+        moe_a2a_backend="none",
+        enable_eplb=False,
+        expert_distribution_recorder_mode=None,
+        enable_expert_distribution_metrics=False,
+        enable_moe_router_replay=False,
+        enable_return_routed_experts=False,
+        enable_dp_attention=False,
+        enable_pdmux=False,
+        enable_torch_compile=False,
+        enable_lora=False,
+        moe_runner_backend="auto",
+    )
+    adapter = WelmV45_80A3MkMoeRouterAdapter(
+        mode=mode,
+        config=config,
+        server_args=server_args,
+        slot_count=1,
+        use_previous_precision=False,
+        use_mxfp8=False,
+    )
+    m = 8
+    hidden_states, gate_weight, expert_bias = _inputs(
+        m, seed=1908, gate_weight_dtype=mode.gate_weight_dtype
+    )
+    expected_weights, expected_ids = _reference(hidden_states, gate_weight, expert_bias)
+    forward_batch = SimpleNamespace(
+        forward_mode=ForwardMode.DECODE,
+        can_run_tbo=False,
+    )
+
+    adapter.begin_forward(
+        forward_batch=forward_batch,
+        num_tokens=m,
+        allow_fused_router=True,
+    )
+    output = adapter.route(
+        slot_id=0,
+        hidden_states=hidden_states,
+        gate_weight=gate_weight,
+        expert_bias=expert_bias,
+    )
+    torch.cuda.synchronize()
+
+    assert output is not None
+    assert torch.equal(output.topk_ids, expected_ids.to(torch.int32))
+    torch.testing.assert_close(
+        output.topk_weights, expected_weights, rtol=3e-6, atol=3e-6
+    )
+
+
 def test_adapter_validation_allows_independent_parallel_features():
     config = SimpleNamespace(
         hidden_size=2048,
@@ -157,6 +227,7 @@ def test_adapter_validation_allows_independent_parallel_features():
     )
 
     WelmV45_80A3MkMoeRouterAdapter._validate_config(
+        mode=MkMoeRouterMode.TF32,
         config=config,
         server_args=server_args,
         slot_count=24,
@@ -197,6 +268,7 @@ def test_adapter_validation_rejects_incompatible_server_features(feature: str):
 
     with pytest.raises(RuntimeError, match=feature):
         WelmV45_80A3MkMoeRouterAdapter._validate_config(
+            mode=MkMoeRouterMode.TF32,
             config=config,
             server_args=server_args,
             slot_count=48,
@@ -242,6 +314,7 @@ def test_adapter_logs_actual_dispatch_once(caplog):
         empty_router_logits=torch.empty((m, 0), device="cuda", dtype=torch.float32),
     )
     adapter._run_fn = lambda *args, **kwargs: None
+    adapter.mode = MkMoeRouterMode.TF32
     adapter._logged_dispatch_ms = set()
     adapter._logged_fallbacks = set()
     hidden_states = torch.empty((m, 2048), device="cuda", dtype=torch.bfloat16)

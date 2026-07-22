@@ -655,7 +655,6 @@ class ServerArgs:
         "megamoe",
     ] = "none"
     moe_runner_backend: str = "auto"
-    enable_welm_v45_80a3_mk_moe_router: bool = False
     record_nolora_graph: bool = True
     flashinfer_mxfp4_moe_precision: Literal["default", "bf16"] = "default"
     enable_flashinfer_allreduce_fusion: bool = False
@@ -6472,15 +6471,6 @@ class ServerArgs:
             choices=MOE_RUNNER_BACKEND_CHOICES,
             default=ServerArgs.moe_runner_backend,
             help="Choose the runner backend for MoE.",
-        )
-        parser.add_argument(
-            "--enable-welm-v45-80a3-mk-moe-router",
-            action="store_true",
-            default=ServerArgs.enable_welm_v45_80a3_mk_moe_router,
-            help=(
-                "Enable the decode-only MK MoE router and TopK kernel for "
-                "WeLM v4.5 80A3."
-            ),
         )
         parser.add_argument(
             "--record-nolora-graph",

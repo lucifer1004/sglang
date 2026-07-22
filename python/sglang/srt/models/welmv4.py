@@ -84,6 +84,11 @@ from sglang.srt.layers.logits_processor import (
 from sglang.srt.layers.moe import MoeRunnerBackend, get_moe_a2a_backend
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
+from sglang.srt.layers.moe.mk_moe_router import (
+    MkMoeRouterMode,
+    WelmV45_80A3MkMoeRouterAdapter,
+    get_mk_moe_router_mode,
+)
 from sglang.srt.layers.moe.topk import StandardTopKOutput, TopK
 from sglang.srt.layers.prefill_cp_logits import route_cp_prefill_hidden_states
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -2442,14 +2447,15 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             ),
         )
 
+        mk_moe_router_mode = get_mk_moe_router_mode()
         self.gate = ReplicatedLinear(
             config.hidden_size,
             config.num_experts,
             bias=False,
+            params_dtype=mk_moe_router_mode.gate_weight_dtype,
             quant_config=None,
             prefix=add_prefix("gate", prefix),
         )
-        self.gate.weight.data = self.gate.weight.to(torch.float32)
         if config.shared_expert_intermediate_size > 0:
             self.shared_expert = Qwen2MoeMLP(
                 hidden_size=config.hidden_size,
@@ -4127,8 +4133,9 @@ class Qwen2MoeModel(nn.Module):
             prefix=add_prefix("layers", prefix),
         )
         self.mk_moe_router = None
-        server_args = get_global_server_args()
-        if server_args.enable_welm_v45_80a3_mk_moe_router:
+        mk_moe_router_mode = get_mk_moe_router_mode()
+        if mk_moe_router_mode is not MkMoeRouterMode.OFF:
+            server_args = get_global_server_args()
             local_moe_blocks = [
                 self.layers[layer_id].mlp
                 for layer_id in range(self.start_layer, self.end_layer)
@@ -4137,11 +4144,8 @@ class Qwen2MoeModel(nn.Module):
                     Qwen2MoeSparseMoeBlock,
                 )
             ]
-            from sglang.srt.layers.moe.mk_moe_router import (
-                WelmV45_80A3MkMoeRouterAdapter,
-            )
-
             self.mk_moe_router = WelmV45_80A3MkMoeRouterAdapter(
+                mode=mk_moe_router_mode,
                 config=config,
                 server_args=server_args,
                 slot_count=len(local_moe_blocks),

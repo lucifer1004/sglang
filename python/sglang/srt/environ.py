@@ -681,6 +681,7 @@ class Envs:
     SGLANG_PLUGINS = EnvStr("")
 
     # WeLM related environment variables
+    SGLANG_WELM_V45_80A3_MK_MOE_ROUTER_MODE = EnvStr("off")
     WELM_ALLOW_PARTIAL_MTP_LOAD = EnvBool(
         False
     )  # Skip mtp layer integration check. Useful for RL.

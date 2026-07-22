@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import Any, Optional
+from enum import Enum
+from typing import Any, Callable, Optional
 
 import torch
 
+from sglang.srt.environ import Envs
 from sglang.srt.layers.moe.topk import StandardTopKOutput
 
 logger = logging.getLogger(__name__)
@@ -13,6 +15,28 @@ logger = logging.getLogger(__name__)
 _HIDDEN_SIZE = 2048
 _NUM_EXPERTS = 512
 _TOP_K = 10
+_MODE_ENV = "SGLANG_WELM_V45_80A3_MK_MOE_ROUTER_MODE"
+
+
+class MkMoeRouterMode(Enum):
+    OFF = "off"
+    TF32 = "tf32"
+    BF16 = "bf16"
+
+    @property
+    def gate_weight_dtype(self) -> torch.dtype:
+        return torch.bfloat16 if self is MkMoeRouterMode.BF16 else torch.float32
+
+
+def get_mk_moe_router_mode() -> MkMoeRouterMode:
+    value = Envs.SGLANG_WELM_V45_80A3_MK_MOE_ROUTER_MODE.get().strip().lower()
+    try:
+        return MkMoeRouterMode(value)
+    except ValueError:
+        choices = ", ".join(mode.value for mode in MkMoeRouterMode)
+        raise RuntimeError(
+            f"{_MODE_ENV} must be one of {{{choices}}}, got {value!r}"
+        ) from None
 
 
 @dataclass
@@ -24,19 +48,58 @@ class _MkRouterPlanState:
     empty_router_logits: torch.Tensor
 
 
+@dataclass(frozen=True)
+class _MkRouterOps:
+    plan: Callable[..., Any]
+    init_workspace: Callable[..., Any]
+    run: Callable[..., Any]
+
+
+def _load_mk_router_ops(mode: MkMoeRouterMode) -> _MkRouterOps:
+    if mode is MkMoeRouterMode.TF32:
+        from mk.kernels.welm_v45_80a3_moe_router import (
+            welm_v45_80a3_moe_router_init_workspace,
+            welm_v45_80a3_moe_router_plan,
+            welm_v45_80a3_moe_router_run,
+        )
+
+        return _MkRouterOps(
+            plan=welm_v45_80a3_moe_router_plan,
+            init_workspace=welm_v45_80a3_moe_router_init_workspace,
+            run=welm_v45_80a3_moe_router_run,
+        )
+    if mode is MkMoeRouterMode.BF16:
+        from mk.kernels.welm_v45_80a3_moe_router_bf16 import (
+            welm_v45_80a3_moe_router_bf16_init_workspace,
+            welm_v45_80a3_moe_router_bf16_plan,
+            welm_v45_80a3_moe_router_bf16_run,
+        )
+
+        return _MkRouterOps(
+            plan=welm_v45_80a3_moe_router_bf16_plan,
+            init_workspace=welm_v45_80a3_moe_router_bf16_init_workspace,
+            run=welm_v45_80a3_moe_router_bf16_run,
+        )
+    raise RuntimeError(f"Cannot initialize MK MoE router in {mode.value!r} mode")
+
+
 class WelmV45_80A3MkMoeRouterAdapter:
     """Decode-only adapter for the fused WeLM MK router and TopK kernel."""
 
     def __init__(
         self,
         *,
+        mode: MkMoeRouterMode,
         config: Any,
         server_args: Any,
         slot_count: int,
         use_previous_precision: bool,
         use_mxfp8: bool,
     ) -> None:
+        if mode is MkMoeRouterMode.OFF:
+            raise RuntimeError("MK MoE router adapter cannot use off mode")
         self._validate_config(
+            mode=mode,
             config=config,
             server_args=server_args,
             slot_count=slot_count,
@@ -44,15 +107,14 @@ class WelmV45_80A3MkMoeRouterAdapter:
             use_mxfp8=use_mxfp8,
         )
 
+        setting = f"{_MODE_ENV}={mode.value}"
         if not torch.cuda.is_available():
-            raise RuntimeError(
-                "--enable-welm-v45-80a3-mk-moe-router requires CUDA"
-            )
+            raise RuntimeError(f"{setting} requires CUDA")
         self.device = torch.device("cuda", torch.cuda.current_device())
         properties = torch.cuda.get_device_properties(self.device)
         if "H20" not in properties.name or properties.multi_processor_count != 78:
             raise RuntimeError(
-                "--enable-welm-v45-80a3-mk-moe-router currently requires an "
+                f"{setting} currently requires an "
                 "NVIDIA H20 with "
                 f"78 SMs, got {properties.name!r} with "
                 f"{properties.multi_processor_count} SMs"
@@ -62,28 +124,24 @@ class WelmV45_80A3MkMoeRouterAdapter:
             import mk
         except ImportError as exc:
             raise RuntimeError(
-                "--enable-welm-v45-80a3-mk-moe-router requires the vendored "
+                f"{setting} requires the vendored "
                 "MK package. "
                 "Initialize 3rdparty/mk and install it with "
                 "`pip install -e 3rdparty/mk --no-deps`."
             ) from exc
         try:
-            from mk.kernels.welm_v45_80a3_moe_router import (
-                welm_v45_80a3_moe_router_init_workspace,
-                welm_v45_80a3_moe_router_plan,
-                welm_v45_80a3_moe_router_run,
-            )
+            ops = _load_mk_router_ops(mode)
         except ImportError as exc:
             raise RuntimeError(
                 "The installed MK package does not provide the WeLM "
-                "router API required by "
-                "--enable-welm-v45-80a3-mk-moe-router."
+                f"router API required by {setting}."
             ) from exc
 
+        self.mode = mode
         self.slot_count = slot_count
-        self._plan_fn = welm_v45_80a3_moe_router_plan
-        self._init_workspace_fn = welm_v45_80a3_moe_router_init_workspace
-        self._run_fn = welm_v45_80a3_moe_router_run
+        self._plan_fn = ops.plan
+        self._init_workspace_fn = ops.init_workspace
+        self._run_fn = ops.run
         self._states: dict[int, _MkRouterPlanState] = {}
         self._active_state: Optional[_MkRouterPlanState] = None
         self._active_m = 0
@@ -91,7 +149,10 @@ class WelmV45_80A3MkMoeRouterAdapter:
         self._logged_fallbacks: set[str] = set()
 
         logger.info(
-            "Enabled MK WeLM MoE router: package=%s device=%s local_slots=%d",
+            "Enabled MK WeLM MoE router: mode=%s gate_weight_dtype=%s "
+            "package=%s device=%s local_slots=%d",
+            mode.value,
+            mode.gate_weight_dtype,
             getattr(mk, "__file__", "unknown"),
             properties.name,
             slot_count,
@@ -100,12 +161,14 @@ class WelmV45_80A3MkMoeRouterAdapter:
     @staticmethod
     def _validate_config(
         *,
+        mode: MkMoeRouterMode,
         config: Any,
         server_args: Any,
         slot_count: int,
         use_previous_precision: bool,
         use_mxfp8: bool,
     ) -> None:
+        setting = f"{_MODE_ENV}={mode.value}"
         if slot_count <= 0:
             raise RuntimeError("MK MoE router requires at least one local MoE layer")
 
@@ -125,9 +188,8 @@ class WelmV45_80A3MkMoeRouterAdapter:
                 mismatches.append(f"{name}={actual!r} (expected {expected!r})")
         if mismatches:
             raise RuntimeError(
-                "--enable-welm-v45-80a3-mk-moe-router does not support this "
-                "model config: "
-                + ", ".join(mismatches)
+                f"{setting} does not support this "
+                "model config: " + ", ".join(mismatches)
             )
 
         required_server_values = {
@@ -149,31 +211,24 @@ class WelmV45_80A3MkMoeRouterAdapter:
                 unsupported.append(f"{name}={actual!r} (expected {expected!r})")
         if unsupported:
             raise RuntimeError(
-                "--enable-welm-v45-80a3-mk-moe-router P0 has unsupported "
-                "server features: "
-                + ", ".join(unsupported)
+                f"{setting} P0 has unsupported "
+                "server features: " + ", ".join(unsupported)
             )
         if getattr(server_args, "enable_lora", False):
-            raise RuntimeError(
-                "--enable-welm-v45-80a3-mk-moe-router P0 does not support LoRA"
-            )
+            raise RuntimeError(f"{setting} P0 does not support LoRA")
         moe_runner_backend = getattr(server_args, "moe_runner_backend", "auto")
         if moe_runner_backend not in ("auto", "triton"):
             raise RuntimeError(
-                "--enable-welm-v45-80a3-mk-moe-router P0 supports only the "
+                f"{setting} P0 supports only the "
                 "auto or triton "
                 f"MoE runner, got {moe_runner_backend!r}"
             )
         if use_previous_precision:
             raise RuntimeError(
-                "--enable-welm-v45-80a3-mk-moe-router does not support "
-                "WELM_USE_PREVIOUS_PRECISION"
+                f"{setting} does not support WELM_USE_PREVIOUS_PRECISION"
             )
         if use_mxfp8:
-            raise RuntimeError(
-                "--enable-welm-v45-80a3-mk-moe-router P0 does not support "
-                "MXFP8 experts"
-            )
+            raise RuntimeError(f"{setting} P0 does not support MXFP8 experts")
 
     def begin_forward(
         self,
@@ -241,6 +296,12 @@ class WelmV45_80A3MkMoeRouterAdapter:
                 f"contiguous={hidden_states.is_contiguous()}",
             )
             return None
+        required_dtype = self.mode.gate_weight_dtype
+        if gate_weight.dtype != required_dtype:
+            raise RuntimeError(
+                f"MK MoE router mode {self.mode.value!r} requires gate weight "
+                f"dtype {required_dtype}, got {gate_weight.dtype}"
+            )
 
         topk_weights = state.topk_weights[slot_id]
         topk_ids = state.topk_ids[slot_id]
