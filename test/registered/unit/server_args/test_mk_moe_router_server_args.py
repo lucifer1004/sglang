@@ -18,7 +18,11 @@ def test_mk_moe_router_is_disabled_by_default(monkeypatch):
 
 @pytest.mark.parametrize(
     ("value", "expected"),
-    [("tf32", MkMoeRouterMode.TF32), ("BF16", MkMoeRouterMode.BF16)],
+    [
+        ("tf32", MkMoeRouterMode.TF32),
+        ("BF16", MkMoeRouterMode.BF16),
+        ("fp32_exact", MkMoeRouterMode.FP32_EXACT),
+    ],
 )
 def test_mk_moe_router_mode_is_selected_by_environment(monkeypatch, value, expected):
     monkeypatch.setenv(_ENV_NAME, value)
@@ -30,6 +34,7 @@ def test_mk_moe_router_mode_selects_gate_weight_dtype():
     assert MkMoeRouterMode.OFF.gate_weight_dtype is torch.float32
     assert MkMoeRouterMode.TF32.gate_weight_dtype is torch.float32
     assert MkMoeRouterMode.BF16.gate_weight_dtype is torch.bfloat16
+    assert MkMoeRouterMode.FP32_EXACT.gate_weight_dtype is torch.float32
 
 
 def test_mk_moe_router_rejects_unknown_mode(monkeypatch):

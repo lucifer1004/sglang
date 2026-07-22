@@ -133,7 +133,14 @@ def test_native_kernel_cuda_graph_replay_matches_sglang():
         )
 
 
-@pytest.mark.parametrize("mode", [MkMoeRouterMode.TF32, MkMoeRouterMode.BF16])
+@pytest.mark.parametrize(
+    "mode",
+    [
+        MkMoeRouterMode.TF32,
+        MkMoeRouterMode.BF16,
+        MkMoeRouterMode.FP32_EXACT,
+    ],
+)
 def test_adapter_dispatches_selected_kernel(mode: MkMoeRouterMode):
     config = SimpleNamespace(
         hidden_size=2048,
@@ -181,6 +188,11 @@ def test_adapter_dispatches_selected_kernel(mode: MkMoeRouterMode):
         num_tokens=m,
         allow_fused_router=True,
     )
+    if mode in (MkMoeRouterMode.TF32, MkMoeRouterMode.FP32_EXACT):
+        assert adapter._active_state is not None
+        assert adapter._active_state.plan.bitwise_sglang is (
+            mode is MkMoeRouterMode.FP32_EXACT
+        )
     output = adapter.route(
         slot_id=0,
         hidden_states=hidden_states,
@@ -191,9 +203,12 @@ def test_adapter_dispatches_selected_kernel(mode: MkMoeRouterMode):
 
     assert output is not None
     assert torch.equal(output.topk_ids, expected_ids.to(torch.int32))
-    torch.testing.assert_close(
-        output.topk_weights, expected_weights, rtol=3e-6, atol=3e-6
-    )
+    if mode is MkMoeRouterMode.FP32_EXACT:
+        assert torch.equal(output.topk_weights, expected_weights)
+    else:
+        torch.testing.assert_close(
+            output.topk_weights, expected_weights, rtol=3e-6, atol=3e-6
+        )
 
 
 def test_adapter_validation_allows_independent_parallel_features():

@@ -3,6 +3,8 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from enum import Enum
+from functools import partial
+from inspect import signature
 from typing import Any, Callable, Optional
 
 import torch
@@ -22,6 +24,7 @@ class MkMoeRouterMode(Enum):
     OFF = "off"
     TF32 = "tf32"
     BF16 = "bf16"
+    FP32_EXACT = "fp32_exact"
 
     @property
     def gate_weight_dtype(self) -> torch.dtype:
@@ -56,15 +59,29 @@ class _MkRouterOps:
 
 
 def _load_mk_router_ops(mode: MkMoeRouterMode) -> _MkRouterOps:
-    if mode is MkMoeRouterMode.TF32:
+    if mode in (MkMoeRouterMode.TF32, MkMoeRouterMode.FP32_EXACT):
         from mk.kernels.welm_v45_80a3_moe_router import (
             welm_v45_80a3_moe_router_init_workspace,
             welm_v45_80a3_moe_router_plan,
             welm_v45_80a3_moe_router_run,
         )
 
+        if (
+            mode is MkMoeRouterMode.FP32_EXACT
+            and "bitwise_sglang"
+            not in signature(welm_v45_80a3_moe_router_plan).parameters
+        ):
+            raise ImportError("MK does not provide the SGLang-bitwise router API")
+
         return _MkRouterOps(
-            plan=welm_v45_80a3_moe_router_plan,
+            plan=(
+                partial(
+                    welm_v45_80a3_moe_router_plan,
+                    bitwise_sglang=True,
+                )
+                if mode is MkMoeRouterMode.FP32_EXACT
+                else welm_v45_80a3_moe_router_plan
+            ),
             init_workspace=welm_v45_80a3_moe_router_init_workspace,
             run=welm_v45_80a3_moe_router_run,
         )
