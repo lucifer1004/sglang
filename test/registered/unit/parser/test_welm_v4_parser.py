@@ -1,9 +1,13 @@
 import json
+import os
+import random
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from sglang.srt.entrypoints.openai.protocol import Function, Tool
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
+from sglang.srt.function_call.utils import infer_type_from_json_schema
 from sglang.srt.function_call.welm_v4_detector import (
     WelmV4StreamingParseError,
     WelmV4ToolDetector,
@@ -61,6 +65,41 @@ class FakeWelmTokenizer:
         return "".join(out)
 
 
+class CountingWelmTokenizer(FakeWelmTokenizer):
+    def __init__(self):
+        super().__init__()
+        self.decode_inputs = []
+
+    def decode(
+        self, ids, skip_special_tokens=False, spaces_between_special_tokens=True
+    ):
+        self.decode_inputs.append(list(ids))
+        return super().decode(
+            ids,
+            skip_special_tokens=skip_special_tokens,
+            spaces_between_special_tokens=spaces_between_special_tokens,
+        )
+
+
+class FakeByteFallbackWelmTokenizer(FakeWelmTokenizer):
+    BYTE_IDS = {2001: b"\xf0", 2002: b"\x9f", 2003: b"\x99", 2004: b"\x82"}
+
+    def decode(
+        self, ids, skip_special_tokens=False, spaces_between_special_tokens=True
+    ):
+        output = bytearray()
+        for token_id in ids:
+            if skip_special_tokens and token_id in self.SPECIAL_TRUE_IDS:
+                continue
+            if token_id in self.BYTE_IDS:
+                output.extend(self.BYTE_IDS[token_id])
+            elif token_id in self._id2tok:
+                output.extend(self._id2tok[token_id].encode())
+            else:
+                output.extend(chr(token_id).encode())
+        return output.decode(errors="replace")
+
+
 def enc(text):
     return [ord(c) for c in text]
 
@@ -109,6 +148,21 @@ class TestWelmV4Reasoning(CustomTestCase):
         res = det.detect_and_parse("", ids)
 
         self.assertEqual(res.normal_text, " answer ")
+
+    def test_non_stream_safe_text_reuse_avoids_answer_decode(self):
+        tok = CountingWelmTokenizer()
+        answer_ids = enc("long answer text")
+        ids = enc("r") + [C["</think>"]] + answer_ids
+        reuse = WelmV4ReasoningDetector(tokenizer=tok, force_reasoning=True)
+        result = reuse.detect_and_parse("r</think>long answer text", ids)
+        self.assertEqual(result.normal_text, "long answer text")
+        self.assertFalse(any(call == answer_ids for call in tok.decode_inputs))
+
+        tok.decode_inputs.clear()
+        fallback = WelmV4ReasoningDetector(tokenizer=tok, force_reasoning=True)
+        result = fallback.detect_and_parse("unaligned text", ids)
+        self.assertEqual(result.normal_text, "long answer text")
+        self.assertIn(answer_ids, tok.decode_inputs)
 
     def test_non_stream_strips_leading_think(self):
         det = self._det(force_reasoning=True)
@@ -172,6 +226,121 @@ class TestWelmV4Reasoning(CustomTestCase):
         self.assertEqual(reasoning, "reason")
         self.assertEqual(normal, "ans")
         self.assertEqual(remaining, enc("ans"))
+
+    def test_stream_span_decode_and_handoff_chunk_matrix(self):
+        seq = enc("reason") + [C["</think>"]] + enc("answer")
+        for chunk_size in (1, 2, 4, 8, 16):
+            with self.subTest(chunk_size=chunk_size):
+                tok = CountingWelmTokenizer()
+                det = WelmV4ReasoningDetector(tokenizer=tok, force_reasoning=True)
+                det.handoff_content_ids = True
+                reasoning, normal, remaining = "", "", []
+                for start in range(0, len(seq), chunk_size):
+                    result = det.parse_streaming_increment(
+                        "",
+                        seq[start : start + chunk_size],
+                    )
+                    reasoning += result.reasoning_text
+                    normal += result.normal_text
+                    remaining.extend(det.remaining_token_ids or [])
+                self.assertEqual((reasoning, normal), ("reason", ""))
+                self.assertEqual(remaining, enc("answer"))
+                self.assertIsNone(det._answer_decoder)
+
+        tok = CountingWelmTokenizer()
+        det = WelmV4ReasoningDetector(tokenizer=tok, force_reasoning=True)
+        result = det.parse_streaming_increment("", enc("abcdefghijklmnop"))
+        self.assertEqual(result.reasoning_text, "abcdefghijklmnop")
+        self.assertLessEqual(len(tok.decode_inputs), 2)
+
+    def test_handoff_preserves_unicode_byte_fallback_for_tool_reparse(self):
+        tok = FakeByteFallbackWelmTokenizer()
+        reasoning = WelmV4ReasoningDetector(tokenizer=tok, force_reasoning=True)
+        tool = WelmV4ToolDetector(tokenizer=tok)
+        reasoning.handoff_content_ids = True
+        tool.reparse_content_ids = True
+        emoji_ids = list(tok.BYTE_IDS)
+
+        first = reasoning.parse_streaming_increment(
+            "", enc("reason") + [C["</think>"], emoji_ids[0]]
+        )
+        first_tool = tool.parse_streaming_increment(
+            "", _tools(), reasoning.remaining_token_ids
+        )
+        second = reasoning.parse_streaming_increment("", emoji_ids[1:] + enc("Z"))
+        second_tool = tool.parse_streaming_increment(
+            "", _tools(), reasoning.remaining_token_ids
+        )
+
+        self.assertEqual(first.reasoning_text, "reason")
+        self.assertEqual(second.normal_text, "")
+        self.assertEqual(first_tool.normal_text + second_tool.normal_text, "🙂Z")
+
+    def test_random_mtp_handoff_parallel_tools_is_chunk_invariant(self):
+        def tool_call(city):
+            return (
+                [C["<tool_call>"]]
+                + enc("get_weather\n")
+                + [C["<arg_key>"]]
+                + enc("city")
+                + [C["</arg_key>"]]
+                + [C["<arg_value>"]]
+                + enc(city)
+                + [C["</arg_value>"], C["</tool_call>"]]
+            )
+
+        normal_prefix = "正文中文 "
+        normal_between = " literal <tool_call> "
+        sequence = (
+            enc("reason")
+            + [C["</think>"]]
+            + enc(normal_prefix)
+            + tool_call("Paris")
+            + enc(normal_between)
+            + tool_call("Tokyo")
+            + [C["<|im_end|>"]]
+        )
+
+        for seed in range(24):
+            with self.subTest(seed=seed):
+                rng = random.Random(seed)
+                reasoning = self._det(force_reasoning=True)
+                tool = WelmV4ToolDetector(tokenizer=self.tok)
+                reasoning.handoff_content_ids = True
+                tool.reparse_content_ids = True
+                reasoning_text = ""
+                normal_text = ""
+                calls = []
+                offset = 0
+                while offset < len(sequence):
+                    size = rng.randint(1, 16)
+                    chunk = sequence[offset : offset + size]
+                    offset += size
+                    reasoning_result = reasoning.parse_streaming_increment("", chunk)
+                    reasoning_text += reasoning_result.reasoning_text
+                    tool_result = tool.parse_streaming_increment(
+                        "", _tools(), reasoning.remaining_token_ids
+                    )
+                    normal_text += tool_result.normal_text
+                    calls.extend(tool_result.calls)
+
+                self.assertEqual(tool.finish_content_id_reparse(), "")
+                names = [call.name for call in calls if call.name]
+                arguments = {}
+                for call in calls:
+                    if call.name is None:
+                        arguments.setdefault(call.tool_index, "")
+                        arguments[call.tool_index] += call.parameters
+                self.assertEqual(reasoning_text, "reason")
+                self.assertEqual(normal_text, normal_prefix + normal_between)
+                self.assertEqual(names, ["get_weather", "get_weather"])
+                self.assertEqual(
+                    [
+                        json.loads(arguments[index])["city"]
+                        for index in sorted(arguments)
+                    ],
+                    ["Paris", "Tokyo"],
+                )
 
     def test_stream_lookalike_in_content(self):
         det = self._det(force_reasoning=True, stream_reasoning=True)
@@ -286,6 +455,39 @@ class TestWelmV4Reasoning(CustomTestCase):
         self.assertEqual(det.remaining_token_ids, [tok.FAIL_ID])
 
 
+class TestJsonSchemaTypeInference(CustomTestCase):
+    def test_local_ref_and_json_pointer_escaping(self):
+        root = {
+            "$defs": {
+                "request/model": {"type": "object"},
+                "array~model": {"type": "array"},
+            }
+        }
+        self.assertEqual(
+            infer_type_from_json_schema({"$ref": "#/$defs/request~1model"}, root),
+            "object",
+        )
+        self.assertEqual(
+            infer_type_from_json_schema({"$ref": "#/$defs/array~0model"}, root),
+            "array",
+        )
+
+    def test_unresolved_remote_and_cyclic_refs_return_none(self):
+        root = {
+            "$defs": {
+                "cycle_a": {"$ref": "#/$defs/cycle_b"},
+                "cycle_b": {"$ref": "#/$defs/cycle_a"},
+            }
+        }
+        for schema in (
+            {"$ref": "#/$defs/missing"},
+            {"$ref": "https://example.com/schema.json"},
+            {"$ref": "#/$defs/cycle_a"},
+        ):
+            with self.subTest(schema=schema):
+                self.assertIsNone(infer_type_from_json_schema(schema, root))
+
+
 class TestWelmV4Tool(CustomTestCase):
     def setUp(self):
         self.tok = FakeWelmTokenizer()
@@ -331,6 +533,197 @@ class TestWelmV4Tool(CustomTestCase):
         self.assertEqual(args["city"], "Beijing")
         self.assertEqual(args["days"], 3)
 
+    def test_local_ref_argument_is_object_in_streaming_and_non_streaming(self):
+        tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="docs_server_docs",
+                    parameters={
+                        "$defs": {
+                            "DynamicModel": {
+                                "type": "object",
+                                "properties": {"action": {"type": "string"}},
+                            }
+                        },
+                        "type": "object",
+                        "properties": {"request": {"$ref": "#/$defs/DynamicModel"}},
+                    },
+                ),
+            )
+        ]
+        ids = self._call_ids(
+            "docs_server_docs",
+            [("request", '{"action":"read_content"}')],
+        )
+
+        result = self._det().detect_and_parse("", tools, ids)
+
+        arguments = json.loads(result.calls[0].parameters)
+        self.assertEqual(arguments["request"], {"action": "read_content"})
+
+        for chunk_size in (1, 4, len(ids)):
+            with self.subTest(chunk_size=chunk_size):
+                normal, calls = self._stream_ids(
+                    self._det(), tools, ids, chunk_size=chunk_size
+                )
+                streamed = json.loads(self._merged_args_by_index(calls)[0])
+                self.assertEqual(normal, "")
+                self.assertEqual(streamed["request"], {"action": "read_content"})
+
+    def test_non_stream_explicit_string_preserves_json_looking_value(self):
+        tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="string_tool",
+                    parameters={
+                        "type": "object",
+                        "properties": {"request": {"type": "string"}},
+                    },
+                ),
+            )
+        ]
+        raw_value = '{"action":"read_content"}'
+        ids = self._call_ids("string_tool", [("request", raw_value)])
+
+        result = self._det().detect_and_parse("", tools, ids)
+
+        arguments = json.loads(result.calls[0].parameters)
+        self.assertEqual(arguments["request"], raw_value)
+
+    def test_non_stream_unresolved_refs_use_conservative_fallback(self):
+        cases = [
+            ({"$ref": "#/$defs/missing"}, {}),
+            ({"$ref": "https://example.com/schema.json"}, {}),
+            (
+                {"$ref": "#/$defs/cycle"},
+                {"$defs": {"cycle": {"$ref": "#/$defs/cycle"}}},
+            ),
+        ]
+        for property_schema, root_extra in cases:
+            with self.subTest(property_schema=property_schema):
+                parameters = {
+                    **root_extra,
+                    "type": "object",
+                    "properties": {
+                        "payload": property_schema,
+                        "scalar": property_schema,
+                    },
+                }
+                tools = [
+                    Tool(
+                        type="function",
+                        function=Function(name="fallback_tool", parameters=parameters),
+                    )
+                ]
+                ids = self._call_ids(
+                    "fallback_tool",
+                    [("payload", '{"ok":true}'), ("scalar", "123")],
+                )
+
+                result = self._det().detect_and_parse("", tools, ids)
+
+                arguments = json.loads(result.calls[0].parameters)
+                self.assertEqual(arguments["payload"], {"ok": True})
+                self.assertEqual(arguments["scalar"], "123")
+
+    def test_stream_plain_span_uses_constant_decode_calls(self):
+        tok = CountingWelmTokenizer()
+        det = WelmV4ToolDetector(tokenizer=tok)
+        result = det.parse_streaming_increment("", self.tools, enc("abcdefghijklmnop"))
+        self.assertEqual(result.normal_text, "abcdefghijklmnop")
+        self.assertLessEqual(len(tok.decode_inputs), 2)
+
+    def test_non_stream_incomplete_tool_call_remains_content(self):
+        incomplete = [C["<tool_call>"]] + enc("get_weather")
+        detector = self._det()
+        result = detector.detect_and_parse("", self.tools, incomplete)
+        self.assertEqual(result.normal_text, "<tool_call>get_weather")
+
+    def test_reparse_malformed_before_name_recovers_actual_ids(self):
+        malformed = (
+            [C["<tool_call>"], C["<arg_value>"]] + enc("junk") + [C["</tool_call>"]]
+        )
+        detector = self._det()
+        detector.reparse_content_ids = True
+        result = detector.parse_streaming_increment("", self.tools, malformed)
+
+        self.assertEqual(result.calls, [])
+        self.assertEqual(result.normal_text, self.tok.decode(malformed))
+        self.assertEqual(detector.finish_content_id_reparse(), "")
+
+    def test_reparse_closed_unknown_tool_recovers_actual_ids(self):
+        invalid = [C["<tool_call>"]] + enc("unknown_tool") + [C["</tool_call>"]]
+        detector = self._det()
+        detector.reparse_content_ids = True
+        result = detector.parse_streaming_increment("", self.tools, invalid)
+
+        self.assertEqual(result.calls, [])
+        self.assertEqual(result.normal_text, self.tok.decode(invalid))
+        self.assertEqual(detector.finish_content_id_reparse(), "")
+
+    def test_reparse_incomplete_before_name_does_not_fabricate_tool_end(self):
+        incomplete = [C["<tool_call>"]] + enc("unknown_tool")
+        det = self._det()
+        det.reparse_content_ids = True
+        result = det.parse_streaming_increment("", self.tools, incomplete)
+
+        self.assertEqual(result.normal_text, "")
+        recovered = det.finish_content_id_reparse()
+        self.assertEqual(recovered, self.tok.decode(incomplete))
+        self.assertNotIn("</tool_call>", recovered)
+
+    def test_reparse_incomplete_after_name_is_irreversible(self):
+        incomplete = (
+            [C["<tool_call>"]] + enc("get_weather") + [C["<arg_key>"]] + enc("city")
+        )
+        det = self._det()
+        det.reparse_content_ids = True
+        result = det.parse_streaming_increment("", self.tools, incomplete)
+
+        self.assertEqual([call.name for call in result.calls], ["get_weather"])
+        with self.assertRaises(WelmV4StreamingParseError):
+            det.finish_content_id_reparse()
+
+    def test_reparse_incomplete_recovery_decode_error_is_structured(self):
+        class FailingRawDecodeTokenizer(FakeWelmTokenizer):
+            def decode(
+                self,
+                ids,
+                skip_special_tokens=False,
+                spaces_between_special_tokens=True,
+            ):
+                if not skip_special_tokens and ids[:1] == [C["<tool_call>"]]:
+                    raise RuntimeError("injected raw decode failure")
+                return super().decode(
+                    ids,
+                    skip_special_tokens=skip_special_tokens,
+                    spaces_between_special_tokens=spaces_between_special_tokens,
+                )
+
+        det = WelmV4ToolDetector(tokenizer=FailingRawDecodeTokenizer())
+        det.reparse_content_ids = True
+        det.parse_streaming_increment(
+            "", self.tools, [C["<tool_call>"]] + enc("unknown_tool")
+        )
+
+        with self.assertRaises(WelmV4StreamingParseError):
+            det.finish_content_id_reparse()
+
+    def test_reparse_orphan_control_ids_remain_content(self):
+        for orphan, expected in (
+            (C["<arg_key>"], "<arg_key>"),
+            (C["</tool_call>"], "</tool_call>"),
+        ):
+            detector = self._det()
+            result = detector.detect_and_parse("", self.tools, [orphan])
+            self.assertEqual(result.normal_text, expected)
+            detector = self._det()
+            detector.reparse_content_ids = True
+            result = detector.parse_streaming_increment("", self.tools, [orphan])
+            self.assertEqual(result.normal_text, expected)
+
     def test_non_stream_lookalike_in_content_is_ignored(self):
         det = self._det()
         ids = enc("To call a tool you write <tool_call> like this.")
@@ -351,6 +744,132 @@ class TestWelmV4Tool(CustomTestCase):
         self.assertEqual(len(res.calls), 2)
         self.assertEqual(json.loads(res.calls[0].parameters)["city"], "A")
         self.assertEqual(json.loads(res.calls[1].parameters)["city"], "B")
+
+    def test_parallel_tool_separator_is_not_content(self):
+        seq = (
+            self._call_ids("get_weather", [("city", "A")])
+            + enc("\n")
+            + self._call_ids("get_weather", [("city", "B")])
+        )
+
+        non_stream = self._det().detect_and_parse("", self.tools, seq)
+        self.assertEqual(non_stream.normal_text, "")
+        self.assertEqual(
+            [json.loads(call.parameters)["city"] for call in non_stream.calls],
+            ["A", "B"],
+        )
+
+        for chunk_size in (1, 2, 7, len(seq)):
+            with self.subTest(chunk_size=chunk_size):
+                normal, calls = self._stream_ids(
+                    self._det(), self.tools, seq, chunk_size=chunk_size
+                )
+                self.assertEqual(normal, "")
+                self.assertEqual(
+                    [call.name for call in calls if call.name],
+                    ["get_weather", "get_weather"],
+                )
+                args_by_index = self._merged_args_by_index(calls)
+                self.assertEqual(
+                    [
+                        json.loads(args_by_index[index])["city"]
+                        for index in sorted(args_by_index)
+                    ],
+                    ["A", "B"],
+                )
+
+    def test_post_tool_real_text_preserves_separator(self):
+        seq = self._call_ids("get_weather", [("city", "A")]) + enc("\nDone")
+
+        non_stream = self._det().detect_and_parse("", self.tools, seq)
+        self.assertEqual(non_stream.normal_text, "\nDone")
+
+        for chunk_size in (1, 3, len(seq)):
+            with self.subTest(chunk_size=chunk_size):
+                normal, calls = self._stream_ids(
+                    self._det(), self.tools, seq, chunk_size=chunk_size
+                )
+                self.assertEqual(normal, "\nDone")
+                self.assertEqual(
+                    [call.name for call in calls if call.name], ["get_weather"]
+                )
+
+    def test_prefix_is_preserved_while_inter_tool_separator_is_dropped(self):
+        prefix = "prefix\n"
+        seq = (
+            enc(prefix)
+            + self._call_ids("get_weather", [("city", "A")])
+            + enc("\n")
+            + self._call_ids("get_weather", [("city", "B")])
+        )
+
+        non_stream = self._det().detect_and_parse("", self.tools, seq)
+        self.assertEqual(non_stream.normal_text, prefix)
+
+        for chunk_size in (1, 5, len(seq)):
+            with self.subTest(chunk_size=chunk_size):
+                normal, calls = self._stream_ids(
+                    self._det(), self.tools, seq, chunk_size=chunk_size
+                )
+                self.assertEqual(normal, prefix)
+                self.assertEqual(
+                    [call.name for call in calls if call.name],
+                    ["get_weather", "get_weather"],
+                )
+
+    def test_post_tool_separator_is_preserved_for_fallback_content(self):
+        fallback_cases = {
+            "unknown": self._call_ids("python", [("code", "1")]),
+            "malformed": (
+                [C["<tool_call>"], C["<arg_value>"]] + enc("junk") + [C["</tool_call>"]]
+            ),
+            "incomplete": [C["<tool_call>"]] + enc("unknown_tool"),
+        }
+        first_call = self._call_ids("get_weather", [("city", "A")])
+
+        for name, fallback_ids in fallback_cases.items():
+            seq = first_call + enc("\n") + fallback_ids
+            expected = "\n" + self.tok.decode(fallback_ids)
+            with self.subTest(mode="non_stream", case=name):
+                result = self._det().detect_and_parse("", self.tools, seq)
+                self.assertEqual(result.normal_text, expected)
+                self.assertEqual(len(result.calls), 1)
+
+            for chunk_size in (1, len(seq)):
+                with self.subTest(mode="stream", case=name, chunk_size=chunk_size):
+                    detector = self._det()
+                    detector.reparse_content_ids = True
+                    normal, calls = self._stream_ids(
+                        detector, self.tools, seq, chunk_size=chunk_size
+                    )
+                    if name == "incomplete":
+                        normal += detector.finish_content_id_reparse()
+                    self.assertEqual(normal, expected)
+                    self.assertEqual(
+                        [call.name for call in calls if call.name], ["get_weather"]
+                    )
+
+    def test_trailing_post_tool_whitespace_is_dropped(self):
+        first_call = self._call_ids("get_weather", [("city", "A")])
+
+        for suffix in ([C["<|im_end|>"]], enc("\n") + [C["<|im_end|>"]]):
+            seq = first_call + suffix
+            with self.subTest(mode="non_stream", suffix=suffix):
+                result = self._det().detect_and_parse("", self.tools, seq)
+                self.assertEqual(result.normal_text, "")
+                self.assertEqual(len(result.calls), 1)
+
+            for chunk_size in (1, len(seq)):
+                with self.subTest(mode="stream", suffix=suffix, chunk_size=chunk_size):
+                    detector = self._det()
+                    normal, calls = self._stream_ids(
+                        detector, self.tools, seq, chunk_size=chunk_size
+                    )
+                    self.assertEqual(normal, "")
+                    self.assertEqual(
+                        [call.name for call in calls if call.name], ["get_weather"]
+                    )
+                    self.assertEqual(detector._normal_ids, [])
 
     def test_non_stream_preserves_text_around_tool_calls(self):
         det = self._det()
@@ -459,14 +978,14 @@ class TestWelmV4Tool(CustomTestCase):
 
     def test_stream_parser_error_falls_back_to_exact_raw_block(self):
         det = self._det()
-        original_dispatch = det._dispatch_stream_token
+        original_dispatch = det._dispatch_stream_span
 
-        def dispatch_or_fail(tid, tools, calls, normal_chunks):
-            if tid == ord("!"):
+        def dispatch_or_fail(token_ids, calls, normal_chunks):
+            if ord("!") in token_ids:
                 raise RuntimeError("injected parser failure")
-            return original_dispatch(tid, tools, calls, normal_chunks)
+            return original_dispatch(token_ids, calls, normal_chunks)
 
-        det._dispatch_stream_token = dispatch_or_fail
+        det._dispatch_stream_span = dispatch_or_fail
         seq = [C["<tool_call>"]] + enc("get_weather!")
 
         res = det.parse_streaming_increment("", self.tools, seq)
@@ -496,14 +1015,14 @@ class TestWelmV4Tool(CustomTestCase):
 
         tok = FailingTokenizer()
         det = WelmV4ToolDetector(tokenizer=tok)
-        original_dispatch = det._dispatch_stream_token
+        original_dispatch = det._dispatch_stream_span
 
-        def dispatch_or_fail(tid, tools, calls, normal_chunks):
-            if tid == tok.FAIL_ID:
+        def dispatch_or_fail(token_ids, calls, normal_chunks):
+            if tok.FAIL_ID in token_ids:
                 raise RuntimeError("injected parser failure")
-            return original_dispatch(tid, tools, calls, normal_chunks)
+            return original_dispatch(token_ids, calls, normal_chunks)
 
-        det._dispatch_stream_token = dispatch_or_fail
+        det._dispatch_stream_span = dispatch_or_fail
         res = det.parse_streaming_increment("A?", self.tools, enc("A") + [tok.FAIL_ID])
 
         self.assertEqual(res.normal_text, "A?")
@@ -511,14 +1030,14 @@ class TestWelmV4Tool(CustomTestCase):
 
     def test_stream_parser_error_after_second_call_committed_aborts_chunk(self):
         det = self._det()
-        original_dispatch = det._dispatch_stream_token
+        original_dispatch = det._dispatch_stream_span
 
-        def dispatch_or_fail(tid, tools, calls, normal_chunks):
-            if tid == ord("!"):
+        def dispatch_or_fail(token_ids, calls, normal_chunks):
+            if ord("!") in token_ids:
                 raise RuntimeError("injected parser failure")
-            return original_dispatch(tid, tools, calls, normal_chunks)
+            return original_dispatch(token_ids, calls, normal_chunks)
 
-        det._dispatch_stream_token = dispatch_or_fail
+        det._dispatch_stream_span = dispatch_or_fail
         good_call = self._call_ids("get_weather", [("city", "Paris")])
         bad_call = [C["<tool_call>"]] + enc("get_weather") + [C["<arg_key>"]] + enc("!")
 
@@ -528,14 +1047,14 @@ class TestWelmV4Tool(CustomTestCase):
 
     def test_stream_parser_error_after_partial_arg_raises(self):
         det = self._det()
-        original_dispatch = det._dispatch_stream_token
+        original_dispatch = det._dispatch_stream_span
 
-        def dispatch_or_fail(tid, tools, calls, normal_chunks):
-            if tid == ord("!"):
+        def dispatch_or_fail(token_ids, calls, normal_chunks):
+            if ord("!") in token_ids:
                 raise RuntimeError("injected parser failure")
-            return original_dispatch(tid, tools, calls, normal_chunks)
+            return original_dispatch(token_ids, calls, normal_chunks)
 
-        det._dispatch_stream_token = dispatch_or_fail
+        det._dispatch_stream_span = dispatch_or_fail
         first_chunk = (
             [C["<tool_call>"]]
             + enc("get_weather")
@@ -558,14 +1077,14 @@ class TestWelmV4Tool(CustomTestCase):
 
         tok = SpecialControlTokenizer()
         det = WelmV4ToolDetector(tokenizer=tok)
-        original_dispatch = det._dispatch_stream_token
+        original_dispatch = det._dispatch_stream_span
 
-        def dispatch_or_fail(tid, tools, calls, normal_chunks):
-            if tid == ord("!"):
+        def dispatch_or_fail(token_ids, calls, normal_chunks):
+            if ord("!") in token_ids:
                 raise RuntimeError("injected parser failure")
-            return original_dispatch(tid, tools, calls, normal_chunks)
+            return original_dispatch(token_ids, calls, normal_chunks)
 
-        det._dispatch_stream_token = dispatch_or_fail
+        det._dispatch_stream_span = dispatch_or_fail
         first_chunk = [C["<tool_call>"]] + enc("get_weather") + enc("!")
 
         first = det.parse_streaming_increment("", self.tools, first_chunk)
@@ -919,6 +1438,23 @@ class TestWelmV4Tool(CustomTestCase):
         self.assertEqual(calls, [])
         self.assertEqual(normal, self.tok.decode(seq))
 
+    def test_unknown_tool_forwarding_enabled(self):
+        seq = self._call_ids("python", [("code", "print(1)")])
+
+        with patch.dict(os.environ, {"SGLANG_FORWARD_UNKNOWN_TOOLS": "true"}):
+            non_stream = self._det().detect_and_parse("", self.tools, seq)
+            _, stream_calls = self._stream_ids(self._det(), self.tools, seq)
+
+        self.assertEqual([call.name for call in non_stream.calls], ["python"])
+        self.assertEqual(
+            [call.name for call in stream_calls if call.name],
+            ["python"],
+        )
+        self.assertEqual(
+            json.loads(non_stream.calls[0].parameters),
+            {"code": "print(1)"},
+        )
+
     def test_stream_unknown_tool_fallback_preserves_special_token_text(self):
         class SpecialControlTokenizer(FakeWelmTokenizer):
             SPECIAL_TRUE_IDS = set(FakeWelmTokenizer.CONTROL.values())
@@ -1026,29 +1562,17 @@ class TestTrimMatchedStopForIdParser(CustomTestCase):
         out = trim_matched_stop_for_id_parser([1, 2, 3], {"matched": 3}, True)
         self.assertEqual(out, [1, 2, 3])
 
-    def test_str_stop_truncates_text(self):
-        out = trim_matched_stop_for_id_parser(
-            "hello<stop>x", {"matched": "<stop>"}, False
-        )
-        self.assertEqual(out, "hello")
+    def test_str_stop_drops_unreliable_ids(self):
+        out = trim_matched_stop_for_id_parser([1, 2, 3], {"matched": "<stop>"}, False)
+        self.assertIsNone(out)
 
-    def test_str_stop_no_stop_trim_keeps(self):
+    def test_regex_stop_drops_unreliable_ids(self):
         out = trim_matched_stop_for_id_parser(
-            "hello<stop>", {"matched": "<stop>"}, True
-        )
-        self.assertEqual(out, "hello<stop>")
-
-    def test_str_stop_not_present_noop(self):
-        out = trim_matched_stop_for_id_parser("hello", {"matched": "<stop>"}, False)
-        self.assertEqual(out, "hello")
-
-    def test_regex_stop_uses_actual_matched_text(self):
-        out = trim_matched_stop_for_id_parser(
-            "hello123tail",
+            [1, 2, 3],
             {"matched": r"\d+", "matched_text": "123"},
             False,
         )
-        self.assertEqual(out, "hello")
+        self.assertIsNone(out)
 
     def test_no_finished_reason_noop(self):
         self.assertEqual(trim_matched_stop_for_id_parser([1, 2], None, False), [1, 2])
@@ -1063,7 +1587,7 @@ class TestTrimMatchedStopForIdParser(CustomTestCase):
             trim_matched_stop_for_id_parser("abc", {"matched": 3}, False), "abc"
         )
         self.assertEqual(
-            trim_matched_stop_for_id_parser([1, 2], {"matched": "x"}, False), [1, 2]
+            trim_matched_stop_for_id_parser([1, 2], {"matched": "x"}, False), None
         )
 
     def test_empty_list_int_stop_noop(self):
@@ -1107,76 +1631,6 @@ class TestWelmV4ToolDecodeFlags(CustomTestCase):
         self.assertFalse(parser.detector.spaces_between_special_tokens)
 
 
-class TestWelmV4StreamStrStopHoldback(CustomTestCase):
-    def setUp(self):
-        self.tok = FakeWelmTokenizer()
-        self.tools = _tools()
-
-    def _scheduler_holds(self, sp, output_ids):
-        if not sp.stop_strs:
-            return False
-        max_len_tail_str = max(sp.stop_str_max_len + 1, sp.stop_regex_max_len + 1)
-        tail_len = min((max_len_tail_str + 1), len(output_ids))
-        tail_str = self.tok.decode(output_ids[-tail_len:])
-        if not tail_str:
-            return False
-        for stop_str in sp.stop_strs:
-            if not stop_str:
-                continue
-            if stop_str in tail_str:
-                return True
-            min_len = min(len(tail_str), len(stop_str))
-            for i in range(1, min_len + 1):
-                if tail_str[-i:] == stop_str[:i]:
-                    return True
-        return False
-
-    def _simulate_stream(self, answer, stop, no_stop_trim):
-        from sglang.srt.sampling.sampling_params import SamplingParams
-
-        output_ids = enc(answer + stop)
-        n = len(output_ids)
-
-        sp = SamplingParams(stop=[stop])
-        sp.normalize(tokenizer=None)
-
-        det = WelmV4ToolDetector(tokenizer=self.tok)  # no tool call -> all content
-        streamed = ""
-        held_partial = False  # observed at least one withheld partial-stop chunk
-        sent_offset = 0
-        for step in range(1, n + 1):
-            cur = output_ids[:step]
-            finished = step == n
-            if not finished and self._scheduler_holds(sp, cur):
-                # Scheduler withholds this chunk: nothing is streamed, the new
-                # tokens stay buffered until a later chunk is released.
-                held_partial = True
-                continue
-
-            delta_ids = output_ids[sent_offset:step]
-            sent_offset = step
-            res = det.parse_streaming_increment("", self.tools, delta_ids)
-            finish_reason = {"matched": stop} if finished else None
-            delta = trim_matched_stop_for_id_parser(
-                res.normal_text, finish_reason, no_stop_trim
-            )
-            streamed += delta
-        return streamed, held_partial
-
-    def test_cross_chunk_str_stop_trimmed_no_leak(self):
-        answer = "The answer is 42"
-        streamed, held_partial = self._simulate_stream(answer, "STOP", False)
-        self.assertTrue(held_partial)
-        self.assertEqual(streamed, answer)
-        self.assertNotIn("STOP", streamed)
-
-    def test_cross_chunk_str_stop_kept_when_no_stop_trim(self):
-        answer = "The answer is 42"
-        streamed, held_partial = self._simulate_stream(answer, "STOP", True)
-        self.assertTrue(held_partial)
-        self.assertEqual(streamed, answer + "STOP")
-
-
 class TestWelmV4ReasoningDecodeFlags(CustomTestCase):
     def setUp(self):
         self.tok = FakeWelmTokenizer()
@@ -1198,25 +1652,6 @@ class TestWelmV4ReasoningDecodeFlags(CustomTestCase):
         res = det.detect_and_parse("", ids)
         self.assertEqual(res.reasoning_text, "re")
         self.assertEqual(res.normal_text, "and")
-
-
-class TestWelmV4ReasoningRegionStrStop(CustomTestCase):
-    def setUp(self):
-        self.tok = FakeWelmTokenizer()
-
-    def _reason(self, no_stop_trim):
-        det = WelmV4ReasoningDetector(tokenizer=self.tok, force_reasoning=True)
-        ids = enc("thinking STOP")
-        res = det.detect_and_parse("", ids)
-        return trim_matched_stop_for_id_parser(
-            res.reasoning_text, {"matched": "STOP"}, no_stop_trim
-        )
-
-    def test_reasoning_region_str_stop_trimmed(self):
-        self.assertEqual(self._reason(False), "thinking ")
-
-    def test_reasoning_region_str_stop_kept_when_no_stop_trim(self):
-        self.assertEqual(self._reason(True), "thinking STOP")
 
 
 class TestWelmV4Wrappers(CustomTestCase):
@@ -1279,6 +1714,38 @@ class TestWelmV4Wrappers(CustomTestCase):
         self.assertEqual(calls[0].name, "get_weather")
         self.assertEqual(json.loads(calls[0].parameters)["city"], "Tokyo")
 
+    def test_mixed_id_and_text_parsers_keep_text_routing(self):
+        welm_reasoning = ReasoningParser(
+            "welm-v4", stream_reasoning=True, force_reasoning=True
+        )
+        welm_reasoning.configure_tokenizer(self.tok)
+        text_tool = FunctionCallParser(self.tools, "glm45")
+        reasoning, normal = welm_reasoning.parse_stream_chunk(
+            "",
+            token_ids=enc("reason") + [C["</think>"]] + enc("answer"),
+        )
+        routed_normal, calls = text_tool.parse_stream_chunk(
+            normal,
+            token_ids=welm_reasoning.remaining_token_ids,
+        )
+        self.assertEqual(reasoning, "reason")
+        self.assertEqual(routed_normal, "answer")
+        self.assertEqual(calls, [])
+
+        text_reasoning = ReasoningParser(
+            "qwen3", stream_reasoning=True, force_reasoning=False
+        )
+        welm_tool = FunctionCallParser(self.tools, "welm-v4")
+        welm_tool.configure_tokenizer(self.tok)
+        reasoning, normal = text_reasoning.parse_stream_chunk(
+            "<think>reason</think>answer",
+            token_ids=enc("ignored"),
+        )
+        routed_normal, calls = welm_tool.parse_stream_chunk(normal, token_ids=None)
+        self.assertEqual(reasoning, "reason")
+        self.assertEqual(routed_normal, "answer")
+        self.assertEqual(calls, [])
+
     def test_registered_in_maps(self):
         self.assertIn("welm-v4", ReasoningParser.DetectorMap)
         self.assertIn("welm-v4", FunctionCallParser.ToolCallParserEnum)
@@ -1293,6 +1760,9 @@ class TestWelmV4Wrappers(CustomTestCase):
             stream_reasoning=False,
             force_reasoning=True,
         )
+        self.assertFalse(reasoning_parser.accepts_token_ids)
+        self.assertIsNone(reasoning_parser.remaining_token_ids)
+        reasoning_parser.configure_tokenizer(self.tok)
         self.assertTrue(reasoning_parser.accepts_token_ids)
 
         self.assertTrue(FunctionCallParser.accepts_token_ids_for("welm-v4"))
@@ -1300,6 +1770,8 @@ class TestWelmV4Wrappers(CustomTestCase):
         self.assertFalse(FunctionCallParser.accepts_token_ids_for(None))
 
         tool_parser = FunctionCallParser(self.tools, "welm-v4")
+        self.assertFalse(tool_parser.accepts_token_ids)
+        tool_parser.configure_tokenizer(self.tok)
         self.assertTrue(tool_parser.accepts_token_ids)
 
 
@@ -1500,73 +1972,31 @@ class TestWelmV4IdBasedStreamStopFilter(CustomTestCase):
             ["<special>"],
         )
 
-    def test_string_stop_aligns_delta_ids_to_trimmed_delta(self):
-        stop = "|STOP"
-        self.assertGreater(len(enc(stop)), 1)
+    def test_string_finish_trims_terminal_stop_id_even_when_eos_is_ignored(self):
         delta, delta_ids, logprobs = self._filter(
-            self._request(),
-            "A",
-            enc("A" + stop),
-            ["A", "|", "S", "T", "O", "P"],
-            {"type": "stop", "matched": stop},
-        )
-
-        self.assertEqual(delta, "A")
-        self.assertEqual(delta_ids, enc("A"))
-        self.assertEqual(
-            [item["token"] for item in logprobs["content"]],
-            ["A", "|", "S", "T", "O", "P"],
-        )
-
-    def test_string_stop_with_multi_token_prefix_is_not_treated_as_token_stop(self):
-        stop = "XYZ"
-        self.assertGreater(len(enc(stop)), 1)
-        delta, delta_ids, logprobs = self._filter(
-            self._request(stop_token_ids=[ord("X")]),
-            "A",
-            enc("A" + stop),
-            ["A", "X", "Y", "Z"],
-            {"type": "stop", "matched": stop},
-        )
-
-        self.assertEqual(delta, "A")
-        self.assertEqual(delta_ids, enc("A"))
-        self.assertEqual(
-            [item["token"] for item in logprobs["content"]],
-            ["A", "X", "Y", "Z"],
-        )
-
-    def test_string_stop_drops_uncertain_ids_but_preserves_raw_logprobs(self):
-        delta, delta_ids, logprobs = self._filter(
-            self._request(),
-            "unmatched",
-            enc("A|STOP"),
-            ["A", "|", "S", "T", "O", "P"],
-            {"type": "stop", "matched": "|STOP"},
-        )
-
-        self.assertEqual(delta, "unmatched")
-        self.assertIsNone(delta_ids)
-        self.assertEqual(
-            [item["token"] for item in logprobs["content"]],
-            ["A", "|", "S", "T", "O", "P"],
-        )
-
-    def test_string_stop_uses_longest_decoding_prefix(self):
-        delta, delta_ids, logprobs = self._filter(
-            self._request(skip_special_tokens=True),
-            "A",
+            self._request(ignore_eos=True),
+            "A<|im_end|>",
             enc("A") + [C["<|im_end|>"]],
             ["A", "<|im_end|>"],
-            {"type": "stop", "matched": "STOP"},
+            {"type": "stop", "matched": "NaN happened"},
         )
 
         self.assertEqual(delta, "A")
-        self.assertEqual(delta_ids, enc("A") + [C["<|im_end|>"]])
+        self.assertEqual(delta_ids, enc("A"))
         self.assertEqual(
             [item["token"] for item in logprobs["content"]],
             ["A", "<|im_end|>"],
         )
+
+    def test_string_finish_without_terminal_stop_id_fails(self):
+        with self.assertRaisesRegex(ValueError, "terminal stop token ID"):
+            self._filter(
+                self._request(stop_token_ids=[ord("|")]),
+                "A|B",
+                enc("A|B"),
+                ["A", "|", "B"],
+                {"type": "stop", "matched": "unexpected"},
+            )
 
     def test_reasoning_parser_dispatches_stream_stop_filter(self):
         delta, delta_ids, logprobs = ReasoningParser.filter_id_based_stream_stop(
@@ -1616,7 +2046,7 @@ class TestWelmV4Fallback(CustomTestCase):
         )
         self.assertEqual(reasoning, "why")
         self.assertEqual(normal, "answer")
-        self.assertEqual(parser.remaining_token_ids, [])
+        self.assertIsNone(parser.remaining_token_ids)
 
     def test_reasoning_stream_falls_back_to_text_parser(self):
         tok = MissingControlTokenizer()
@@ -1631,7 +2061,7 @@ class TestWelmV4Fallback(CustomTestCase):
             normal += normal_delta
         self.assertEqual(reasoning, "why")
         self.assertEqual(normal, "answer")
-        self.assertEqual(parser.remaining_token_ids, [])
+        self.assertIsNone(parser.remaining_token_ids)
 
     def test_tool_falls_back_to_text_parser(self):
         tok = MissingControlTokenizer()

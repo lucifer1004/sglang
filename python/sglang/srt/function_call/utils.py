@@ -101,7 +101,28 @@ def _get_tool_schema(tool: Tool) -> dict:
     }
 
 
-def infer_type_from_json_schema(schema: Dict[str, Any]) -> Optional[str]:
+def _resolve_local_json_schema_ref(
+    ref: str, root_schema: Dict[str, Any]
+) -> Optional[Dict[str, Any]]:
+    if ref == "#":
+        return root_schema
+    if not ref.startswith("#/"):
+        return None
+
+    resolved: Any = root_schema
+    for part in ref[2:].split("/"):
+        key = part.replace("~1", "/").replace("~0", "~")
+        if not isinstance(resolved, dict) or key not in resolved:
+            return None
+        resolved = resolved[key]
+    return resolved if isinstance(resolved, dict) else None
+
+
+def infer_type_from_json_schema(
+    schema: Dict[str, Any],
+    root_schema: Optional[Dict[str, Any]] = None,
+    _visited_refs: Optional[set[str]] = None,
+) -> Optional[str]:
     """
     Infer the primary type of a parameter from JSON Schema.
 
@@ -115,12 +136,16 @@ def infer_type_from_json_schema(schema: Dict[str, Any]) -> Optional[str]:
 
     Args:
         schema: JSON Schema definition
+        root_schema: Complete schema used to resolve local ``$ref`` pointers
 
     Returns:
         Inferred type ('string', 'number', 'object', 'array', etc.) or None
     """
     if not isinstance(schema, dict):
         return None
+    if root_schema is None:
+        root_schema = schema
+    visited_refs = _visited_refs or set()
 
     # Priority 1: Direct type field (including type arrays)
     if "type" in schema:
@@ -134,14 +159,28 @@ def infer_type_from_json_schema(schema: Dict[str, Any]) -> Optional[str]:
                 return non_null_types[0]
             return "string"  # If only null, default to string
 
-    # Priority 2: Handle anyOf/oneOf
+    # Priority 2: Resolve local JSON Schema references
+    ref = schema.get("$ref")
+    if isinstance(ref, str):
+        if ref in visited_refs:
+            return None
+        resolved_schema = _resolve_local_json_schema_ref(ref, root_schema)
+        if resolved_schema is None:
+            return None
+        return infer_type_from_json_schema(
+            resolved_schema, root_schema, visited_refs | {ref}
+        )
+
+    # Priority 3: Handle anyOf/oneOf
     if "anyOf" in schema or "oneOf" in schema:
         schemas = schema.get("anyOf") or schema.get("oneOf")
         types = []
 
         if isinstance(schemas, list):
             for sub_schema in schemas:
-                inferred_type = infer_type_from_json_schema(sub_schema)
+                inferred_type = infer_type_from_json_schema(
+                    sub_schema, root_schema, visited_refs
+                )
                 if inferred_type:
                     types.append(inferred_type)
 
@@ -155,7 +194,7 @@ def infer_type_from_json_schema(schema: Dict[str, Any]) -> Optional[str]:
                 # Otherwise return first type
                 return types[0]
 
-    # Priority 3: Handle enum (infer type from enum values)
+    # Priority 4: Handle enum (infer type from enum values)
     if "enum" in schema and isinstance(schema["enum"], list):
         if not schema["enum"]:
             return "string"
@@ -184,20 +223,22 @@ def infer_type_from_json_schema(schema: Dict[str, Any]) -> Optional[str]:
         # Mixed types, prioritize string
         return "string"
 
-    # Priority 4: Handle allOf (must satisfy all types)
+    # Priority 5: Handle allOf (must satisfy all types)
     if "allOf" in schema and isinstance(schema["allOf"], list):
         schemas = schema["allOf"]
         for sub_schema in schemas:
-            inferred_type = infer_type_from_json_schema(sub_schema)
+            inferred_type = infer_type_from_json_schema(
+                sub_schema, root_schema, visited_refs
+            )
             if inferred_type and inferred_type != "string":
                 return inferred_type
         return "string"
 
-    # Priority 5: Infer object type
+    # Priority 6: Infer object type
     if "properties" in schema:
         return "object"
 
-    # Priority 6: Infer array type
+    # Priority 7: Infer array type
     if "items" in schema:
         return "array"
 

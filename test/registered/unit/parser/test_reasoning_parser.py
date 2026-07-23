@@ -880,6 +880,14 @@ class TestReasoningParser(CustomTestCase):
         self.assertEqual(reasoning, "")  # Buffer cleared when end token processed
         self.assertEqual(normal, "answer")
 
+    def test_text_parser_ignores_stream_token_ids(self):
+        """Text-based parsers should keep ignoring optional token-id deltas."""
+        parser = ReasoningParser("qwen3")
+
+        reasoning, normal = parser.parse_stream_chunk("<think>", token_ids=[1])
+        self.assertEqual(reasoning, "")
+        self.assertEqual(normal, "")
+
     def test_case_insensitive_model_type(self):
         """Test case insensitive model type matching."""
         parser1 = ReasoningParser("DeepSeek-R1")

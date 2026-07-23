@@ -10,12 +10,13 @@ from sglang.test.test_utils import maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()  # must precede any import that pulls in sgl_kernel
 
+import hashlib
 import json
 import unittest
 import uuid
 from http import HTTPStatus
 from typing import Optional
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, PropertyMock, call, patch
 
 from fastapi import Request
 
@@ -97,6 +98,12 @@ class _FakeWelmTokenizer:
     CONTROL = {
         "<think>": 1001,
         "</think>": 1002,
+        "<tool_call>": 1003,
+        "</tool_call>": 1004,
+        "<arg_key>": 1005,
+        "</arg_key>": 1006,
+        "<arg_value>": 1007,
+        "</arg_value>": 1008,
         "<|im_end|>": 1009,
     }
     eos_token_id = CONTROL["<|im_end|>"]
@@ -151,20 +158,27 @@ class ServingChatTestCase(unittest.TestCase):
         self.fastapi_request = Mock(spec=Request)
         self.fastapi_request.headers = {}
 
-    def _welm_chat(self):
+    def _welm_chat(self, *, with_tools=False):
         self.tm.server_args.incremental_streaming_output = True
         self.tm.server_args.reasoning_parser = "welm-v4"
-        self.tm.server_args.tool_call_parser = None
+        self.tm.server_args.tool_call_parser = "welm-v4" if with_tools else None
         self.tm.tokenizer = _FakeWelmTokenizer()
         self.tm.model_config.hf_eos_token_id = {self.tm.tokenizer.eos_token_id}
         return OpenAIServingChat(self.tm, self.template_manager)
 
     def _run_chat_stream(self, chat, request):
+        adapted_request = Mock(spec=GenerateReqInput)
+        adapted_request.sampling_params = {
+            "stop": request.stop,
+            "stop_regex": request.stop_regex,
+            "no_stop_trim": request.no_stop_trim,
+        }
+
         async def collect():
             return [
                 chunk
                 async for chunk in chat._generate_chat_stream(
-                    Mock(spec=GenerateReqInput), request, self.fastapi_request
+                    adapted_request, request, self.fastapi_request
                 )
             ]
 
@@ -287,6 +301,62 @@ class ServingChatTestCase(unittest.TestCase):
             second_tools,
             [tool.function.model_dump(exclude_unset=True) for tool in req.tools],
         )
+
+    def test_tool_constraint_reasoning_ownership(self):
+        named = {"type": "function", "function": {"name": "get_weather"}}
+        cases = [
+            ("required", True, "welm-v4", False),
+            (named, True, None, True),
+            ("required", False, None, False),
+            (named, False, "welm-v4", False),
+        ]
+        for tool_choice, thinking_mode, reasoning_parser, expected in cases:
+            with self.subTest(
+                tool_choice=tool_choice,
+                thinking_mode=thinking_mode,
+                reasoning_parser=reasoning_parser,
+            ):
+                request = ChatCompletionRequest(
+                    model="x",
+                    messages=[{"role": "user", "content": "Hi?"}],
+                    tools=[
+                        {
+                            "type": "function",
+                            "function": {"name": "get_weather"},
+                        }
+                    ],
+                    tool_choice=tool_choice,
+                )
+                parser = Mock()
+                parser.get_structure_constraint.return_value = (
+                    "structural_tag",
+                    "constraint",
+                )
+                self.tm.server_args.reasoning_parser = reasoning_parser
+
+                with (
+                    patch.object(
+                        self.chat,
+                        "_get_reasoning_from_request",
+                        return_value=thinking_mode,
+                    ),
+                    patch.object(
+                        self.chat,
+                        "_build_function_call_parser",
+                        return_value=parser,
+                    ),
+                    patch.object(
+                        self.chat,
+                        "_apply_conversation_template",
+                        return_value=Mock(),
+                    ),
+                ):
+                    self.chat._process_messages(request, is_multimodal=False)
+
+                self.assertEqual(
+                    parser.get_structure_constraint.call_args.kwargs["thinking_mode"],
+                    expected,
+                )
 
     def test_stop_str_isolation_between_requests(self):
         """Test that stop strings from one request don't affect subsequent requests.
@@ -1274,7 +1344,7 @@ class ServingChatTestCase(unittest.TestCase):
         )
 
     def test_welm_incremental_ids_and_logprobs_split(self):
-        chat = self._welm_chat()
+        chat = self._welm_chat(with_tools=True)
         eos_id = self.tm.tokenizer.eos_token_id
 
         output_ids = [
@@ -1329,6 +1399,15 @@ class ServingChatTestCase(unittest.TestCase):
         req = ChatCompletionRequest(
             model="x",
             messages=[{"role": "user", "content": "Hi?"}],
+            tools=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "get_weather",
+                        "parameters": {"type": "object", "properties": {}},
+                    },
+                }
+            ],
             stream=True,
             stream_reasoning=True,
             logprobs=True,
@@ -1353,6 +1432,1129 @@ class ServingChatTestCase(unittest.TestCase):
         self.assertEqual("".join(content_parts), "a")
         self.assertEqual(reasoning_logprobs, ["<think>", "r", "</think>"])
         self.assertEqual(content_logprobs, ["a", "<|im_end|>"])
+
+    def test_welm_streaming_handoff_preserves_content_and_done(self):
+        chat = self._welm_chat(with_tools=True)
+        tokenizer = self.tm.tokenizer
+        output_ids = [
+            tokenizer.CONTROL["<think>"],
+            ord("r"),
+            tokenizer.CONTROL["</think>"],
+            ord("a"),
+            tokenizer.eos_token_id,
+        ]
+
+        async def generate():
+            frames = [
+                ("<think>r", output_ids[:2], None),
+                (
+                    "</think>a<|im_end|>",
+                    output_ids[2:],
+                    {
+                        "type": "stop",
+                        "matched": tokenizer.eos_token_id,
+                    },
+                ),
+            ]
+            for text, frame_ids, finish_reason in frames:
+                yield {
+                    "text": text,
+                    "output_ids": frame_ids,
+                    "meta_info": {
+                        "id": "chatcmpl-welm-handoff",
+                        "prompt_tokens": 1,
+                        "completion_tokens": len(output_ids),
+                        "reasoning_tokens": 3,
+                        "cached_tokens": 0,
+                        "finish_reason": finish_reason,
+                        "output_token_logprobs": None,
+                        "output_top_logprobs": None,
+                    },
+                    "index": 0,
+                }
+
+        self.tm.generate_request.return_value = generate()
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            tools=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "get_weather",
+                        "parameters": {"type": "object", "properties": {}},
+                    },
+                }
+            ],
+            stream=True,
+            stream_reasoning=True,
+            stop="STOP",
+            no_stop_trim=True,
+        )
+
+        reasoning_parser = chat._build_reasoning_parser(
+            chat.reasoning_parser, True, True, request
+        )
+        tool_parser = chat._build_function_call_parser(request.tools, request)
+        with (
+            patch.object(
+                type(reasoning_parser.detector),
+                "handoff_content_ids",
+                new_callable=PropertyMock,
+                create=True,
+            ) as handoff_flag,
+            patch.object(
+                type(tool_parser.detector),
+                "reparse_content_ids",
+                new_callable=PropertyMock,
+                create=True,
+            ) as reparse_flag,
+            patch.object(
+                chat, "_build_reasoning_parser", return_value=reasoning_parser
+            ),
+            patch.object(
+                chat, "_build_function_call_parser", return_value=tool_parser
+            ) as build_tool_parser,
+        ):
+            output = self._run_chat_stream(chat, request)
+        self.assertEqual(build_tool_parser.call_count, 1)
+        self.assertEqual(
+            [entry for entry in handoff_flag.call_args_list if entry.args],
+            [call(True)],
+        )
+        self.assertEqual(
+            [entry for entry in reparse_flag.call_args_list if entry.args],
+            [call(True)],
+        )
+        reasoning, content = [], []
+        for choice in self._stream_choices(output):
+            delta = choice["delta"]
+            reasoning.append(delta.get("reasoning_content") or "")
+            content.append(delta.get("content") or "")
+        self.assertEqual("".join(reasoning), "r")
+        self.assertEqual("".join(content), "a")
+        self.assertEqual(output[-1], "data: [DONE]\n\n")
+
+    def test_welm_streaming_text_stop_uses_text_parsers_from_first_chunk(self):
+        for stop_kwargs in ({"stop": "STOP"}, {"stop_regex": "ST.*"}):
+            with self.subTest(stop_kwargs=stop_kwargs):
+                chat = self._welm_chat(with_tools=True)
+                tokenizer = self.tm.tokenizer
+                output_ids = [
+                    tokenizer.CONTROL["<think>"],
+                    ord("r"),
+                    tokenizer.CONTROL["</think>"],
+                    tokenizer.CONTROL["<tool_call>"],
+                    *map(ord, "get_weather\n"),
+                    tokenizer.CONTROL["</tool_call>"],
+                    *map(ord, "STOP"),
+                ]
+
+                async def generate():
+                    frames = [
+                        ("<think>r", output_ids[:2], None),
+                        (
+                            "</think><tool_call>get_weather\n",
+                            output_ids[2:-5],
+                            None,
+                        ),
+                        (
+                            "</tool_call>",
+                            output_ids[-5:],
+                            {"type": "stop", "matched": "STOP"},
+                        ),
+                    ]
+                    for text, frame_ids, finish_reason in frames:
+                        yield {
+                            "text": text,
+                            "output_ids": frame_ids,
+                            "meta_info": {
+                                "id": "chatcmpl-welm-text-stop",
+                                "prompt_tokens": 1,
+                                "completion_tokens": len(output_ids),
+                                "reasoning_tokens": 3,
+                                "cached_tokens": 0,
+                                "finish_reason": finish_reason,
+                                "output_token_logprobs": None,
+                                "output_top_logprobs": None,
+                            },
+                            "index": 0,
+                        }
+
+                self.tm.generate_request.return_value = generate()
+                request = ChatCompletionRequest(
+                    model="x",
+                    messages=[{"role": "user", "content": "Hi?"}],
+                    tools=[
+                        {
+                            "type": "function",
+                            "function": {"name": "get_weather"},
+                        }
+                    ],
+                    stream=True,
+                    stream_reasoning=True,
+                    **stop_kwargs,
+                )
+                reasoning_parser = chat._build_reasoning_parser(
+                    chat.reasoning_parser, True, True, request
+                )
+                tool_parser = chat._build_function_call_parser(request.tools, request)
+                with (
+                    patch.object(
+                        chat,
+                        "_build_reasoning_parser",
+                        return_value=reasoning_parser,
+                    ),
+                    patch.object(
+                        chat,
+                        "_build_function_call_parser",
+                        return_value=tool_parser,
+                    ),
+                    patch.object(
+                        chat,
+                        "_filter_id_based_stream_stop",
+                        wraps=chat._filter_id_based_stream_stop,
+                    ) as stop_filter,
+                ):
+                    output = self._run_chat_stream(chat, request)
+
+                reasoning, names = [], []
+                for choice in self._stream_choices(output):
+                    delta = choice["delta"]
+                    reasoning.append(delta.get("reasoning_content") or "")
+                    names.extend(
+                        tool_call["function"].get("name")
+                        for tool_call in delta.get("tool_calls") or []
+                        if tool_call["function"].get("name")
+                    )
+                self.assertEqual(stop_filter.call_count, 0)
+                self.assertFalse(reasoning_parser.detector.handoff_content_ids)
+                self.assertFalse(tool_parser.detector.reparse_content_ids)
+                self.assertEqual("".join(reasoning), "r")
+                self.assertEqual(names, ["get_weather"])
+                self.assertEqual(output[-1], "data: [DONE]\n\n")
+
+    def test_welm_streaming_text_stop_configured_but_not_hit_still_text_routes(self):
+        """The streaming gate is request-level: a configured string stop routes
+        the whole request through text parsers even when generation finishes
+        via a stop token (EOS) and the string stop never matches."""
+        chat = self._welm_chat(with_tools=True)
+        tokenizer = self.tm.tokenizer
+        output_ids = [
+            tokenizer.CONTROL["<think>"],
+            ord("r"),
+            tokenizer.CONTROL["</think>"],
+            tokenizer.CONTROL["<tool_call>"],
+            *map(ord, "get_weather\n"),
+            tokenizer.CONTROL["</tool_call>"],
+            tokenizer.eos_token_id,
+        ]
+
+        async def generate():
+            frames = [
+                ("<think>r", output_ids[:2], None),
+                (
+                    "</think><tool_call>get_weather\n",
+                    output_ids[2:-2],
+                    None,
+                ),
+                (
+                    "</tool_call>",
+                    output_ids[-2:],
+                    {"type": "stop", "matched": tokenizer.eos_token_id},
+                ),
+            ]
+            for text, frame_ids, finish_reason in frames:
+                yield {
+                    "text": text,
+                    "output_ids": frame_ids,
+                    "meta_info": {
+                        "id": "chatcmpl-welm-stop-not-hit",
+                        "prompt_tokens": 1,
+                        "completion_tokens": len(output_ids),
+                        "reasoning_tokens": 3,
+                        "cached_tokens": 0,
+                        "finish_reason": finish_reason,
+                        "output_token_logprobs": None,
+                        "output_top_logprobs": None,
+                    },
+                    "index": 0,
+                }
+
+        self.tm.generate_request.return_value = generate()
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            tools=[
+                {
+                    "type": "function",
+                    "function": {"name": "get_weather"},
+                }
+            ],
+            stream=True,
+            stream_reasoning=True,
+            stop="STOP",
+        )
+        reasoning_parser = chat._build_reasoning_parser(
+            chat.reasoning_parser, True, True, request
+        )
+        tool_parser = chat._build_function_call_parser(request.tools, request)
+        with (
+            patch.object(
+                chat,
+                "_build_reasoning_parser",
+                return_value=reasoning_parser,
+            ),
+            patch.object(
+                chat,
+                "_build_function_call_parser",
+                return_value=tool_parser,
+            ),
+            patch.object(
+                chat,
+                "_filter_id_based_stream_stop",
+                wraps=chat._filter_id_based_stream_stop,
+            ) as stop_filter,
+        ):
+            output = self._run_chat_stream(chat, request)
+
+        reasoning, names = [], []
+        for choice in self._stream_choices(output):
+            delta = choice["delta"]
+            reasoning.append(delta.get("reasoning_content") or "")
+            names.extend(
+                tool_call["function"].get("name")
+                for tool_call in delta.get("tool_calls") or []
+                if tool_call["function"].get("name")
+            )
+        self.assertEqual(stop_filter.call_count, 0)
+        self.assertFalse(reasoning_parser.detector.handoff_content_ids)
+        self.assertFalse(tool_parser.detector.reparse_content_ids)
+        self.assertEqual("".join(reasoning), "r")
+        self.assertEqual(names, ["get_weather"])
+        self.assertEqual(output[-1], "data: [DONE]\n\n")
+
+    def test_welm_streaming_partial_token_text_stop_keeps_authoritative_text(self):
+        chat = self._welm_chat()
+        tokenizer = self.tm.tokenizer
+
+        async def generate():
+            yield {
+                "text": "r</think>a",
+                "output_ids": [
+                    ord("r"),
+                    tokenizer.CONTROL["</think>"],
+                    *map(ord, "apple"),
+                ],
+                "meta_info": {
+                    "id": "chatcmpl-welm-partial-token-stop",
+                    "prompt_tokens": 1,
+                    "completion_tokens": 7,
+                    "reasoning_tokens": 2,
+                    "cached_tokens": 0,
+                    "finish_reason": {"type": "stop", "matched": "p"},
+                    "output_token_logprobs": None,
+                    "output_top_logprobs": None,
+                },
+                "index": 0,
+            }
+
+        self.tm.generate_request.return_value = generate()
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            stream=True,
+            stop="p",
+        )
+        with patch.object(
+            chat,
+            "_filter_id_based_stream_stop",
+            wraps=chat._filter_id_based_stream_stop,
+        ) as stop_filter:
+            output = self._run_chat_stream(chat, request)
+        visible_content = "".join(
+            choice["delta"].get("content") or ""
+            for choice in self._stream_choices(output)
+        )
+        self.assertEqual(stop_filter.call_count, 0)
+        self.assertEqual(visible_content, "a")
+
+    def test_welm_streaming_string_finish_with_terminal_eos_stays_successful(self):
+        chat = self._welm_chat()
+        tokenizer = self.tm.tokenizer
+
+        async def generate():
+            yield {
+                "text": "r</think>a<|im_end|>",
+                "output_ids": [
+                    ord("r"),
+                    tokenizer.CONTROL["</think>"],
+                    ord("a"),
+                    tokenizer.eos_token_id,
+                ],
+                "meta_info": {
+                    "id": "chatcmpl-welm-vocab-boundary",
+                    "prompt_tokens": 1,
+                    "completion_tokens": 4,
+                    "reasoning_tokens": 2,
+                    "cached_tokens": 0,
+                    "finish_reason": {"type": "stop", "matched": "NaN happened"},
+                    "output_token_logprobs": None,
+                    "output_top_logprobs": None,
+                },
+                "index": 0,
+            }
+
+        self.tm.generate_request.return_value = generate()
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            stream=True,
+            ignore_eos=True,
+        )
+        output = self._run_chat_stream(chat, request)
+        visible_content = "".join(
+            choice["delta"].get("content") or ""
+            for choice in self._stream_choices(output)
+        )
+        self.assertEqual(visible_content, "a")
+        self.assertEqual(output[-1], "data: [DONE]\n\n")
+
+    def test_welm_streaming_unexpected_string_finish_is_structured_error(self):
+        chat = self._welm_chat()
+        tokenizer = self.tm.tokenizer
+
+        async def generate():
+            yield {
+                "text": "r</think>a",
+                "output_ids": [
+                    ord("r"),
+                    tokenizer.CONTROL["</think>"],
+                    ord("a"),
+                ],
+                "meta_info": {
+                    "id": "chatcmpl-welm-invalid-string-finish",
+                    "prompt_tokens": 1,
+                    "completion_tokens": 3,
+                    "reasoning_tokens": 2,
+                    "cached_tokens": 0,
+                    "finish_reason": {"type": "stop", "matched": "unexpected"},
+                    "output_token_logprobs": None,
+                    "output_top_logprobs": None,
+                },
+                "index": 0,
+            }
+
+        self.tm.generate_request.return_value = generate()
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            stream=True,
+        )
+        output = self._run_chat_stream(chat, request)
+        error = json.loads(output[-2][len("data: ") :])
+        self.assertIn("terminal stop token ID", error["error"]["message"])
+        self.assertEqual(output[-1], "data: [DONE]\n\n")
+
+    def test_welm_handoff_splits_reasoning_and_tool_logprobs(self):
+        chat = self._welm_chat(with_tools=True)
+        tokenizer = self.tm.tokenizer
+        tool_ids = (
+            [tokenizer.CONTROL["<tool_call>"]]
+            + list(map(ord, "get_weather"))
+            + [tokenizer.CONTROL["</tool_call>"]]
+        )
+        output_ids = [
+            tokenizer.CONTROL["<think>"],
+            ord("r"),
+            tokenizer.CONTROL["</think>"],
+            *tool_ids,
+        ]
+        token_text = [
+            "<think>",
+            "r",
+            "</think>",
+            "<tool_call>",
+            *list("get_weather"),
+            "</tool_call>",
+        ]
+
+        async def generate():
+            yield {
+                "text": "<think>r</think><tool_call>get_weather</tool_call>",
+                "output_ids": output_ids,
+                "meta_info": {
+                    "id": "chatcmpl-welm-tool-logprobs",
+                    "prompt_tokens": 1,
+                    "completion_tokens": len(output_ids),
+                    "reasoning_tokens": 3,
+                    "cached_tokens": 0,
+                    "finish_reason": {"type": "stop", "matched": None},
+                    "output_token_logprobs": [
+                        (-0.1, token_id, text)
+                        for token_id, text in zip(output_ids, token_text)
+                    ],
+                    "output_token_logprobs_length": len(output_ids),
+                    "output_top_logprobs": [],
+                },
+                "index": 0,
+            }
+
+        self.tm.generate_request.return_value = generate()
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            tools=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "get_weather",
+                        "parameters": {"type": "object", "properties": {}},
+                    },
+                }
+            ],
+            stream=True,
+            stream_reasoning=True,
+            logprobs=True,
+        )
+
+        reasoning_logprobs = []
+        tool_logprobs = []
+        tool_names = []
+        for choice in self._stream_choices(self._run_chat_stream(chat, request)):
+            tokens = [
+                item["token"]
+                for item in (choice.get("logprobs") or {}).get("content", [])
+            ]
+            delta = choice["delta"]
+            if delta.get("reasoning_content"):
+                reasoning_logprobs.extend(tokens)
+            if delta.get("tool_calls"):
+                tool_logprobs.extend(tokens)
+                name = delta["tool_calls"][0]["function"].get("name")
+                if name:
+                    tool_names.append(name)
+
+        self.assertEqual(reasoning_logprobs, token_text[:3])
+        self.assertEqual(tool_logprobs, token_text[3:])
+        self.assertEqual(tool_names, ["get_weather"])
+
+    def test_welm_handoff_keeps_choice_state_isolated(self):
+        chat = self._welm_chat(with_tools=True)
+        think_end = self.tm.tokenizer.CONTROL["</think>"]
+
+        async def generate():
+            frames = [
+                (0, "r0", list(map(ord, "r0")), None),
+                (
+                    1,
+                    "r1</think>b",
+                    list(map(ord, "r1")) + [think_end, ord("b")],
+                    {"type": "stop", "matched": None},
+                ),
+                (
+                    0,
+                    "</think>a",
+                    [think_end, ord("a")],
+                    {"type": "stop", "matched": None},
+                ),
+            ]
+            for index, text, output_ids, finish_reason in frames:
+                yield {
+                    "text": text,
+                    "output_ids": output_ids,
+                    "meta_info": {
+                        "id": "chatcmpl-welm-choice-state",
+                        "prompt_tokens": 1,
+                        "completion_tokens": len(output_ids),
+                        "reasoning_tokens": 0,
+                        "cached_tokens": 0,
+                        "finish_reason": finish_reason,
+                        "output_token_logprobs": None,
+                        "output_top_logprobs": None,
+                    },
+                    "index": index,
+                }
+
+        self.tm.generate_request.return_value = generate()
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            tools=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "get_weather",
+                        "parameters": {"type": "object", "properties": {}},
+                    },
+                }
+            ],
+            n=2,
+            stream=True,
+            stream_reasoning=True,
+        )
+
+        outputs = {
+            0: {"reasoning": "", "content": ""},
+            1: {"reasoning": "", "content": ""},
+        }
+        for chunk in self._run_chat_stream(chat, request):
+            if not chunk.startswith("data: ") or chunk.strip() == "data: [DONE]":
+                continue
+            payload = json.loads(chunk[len("data: ") :])
+            for choice in payload.get("choices", []):
+                delta = choice["delta"]
+                state = outputs[choice["index"]]
+                state["reasoning"] += delta.get("reasoning_content") or ""
+                state["content"] += delta.get("content") or ""
+
+        self.assertEqual(outputs[0], {"reasoning": "r0", "content": "a"})
+        self.assertEqual(outputs[1], {"reasoning": "r1", "content": "b"})
+
+    def test_welm_streaming_handoff_missing_ids_is_structured_error(self):
+        chat = self._welm_chat(with_tools=True)
+
+        async def generate():
+            yield {
+                "text": "r</think>a",
+                "output_ids": [
+                    ord("r"),
+                    self.tm.tokenizer.CONTROL["</think>"],
+                    ord("a"),
+                ],
+                "meta_info": {
+                    "id": "chatcmpl-welm-handoff-error",
+                    "prompt_tokens": 1,
+                    "completion_tokens": 3,
+                    "reasoning_tokens": 2,
+                    "cached_tokens": 0,
+                    "finish_reason": None,
+                    "output_token_logprobs": None,
+                    "output_top_logprobs": None,
+                },
+                "index": 0,
+            }
+
+        self.tm.generate_request.return_value = generate()
+        chat._filter_id_based_stream_stop = Mock(
+            return_value=("r</think>a", None, None)
+        )
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            tools=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "get_weather",
+                        "parameters": {"type": "object", "properties": {}},
+                    },
+                }
+            ],
+            stream=True,
+        )
+
+        output = self._run_chat_stream(chat, request)
+        error = json.loads(output[-2][len("data: ") :])
+        self.assertIn("requires token ids", error["error"]["message"])
+        self.assertEqual(output[-1], "data: [DONE]\n\n")
+
+    def test_welm_streaming_incomplete_before_name_recovers_actual_content(self):
+        chat = self._welm_chat(with_tools=True)
+        tokenizer = self.tm.tokenizer
+        incomplete = [tokenizer.CONTROL["<tool_call>"]] + list(map(ord, "unknown_tool"))
+        output_ids = [
+            ord("r"),
+            tokenizer.CONTROL["</think>"],
+            *incomplete,
+        ]
+
+        async def generate():
+            yield {
+                "text": "r</think><tool_call>unknown_tool",
+                "output_ids": output_ids,
+                "meta_info": {
+                    "id": "chatcmpl-welm-incomplete-content",
+                    "prompt_tokens": 1,
+                    "completion_tokens": len(output_ids),
+                    "reasoning_tokens": 2,
+                    "cached_tokens": 0,
+                    "finish_reason": {"type": "stop", "matched": None},
+                    "output_token_logprobs": None,
+                    "output_top_logprobs": None,
+                },
+                "index": 0,
+            }
+
+        self.tm.generate_request.return_value = generate()
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            tools=[{"type": "function", "function": {"name": "get_weather"}}],
+            stream=True,
+        )
+
+        output = self._run_chat_stream(chat, request)
+        visible_content = "".join(
+            choice["delta"].get("content") or ""
+            for choice in self._stream_choices(output)
+        )
+        self.assertEqual(visible_content, "<tool_call>unknown_tool")
+        self.assertNotIn("</tool_call>", visible_content)
+        self.assertEqual(output[-1], "data: [DONE]\n\n")
+
+    def test_welm_streaming_incomplete_after_name_is_structured_error(self):
+        chat = self._welm_chat(with_tools=True)
+        tokenizer = self.tm.tokenizer
+        incomplete = (
+            [tokenizer.CONTROL["<tool_call>"]]
+            + list(map(ord, "get_weather"))
+            + [tokenizer.CONTROL["<arg_key>"]]
+            + list(map(ord, "city"))
+        )
+        output_ids = [
+            ord("r"),
+            tokenizer.CONTROL["</think>"],
+            *incomplete,
+        ]
+
+        async def generate():
+            yield {
+                "text": "r</think><tool_call>get_weather<arg_key>city",
+                "output_ids": output_ids,
+                "meta_info": {
+                    "id": "chatcmpl-welm-incomplete-tool",
+                    "prompt_tokens": 1,
+                    "completion_tokens": len(output_ids),
+                    "reasoning_tokens": 2,
+                    "cached_tokens": 0,
+                    "finish_reason": {"type": "stop", "matched": None},
+                    "output_token_logprobs": None,
+                    "output_top_logprobs": None,
+                },
+                "index": 0,
+            }
+
+        self.tm.generate_request.return_value = generate()
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            tools=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "get_weather",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"city": {"type": "string"}},
+                        },
+                    },
+                }
+            ],
+            stream=True,
+        )
+
+        output = self._run_chat_stream(chat, request)
+        error = json.loads(output[-2][len("data: ") :])
+        self.assertIn("irreversible output", error["error"]["message"])
+        self.assertEqual(output[-1], "data: [DONE]\n\n")
+
+    def test_welm_streaming_valid_tool_call_matches_sse_golden(self):
+        chat = self._welm_chat(with_tools=True)
+        tokenizer = self.tm.tokenizer
+        output_ids = [
+            tokenizer.CONTROL["<think>"],
+            ord("r"),
+            tokenizer.CONTROL["</think>"],
+            tokenizer.CONTROL["<tool_call>"],
+            *map(ord, "get_weather"),
+            tokenizer.CONTROL["</tool_call>"],
+        ]
+
+        async def generate():
+            yield {
+                "text": "<think>r</think><tool_call>get_weather</tool_call>",
+                "output_ids": output_ids,
+                "meta_info": {
+                    "id": "chatcmpl-welm-golden",
+                    "prompt_tokens": 1,
+                    "completion_tokens": len(output_ids),
+                    "reasoning_tokens": 3,
+                    "cached_tokens": 0,
+                    "finish_reason": {"type": "stop", "matched": None},
+                    "output_token_logprobs": None,
+                    "output_top_logprobs": None,
+                },
+                "index": 0,
+            }
+
+        self.tm.generate_request.return_value = generate()
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            tools=[{"type": "function", "function": {"name": "get_weather"}}],
+            stream=True,
+            stream_reasoning=True,
+        )
+
+        with (
+            patch(
+                "sglang.srt.entrypoints.openai.serving_chat.time.time",
+                return_value=123,
+            ),
+            patch(
+                "sglang.srt.entrypoints.openai.serving_chat.uuid.uuid4",
+                return_value=uuid.UUID(int=1),
+            ),
+        ):
+            output = self._run_chat_stream(chat, request)
+        wire = "".join(output).encode()
+        self.assertEqual(len(output), 6)
+        self.assertEqual(
+            hashlib.sha256(wire).hexdigest(),
+            "ee9af56312954feba68cbb55cac9d9297c3c729d69dfc014d73af906c9557097",
+        )
+        self.assertNotIn(b"<tool_call>", wire)
+        self.assertNotIn(b"</tool_call>", wire)
+
+    def test_welm_required_and_named_streaming_keep_native_xml(self):
+        tool_choices = [
+            "required",
+            {"type": "function", "function": {"name": "get_weather"}},
+        ]
+        for tool_choice in tool_choices:
+            for parallel_tool_calls in (False, True):
+                with self.subTest(
+                    tool_choice=tool_choice,
+                    parallel_tool_calls=parallel_tool_calls,
+                ):
+                    self.tm = _MockTokenizerManager()
+                    chat = self._welm_chat(with_tools=True)
+                    tokenizer = self.tm.tokenizer
+                    output_ids = [
+                        tokenizer.CONTROL["<think>"],
+                        ord("r"),
+                        tokenizer.CONTROL["</think>"],
+                        tokenizer.CONTROL["<tool_call>"],
+                        *map(ord, "get_weather"),
+                        tokenizer.CONTROL["</tool_call>"],
+                    ]
+
+                    async def generate():
+                        yield {
+                            "text": (
+                                "<think>r</think>" "<tool_call>get_weather</tool_call>"
+                            ),
+                            "output_ids": output_ids,
+                            "meta_info": {
+                                "id": "chatcmpl-welm-native-xml",
+                                "prompt_tokens": 1,
+                                "completion_tokens": len(output_ids),
+                                "reasoning_tokens": 3,
+                                "cached_tokens": 0,
+                                "finish_reason": {
+                                    "type": "stop",
+                                    "matched": None,
+                                },
+                                "output_token_logprobs": None,
+                                "output_top_logprobs": None,
+                            },
+                            "index": 0,
+                        }
+
+                    self.tm.generate_request.return_value = generate()
+                    request = ChatCompletionRequest(
+                        model="x",
+                        messages=[{"role": "user", "content": "Hi?"}],
+                        tools=[
+                            {
+                                "type": "function",
+                                "function": {"name": "get_weather"},
+                            }
+                        ],
+                        tool_choice=tool_choice,
+                        parallel_tool_calls=parallel_tool_calls,
+                        stream=True,
+                        stream_reasoning=True,
+                    )
+
+                    output = self._run_chat_stream(chat, request)
+                    names = []
+                    visible_content = ""
+                    for choice in self._stream_choices(output):
+                        delta = choice["delta"]
+                        visible_content += delta.get("content") or ""
+                        for tool_call in delta.get("tool_calls") or []:
+                            name = tool_call["function"].get("name")
+                            if name:
+                                names.append(name)
+
+                    self.assertEqual(names, ["get_weather"])
+                    self.assertNotIn("<tool_call>", visible_content)
+                    self.assertEqual(output[-1], "data: [DONE]\n\n")
+
+    def test_welm_nonstream_handoff_preserves_plain_content(self):
+        chat = self._welm_chat(with_tools=True)
+        tokenizer = self.tm.tokenizer
+        output_ids = [ord("r"), tokenizer.CONTROL["</think>"], ord("a")]
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            tools=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "get_weather",
+                        "parameters": {"type": "object", "properties": {}},
+                    },
+                }
+            ],
+        )
+        ret = [
+            {
+                "text": "r</think>a",
+                "output_ids": output_ids,
+                "meta_info": {
+                    "id": "chatcmpl-welm-nonstream",
+                    "prompt_tokens": 1,
+                    "completion_tokens": len(output_ids),
+                    "reasoning_tokens": 2,
+                    "cached_tokens": 0,
+                    "weight_version": "default",
+                    "finish_reason": {"type": "stop", "matched": None},
+                },
+                "index": 0,
+            }
+        ]
+
+        reasoning_parser = chat._build_reasoning_parser(
+            chat.reasoning_parser, False, True, request
+        )
+        tool_parser = chat._build_function_call_parser(request.tools, request)
+        with (
+            patch.object(
+                chat, "_build_reasoning_parser", return_value=reasoning_parser
+            ),
+            patch.object(
+                chat, "_build_function_call_parser", return_value=tool_parser
+            ) as build_tool_parser,
+        ):
+            response = chat._build_chat_response(request, ret, created=0)
+        self.assertEqual(build_tool_parser.call_count, 1)
+        self.assertFalse(reasoning_parser.detector.handoff_content_ids)
+        self.assertFalse(tool_parser.detector.reparse_content_ids)
+        self.assertEqual(response.choices[0].message.reasoning_content, "r")
+        self.assertEqual(response.choices[0].message.content, "a")
+        self.assertIsNone(response.choices[0].message.tool_calls)
+        self.assertEqual(response.choices[0].finish_reason, "stop")
+
+    def test_welm_nonstream_text_stop_ignores_all_post_stop_ids(self):
+        chat = self._welm_chat(with_tools=True)
+        tokenizer = self.tm.tokenizer
+        output_ids = [
+            ord("r"),
+            tokenizer.CONTROL["</think>"],
+            ord("a"),
+            *map(ord, "STOP"),
+            tokenizer.CONTROL["<tool_call>"],
+            *map(ord, "get_weather"),
+            tokenizer.CONTROL["</tool_call>"],
+        ]
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            tools=[{"type": "function", "function": {"name": "get_weather"}}],
+            stop="STOP",
+        )
+        ret = [
+            {
+                "text": "r</think>a",
+                "output_ids": output_ids,
+                "meta_info": {
+                    "id": "chatcmpl-welm-text-stop",
+                    "prompt_tokens": 1,
+                    "completion_tokens": len(output_ids),
+                    "reasoning_tokens": 2,
+                    "cached_tokens": 0,
+                    "weight_version": "default",
+                    "finish_reason": {"type": "stop", "matched": "STOP"},
+                },
+                "index": 0,
+            }
+        ]
+
+        reasoning_parser = chat._build_reasoning_parser(
+            chat.reasoning_parser, False, True, request
+        )
+        tool_parser = chat._build_function_call_parser(request.tools, request)
+        with (
+            patch.object(
+                chat, "_build_reasoning_parser", return_value=reasoning_parser
+            ),
+            patch.object(chat, "_build_function_call_parser", return_value=tool_parser),
+        ):
+            response = chat._build_chat_response(request, ret, created=0)
+
+        self.assertIsNone(reasoning_parser.remaining_token_ids)
+        self.assertEqual(response.choices[0].message.reasoning_content, "r")
+        self.assertEqual(response.choices[0].message.content, "a")
+        self.assertIsNone(response.choices[0].message.tool_calls)
+        self.assertEqual(response.choices[0].matched_stop, "STOP")
+
+    def test_welm_nonstream_stop_configured_but_eos_finish_keeps_id_parser(self):
+        """A configured string stop only forces text fallback when it actually
+        matches. Finishing via an int stop-token (EOS) must keep the token-ID
+        parser: the trailing stop ID is trimmed and the tool call parses from
+        the remaining IDs."""
+        chat = self._welm_chat(with_tools=True)
+        tokenizer = self.tm.tokenizer
+        output_ids = [
+            ord("r"),
+            tokenizer.CONTROL["</think>"],
+            ord("a"),
+            tokenizer.CONTROL["<tool_call>"],
+            *map(ord, "get_weather"),
+            tokenizer.CONTROL["<arg_key>"],
+            *map(ord, "city"),
+            tokenizer.CONTROL["</arg_key>"],
+            tokenizer.CONTROL["<arg_value>"],
+            *map(ord, "Paris"),
+            tokenizer.CONTROL["</arg_value>"],
+            tokenizer.CONTROL["</tool_call>"],
+            tokenizer.eos_token_id,
+        ]
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            tools=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "get_weather",
+                        "parameters": {"type": "object", "properties": {}},
+                    },
+                }
+            ],
+            stop="STOP",
+        )
+        ret = [
+            {
+                "text": "r</think>a<tool_call>get_weather...",
+                "output_ids": output_ids,
+                "meta_info": {
+                    "id": "chatcmpl-welm-eos-stop",
+                    "prompt_tokens": 1,
+                    "completion_tokens": len(output_ids),
+                    "reasoning_tokens": 2,
+                    "cached_tokens": 0,
+                    "weight_version": "default",
+                    "finish_reason": {
+                        "type": "stop",
+                        "matched": tokenizer.eos_token_id,
+                    },
+                },
+                "index": 0,
+            }
+        ]
+
+        reasoning_parser = chat._build_reasoning_parser(
+            chat.reasoning_parser, False, True, request
+        )
+        tool_parser = chat._build_function_call_parser(request.tools, request)
+        with (
+            patch.object(
+                chat, "_build_reasoning_parser", return_value=reasoning_parser
+            ),
+            patch.object(chat, "_build_function_call_parser", return_value=tool_parser),
+        ):
+            response = chat._build_chat_response(request, ret, created=0)
+
+        self.assertIsNotNone(reasoning_parser.remaining_token_ids)
+        choice = response.choices[0]
+        self.assertEqual(choice.message.reasoning_content, "r")
+        self.assertEqual(choice.message.content, "a")
+        self.assertIsNotNone(choice.message.tool_calls)
+        self.assertEqual(choice.message.tool_calls[0].function.name, "get_weather")
+        self.assertEqual(
+            json.loads(choice.message.tool_calls[0].function.arguments),
+            {"city": "Paris"},
+        )
+        self.assertEqual(choice.finish_reason, "tool_calls")
+
+    def test_welm_nonstream_tool_decode_error_preserves_content(self):
+        class FailingTokenizer(_FakeWelmTokenizer):
+            fail_id = 424247
+
+            def decode(
+                self,
+                token_ids,
+                skip_special_tokens=True,
+                spaces_between_special_tokens=True,
+            ):
+                if self.fail_id in token_ids:
+                    raise RuntimeError("injected decode failure")
+                return super().decode(
+                    token_ids,
+                    skip_special_tokens=skip_special_tokens,
+                    spaces_between_special_tokens=spaces_between_special_tokens,
+                )
+
+        self.tm.server_args.reasoning_parser = "welm-v4"
+        self.tm.server_args.tool_call_parser = "welm-v4"
+        self.tm.tokenizer = FailingTokenizer()
+        chat = OpenAIServingChat(self.tm, self.template_manager)
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            tools=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "get_weather",
+                        "parameters": {"type": "object", "properties": {}},
+                    },
+                }
+            ],
+        )
+        tool_ids = [
+            self.tm.tokenizer.fail_id,
+            self.tm.tokenizer.CONTROL["<tool_call>"],
+            *map(ord, "get_weather"),
+            self.tm.tokenizer.CONTROL["<arg_key>"],
+            *map(ord, "city"),
+            self.tm.tokenizer.CONTROL["</arg_key>"],
+            self.tm.tokenizer.CONTROL["<arg_value>"],
+            *map(ord, "Paris"),
+            self.tm.tokenizer.CONTROL["</arg_value>"],
+            self.tm.tokenizer.CONTROL["</tool_call>"],
+        ]
+        ret = [
+            {
+                "text": "r</think>bad<tool_call>get_weather...",
+                "output_ids": [
+                    ord("r"),
+                    self.tm.tokenizer.CONTROL["</think>"],
+                    *tool_ids,
+                ],
+                "meta_info": {
+                    "id": "chatcmpl-welm-nonstream-error",
+                    "prompt_tokens": 1,
+                    "completion_tokens": 3,
+                    "reasoning_tokens": 2,
+                    "cached_tokens": 0,
+                    "weight_version": "default",
+                    "finish_reason": {"type": "stop", "matched": None},
+                },
+                "index": 0,
+            }
+        ]
+
+        response = chat._build_chat_response(request, ret, created=0)
+        self.assertEqual(
+            response.choices[0].message.content,
+            "bad<tool_call>get_weather...",
+        )
+        self.assertIsNone(response.choices[0].message.tool_calls)
 
     def test_regex_finish_reason_trims_actual_match_not_pattern(self):
         finish_reason = FINISHED_MATCHED_REGEX(r"\d+", "123").to_json()

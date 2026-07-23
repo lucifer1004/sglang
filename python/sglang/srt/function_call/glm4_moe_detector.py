@@ -3,9 +3,9 @@ import json
 import logging
 import re
 from enum import Enum
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Literal, Optional, Tuple, Union
 
-from sglang.srt.entrypoints.openai.protocol import Tool
+from sglang.srt.entrypoints.openai.protocol import Tool, ToolChoice
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
 from sglang.srt.function_call.core_types import (
     StreamingParseResult,
@@ -13,6 +13,19 @@ from sglang.srt.function_call.core_types import (
     _GetInfoFunc,
 )
 from sglang.srt.function_call.utils import infer_type_from_json_schema
+
+try:
+    from xgrammar import StructuralTag
+    from xgrammar.structural_tag import (
+        AnyTextFormat,
+        JSONSchemaFormat,
+        SequenceFormat,
+        TagFormat,
+        TagsWithSeparatorFormat,
+        TriggeredTagsFormat,
+    )
+except ImportError:
+    StructuralTag = None  # type: ignore
 
 logger = logging.getLogger(__name__)
 
@@ -52,14 +65,15 @@ def get_argument_type(
     if func_name not in name2tool:
         return None
     tool = name2tool[func_name]
-    properties = (tool.function.parameters or {}).get("properties", {})
+    parameters = tool.function.parameters or {}
+    properties = parameters.get("properties", {})
     if not isinstance(properties, dict):
         properties = {}
     if arg_key not in properties:
         return None
 
     # Use new type inference function for complex JSON Schema support
-    return infer_type_from_json_schema(properties[arg_key])
+    return infer_type_from_json_schema(properties[arg_key], parameters)
 
 
 def _convert_to_number(value: str) -> Any:
@@ -634,8 +648,76 @@ class Glm4MoeDetector(BaseFormatDetector):
 
         return arguments
 
+    def get_structural_tag(
+        self,
+        tools: Union[List[Tool], None] = None,
+        tool_choice: Union[ToolChoice, Literal["auto", "required"]] = "auto",
+        thinking_mode: bool = False,
+    ) -> Optional["StructuralTag"]:
+        if not tools or StructuralTag is None:
+            return None
+
+        def _tool_tag(tool: Tool) -> TagFormat:
+            return TagFormat(
+                begin=f"{self.bot_token}{tool.function.name}\n",
+                content=JSONSchemaFormat(
+                    json_schema=tool.function.parameters or {}, style="glm_xml"
+                ),
+                end=self.eot_token,
+            )
+
+        if isinstance(tool_choice, ToolChoice):
+            target = next(
+                (t for t in tools if t.function.name == tool_choice.function.name),
+                None,
+            )
+            if target is None:
+                return None
+            suffix = _tool_tag(target)
+        else:
+            tags = [_tool_tag(tool) for tool in tools]
+            if tool_choice == "required":
+                suffix = TagsWithSeparatorFormat(
+                    tags=tags, separator="", at_least_one=True
+                )
+            else:
+                suffix = TriggeredTagsFormat(
+                    triggers=[self.bot_token],
+                    tags=tags,
+                    excludes=[
+                        "<think>",
+                        "</think>",
+                        self.eot_token,
+                        "<arg_key>",
+                        "</arg_key>",
+                        "<arg_value>",
+                        "</arg_value>",
+                    ],
+                )
+
+        if thinking_mode:
+            reasoning = TagFormat(
+                begin="",
+                content=AnyTextFormat(
+                    excludes=[
+                        "<think>",
+                        "</think>",
+                        self.bot_token,
+                        self.eot_token,
+                        "<arg_key>",
+                        "</arg_key>",
+                        "<arg_value>",
+                        "</arg_value>",
+                    ]
+                ),
+                end="</think>",
+            )
+            suffix = SequenceFormat(elements=[reasoning, suffix])
+
+        return StructuralTag(format=suffix)
+
     def supports_structural_tag(self) -> bool:
-        return False
+        return StructuralTag is not None
 
     def structure_info(self) -> _GetInfoFunc:
         raise NotImplementedError()

@@ -11,7 +11,7 @@ text-based GLM parser.
 import json
 import logging
 from enum import Enum
-from typing import List, Optional, Union
+from typing import List, Optional
 
 from sglang.srt.entrypoints.openai.protocol import Tool
 from sglang.srt.environ import envs
@@ -90,7 +90,7 @@ class _IncrementalDecoder:
 
 
 def trim_matched_stop_for_id_parser(
-    output: Union[str, List[int], None],
+    output: Optional[List[int]],
     finished_reason: Optional[dict],
     no_stop_trim: bool,
 ):
@@ -99,9 +99,8 @@ def trim_matched_stop_for_id_parser(
     matched = finished_reason.get("matched_text") or finished_reason.get("matched")
     if not matched:
         return output
-    if isinstance(matched, str) and isinstance(output, str):
-        pos = output.find(matched)
-        return output[:pos] if pos != -1 else output
+    if isinstance(matched, str) and isinstance(output, list):
+        return None
     if isinstance(matched, int) and isinstance(output, list) and output:
         return output[:-1]
     return output
@@ -119,42 +118,6 @@ def _collect_token_ids(*values) -> set[int]:
     return token_ids
 
 
-def _decode_stream_ids(
-    tokenizer,
-    token_ids: List[int],
-    skip_special_tokens: bool,
-    spaces_between_special_tokens: bool,
-) -> str:
-    if not token_ids:
-        return ""
-    return tokenizer.decode(
-        token_ids,
-        skip_special_tokens=skip_special_tokens,
-        spaces_between_special_tokens=spaces_between_special_tokens,
-    )
-
-
-def _find_delta_id_prefix_for_text(
-    tokenizer,
-    delta_ids: List[int],
-    target_text: str,
-    skip_special_tokens: bool,
-    spaces_between_special_tokens: bool,
-) -> Optional[int]:
-    for end in range(len(delta_ids), -1, -1):
-        if (
-            _decode_stream_ids(
-                tokenizer,
-                delta_ids[:end],
-                skip_special_tokens,
-                spaces_between_special_tokens,
-            )
-            == target_text
-        ):
-            return end
-    return None
-
-
 def filter_id_based_stream_stop(
     request,
     tokenizer,
@@ -166,32 +129,27 @@ def filter_id_based_stream_stop(
     skip_special_tokens: bool,
     spaces_between_special_tokens: bool,
 ) -> tuple[str, Optional[List[int]], Optional[dict]]:
-    if request.no_stop_trim or not delta_ids:
+    if request.no_stop_trim:
         return delta, delta_ids, choice_logprobs
 
     finish_reason = finish_reason or {}
     matched = finish_reason.get("matched_text") or finish_reason.get("matched")
     if isinstance(matched, str):
-        keep_len = _find_delta_id_prefix_for_text(
-            tokenizer,
-            delta_ids,
-            delta,
-            skip_special_tokens,
-            spaces_between_special_tokens,
+        stop_token_ids = _collect_token_ids(
+            getattr(request, "stop_token_ids", None),
+            getattr(tokenizer, "eos_token_id", None),
+            getattr(tokenizer, "additional_stop_token_ids", None),
+            getattr(model_config, "hf_eos_token_id", None),
         )
-        if keep_len is None:
-            logger.warning(
-                "Failed to align WeLM-v4 string stop with token ids; "
-                "falling back to the authoritative trimmed text."
+        if not delta_ids or delta_ids[-1] not in stop_token_ids:
+            raise ValueError(
+                "WeLM-v4 ID parser received a string finish reason without "
+                "a terminal stop token ID"
             )
-            return delta, None, choice_logprobs
-        return (
-            delta,
-            delta_ids[:keep_len],
-            choice_logprobs,
-        )
-
-    if isinstance(matched, int):
+        stop_pos = len(delta_ids) - 1
+    elif not delta_ids:
+        return delta, delta_ids, choice_logprobs
+    elif isinstance(matched, int):
         stop_token_ids = {matched}
     elif request.ignore_eos:
         return delta, delta_ids, choice_logprobs
@@ -203,20 +161,24 @@ def filter_id_based_stream_stop(
             getattr(model_config, "hf_eos_token_id", None),
         )
 
-    stop_pos = next(
-        (i for i, token_id in enumerate(delta_ids) if token_id in stop_token_ids),
-        None,
-    )
-    if stop_pos is None:
-        return delta, delta_ids, choice_logprobs
+    if not isinstance(matched, str):
+        stop_pos = next(
+            (i for i, token_id in enumerate(delta_ids) if token_id in stop_token_ids),
+            None,
+        )
+        if stop_pos is None:
+            return delta, delta_ids, choice_logprobs
 
     filtered_ids = delta_ids[:stop_pos]
     return (
-        _decode_stream_ids(
-            tokenizer,
-            filtered_ids,
-            skip_special_tokens,
-            spaces_between_special_tokens,
+        (
+            tokenizer.decode(
+                filtered_ids,
+                skip_special_tokens=skip_special_tokens,
+                spaces_between_special_tokens=spaces_between_special_tokens,
+            )
+            if filtered_ids
+            else ""
         ),
         filtered_ids,
         # Keep logprobs for the raw sampled token sequence, including the stop
@@ -266,6 +228,7 @@ class WelmV4ToolDetector(BaseFormatDetector):
         self.arg_value_id = None
         self.arg_value_end_id = None
         self.id_capable = False
+        self.reparse_content_ids: bool = False
 
         self._normal_ids: List[int] = []
         self._normal_decoder: Optional[_IncrementalDecoder] = None
@@ -280,6 +243,7 @@ class WelmV4ToolDetector(BaseFormatDetector):
         self._current_value_ids: List[int] = []
         self._current_value_decoder: Optional[_IncrementalDecoder] = None
         self._arg_count = 0
+        self._pending_post_tool_whitespace_ids: Optional[List[int]] = None
         self.skip_unstreamed_arg_backfill = False
         self.configure_tokenizer(
             tokenizer,
@@ -298,6 +262,7 @@ class WelmV4ToolDetector(BaseFormatDetector):
         self.spaces_between_special_tokens = spaces_between_special_tokens
         self._normal_ids = []
         self._normal_decoder = None
+        self._pending_post_tool_whitespace_ids = None
         self.skip_unstreamed_arg_backfill = False
         self._reset_streaming_tool_state()
         self.bot_id = _resolve_token_id(tokenizer, self.bot_token)
@@ -317,6 +282,7 @@ class WelmV4ToolDetector(BaseFormatDetector):
                 self.arg_value_end_id,
             ]
         )
+        self.accepts_token_ids = self.id_capable
 
     def _reset_streaming_tool_state(self) -> None:
         self._phase = _StreamPhase.OUTSIDE
@@ -364,6 +330,7 @@ class WelmV4ToolDetector(BaseFormatDetector):
         self.skip_unstreamed_arg_backfill = True
         self.current_tool_name_sent = False
         self._normal_ids = []
+        self._pending_post_tool_whitespace_ids = None
         self._normal_decoder = self._new_decoder()
         self._reset_streaming_tool_state()
 
@@ -371,7 +338,6 @@ class WelmV4ToolDetector(BaseFormatDetector):
         self,
         *,
         index: int,
-        tid: int,
         ids: List[int],
         in_tool_before: bool,
         active_block_before: List[int],
@@ -380,16 +346,17 @@ class WelmV4ToolDetector(BaseFormatDetector):
         active_call_base: int,
         new_text: str,
     ) -> StreamingParseResult:
+        pending_ids = self._pending_post_tool_whitespace_ids or []
+        self._pending_post_tool_whitespace_ids = None
         if in_tool_before:
             calls = calls[:active_call_base]
-            raw_ids = [
+            raw_ids = pending_ids + [
                 *([self.bot_id] if self.bot_id is not None else []),
                 *active_block_before,
-                tid,
-                *ids[index + 1 :],
+                *ids[index:],
             ]
         else:
-            raw_ids = ids[index:]
+            raw_ids = pending_ids + ids[index:]
 
         try:
             raw_text = self._decode(raw_ids, skip_special_tokens=False)
@@ -425,29 +392,39 @@ class WelmV4ToolDetector(BaseFormatDetector):
 
         normal_ids = ids[:first]
         calls: List[ToolCallItem] = []
+        pending_gap_ids: List[int] = []
         i = first
         while i < len(ids):
             try:
                 close = ids.index(self.eot_id, i + 1)
             except ValueError:
+                normal_ids.extend(pending_gap_ids)
                 normal_ids.extend(ids[i:])
                 break
             block = ids[i + 1 : close]
             try:
                 parsed_calls = self._parse_block_ids(block, tools)
-                if parsed_calls:
-                    calls.extend(parsed_calls)
-                else:
-                    normal_ids.extend(ids[i : close + 1])
             except Exception as e:
                 logger.error("WeLM-v4 tool block parse error: %s", e, exc_info=True)
+                parsed_calls = None
+            if parsed_calls:
+                pending_gap_ids.clear()
+                calls.extend(parsed_calls)
+            else:
+                normal_ids.extend(pending_gap_ids)
+                pending_gap_ids.clear()
                 normal_ids.extend(ids[i : close + 1])
             i = close + 1
             try:
                 next_tool = ids.index(self.bot_id, i)
             except ValueError:
                 next_tool = len(ids)
-            normal_ids.extend(ids[i:next_tool])
+            gap_ids = ids[i:next_tool]
+            if parsed_calls and not self._decode(gap_ids).strip():
+                if next_tool < len(ids):
+                    pending_gap_ids = list(gap_ids)
+            else:
+                normal_ids.extend(gap_ids)
             i = next_tool
 
         return StreamingParseResult(normal_text=self._decode(normal_ids), calls=calls)
@@ -517,12 +494,19 @@ class WelmV4ToolDetector(BaseFormatDetector):
     ):
         arguments = {}
         for key, value in pairs:
-            arg_type = get_argument_type(func_name, key, tools) or "string"
+            arg_type = get_argument_type(func_name, key, tools)
             if arg_type == "string":
                 arguments[key] = value
                 continue
             parsed_value, is_valid_json = parse_arguments(value, arg_type)
-            arguments[key] = parsed_value if is_valid_json else value
+            if arg_type is None:
+                arguments[key] = (
+                    parsed_value
+                    if is_valid_json and isinstance(parsed_value, (dict, list))
+                    else value
+                )
+            else:
+                arguments[key] = parsed_value if is_valid_json else value
         return arguments
 
     def _is_known_or_forwarded_tool(self, func_name: str, tools: List[Tool]) -> bool:
@@ -553,6 +537,7 @@ class WelmV4ToolDetector(BaseFormatDetector):
         self.current_tool_id += 1
         self._active_tool_index = self.current_tool_id
         self.current_tool_name_sent = True
+        self._pending_post_tool_whitespace_ids = None
         self._ensure_tool_tracking(self._active_tool_index, func_name)
         calls.append(
             ToolCallItem(
@@ -610,10 +595,12 @@ class WelmV4ToolDetector(BaseFormatDetector):
         self._append_arg_delta(calls, prefix)
         self._phase = _StreamPhase.VALUE
 
-    def _append_value_token(self, tid: int, calls: List[ToolCallItem]) -> None:
+    def _append_value_span(
+        self, token_ids: List[int], calls: List[ToolCallItem]
+    ) -> None:
         if self._current_value_decoder is None:
             self._current_value_decoder = self._new_decoder()
-        self._current_value_ids.append(tid)
+        self._current_value_ids.extend(token_ids)
         delta = self._current_value_decoder.step(self._current_value_ids)
         if not delta:
             return
@@ -670,11 +657,27 @@ class WelmV4ToolDetector(BaseFormatDetector):
 
         self.current_tool_name_sent = False
         self._reset_streaming_tool_state()
+        self._pending_post_tool_whitespace_ids = []
 
     def _handle_tool_start(self) -> None:
         self._reset_streaming_tool_state()
         self._phase = _StreamPhase.NAME
         self._active_block_ids = []
+
+    def _handle_outside_span(
+        self, token_ids: List[int], normal_chunks: List[str]
+    ) -> None:
+        if not token_ids:
+            return
+        if self._pending_post_tool_whitespace_ids is not None:
+            candidate_ids = self._pending_post_tool_whitespace_ids + token_ids
+            if not self._decode(candidate_ids).strip():
+                self._pending_post_tool_whitespace_ids = candidate_ids
+                return
+            token_ids = candidate_ids
+            self._pending_post_tool_whitespace_ids = None
+        self._normal_ids.extend(token_ids)
+        normal_chunks.append(self._normal_decoder.step(self._normal_ids))
 
     def _handle_outside_token(self, tid: int, normal_chunks: List[str]) -> None:
         if tid == self.bot_id:
@@ -691,13 +694,15 @@ class WelmV4ToolDetector(BaseFormatDetector):
             normal_chunks.append(self._decode([tid], skip_special_tokens=False))
             return
 
-        self._normal_ids.append(tid)
-        normal_chunks.append(self._normal_decoder.step(self._normal_ids))
+        self._handle_outside_span([tid], normal_chunks)
 
     def _emit_active_tool_as_text(self, normal_chunks: List[str]) -> None:
+        pending_ids = self._pending_post_tool_whitespace_ids or []
+        self._pending_post_tool_whitespace_ids = None
+        raw_ids = pending_ids + [self.bot_id, *self._active_block_ids, self.eot_id]
         normal_chunks.append(
             self._decode(
-                [self.bot_id, *self._active_block_ids, self.eot_id],
+                raw_ids,
                 skip_special_tokens=False,
             )
         )
@@ -819,7 +824,21 @@ class WelmV4ToolDetector(BaseFormatDetector):
             )
             return
 
-        self._append_value_token(tid, calls)
+        self._append_value_span([tid], calls)
+
+    def _dispatch_stream_span(
+        self, token_ids: List[int], calls: List[ToolCallItem], normal_chunks: List[str]
+    ) -> None:
+        if self._phase is _StreamPhase.OUTSIDE:
+            self._handle_outside_span(token_ids, normal_chunks)
+        elif self._phase is _StreamPhase.NAME:
+            self._name_ids.extend(token_ids)
+        elif self._phase is _StreamPhase.KEY:
+            self._key_ids.extend(token_ids)
+        elif self._phase in {_StreamPhase.WAIT_VALUE, _StreamPhase.BETWEEN_ARGS}:
+            self._separator_ids.extend(token_ids)
+        elif self._phase is _StreamPhase.VALUE:
+            self._append_value_span(token_ids, calls)
 
     def _dispatch_stream_token(
         self,
@@ -849,7 +868,12 @@ class WelmV4ToolDetector(BaseFormatDetector):
         tools: List[Tool],
         token_ids: Optional[List[int]] = None,
     ) -> StreamingParseResult:
+        reparse_content_ids = self.reparse_content_ids
         if not self.id_capable or token_ids is None:
+            if reparse_content_ids:
+                raise WelmV4StreamingParseError(
+                    "WeLM-v4 tool-call parser reparse lost token ids"
+                )
             return self._fallback.parse_streaming_increment(new_text, tools)
 
         if self._normal_decoder is None:
@@ -858,15 +882,26 @@ class WelmV4ToolDetector(BaseFormatDetector):
         normal_chunks: List[str] = []
         calls: List[ToolCallItem] = []
 
-        ids = token_ids or []
+        ids = list(token_ids or [])
+        structural_ids = self._structural_token_ids()
         active_call_base = 0
-        for index, tid in enumerate(ids):
+        index = 0
+        while index < len(ids):
+            is_control = ids[index] in structural_ids
+            end = index + 1
+            if not is_control:
+                while end < len(ids) and ids[end] not in structural_ids:
+                    end += 1
+            span = ids[index:end]
             in_tool_before = self._phase is not _StreamPhase.OUTSIDE
             active_block_before = list(self._active_block_ids)
-            if not in_tool_before and tid == self.bot_id:
+            if not in_tool_before and is_control and span[0] == self.bot_id:
                 active_call_base = len(calls)
             try:
-                self._dispatch_stream_token(tid, tools, calls, normal_chunks)
+                if is_control:
+                    self._dispatch_stream_token(span[0], tools, calls, normal_chunks)
+                else:
+                    self._dispatch_stream_span(span, calls, normal_chunks)
             except WelmV4StreamingParseError:
                 raise
             except Exception as exc:
@@ -878,7 +913,6 @@ class WelmV4ToolDetector(BaseFormatDetector):
                     ) from exc
                 return self._streaming_error_result(
                     index=index,
-                    tid=tid,
                     ids=ids,
                     in_tool_before=in_tool_before,
                     active_block_before=active_block_before,
@@ -887,13 +921,43 @@ class WelmV4ToolDetector(BaseFormatDetector):
                     active_call_base=active_call_base,
                     new_text=new_text,
                 )
-            if in_tool_before and tid != self.eot_id:
-                self._active_block_ids.append(tid)
+            if in_tool_before and not (is_control and span[0] == self.eot_id):
+                self._active_block_ids.extend(span)
+            index = end
 
         return StreamingParseResult(normal_text="".join(normal_chunks), calls=calls)
 
+    def finish_content_id_reparse(self) -> str:
+        if self._phase is _StreamPhase.OUTSIDE:
+            self._pending_post_tool_whitespace_ids = None
+            return ""
+        if self.current_tool_name_sent:
+            self._reset_after_streaming_error()
+            raise WelmV4StreamingParseError(
+                "WeLM-v4 tool call ended after irreversible output was streamed"
+            )
+
+        try:
+            pending_ids = self._pending_post_tool_whitespace_ids or []
+            self._pending_post_tool_whitespace_ids = None
+            raw_ids = pending_ids + [self.bot_id, *self._active_block_ids]
+            raw_text = self._decode(
+                raw_ids,
+                skip_special_tokens=False,
+            )
+        except Exception as exc:
+            self._reset_after_streaming_error()
+            raise WelmV4StreamingParseError(
+                "WeLM-v4 parser could not recover incomplete content token ids"
+            ) from exc
+        self._reset_after_streaming_error()
+        return raw_text
+
     def supports_structural_tag(self) -> bool:
-        return False
+        return self._fallback.supports_structural_tag()
+
+    def get_structural_tag(self, *args, **kwargs):
+        return self._fallback.get_structural_tag(*args, **kwargs)
 
     def structure_info(self):
         return self._fallback.structure_info()

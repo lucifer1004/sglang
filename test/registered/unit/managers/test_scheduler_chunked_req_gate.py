@@ -19,6 +19,20 @@ from sglang.srt.mem_cache.common import maybe_cache_unfinished_req
 register_cpu_ci(est_time=6, suite="stage-a-test-cpu")
 
 
+def test_token_stop_truncates_multi_token_mtp_acceptance():
+    req = Req.__new__(Req)
+    req.output_ids = [10, 20, 99, 30, 40]
+    req.finished_len = None
+    req.finished_reason = None
+    req.sampling_params = SimpleNamespace(ignore_eos=False, stop_token_ids={99})
+    req.eos_token_ids = set()
+    req.tokenizer = None
+
+    assert req._check_token_based_finish([20, 99, 30, 40])
+    assert req.finished_len == 3
+    assert req.output_ids_through_stop == [10, 20, 99]
+
+
 def _make_req(
     *,
     req_pool_idx: int,
@@ -174,9 +188,9 @@ class TestStashGatePreservesPrefixIndices(CustomTestCase):
 
         maybe_cache_unfinished_req(req, tree_cache, chunked=True)
 
-        expected = pool.req_to_token[
-            self.POOL_IDX, : self.POST_RESET_FILL_LEN
-        ].to(dtype=torch.int64)
+        expected = pool.req_to_token[self.POOL_IDX, : self.POST_RESET_FILL_LEN].to(
+            dtype=torch.int64
+        )
         self.assertTrue(torch.equal(req.prefix_indices, expected))
         self.assertEqual(req.cache_protected_len, 0)
         tree_cache.cache_unfinished_req.assert_not_called()

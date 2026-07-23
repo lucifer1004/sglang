@@ -2738,6 +2738,46 @@ class TestGlm4MoeDetector(unittest.TestCase):
         ]
         self.detector = Glm4MoeDetector()
 
+    def test_structural_tag_requires_glm45_newline_and_compiles(self):
+        import xgrammar as xgr
+        from xgrammar.testing import _is_grammar_accept_string
+
+        choices = [
+            "auto",
+            "required",
+            ToolChoice(function=ToolChoiceFuncName(name="get_weather")),
+        ]
+        for thinking_mode in (False, True):
+            for tool_choice in choices:
+                with self.subTest(
+                    thinking_mode=thinking_mode, tool_choice=tool_choice
+                ):
+                    structural_tag = self.detector.get_structural_tag(
+                        self.tools,
+                        tool_choice=tool_choice,
+                        thinking_mode=thinking_mode,
+                    )
+                    self.assertIsInstance(structural_tag, xgr.StructuralTag)
+                    grammar = xgr.Grammar.from_structural_tag(structural_tag)
+                    self.assertIsInstance(grammar, xgr.Grammar)
+                    serialized = structural_tag.model_dump_json()
+                    self.assertIn("<tool_call>get_weather\\n", serialized)
+
+        required = self.detector.get_structural_tag(
+            self.tools, tool_choice="required", thinking_mode=False
+        )
+        grammar = xgr.Grammar.from_structural_tag(required)
+        with_newline = (
+            "<tool_call>get_weather\n"
+            "<arg_key>city</arg_key><arg_value>Paris</arg_value>"
+            "<arg_key>date</arg_key><arg_value>2026-07-18</arg_value>"
+            "</tool_call>"
+        )
+        without_newline = with_newline.replace("get_weather\n", "get_weather", 1)
+        self.assertTrue(_is_grammar_accept_string(grammar, with_newline))
+        self.assertTrue(_is_grammar_accept_string(grammar, with_newline * 2))
+        self.assertFalse(_is_grammar_accept_string(grammar, without_newline))
+
     def test_single_tool_call(self):
         text = (
             "<tool_call>get_weather\n"
@@ -4755,6 +4795,39 @@ class TestGetStructureConstraint(unittest.TestCase):
         result = parser.get_structure_constraint("required")
         self.assertIsNotNone(result)
         self.assertEqual(result[0], "structural_tag")
+
+    def test_welm_required_named_and_strict_auto_keep_native_xml(self):
+        parser = self._make_parser("welm-v4", strict=True)
+        named = ToolChoice(function=ToolChoiceFuncName(name="get_weather"))
+        for tool_choice in ("auto", "required", named):
+            for parallel_tool_calls in (False, True):
+                for thinking_mode in (False, True):
+                    with self.subTest(
+                        tool_choice=tool_choice,
+                        parallel_tool_calls=parallel_tool_calls,
+                        thinking_mode=thinking_mode,
+                    ):
+                        result = parser.get_structure_constraint(
+                            tool_choice,
+                            parallel_tool_calls=parallel_tool_calls,
+                            thinking_mode=thinking_mode,
+                        )
+                        self.assertIsNotNone(result)
+                        self.assertEqual(result[0], "structural_tag")
+                        serialized = result[1].model_dump_json()
+                        self.assertIn("<tool_call>get_weather\\n", serialized)
+                        self.assertNotIn('"type":"json_schema"', serialized[:40])
+
+        native_xml = (
+            "<tool_call>get_weather\n"
+            "<arg_key>city</arg_key><arg_value>Paris</arg_value>"
+            "</tool_call>"
+        )
+        normal_text, calls = parser.parse_non_stream(native_xml)
+        self.assertEqual(normal_text, "")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0].name, "get_weather")
+        self.assertEqual(json.loads(calls[0].parameters), {"city": "Paris"})
 
     # --- structural_tag content verification ---
 

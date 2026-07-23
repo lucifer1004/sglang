@@ -68,7 +68,7 @@ def get_argument_type(
     arg_spec = properties.get(arg_key)
     if isinstance(arg_spec, dict):
         # Use the new type inference function for complex JSON Schema support
-        return infer_type_from_json_schema(arg_spec)
+        return infer_type_from_json_schema(arg_spec, params)
 
     return None
 

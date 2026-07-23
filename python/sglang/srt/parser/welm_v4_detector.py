@@ -65,8 +65,9 @@ class WelmV4ReasoningDetector(BaseReasoningFormatDetector):
         self.think_start_id = None
         self.think_end_id = None
         self.id_capable = False
+        self.handoff_content_ids: bool = False
 
-        self.remaining_token_ids: List[int] = []
+        self.remaining_token_ids: Optional[List[int]] = None
         self._stripped_reasoning_start = False
         self._reasoning_ids: List[int] = []
         self._answer_ids: List[int] = []
@@ -92,6 +93,7 @@ class WelmV4ReasoningDetector(BaseReasoningFormatDetector):
         self.id_capable = (
             self.think_start_id is not None and self.think_end_id is not None
         )
+        self.accepts_token_ids = self.id_capable
         self._reset_streaming_state()
 
     @staticmethod
@@ -131,16 +133,16 @@ class WelmV4ReasoningDetector(BaseReasoningFormatDetector):
         if not keep_reasoning_state:
             self._in_reasoning = getattr(self, "force_reasoning", True)
             self._stripped_reasoning_start = False
-        self.remaining_token_ids = []
+        self.remaining_token_ids = [] if self.id_capable else None
         self._reasoning_ids = []
         self._answer_ids = []
         self._reasoning_decoder = None
         self._answer_decoder = None
 
-    def _ensure_stream_decoders(self) -> None:
+    def _ensure_stream_decoders(self, decode_normal_text: bool = True) -> None:
         if self._reasoning_decoder is None:
             self._reasoning_decoder = self._new_decoder()
-        if self._answer_decoder is None:
+        if decode_normal_text and self._answer_decoder is None:
             self._answer_decoder = self._new_decoder()
 
     def _streaming_error_result(
@@ -151,15 +153,28 @@ class WelmV4ReasoningDetector(BaseReasoningFormatDetector):
         self._reset_streaming_state(keep_reasoning_state=True)
         self._in_reasoning = in_reasoning
         if in_reasoning:
+            self.remaining_token_ids = []
             return StreamingParseResult(reasoning_text=new_text)
         self.remaining_token_ids = list(token_ids or [])
         return StreamingParseResult(normal_text=new_text)
+
+    def _normal_text_from_full_text(
+        self, full_text: str, ids: List[int], answer_start: int
+    ) -> str:
+        answer_ids = ids[answer_start:]
+        # Decoding the shorter prefix can avoid a much larger answer decode,
+        # but only when it maps exactly onto the authoritative full text.
+        if answer_ids and answer_start < len(answer_ids):
+            prefix_text = self._decode(ids[:answer_start])
+            if full_text.startswith(prefix_text):
+                return full_text[len(prefix_text) :]
+        return self._decode(answer_ids)
 
     def detect_and_parse(
         self, text: str, token_ids: Optional[List[int]] = None
     ) -> StreamingParseResult:
         if not self.id_capable or token_ids is None:
-            self.remaining_token_ids = []
+            self.remaining_token_ids = None
             return super().detect_and_parse(text)
 
         ids = list(token_ids or [])
@@ -177,50 +192,59 @@ class WelmV4ReasoningDetector(BaseReasoningFormatDetector):
         answer_ids = ids[end + 1 :]
         self.remaining_token_ids = answer_ids
         return StreamingParseResult(
-            normal_text=self._decode(answer_ids),
+            normal_text=self._normal_text_from_full_text(text, ids, end + 1),
             reasoning_text=self._decode(reasoning_ids),
         )
 
     def parse_streaming_increment(
         self, new_text: str, token_ids: Optional[List[int]] = None
     ) -> StreamingParseResult:
+        handoff_content_ids = self.handoff_content_ids
         if not self.id_capable or token_ids is None:
-            self.remaining_token_ids = []
+            if handoff_content_ids:
+                raise ValueError("WeLM-v4 reasoning handoff requires token ids")
+            self.remaining_token_ids = None
             return super().parse_streaming_increment(new_text)
 
-        self._ensure_stream_decoders()
+        self._ensure_stream_decoders(decode_normal_text=not handoff_content_ids)
         reasoning_out = ""
         normal_out = ""
         self.remaining_token_ids = []
+        ids = list(token_ids)
+        if handoff_content_ids and not self._in_reasoning:
+            self.remaining_token_ids = ids
+            return StreamingParseResult()
 
         try:
-            for tid in token_ids:
-                if self._in_reasoning:
-                    if (
-                        not self._stripped_reasoning_start
-                        and tid == self.think_start_id
-                    ):
-                        self._stripped_reasoning_start = True
-                        continue
-                    self._stripped_reasoning_start = True
+            start = 0
+            if self._in_reasoning:
+                start = self._reasoning_start(ids)
+                try:
+                    end = ids.index(self.think_end_id, start)
+                except ValueError:
+                    end = len(ids)
 
-                    if tid == self.think_end_id:
-                        reasoning_out += self._reasoning_decoder.flush(
-                            self._reasoning_ids
-                        )
-                        self._in_reasoning = False
-                        continue
+                self._stripped_reasoning_start = True
+                self._reasoning_ids.extend(ids[start:end])
+                if self.stream_reasoning:
+                    reasoning_out += self._reasoning_decoder.step(self._reasoning_ids)
+                if end == len(ids):
+                    return StreamingParseResult(reasoning_text=reasoning_out)
 
-                    self._reasoning_ids.append(tid)
-                    if self.stream_reasoning:
-                        reasoning_out += self._reasoning_decoder.step(
-                            self._reasoning_ids
-                        )
-                else:
-                    self._answer_ids.append(tid)
-                    normal_out += self._answer_decoder.step(self._answer_ids)
-                    self.remaining_token_ids.append(tid)
-        except Exception:
+                reasoning_out += self._reasoning_decoder.flush(self._reasoning_ids)
+                self._in_reasoning = False
+                start = end + 1
+
+            answer_ids = ids[start:]
+            self.remaining_token_ids = answer_ids
+            if answer_ids and not handoff_content_ids:
+                self._answer_ids.extend(answer_ids)
+                normal_out = self._answer_decoder.step(self._answer_ids)
+        except Exception as exc:
+            if handoff_content_ids:
+                raise ValueError(
+                    "WeLM-v4 reasoning parser could not hand off content token ids"
+                ) from exc
             return self._streaming_error_result(new_text, token_ids)
 
         return StreamingParseResult(
