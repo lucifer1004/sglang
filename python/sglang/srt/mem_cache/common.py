@@ -598,6 +598,19 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
 
     allocator = batch.tree_cache.token_to_kv_pool_allocator
     logical_out_cache_loc = None
+    if (
+        isinstance(allocator, CPShardedKVPoolAllocator)
+        or batch.tree_cache.page_size > 1
+    ):
+        safe_last_indices = torch.clamp(batch.seq_lens - 1, min=0)
+        last_loc = batch.req_to_token_pool.req_to_token[
+            batch.req_pool_indices, safe_last_indices
+        ]
+        last_loc = torch.where(
+            batch.seq_lens > 0,
+            last_loc,
+            torch.full_like(last_loc, -1),
+        )
     if isinstance(allocator, CPShardedKVPoolAllocator):
         if token_per_req != 1:
             raise NotImplementedError(
@@ -610,9 +623,6 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
             ],
             dtype=torch.int64,
         )
-        last_loc = batch.req_to_token_pool.req_to_token[
-            batch.req_pool_indices, batch.seq_lens - 1
-        ]
         seq_lens_next = batch.seq_lens + token_per_req
         evict_from_tree_cache(batch.tree_cache, bs * token_per_req)
         alloc_result = allocator.alloc_decode_with_logical(
@@ -630,9 +640,6 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
         out_cache_loc = alloc_token_slots(batch.tree_cache, bs * token_per_req)
     else:
         # Paged allocation
-        last_loc = batch.req_to_token_pool.req_to_token[
-            batch.req_pool_indices, batch.seq_lens - 1
-        ]
         seq_lens_next = batch.seq_lens + token_per_req
         out_cache_loc = alloc_paged_token_slots_decode(
             tree_cache=batch.tree_cache,
@@ -678,7 +685,16 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
     return out_cache_loc
 
 
-def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = True):
+def release_kv_cache(
+    req: Req,
+    tree_cache: BasePrefixCache,
+    is_insert: bool = True,
+    allow_uncommitted_tail: bool = False,
+):
+    if allow_uncommitted_tail and is_insert:
+        raise AssertionError(
+            "Uncommitted KV tail may only be released without cache insertion"
+        )
     # MambaRadixCache may alloc mamba state before alloc KV cache
     if req.req_pool_idx is None:
         assert (
@@ -703,6 +719,11 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
         return
 
     start_p, end_p = req.pop_overallocated_kv_cache()
+    if allow_uncommitted_tail:
+        assert end_p == start_p + 1, (
+            "Deferred decode retraction must expose exactly one uncommitted KV "
+            f"slot, got [{start_p}, {end_p})"
+        )
 
     global_server_args = get_global_server_args()
     page_size = global_server_args.page_size
@@ -712,7 +733,7 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
     # so they fall into the free path below (#22373).
     if spec_algo is None and not global_server_args.strip_thinking_cache:
         assert (
-            start_p == end_p
+            start_p == end_p or allow_uncommitted_tail
         ), f"Unexpected overallocated KV cache, {req.kv_committed_len=}, {req.kv_allocated_len=}"
 
     if page_size > 1:

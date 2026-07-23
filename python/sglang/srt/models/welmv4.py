@@ -122,8 +122,13 @@ from sglang.srt.model_executor.forward_batch_context import get_current_forward_
 from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     PPProxyTensors,
+    WelmDeferredPrefillCompletion,
 )
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.models.welm_deferred_mirror import (
+    WelmDeferredModelExecution,
+    get_welm_deferred_model_execution,
+)
 from sglang.srt.models.welm_perf_opt import (
     compute_welm_oe_embedding,
     welm_embeddings,
@@ -136,6 +141,7 @@ from sglang.srt.utils import (
     add_prefix,
     get_bool_env_var,
     is_cuda,
+    log_info_on_rank0,
     make_layers,
     set_weight_attrs,
 )
@@ -713,6 +719,26 @@ def _welm_cp_prefill_prefix_send_only(
     return gather_plan.prefix.local_physical_slots.numel() != 0
 
 
+def _welm_cp_prefill_short_empty_rank(
+    row_count: int,
+    forward_batch: ForwardBatch,
+) -> bool:
+    runtime_layout = getattr(
+        forward_batch, "attn_cp_prefill_runtime_layout", None
+    )
+    return bool(
+        row_count == 0
+        and runtime_layout is not None
+        and getattr(runtime_layout, "active_local_tokens", 0) == 0
+        and getattr(runtime_layout, "kv_local_tokens", 0) == 0
+        and getattr(
+            forward_batch,
+            "attn_cp_prefill_short_full_kv_collective",
+            False,
+        )
+    )
+
+
 def _welm_should_dispatch_attention(
     row_count: int,
     forward_batch: ForwardBatch,
@@ -735,6 +761,7 @@ def _welm_should_dispatch_attention(
         or needs_empty_dp_collectives
         or has_local_kv
         or _welm_cp_prefill_prefix_send_only(row_count, forward_batch)
+        or _welm_cp_prefill_short_empty_rank(row_count, forward_batch)
     )
 
 
@@ -892,14 +919,23 @@ def _welm_prepare_cp_prefill_logits_states(
             + runtime_layout.spec.extend_len
             - 1
         )
+        if (
+            logits_metadata.capture_hidden_mode.need_capture()
+            and not aux_hidden_states
+            and hidden_states.shape[0] != 0
+        ):
+            raise RuntimeError(
+                "WeLM Phase 2 active CP rank is missing the captured "
+                "last hidden state"
+            )
         routed_hidden_states = route_cp_prefill_hidden_states(
             hidden_states,
             runtime_layout,
             logical_start=final_logical,
             token_count=1,
         )
-        routed_aux_hidden_states = (
-            [
+        if aux_hidden_states:
+            routed_aux_hidden_states = [
                 route_cp_prefill_hidden_states(
                     hidden,
                     runtime_layout,
@@ -908,9 +944,20 @@ def _welm_prepare_cp_prefill_logits_states(
                 )
                 for hidden in aux_hidden_states
             ]
-            if aux_hidden_states is not None
-            else None
-        )
+        elif logits_metadata.capture_hidden_mode.need_capture():
+            # KV-mirror contraction can leave this CP rank with no Q rows. It
+            # must still enqueue the owner's LAST-capture route so every rank
+            # observes the same Global TP collective sequence.
+            routed_aux_hidden_states = [
+                route_cp_prefill_hidden_states(
+                    hidden_states,
+                    runtime_layout,
+                    logical_start=final_logical,
+                    token_count=1,
+                )
+            ]
+        else:
+            routed_aux_hidden_states = None
     logits_metadata.prefill_cp_pruned = True
     return _WelmPreparedLogits(
         hidden_states=routed_hidden_states,
@@ -1165,13 +1212,21 @@ def _welm_write_kv_cache_only(
 ) -> None:
     if k is None or v is None:
         return
-    if forward_batch.out_cache_loc is None:
+    runtime_layout = getattr(
+        forward_batch, "attn_cp_prefill_runtime_layout", None
+    )
+    cache_loc = (
+        runtime_layout.local_out_cache_loc
+        if runtime_layout is not None
+        else forward_batch.out_cache_loc
+    )
+    if cache_loc is None:
         return
-    if k.numel() == 0 or v.numel() == 0 or forward_batch.out_cache_loc.numel() == 0:
+    if k.numel() == 0 or v.numel() == 0 or cache_loc.numel() == 0:
         return
     forward_batch.token_to_kv_pool.set_kv_buffer(
         attn,
-        forward_batch.out_cache_loc,
+        cache_loc,
         k.view(-1, attn.tp_k_head_num, attn.qk_head_dim),
         v.view(-1, attn.tp_v_head_num, attn.v_head_dim),
         attn.k_scale,
@@ -1431,6 +1486,21 @@ def _welm_update_contracted_dp_metadata(
     set_is_extend_in_batch(forward_batch.is_extend_in_batch)
     if marker_attr is not None:
         setattr(forward_batch, marker_attr, new_local_num_tokens)
+
+
+def _welm_effective_kv_mirror_pairs(
+    config: PretrainedConfig,
+) -> Tuple[List[int], List[int]]:
+    execution = get_welm_deferred_model_execution(config)
+    if execution is None or execution.role != "prefill":
+        return (
+            list(getattr(config, "kv_mirror_layers", [])),
+            list(getattr(config, "kv_mirror_imitated_layers", [])),
+        )
+    return (
+        [pair.target_layer for pair in execution.plan.pairs],
+        [pair.source_layer for pair in execution.plan.pairs],
+    )
 
 
 def _get_kv_mirror_pair_maps(
@@ -3000,6 +3070,119 @@ def get_rope(
     return rotary_emb
 
 
+@dataclass(frozen=True)
+class WelmDeferredKVCacheLayer:
+    layer_id: int
+    tp_k_head_num: int
+    tp_v_head_num: int
+    qk_head_dim: int
+    v_head_dim: int
+    k_scale: Optional[float] = None
+    v_scale: Optional[float] = None
+
+
+@dataclass(frozen=True)
+class WelmDeferredWeightLoadStats:
+    relocated_tensors: int
+    omitted_tensors: int
+    omitted_bytes: int
+
+
+class WelmDeferredTargetKVFinalizer(nn.Module):
+    def __init__(
+        self,
+        *,
+        target_layer_id: int,
+        num_kv_heads: int,
+        head_dim: int,
+        qk_norm: bool,
+        k_norm: bool,
+        qk_norm_eps: float,
+        rotary_emb: WelmV4InplaceRotaryEmbedding,
+        scale_seq_factor: int,
+        scale_rope_positions: bool,
+    ) -> None:
+        super().__init__()
+        self.target_layer_id = target_layer_id
+        self.num_kv_heads = num_kv_heads
+        self.head_dim = head_dim
+        self.scale_seq_factor = scale_seq_factor
+        self.scale_rope_positions = scale_rope_positions
+        self.apply_k_norm = qk_norm or k_norm
+        self.k_norm = (
+            WelmV4FusedRMSNorm(head_dim, eps=qk_norm_eps)
+            if self.apply_k_norm
+            else nn.Identity()
+        )
+        # The source attention already owns and moves this shared RoPE module.
+        object.__setattr__(self, "rotary_emb", rotary_emb)
+        self.cache_layer = WelmDeferredKVCacheLayer(
+            layer_id=target_layer_id,
+            tp_k_head_num=num_kv_heads,
+            tp_v_head_num=num_kv_heads,
+            qk_head_dim=head_dim,
+            v_head_dim=head_dim,
+        )
+
+    def forward(
+        self,
+        positions: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> None:
+        if key.shape != value.shape:
+            raise RuntimeError(
+                "WeLM deferred target K/V shapes differ for "
+                f"layer {self.target_layer_id}: {key.shape} vs {value.shape}"
+            )
+        if key.shape[0] != positions.shape[0]:
+            raise RuntimeError(
+                "WeLM deferred target K rows do not match positions for "
+                f"layer {self.target_layer_id}: {key.shape[0]} vs {positions.shape[0]}"
+            )
+        out_cache_loc = getattr(forward_batch, "out_cache_loc", None)
+        if key.shape[0] > 0 and (
+            out_cache_loc is None or out_cache_loc.numel() == 0
+        ):
+            raise RuntimeError(
+                "WeLM deferred target K/V has rows but no cache destination for "
+                f"layer {self.target_layer_id}"
+            )
+
+        if self.apply_k_norm:
+            key_by_head = key.view(
+                key.shape[0], self.num_kv_heads, self.head_dim
+            )
+            key_by_head = mmq_style_k_rms_norm(
+                key_by_head.contiguous(), self.k_norm.weight, self.k_norm.eps
+            )
+            key = key_by_head.view(key.shape)
+
+        rope_positions = positions
+        if self.scale_rope_positions and self.scale_seq_factor > 1:
+            rope_positions = positions // self.scale_seq_factor
+        self.rotary_emb.forward_k_only_cuda(rope_positions, key)
+        _welm_write_kv_cache_only(self.cache_layer, key, value, forward_batch)
+
+
+def _welm_finalize_deferred_target_kv(
+    finalizers: nn.ModuleDict,
+    positions: torch.Tensor,
+    forward_batch: ForwardBatch,
+    kv_mirror_states: Dict[int, Tuple[torch.Tensor, torch.Tensor]],
+) -> None:
+    for target_layer_key, finalizer in finalizers.items():
+        target_layer_id = int(target_layer_key)
+        mirror_kv = kv_mirror_states.pop(target_layer_id, None)
+        if mirror_kv is None:
+            raise RuntimeError(
+                "WeLM deferred source projection did not produce K/V for "
+                f"target layer {target_layer_id}"
+            )
+        finalizer(positions, *mirror_kv, forward_batch)
+
+
 class Qwen2MoeAttention(nn.Module):
     @staticmethod
     def _normalize_sliding_window_size(config: PretrainedConfig, window) -> int:
@@ -3291,6 +3474,30 @@ class Qwen2MoeAttention(nn.Module):
             )
         else:
             self.qkv_proj = StandardQkvProjection(**qkv_proj_kwargs)
+        self.deferred_target_kv_finalizers = nn.ModuleDict()
+        deferred_execution = get_welm_deferred_model_execution(config)
+        if deferred_execution is not None and deferred_execution.role == "prefill":
+            for target_layer_id in imitated_to_mirrors.get(
+                self.kv_mirror_layer_idx, []
+            ):
+                target_uses_scaled_positions = bool(
+                    scale_seq_attn_per_suffix_layerwise
+                    and len(scale_seq_attn_per_suffix_layerwise) > target_layer_id
+                    and scale_seq_attn_per_suffix_layerwise[target_layer_id]
+                )
+                self.deferred_target_kv_finalizers[str(target_layer_id)] = (
+                    WelmDeferredTargetKVFinalizer(
+                        target_layer_id=target_layer_id,
+                        num_kv_heads=self.num_kv_heads,
+                        head_dim=self.head_dim,
+                        qk_norm=qk_norm,
+                        k_norm=k_norm,
+                        qk_norm_eps=qk_norm_eps,
+                        rotary_emb=self.rotary_emb,
+                        scale_seq_factor=max(int(scale_seq_times or 0) + 1, 1),
+                        scale_rope_positions=target_uses_scaled_positions,
+                    )
+                )
         if is_nextn:
             self.need_clear_kv_cache = self.layer_idx == num_nextn_predict_layers - 1
         elif get_global_server_args().speculative_algorithm is not None:
@@ -3346,9 +3553,12 @@ class Qwen2MoeAttention(nn.Module):
                     f"{dump_prefix}.req_pool_indices",
                     forward_batch.req_pool_indices,
                 )
-        if _welm_cp_prefill_prefix_send_only(
+        communication_only = _welm_cp_prefill_prefix_send_only(
             hidden_states.shape[0], forward_batch
-        ):
+        ) or _welm_cp_prefill_short_empty_rank(
+            hidden_states.shape[0], forward_batch
+        )
+        if communication_only:
             if scp_per_suffix:
                 raise NotImplementedError(
                     "Phase 2 prefix-only K/V send does not support suffix parallel"
@@ -3367,6 +3577,13 @@ class Qwen2MoeAttention(nn.Module):
         q, k, v, hidden_states = self.qkv_proj.forward(
             self, hidden_states, forward_batch, kv_mirror_states
         )
+        if self.deferred_target_kv_finalizers:
+            _welm_finalize_deferred_target_kv(
+                self.deferred_target_kv_finalizers,
+                positions,
+                forward_batch,
+                kv_mirror_states,
+            )
         if (k is None) != (v is None):
             raise RuntimeError(
                 "WeLMV4 attention expects K/V to be both present or both absent."
@@ -3637,10 +3854,10 @@ class Qwen2MoeDecoderLayer(nn.Module):
         )
         qk_rope_head_dim = getattr(config, "qk_rope_head_dim", head_dim)
 
-        self.kv_mirror_layers = getattr(config, "kv_mirror_layers", [])
-        self.kv_mirror_imitated_layers = getattr(
-            config, "kv_mirror_imitated_layers", []
-        )
+        (
+            self.kv_mirror_layers,
+            self.kv_mirror_imitated_layers,
+        ) = _welm_effective_kv_mirror_pairs(config)
         self.sliding_window_size_layerwise = getattr(
             config, "sliding_window_size_layerwise", []
         )
@@ -4101,6 +4318,14 @@ class Qwen2MoeModel(nn.Module):
     ) -> None:
         super().__init__()
         self.config = config
+        self.deferred_execution: Optional[WelmDeferredModelExecution] = (
+            get_welm_deferred_model_execution(config)
+        )
+        self.execution_end_layer = (
+            self.deferred_execution.execution_end_layer
+            if self.deferred_execution is not None
+            else config.num_hidden_layers
+        )
         self.padding_idx = getattr(config, "pad_token_id", None)
         self.vocab_size = config.vocab_size
         self.pp_group = get_pp_group()
@@ -4221,15 +4446,21 @@ class Qwen2MoeModel(nn.Module):
 
         # Use the provided decoder layer type or default to Qwen2MoeDecoderLayer
         decoder_layer_type = decoder_layer_type or Qwen2MoeDecoderLayer
-        self.layers, self.start_layer, self.end_layer = make_layers(
-            config.num_hidden_layers,
-            lambda idx, prefix: decoder_layer_type(
+
+        def build_decoder_layer(idx, prefix):
+            if idx >= self.execution_end_layer:
+                return PPMissingLayer()
+            return decoder_layer_type(
                 layer_id=idx,
                 config=config,
                 quant_config=quant_config,
                 prefix=prefix,
                 alt_stream=alt_stream,
-            ),
+            )
+
+        self.layers, self.start_layer, self.end_layer = make_layers(
+            config.num_hidden_layers,
+            build_decoder_layer,
             pp_rank=self.pp_group.rank_in_group,
             pp_size=self.pp_group.world_size,
             prefix=add_prefix("layers", prefix),
@@ -4256,7 +4487,12 @@ class Qwen2MoeModel(nn.Module):
             )
             for slot_id, block in enumerate(local_moe_blocks):
                 block.set_mk_moe_router(self.mk_moe_router, slot_id)
-        if self.pp_group.is_last_rank:
+        if (
+            self.deferred_execution is not None
+            and self.deferred_execution.omit_final_output
+        ):
+            self.norm = PPMissingLayer(return_tuple=True)
+        elif self.pp_group.is_last_rank:
             self.norm = (
                 RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
                 if welm_use_previous_precision()
@@ -4386,8 +4622,10 @@ class Qwen2MoeModel(nn.Module):
         aux_hidden_states = []
         use_previous_precision = welm_use_previous_precision()
         pre_norm_hidden_states = None
-        if forward_batch.can_run_tbo and not _welm_should_contract_kv_mirror(
-            forward_batch
+        if (
+            forward_batch.can_run_tbo
+            and self.execution_end_layer == self.config.num_hidden_layers
+            and not _welm_should_contract_kv_mirror(forward_batch)
         ):
             hidden_states, residual = model_forward_maybe_tbo(
                 layers=self.layers,
@@ -4400,7 +4638,10 @@ class Qwen2MoeModel(nn.Module):
             )
         else:
             kv_mirror_indices_initialized = False
-            for i in range(self.start_layer, self.end_layer):
+            for i in range(
+                self.start_layer,
+                min(self.end_layer, self.execution_end_layer),
+            ):
                 if i in self.layers_to_capture:
                     aux_hidden_states.append(
                         hidden_states + residual
@@ -4437,6 +4678,15 @@ class Qwen2MoeModel(nn.Module):
                         mtp_kv_mirror_states = _clone_welm_kv_mirror_states(
                             kv_mirror_states
                         )
+        omit_final_output = (
+            self.deferred_execution is not None
+            and self.deferred_execution.omit_final_output
+        )
+        if omit_final_output and kv_mirror_states:
+            raise RuntimeError(
+                "WeLM deferred Prefill retained temporary mirror K/V "
+                f"for target layers {sorted(kv_mirror_states)}"
+            )
         _set_welm_kv_mirror_states(forward_batch, kv_mirror_states)
         if mtp_kv_mirror_states:
             model_specific_states = dict(forward_batch.model_specific_states or {})
@@ -4449,7 +4699,7 @@ class Qwen2MoeModel(nn.Module):
             _pack_welm_kv_mirror_states(proxy_tensors, kv_mirror_states)
             return PPProxyTensors(proxy_tensors)
         else:
-            if hidden_states.shape[0] != 0:
+            if hidden_states.shape[0] != 0 and not omit_final_output:
                 if use_previous_precision:
                     if residual is None:
                         hidden_states = self.norm(hidden_states)
@@ -4588,6 +4838,9 @@ class WeLMV4MoeForCausalLM(nn.Module):
         self.pp_group = get_pp_group()
         self.config = config
         self.quant_config = quant_config
+        self.deferred_execution: Optional[WelmDeferredModelExecution] = (
+            get_welm_deferred_model_execution(config)
+        )
         alt_stream = torch.cuda.Stream(device=torch.cuda.current_device())
         self.model = Qwen2MoeModel(
             config,
@@ -4595,14 +4848,20 @@ class WeLMV4MoeForCausalLM(nn.Module):
             prefix=add_prefix("model", prefix),
             alt_stream=alt_stream,
         )
-        self.lm_head = ParallelLMHead(
-            config.vocab_size,
-            config.hidden_size,
-            quant_config=quant_config,
-            prefix=add_prefix("lm_head", prefix),
-            use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
-            padding_size=get_global_server_args().welm_vocab_padding_size,
-        )
+        if (
+            self.deferred_execution is not None
+            and self.deferred_execution.omit_final_output
+        ):
+            self.lm_head = PPMissingLayer()
+        else:
+            self.lm_head = ParallelLMHead(
+                config.vocab_size,
+                config.hidden_size,
+                quant_config=quant_config,
+                prefix=add_prefix("lm_head", prefix),
+                use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
+                padding_size=get_global_server_args().welm_vocab_padding_size,
+            )
         self.logits_processor = LogitsProcessor(config)
         # For EAGLE3 support
         self.capture_aux_hidden_states = False
@@ -4628,7 +4887,12 @@ class WeLMV4MoeForCausalLM(nn.Module):
         input_embeds: torch.Tensor = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
         skip_oe_fusion: bool = False,
-    ) -> torch.Tensor:
+    ) -> Union[
+        torch.Tensor,
+        LogitsProcessorOutput,
+        PPProxyTensors,
+        WelmDeferredPrefillCompletion,
+    ]:
         model_output = self.model(
             input_ids,
             positions,
@@ -4637,6 +4901,34 @@ class WeLMV4MoeForCausalLM(nn.Module):
             pp_proxy_tensors=pp_proxy_tensors,
             skip_oe_fusion=skip_oe_fusion,
         )
+        if (
+            self.deferred_execution is not None
+            and self.deferred_execution.omit_final_output
+        ):
+            if not self.pp_group.is_last_rank:
+                raise RuntimeError(
+                    "WeLM deferred Prefill completion does not support pipeline parallelism"
+                )
+            if not forward_batch.forward_mode.is_extend(
+                include_draft_extend_v2=True
+            ):
+                raise RuntimeError(
+                    "WeLM deferred Prefill completion requires an extend forward"
+                )
+            if isinstance(model_output, tuple):
+                raise RuntimeError(
+                    "WeLM deferred Prefill does not support hidden-state output payloads"
+                )
+            capture_hidden_mode = getattr(forward_batch, "capture_hidden_mode", None)
+            if getattr(forward_batch, "return_logprob", False) or (
+                capture_hidden_mode is not None
+                and capture_hidden_mode.need_capture()
+            ):
+                raise RuntimeError(
+                    "WeLM deferred Prefill does not support logprob or hidden-state output payloads"
+                )
+            return WelmDeferredPrefillCompletion()
+
         aux_hidden_states = None
         if isinstance(model_output, tuple):
             hidden_states, aux_hidden_states = model_output
@@ -4852,8 +5144,42 @@ class WeLMV4MoeForCausalLM(nn.Module):
                     continue
                 kv_mirror_route[hf_name[: -len(".weight")]] = (module, slot)
 
+        deferred_execution = getattr(self, "deferred_execution", None)
+        is_deferred_prefill = (
+            deferred_execution is not None and deferred_execution.role == "prefill"
+        )
+        deferred_finalizer_route = {}
+        if is_deferred_prefill:
+            for module in modules_dict.values():
+                if not isinstance(module, WelmDeferredTargetKVFinalizer):
+                    continue
+                k_norm_weight = getattr(getattr(module, "k_norm", None), "weight", None)
+                if k_norm_weight is None:
+                    continue
+                hf_name = (
+                    f"model.layers.{module.target_layer_id}.self_attn.k_norm.weight"
+                )
+                if hf_name in deferred_finalizer_route:
+                    raise RuntimeError(
+                        f"duplicate deferred target K-norm route for {hf_name}"
+                    )
+                deferred_finalizer_route[hf_name] = k_norm_weight
+
+        relocated_weight_names = set()
+        relocated_tensors = 0
+        omitted_tensors = 0
+        omitted_bytes = 0
+        omitted_layer_ids = (
+            frozenset(deferred_execution.omitted_layer_ids)
+            if is_deferred_prefill
+            else frozenset()
+        )
+
         def maybe_load_remote_kv_mirror_weight(
-            name: str, loaded_weight: torch.Tensor
+            name: str,
+            loaded_weight: torch.Tensor,
+            *,
+            strict: bool = False,
         ) -> bool:
             target = kv_mirror_route.get(name.rpartition(".")[0])
             if target is None:
@@ -4868,7 +5194,25 @@ class WeLMV4MoeForCausalLM(nn.Module):
             )
             if pair_param is not None and hasattr(pair_param, "weight_loader"):
                 pair_param.weight_loader(pair_param, loaded_weight, slot)
+                return True
+            if strict:
+                raise RuntimeError(
+                    "WeLM deferred target K/V route resolved without a loadable "
+                    f"parameter: name={name}, slot={slot}"
+                )
             return True
+
+        def record_relocated_weight(name: str) -> None:
+            nonlocal relocated_tensors
+            if name in relocated_weight_names:
+                raise RuntimeError(f"duplicate relocated weight {name}")
+            relocated_weight_names.add(name)
+            relocated_tensors += 1
+
+        def record_omitted_weight(loaded_weight: torch.Tensor) -> None:
+            nonlocal omitted_tensors, omitted_bytes
+            omitted_tensors += 1
+            omitted_bytes += loaded_weight.numel() * loaded_weight.element_size()
 
         if is_nextn:
             is_welm_mtp_nextn = bool(
@@ -4941,6 +5285,51 @@ class WeLMV4MoeForCausalLM(nn.Module):
                             ]
                         )
             layer_id = get_layer_id(name)
+            if is_deferred_prefill:
+                finalizer_param = deferred_finalizer_route.get(name)
+                if finalizer_param is not None:
+                    record_relocated_weight(name)
+                    weight_loader = getattr(
+                        finalizer_param, "weight_loader", default_weight_loader
+                    )
+                    weight_loader(finalizer_param, loaded_weight)
+                    continue
+
+                is_pruned_layer = (
+                    layer_id is not None and layer_id in omitted_layer_ids
+                )
+                if is_pruned_layer and (
+                    ".self_attn.k_proj." in name
+                    or ".self_attn.v_proj." in name
+                ):
+                    projection_name = (
+                        "K" if ".self_attn.k_proj." in name else "V"
+                    )
+                    route_name = name.rpartition(".")[0]
+                    if route_name not in kv_mirror_route:
+                        raise RuntimeError(
+                            f"WeLM deferred target {projection_name} projection "
+                            f"has no relocated route for layer {layer_id}: {name}"
+                        )
+                    record_relocated_weight(name)
+                    if not maybe_load_remote_kv_mirror_weight(
+                        name, loaded_weight, strict=True
+                    ):
+                        raise RuntimeError(
+                            f"WeLM deferred target {projection_name} projection "
+                            f"has no relocated route for layer {layer_id}: {name}"
+                        )
+                    continue
+                if is_pruned_layer and ".self_attn.k_norm." in name:
+                    raise RuntimeError(
+                        "WeLM deferred target K-norm has no relocated route for "
+                        f"layer {layer_id}: {name}"
+                    )
+                if is_pruned_layer or name.startswith("model.norm.") or name.startswith(
+                    "lm_head."
+                ):
+                    record_omitted_weight(loaded_weight)
+                    continue
             if (
                 layer_id is not None
                 and hasattr(self.model, "start_layer")
@@ -5067,6 +5456,20 @@ class WeLMV4MoeForCausalLM(nn.Module):
                     f"extra_steps={sorted(extra_nextn_steps)}, "
                     f"num_nextn_predict_layers={num_nextn_layers}."
                 )
+
+        if is_deferred_prefill:
+            self.welm_deferred_weight_load_stats = WelmDeferredWeightLoadStats(
+                relocated_tensors=relocated_tensors,
+                omitted_tensors=omitted_tensors,
+                omitted_bytes=omitted_bytes,
+            )
+            log_info_on_rank0(
+                logger,
+                "WeLM deferred Prefill weight load: "
+                f"relocated_tensors={relocated_tensors}, "
+                f"omitted_tensors={omitted_tensors}, "
+                f"omitted_bytes={omitted_bytes}",
+            )
 
     def get_embed_and_head(self):
         return [

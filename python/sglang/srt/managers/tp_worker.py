@@ -41,7 +41,11 @@ from sglang.srt.managers.schedule_batch import ModelWorkerBatch, ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.model_executor.forward_batch_info import (
+    ForwardBatch,
+    PPProxyTensors,
+    WelmDeferredPrefillCompletion,
+)
 from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import MultiprocessingSerializer, broadcast_pyobj, set_random_seed
@@ -534,6 +538,37 @@ class TpModelWorker(BaseTpWorker):
                 skip_attn_backend_init=skip_attn_backend_init,
             )
             logits_output, can_run_cuda_graph = out.logits_output, out.can_run_graph
+            if isinstance(logits_output, WelmDeferredPrefillCompletion):
+                if is_verify:
+                    raise RuntimeError(
+                        "WeLM deferred Prefill completion cannot be used for target verification"
+                    )
+                capture_hidden_mode = getattr(
+                    model_worker_batch, "capture_hidden_mode", None
+                )
+                return_hidden_states = getattr(
+                    model_worker_batch, "return_hidden_states", False
+                ) or (
+                    capture_hidden_mode is not None
+                    and capture_hidden_mode.need_capture()
+                )
+                if model_worker_batch.return_logprob or return_hidden_states:
+                    raise RuntimeError(
+                        "WeLM deferred Prefill does not support an output payload"
+                    )
+                return GenerationBatchResult(
+                    logits_output=None,
+                    welm_deferred_prefill_completion=logits_output,
+                    next_token_ids=torch.zeros(
+                        len(model_worker_batch.seq_lens),
+                        dtype=torch.long,
+                        device=model_worker_batch.input_ids.device,
+                    ),
+                    can_run_cuda_graph=can_run_cuda_graph,
+                    expert_distribution_metrics=out.expert_distribution_metrics,
+                    routed_experts_output=out.routed_experts_output,
+                    indexer_topk_output=out.indexer_topk_output,
+                )
             batch_result = GenerationBatchResult(
                 logits_output=logits_output,
                 can_run_cuda_graph=can_run_cuda_graph,

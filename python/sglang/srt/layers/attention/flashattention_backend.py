@@ -29,6 +29,7 @@ from sglang.srt.layers.attention.cp_sharded_kv import (
     build_cp_sharded_kv_prefill_plan,
     gather_cp_prefill_kv,
     gather_cp_prefill_swa_kv,
+    should_use_full_cp_kv_collective,
 )
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.radix_attention import AttentionType
@@ -502,6 +503,18 @@ class FlashAttentionBackend(AttentionBackend):
                     device=model_runner.device,
                     max_rows=self.max_context_len,
                     row_width=k_row_width,
+                    max_calls_per_forward=max(
+                        1,
+                        int(model_runner.model_config.num_hidden_layers)
+                        + int(
+                            getattr(
+                                model_runner.model_config,
+                                "num_nextn_predict_layers",
+                                0,
+                            )
+                            or 0
+                        ),
+                    ),
                 )
                 model_runner._prefill_cp_kv_ipc_transport = transport
                 logger.info(
@@ -2688,6 +2701,26 @@ class FlashAttentionBackend(AttentionBackend):
         value = value_cache[pages, offsets].contiguous()
         return key, value
 
+    def _resolve_cp_prefill_swa_prefix_slots(
+        self,
+        prefix_slots: torch.Tensor,
+        *,
+        missing_slot_message: str,
+    ) -> torch.Tensor:
+        if prefix_slots.numel() == 0:
+            return prefix_slots
+
+        prefix_slots = self.cp_sharded_page_table_resolver.resolve_swa_slots(
+            prefix_slots
+        )
+        no_dummy = torch.all(prefix_slots != 0)
+        if prefix_slots.device.type == "cpu":
+            if not bool(no_dummy):
+                raise RuntimeError(missing_slot_message)
+        else:
+            torch._assert_async(no_dummy, missing_slot_message)
+        return prefix_slots
+
     def _forward_extend_sharded_kv_swa_compact(
         self,
         q_local: torch.Tensor,
@@ -2719,21 +2752,12 @@ class FlashAttentionBackend(AttentionBackend):
         prefix_slots = gather_plan.prefix.local_physical_slots.index_select(
             0, prefix_send_indices
         )
-        if prefix_slots.numel() != 0:
-            prefix_slots = self.cp_sharded_page_table_resolver.resolve_swa_slots(
-                prefix_slots
-            )
-            no_dummy = torch.all(prefix_slots != 0)
-            if prefix_slots.device.type == "cpu":
-                if not bool(no_dummy):
-                    raise RuntimeError(
-                        "Phase 2 SWA compact gather selected a missing prefix slot"
-                    )
-            else:
-                torch._assert_async(
-                    no_dummy,
-                    "Phase 2 SWA compact gather selected a missing prefix slot",
-                )
+        prefix_slots = self._resolve_cp_prefill_swa_prefix_slots(
+            prefix_slots,
+            missing_slot_message=(
+                "Phase 2 SWA compact gather selected a missing prefix slot"
+            ),
+        )
         packed_prefix_k, packed_prefix_v = self._read_cp_prefill_prefix_kv(
             prefix_slots,
             key_cache,
@@ -2869,7 +2893,14 @@ class FlashAttentionBackend(AttentionBackend):
                 "Phase 2 K/V rows do not match the owner-local runtime layout"
             )
 
-        if window_size != (-1, -1):
+        use_full_collective = should_use_full_cp_kv_collective(
+            runtime_layout,
+            page_size=self.page_size,
+        )
+        use_dense_swa_full_collective = (
+            window_size != (-1, -1) and use_full_collective
+        )
+        if window_size != (-1, -1) and not use_full_collective:
             return self._forward_extend_sharded_kv_swa_compact(
                 q_local,
                 k_local,
@@ -2884,12 +2915,17 @@ class FlashAttentionBackend(AttentionBackend):
                 kwargs=kwargs,
             )
 
-        destination_ranks = tuple(
+        active_destination_ranks = tuple(
             rank
             for rank, count in enumerate(
                 runtime_layout.active_tokens_per_cp_rank()
             )
             if count != 0
+        )
+        destination_ranks = (
+            tuple(range(len(runtime_layout.active_per_rank_tokens)))
+            if use_full_collective
+            else active_destination_ranks
         )
         ipc_lease = None
         prefill_cp_kv_ipc_transport = getattr(
@@ -2900,7 +2936,11 @@ class FlashAttentionBackend(AttentionBackend):
             "attn_cp_prefill_kv_source_push_plan",
             None,
         )
-        if source_push_plan is not None:
+        use_ipc_source_push = (
+            source_push_plan is not None
+            and not use_dense_swa_full_collective
+        )
+        if use_ipc_source_push:
             if prefill_cp_kv_ipc_transport is None:
                 raise RuntimeError(
                     "Prefill CP K/V IPC source-push plan is missing its transport; "
@@ -2924,6 +2964,12 @@ class FlashAttentionBackend(AttentionBackend):
                 raise RuntimeError(
                     "Prefill CP K/V IPC requires contiguous paged K/V cache"
                 )
+            forward_iter = getattr(forward_batch, "forward_iter", None)
+            if forward_iter is None:
+                raise RuntimeError(
+                    "Prefill CP K/V IPC requires the scheduler forward_iter; "
+                    "local epoch fallback is disabled in production"
+                )
             ipc_lease = prefill_cp_kv_ipc_transport.push(
                 plan=source_push_plan,
                 prefix_key_rows=key_cache.view(-1, k_row_width),
@@ -2931,6 +2977,8 @@ class FlashAttentionBackend(AttentionBackend):
                 extend_key_rows=k_local.view(-1, k_row_width),
                 extend_value_rows=v_local.view(-1, v_row_width),
                 destination_ranks=destination_ranks,
+                forward_iter=forward_iter,
+                operation_index=layer.layer_id,
             )
             if ipc_lease is None:
                 full_k = None
@@ -2942,13 +2990,23 @@ class FlashAttentionBackend(AttentionBackend):
                 full_v = ipc_lease.value.view(
                     -1, layer.tp_v_head_num, layer.v_head_dim
                 )
-        elif prefill_cp_kv_ipc_transport is not None:
+        elif (
+            prefill_cp_kv_ipc_transport is not None
+            and not use_dense_swa_full_collective
+        ):
             raise RuntimeError(
                 "Prefill CP K/V IPC is missing its source-push plan; "
                 "NCCL gather fallback is disabled"
             )
         else:
             prefix_slots = gather_plan.prefix.local_physical_slots
+            if use_dense_swa_full_collective:
+                prefix_slots = self._resolve_cp_prefill_swa_prefix_slots(
+                    prefix_slots,
+                    missing_slot_message=(
+                        "Phase 2 short SWA gather selected a missing prefix slot"
+                    ),
+                )
             local_prefix_k, local_prefix_v = self._read_cp_prefill_prefix_kv(
                 prefix_slots,
                 key_cache,
@@ -2966,7 +3024,9 @@ class FlashAttentionBackend(AttentionBackend):
             )
         try:
             if runtime_layout.active_local_tokens == 0:
-                if full_k is not None or full_v is not None:
+                if not use_full_collective and (
+                    full_k is not None or full_v is not None
+                ):
                     raise RuntimeError(
                         "empty-Q CP rank unexpectedly received gathered K/V"
                     )
@@ -3046,23 +3106,37 @@ class FlashAttentionBackend(AttentionBackend):
         gather_plan,
         *,
         save_kv_cache: bool,
+        short_full_participation: bool = False,
     ) -> None:
         if save_kv_cache:
             return
-        prefix_send_only = (
+        zero_row_participant = (
             runtime_layout.active_local_tokens == 0
             and getattr(runtime_layout, "kv_local_tokens", 0) == 0
-            and gather_plan.prefix.local_physical_slots.numel() != 0
+            and (
+                gather_plan.prefix.local_physical_slots.numel() != 0
+                or short_full_participation
+            )
         )
-        if not prefix_send_only:
+        if not zero_row_participant:
             raise RuntimeError(
                 "Phase 2 save_kv_cache=False is valid only for a "
-                "prefix-send-only CP rank"
+                "prefix-send-only or bounded short-participation CP rank"
             )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Initialize forward metadata hence all layers in the forward pass can reuse it."""
         self._validate_cp_prefill_runtime(forward_batch)
+        runtime_layout = getattr(
+            forward_batch, "attn_cp_prefill_runtime_layout", None
+        )
+        if runtime_layout is not None:
+            forward_batch.attn_cp_prefill_short_full_kv_collective = (
+                should_use_full_cp_kv_collective(
+                    runtime_layout,
+                    page_size=self.page_size,
+                )
+            )
         metadata = FlashAttentionMetadata()
         metadata.requires_exact_logprob = (
             self._attncp_forward_batch_requires_exact_logprob(forward_batch)
@@ -3664,6 +3738,13 @@ class FlashAttentionBackend(AttentionBackend):
                 runtime_layout,
                 gather_plan,
                 save_kv_cache=save_kv_cache,
+                short_full_participation=bool(
+                    getattr(
+                        forward_batch,
+                        "attn_cp_prefill_short_full_kv_collective",
+                        False,
+                    )
+                ),
             )
             if self._is_scp_suffix_layer(layer, forward_batch):
                 raise NotImplementedError(

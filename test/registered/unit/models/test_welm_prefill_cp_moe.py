@@ -134,7 +134,7 @@ def test_prefill_cp_ppln_keeps_communicator_fp32_residual(
     )
     monkeypatch.setattr(
         welmv4_model,
-        "_welm_should_contract_idle_extend_dp_metadata",
+        "_welm_should_sync_kv_mirror_dp_metadata",
         lambda *_: False,
     )
     monkeypatch.setattr(
@@ -208,7 +208,8 @@ def test_prefill_cp_moe_routes_only_owner_rows_but_keeps_full_expert_input(
             captured["expert_topk"] = topk_output
             return tensor.clone()
 
-    def router_linear(tensor, weight):
+    def router_linear(tensor, weight, *, use_mxfp8):
+        assert not use_mxfp8
         captured["router_hidden"] = tensor
         return torch.arange(8, dtype=torch.float32).view(2, 4)
 
@@ -223,6 +224,7 @@ def test_prefill_cp_moe_routes_only_owner_rows_but_keeps_full_expert_input(
         welmv4_model, "get_global_experts_capturer", lambda: None
     )
     block = SimpleNamespace(
+        _mk_moe_router=None,
         layer_id=3,
         shared_expert=SharedExpert(),
         shared_expert_gate=None,
@@ -231,6 +233,7 @@ def test_prefill_cp_moe_routes_only_owner_rows_but_keeps_full_expert_input(
         experts=Experts(),
         tp_size=1,
         router_score_func="sigmoid",
+        use_mxfp8=False,
     )
 
     output = welmv4_model.Qwen2MoeSparseMoeBlock.forward(
@@ -278,7 +281,7 @@ def test_prefill_cp_default_router_does_not_require_fp32_hidden(monkeypatch):
     monkeypatch.setattr(
         welmv4_model,
         "mmq_style_router_linear",
-        lambda tensor, _weight: torch.ones((tensor.shape[0], 4)),
+        lambda tensor, _weight, *, use_mxfp8: torch.ones((tensor.shape[0], 4)),
     )
     monkeypatch.setattr(
         welmv4_model,
@@ -287,6 +290,7 @@ def test_prefill_cp_default_router_does_not_require_fp32_hidden(monkeypatch):
     )
     monkeypatch.setattr(welmv4_model, "get_global_experts_capturer", lambda: None)
     block = SimpleNamespace(
+        _mk_moe_router=None,
         layer_id=3,
         shared_expert=None,
         shared_expert_gate=None,
@@ -295,6 +299,7 @@ def test_prefill_cp_default_router_does_not_require_fp32_hidden(monkeypatch):
         experts=lambda tensor, _topk: tensor,
         tp_size=1,
         router_score_func="sigmoid",
+        use_mxfp8=False,
     )
 
     output = welmv4_model.Qwen2MoeSparseMoeBlock.forward(
@@ -315,6 +320,7 @@ def test_prefill_cp_moe_rejects_nonstandard_local_topk(monkeypatch):
         local_rows=lambda tensor: tensor[:1],
     )
     block = SimpleNamespace(
+        _mk_moe_router=None,
         layer_id=0,
         shared_expert=None,
         shared_expert_gate=None,
@@ -323,12 +329,13 @@ def test_prefill_cp_moe_rejects_nonstandard_local_topk(monkeypatch):
         experts=MagicMock(),
         tp_size=1,
         router_score_func="sigmoid",
+        use_mxfp8=False,
     )
     monkeypatch.setattr(welmv4_model, "welm_use_previous_precision", lambda: False)
     monkeypatch.setattr(
         welmv4_model,
         "mmq_style_router_linear",
-        lambda tensor, _weight: torch.ones((tensor.shape[0], 4)),
+        lambda tensor, _weight, *, use_mxfp8: torch.ones((tensor.shape[0], 4)),
     )
     monkeypatch.setattr(
         welmv4_model,
@@ -454,7 +461,7 @@ def test_non_dp_decode_does_not_select_layer_communicator_reduce_scatter(monkeyp
         welmv4_model, "_welm_should_dispatch_attention", lambda *_args: True
     )
     monkeypatch.setattr(
-        welmv4_model, "_welm_should_contract_idle_extend_dp_metadata", lambda *_: False
+        welmv4_model, "_welm_should_sync_kv_mirror_dp_metadata", lambda *_: False
     )
     monkeypatch.setattr(
         welmv4_model, "_welm_should_contract_kv_mirror", lambda *_: False

@@ -32,11 +32,18 @@ class BatchedFrequencyPenalizer(_BatchedPenalizer):
             )
         ).unsqueeze_(1)
 
-    def _cumulate_output_tokens(self, output_ids: torch.Tensor):
+    def _cumulate_output_tokens(
+        self,
+        output_ids: torch.Tensor,
+        row_active_mask: torch.Tensor | None = None,
+    ):
+        src = self.frequency_penalties
+        if row_active_mask is not None:
+            src = src * row_active_mask.unsqueeze(1)
         self.cumulated_frequency_penalties.scatter_add_(
             dim=1,
             index=output_ids.unsqueeze(1),
-            src=self.frequency_penalties,
+            src=src,
         )
 
     def _apply(self, logits: torch.Tensor) -> torch.Tensor:

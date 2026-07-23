@@ -456,6 +456,79 @@ def test_welm_routes_final_hidden_and_aux_before_logits(monkeypatch):
     assert all(call[2:] == (47, 1) for call in calls)
 
 
+def test_welm_empty_cp_rank_keeps_last_capture_route_sequence(monkeypatch):
+    runtime = _runtime(cp_rank=1, owner_rotation=0, contracted=True)
+    assert runtime.active_local_tokens == 0
+    empty = torch.empty((0, 1))
+    metadata = SimpleNamespace(
+        extend_return_logprob=False,
+        capture_hidden_mode=_CaptureStoredLast(),
+        prefill_cp_pruned=False,
+    )
+    monkeypatch.setattr(
+        welmv4_model.LogitsMetadata,
+        "from_forward_batch",
+        lambda _batch: metadata,
+    )
+    calls = []
+
+    def fake_route(tensor, passed_runtime, *, logical_start, token_count):
+        calls.append((tensor, passed_runtime, logical_start, token_count))
+        return tensor.new_tensor([[float(logical_start)]])
+
+    monkeypatch.setattr(
+        welmv4_model, "route_cp_prefill_hidden_states", fake_route
+    )
+
+    prepared = welmv4_model._welm_prepare_cp_prefill_logits_states(
+        empty,
+        None,
+        SimpleNamespace(
+            attn_cp_prefill_runtime_layout=runtime,
+            multi_item_delimiter_indices=None,
+        ),
+    )
+
+    assert prepared.hidden_states.tolist() == [[47.0]]
+    assert prepared.aux_hidden_states[0].tolist() == [[47.0]]
+    assert len(calls) == 2
+    assert all(call[0].shape == (0, 1) for call in calls)
+    assert all(call[1] is runtime for call in calls)
+    assert all(call[2:] == (47, 1) for call in calls)
+
+
+def test_welm_active_cp_rank_fails_before_route_without_last_capture(monkeypatch):
+    runtime = _runtime(cp_rank=0, owner_rotation=0, contracted=True)
+    assert runtime.active_local_tokens == 1
+    metadata = SimpleNamespace(
+        extend_return_logprob=False,
+        capture_hidden_mode=_CaptureStoredLast(),
+        prefill_cp_pruned=False,
+    )
+    monkeypatch.setattr(
+        welmv4_model.LogitsMetadata,
+        "from_forward_batch",
+        lambda _batch: metadata,
+    )
+    monkeypatch.setattr(
+        welmv4_model,
+        "route_cp_prefill_hidden_states",
+        lambda *_args, **_kwargs: pytest.fail(
+            "missing LAST capture must fail before routing"
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="missing the captured last hidden state"):
+        welmv4_model._welm_prepare_cp_prefill_logits_states(
+            torch.ones((1, 1)),
+            None,
+            SimpleNamespace(
+                attn_cp_prefill_runtime_layout=runtime,
+                multi_item_delimiter_indices=None,
+            ),
+        )
+
+
 def test_welm_no_q_chunk_skips_logits_routing(monkeypatch):
     runtime = contract_cp_prefill_runtime_to_last_q(
         _runtime(cp_rank=0, owner_rotation=0, contracted=False),

@@ -13,7 +13,8 @@ if TYPE_CHECKING:
 _CP_SIZE = 4
 _ROW_WIDTH = 256
 _VECTOR_BYTES = 16
-_SIGNAL_BYTES = 4
+_SIGNAL_BYTES = 8
+_INT64_MAX = (1 << 63) - 1
 _ALLOWED_THREAD_COUNTS = (64, 128, 256, 512)
 
 
@@ -70,13 +71,13 @@ def _validate_peer_bases(peer_bases: torch.Tensor) -> None:
 def _validate_signal_metadata(
     *, signal_offset_bytes: int, signal_stride_bytes: int, epoch: int
 ) -> None:
-    if epoch <= 0 or epoch > 0xFFFFFFFF:
-        raise ValueError("epoch must fit in a non-zero uint32")
+    if epoch <= 0 or epoch > _INT64_MAX:
+        raise ValueError("epoch must fit in a positive int64")
     _require_non_negative_aligned(
         "signal_offset_bytes", signal_offset_bytes, _SIGNAL_BYTES
     )
     if signal_stride_bytes < _SIGNAL_BYTES:
-        raise ValueError("signal_stride_bytes must fit one int32 signal")
+        raise ValueError("signal_stride_bytes must fit one int64 signal")
     _require_non_negative_aligned(
         "signal_stride_bytes", signal_stride_bytes, _SIGNAL_BYTES
     )

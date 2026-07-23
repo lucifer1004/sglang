@@ -3409,12 +3409,23 @@ class Scheduler(
 
         # Update waiting queue
         can_run_list: List[Req] = adder.can_run_list
+        completed_without_forward_reqs: List[Req] = (
+            adder.completed_without_forward_reqs
+        )
         self.next_attn_cp_owner_rotation = adder.next_attn_cp_owner_rotation
+        scheduled_reqs = set(can_run_list)
+        scheduled_reqs.update(completed_without_forward_reqs)
+        if scheduled_reqs:
+            self.waiting_queue = [
+                req for req in self.waiting_queue if req not in scheduled_reqs
+            ]
+        if completed_without_forward_reqs:
+            self.process_deferred_prefill_without_forward(
+                completed_without_forward_reqs
+            )
         if len(can_run_list) == 0:
             return None
 
-        can_run_set = set(can_run_list)
-        self.waiting_queue = [x for x in self.waiting_queue if x not in can_run_set]
         if adder.preempt_list:
             for req in adder.preempt_list:
                 self._add_request_to_queue(req)
@@ -4383,13 +4394,13 @@ class Scheduler(
             for decode_req in self.disagg_decode_prealloc_queue.queue:
                 if recv_req.abort_all or decode_req.req.rid.startswith(recv_req.rid):
                     logger.debug(f"Abort prealloc queue request. {decode_req.req.rid=}")
-                    decode_req.kv_receiver.abort()
+                    decode_req.request_abort()
 
             # Abort requests waiting for kvcache to release tree cache
             for decode_req in self.disagg_decode_transfer_queue.queue:
                 if recv_req.abort_all or decode_req.req.rid.startswith(recv_req.rid):
                     logger.debug(f"Abort transfer queue request. {decode_req.req.rid=}")
-                    decode_req.kv_receiver.abort()
+                    decode_req.request_abort()
 
             # Abort requests already retracted to CPU cache
             if self.disagg_decode_prealloc_queue.retracted_queue:

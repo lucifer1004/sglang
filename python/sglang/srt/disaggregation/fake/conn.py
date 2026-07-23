@@ -79,6 +79,9 @@ class FakeKVSender(BaseKVSender):
             f"FakeKVSender send with kv_indices: {kv_indices}, state_indices: {state_indices}"
         )
 
+    def should_send_kv_chunk(self, num_pages: int, last_chunk: bool) -> bool:
+        return num_pages > 0 or last_chunk
+
     def failure_exception(self):
         raise Exception("Fake KVSender Exception")
 

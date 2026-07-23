@@ -5,10 +5,15 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=5, suite="stage-a-test-cpu")
 
 import unittest
+from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
 
 import sglang.srt.disaggregation.common.conn as common_conn
+from sglang.srt.disaggregation.common.welm_deferred_protocol import (
+    build_welm_deferred_mirror_capability,
+)
 from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.models.welm_deferred_mirror import WelmDeferredMirrorPlan
 from sglang.test.test_utils import CustomTestCase
 
 
@@ -237,6 +242,105 @@ class TestRegisterToBootstrap(CustomTestCase):
         ]
         for field in required_fields:
             self.assertIn(field, payload)
+
+        self.assertNotIn("welm_deferred_mirror", payload)
+
+    @patch("sglang.srt.disaggregation.common.conn.time")
+    @patch("sglang.srt.disaggregation.common.conn.requests.put")
+    def test_payload_includes_deferred_capability_only_when_enabled(
+        self, mock_put, mock_time
+    ):
+        mock_time.monotonic.return_value = 0.0
+        success_resp = MagicMock()
+        success_resp.status_code = 200
+        mock_put.return_value = success_resp
+        mgr = self._make_manager()
+        mgr.welm_deferred_mirror_capability = self._make_capability()
+
+        mgr.register_to_bootstrap()
+
+        payload = mock_put.call_args[1]["json"]
+        self.assertEqual(
+            payload["welm_deferred_mirror"],
+            mgr.welm_deferred_mirror_capability.to_wire(),
+        )
+
+    @patch("sglang.srt.disaggregation.common.conn.time")
+    @patch("sglang.srt.disaggregation.common.conn.requests.put")
+    def test_capability_conflict_fails_without_retry_for_legacy_rank(
+        self, mock_put, mock_time
+    ):
+        conflict = MagicMock()
+        conflict.status_code = 409
+        conflict.text = "Inconsistent WeLM deferred capability"
+        mock_put.return_value = conflict
+        mgr = self._make_manager()
+
+        with self.assertRaisesRegex(RuntimeError, "capability conflict"):
+            mgr.register_to_bootstrap()
+
+        mock_put.assert_called_once()
+        mock_time.sleep.assert_not_called()
+
+    @patch("sglang.srt.disaggregation.common.conn.requests.get")
+    def test_decode_rejects_capability_mismatch_before_rank_mapping(self, mock_get):
+        mgr = object.__new__(common_conn.CommonKVManager)
+        mgr.prefill_info_table = {}
+        mgr.kv_args = MagicMock(page_size=16)
+        mgr.server_args = MagicMock(kv_cache_dtype="auto", enable_hisparse=False)
+        mgr.welm_deferred_mirror_capability = self._make_capability()
+        mgr._resolve_rank_mapping = MagicMock()
+
+        remote = self._make_capability().to_wire()
+        remote["mirror_fingerprint"] = "different"
+        response = MagicMock(status_code=200)
+        response.json.return_value = {
+            "attn_tp_size": 1,
+            "attn_cp_size": 1,
+            "dp_size": 1,
+            "pp_size": 1,
+            "page_size": 16,
+            "kv_cache_dtype": "auto",
+            "follow_bootstrap_room": True,
+            "welm_deferred_mirror": remote,
+        }
+        mock_get.return_value = response
+
+        with self.assertRaisesRegex(RuntimeError, "local=.*remote="):
+            mgr.try_ensure_parallel_info("127.0.0.1:8998")
+
+        mgr._resolve_rank_mapping.assert_not_called()
+        self.assertEqual(mgr.prefill_info_table, {})
+
+    @patch("sglang.srt.disaggregation.common.conn.requests.get")
+    def test_decode_rejects_malformed_capability_before_rank_mapping(self, mock_get):
+        mgr = object.__new__(common_conn.CommonKVManager)
+        mgr.prefill_info_table = {}
+        mgr.kv_args = MagicMock(page_size=16)
+        mgr.server_args = MagicMock(kv_cache_dtype="auto", enable_hisparse=False)
+        mgr.welm_deferred_mirror_capability = self._make_capability()
+        mgr._resolve_rank_mapping = MagicMock()
+
+        malformed = self._make_capability().to_wire()
+        del malformed["protocol_version"]
+        response = MagicMock(status_code=200)
+        response.json.return_value = {
+            "attn_tp_size": 1,
+            "attn_cp_size": 1,
+            "dp_size": 1,
+            "pp_size": 1,
+            "page_size": 16,
+            "kv_cache_dtype": "auto",
+            "follow_bootstrap_room": True,
+            "welm_deferred_mirror": malformed,
+        }
+        mock_get.return_value = response
+
+        with self.assertRaisesRegex(RuntimeError, "Invalid Prefill P/D capability"):
+            mgr.try_ensure_parallel_info("127.0.0.1:8998")
+
+        mgr._resolve_rank_mapping.assert_not_called()
+        self.assertEqual(mgr.prefill_info_table, {})
 
     @patch("sglang.srt.disaggregation.common.conn.time")
     @patch("sglang.srt.disaggregation.common.conn.requests.put")
@@ -550,6 +654,81 @@ class TestRegisterToBootstrap(CustomTestCase):
                 self.assertEqual(info.required_dst_info_num, 2)
                 self.assertEqual(info.required_prefill_response_num, 2)
 
+    def test_deferred_capability_does_not_change_kv_rank_mapping(self):
+        from sglang.srt.disaggregation.common.conn import (
+            CommonKVManager,
+            PrefillServerInfo,
+        )
+
+        capability = build_welm_deferred_mirror_capability(
+            model_identity="/models/welm",
+            plan=WelmDeferredMirrorPlan(
+                num_hidden_layers=48,
+                execution_end_layer=33,
+                pairs=(),
+                fingerprint="fingerprint",
+            ),
+        )
+
+        def make_manager(deferred_capability):
+            return SimpleNamespace(
+                attn_tp_size=2,
+                attn_tp_rank=0,
+                attn_dp_size=4,
+                attn_dp_rank=2,
+                attn_cp_size=1,
+                attn_cp_rank=0,
+                attn_tp_rank_includes_cp=False,
+                enable_all_cp_ranks_for_transfer=False,
+                is_cp_sharded_kv=False,
+                is_mla_backend=False,
+                pp_size=1,
+                pp_rank=0,
+                kv_args=SimpleNamespace(
+                    engine_rank=0,
+                    total_kv_head_num=2,
+                ),
+                welm_deferred_mirror_capability=deferred_capability,
+            )
+
+        def make_prefill_info(deferred_capability):
+            return PrefillServerInfo(
+                attn_tp_size=8,
+                attn_cp_size=1,
+                dp_size=1,
+                pp_size=1,
+                page_size=16,
+                kv_cache_dtype="auto",
+                follow_bootstrap_room=True,
+                all_cp_ranks_transfer=False,
+                welm_deferred_mirror=deferred_capability,
+            )
+
+        generic_info = make_prefill_info(None)
+        deferred_info = make_prefill_info(capability)
+        CommonKVManager._resolve_rank_mapping(make_manager(None), generic_info)
+        CommonKVManager._resolve_rank_mapping(
+            make_manager(capability), deferred_info
+        )
+
+        generic_mapping = (
+            generic_info.target_tp_rank,
+            generic_info.target_tp_ranks,
+            generic_info.target_cp_ranks,
+            generic_info.target_pp_ranks,
+            generic_info.required_dst_info_num,
+            generic_info.required_prefill_response_num,
+        )
+        deferred_mapping = (
+            deferred_info.target_tp_rank,
+            deferred_info.target_tp_ranks,
+            deferred_info.target_cp_ranks,
+            deferred_info.target_pp_ranks,
+            deferred_info.required_dst_info_num,
+            deferred_info.required_prefill_response_num,
+        )
+        self.assertEqual(deferred_mapping, generic_mapping)
+
     @patch("sglang.srt.disaggregation.common.conn.time")
     @patch("sglang.srt.disaggregation.common.conn.requests.put")
     def test_url_with_dist_init_addr(self, mock_put, mock_time):
@@ -604,8 +783,21 @@ class TestRegisterToBootstrap(CustomTestCase):
         mgr.server_args = MagicMock()
         mgr.server_args.kv_cache_dtype = "auto"
         mgr.server_args.load_balance_method = "follow_bootstrap_room"
+        mgr.welm_deferred_mirror_capability = None
 
         return mgr
+
+    @staticmethod
+    def _make_capability():
+        return build_welm_deferred_mirror_capability(
+            model_identity="/models/welm",
+            plan=WelmDeferredMirrorPlan(
+                num_hidden_layers=48,
+                execution_end_layer=33,
+                pairs=(),
+                fingerprint="fingerprint",
+            ),
+        )
 
 
 if __name__ == "__main__":

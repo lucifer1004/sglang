@@ -22,6 +22,7 @@ _SUPPORTED_CP_SIZE = 4
 _SUPPORTED_ROW_WIDTH = 256
 _ROWS_PER_BLOCK = 16
 _NUM_THREADS = 128
+_INT64_MAX = (1 << 63) - 1
 
 
 def _align_up(value: int, alignment: int) -> int:
@@ -102,6 +103,41 @@ class CPKVIPCTransferTicket:
     waits_for_previous_consumption: bool
 
 
+class CPKVIPCForwardEpochSequencer:
+    """Derive IPC epochs from stable forward and attention operation ids."""
+
+    def __init__(self, *, max_calls_per_forward: int):
+        if max_calls_per_forward <= 0:
+            raise ValueError("max_calls_per_forward must be positive")
+        self._max_calls_per_forward = max_calls_per_forward
+        self._epoch_stride = 1 << (max_calls_per_forward - 1).bit_length()
+        self._forward_iter: int | None = None
+        self._last_operation_index = -1
+
+    def next_epoch(self, *, forward_iter: int, operation_index: int) -> int:
+        if forward_iter <= 0:
+            raise ValueError("forward_iter must be positive")
+        if operation_index < 0 or operation_index >= self._max_calls_per_forward:
+            raise ValueError("K/V IPC operation index is outside forward capacity")
+        if self._forward_iter is None or forward_iter > self._forward_iter:
+            self._forward_iter = forward_iter
+            self._last_operation_index = -1
+        elif forward_iter < self._forward_iter:
+            raise RuntimeError("K/V IPC forward_iter moved backwards")
+
+        if operation_index <= self._last_operation_index:
+            raise RuntimeError(
+                "K/V IPC operation ids must increase within one forward"
+            )
+        epoch = (
+            (forward_iter - 1) * self._epoch_stride + operation_index + 1
+        )
+        if epoch > _INT64_MAX:
+            raise RuntimeError("K/V IPC epoch exhausted int64 capacity")
+        self._last_operation_index = operation_index
+        return epoch
+
+
 class CPKVIPCEpochTracker:
     """Host-side sequencing for one reusable source-push arena slot."""
 
@@ -123,7 +159,11 @@ class CPKVIPCEpochTracker:
             raise ValueError(f"{name} mask must select ranks inside the CP group")
 
     def begin(
-        self, *, source_mask: int, destination_mask: int
+        self,
+        *,
+        source_mask: int,
+        destination_mask: int,
+        epoch: int | None = None,
     ) -> CPKVIPCTransferTicket:
         if self._pending_local_release is not None:
             raise RuntimeError(
@@ -131,14 +171,18 @@ class CPKVIPCEpochTracker:
             )
         self._validate_mask("source", source_mask)
         self._validate_mask("destination", destination_mask)
-        if self._next_epoch > 0xFFFFFFFF:
-            raise RuntimeError("K/V IPC epoch exhausted uint32 capacity")
+        if epoch is None:
+            epoch = self._next_epoch
+        elif epoch < self._next_epoch:
+            raise RuntimeError("K/V IPC epoch must increase monotonically")
+        if epoch > _INT64_MAX:
+            raise RuntimeError("K/V IPC epoch exhausted int64 capacity")
 
         previous_source = self._pending_source_consumption
         local_bit = 1 << self._local_rank
         is_local_source = bool(source_mask & local_bit)
         ticket = CPKVIPCTransferTicket(
-            epoch=self._next_epoch,
+            epoch=epoch,
             source_mask=source_mask,
             destination_mask=destination_mask,
             previous_consumed_epoch=(
@@ -155,7 +199,7 @@ class CPKVIPCEpochTracker:
                 is_local_source and previous_source is not None
             ),
         )
-        self._next_epoch += 1
+        self._next_epoch = epoch + 1
         if is_local_source:
             self._pending_source_consumption = ticket
         if ticket.requires_local_release:
@@ -205,6 +249,7 @@ class CPKVIPCSourcePushTransport:
         device: torch.device | str,
         max_rows: int,
         row_width: int,
+        max_calls_per_forward: int = 256,
     ):
         self.cp_group = cp_group
         self.cp_size = int(cp_group.world_size)
@@ -247,6 +292,9 @@ class CPKVIPCSourcePushTransport:
         self._epochs = CPKVIPCEpochTracker(
             cp_size=self.cp_size,
             local_rank=self.cp_rank,
+        )
+        self._forward_epochs = CPKVIPCForwardEpochSequencer(
+            max_calls_per_forward=max_calls_per_forward
         )
         self._load_jit_across_group()
 
@@ -361,6 +409,8 @@ class CPKVIPCSourcePushTransport:
         extend_key_rows: torch.Tensor,
         extend_value_rows: torch.Tensor,
         destination_ranks,
+        forward_iter: int | None = None,
+        operation_index: int | None = None,
     ) -> CPKVIPCArenaLease | None:
         self.layout.require_capacity(plan.logical_token_count)
         destination_mask = self._destination_mask(
@@ -389,9 +439,25 @@ class CPKVIPCSourcePushTransport:
             raise RuntimeError(
                 "Extend K/V rows do not match the owner-local source plan"
             )
+        if forward_iter is None:
+            if operation_index is not None:
+                raise ValueError(
+                    "K/V IPC operation index requires a scheduler forward_iter"
+                )
+            epoch = None
+        else:
+            if operation_index is None:
+                raise ValueError(
+                    "K/V IPC production epochs require a stable operation index"
+                )
+            epoch = self._forward_epochs.next_epoch(
+                forward_iter=forward_iter,
+                operation_index=operation_index,
+            )
         ticket = self._epochs.begin(
             source_mask=plan.source_mask,
             destination_mask=destination_mask,
+            epoch=epoch,
         )
 
         if ticket.waits_for_previous_consumption:

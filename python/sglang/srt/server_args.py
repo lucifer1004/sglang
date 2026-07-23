@@ -890,6 +890,8 @@ class ServerArgs:
     welm_shared_embedding_numa_node: Optional[int] = None
     welm_shared_embedding_manifest_path: Optional[str] = None
     enable_welm_kv_mirror_opt: bool = False
+    # Internal execution mode selected by --enable-kv-mirror-deferred.
+    welm_kv_mirror_pd_mode: str = "legacy"
     # WeLM vocab embedding padding multiple. Default mirrors sglang's
     # DEFAULT_VOCAB_PADDING_SIZE (layers.vocab_parallel_embedding); slime's
     # shard transfer passes 128 to align with mmq checkpoint's 128-padded vocab.
@@ -7641,6 +7643,14 @@ class ServerArgs:
             action="store_true",
             dest="enable_welm_kv_mirror_opt",
             help="Deprecated: use --enable-welm-kv-mirror-opt instead.",
+        )
+        parser.add_argument(
+            "--enable-kv-mirror-deferred",
+            action="store_const",
+            const="deferred-last-prompt",
+            dest="welm_kv_mirror_pd_mode",
+            default=ServerArgs.welm_kv_mirror_pd_mode,
+            help="Defer the last prompt token's WeLM KV mirror layers to decode.",
         )
         parser.add_argument(
             "--welm-vocab-padding-size",

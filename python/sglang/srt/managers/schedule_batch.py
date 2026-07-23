@@ -96,6 +96,11 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
 )
+from sglang.srt.models.welm_deferred_mirror import (
+    DeferredDecodeInputKind,
+    WelmDeferredPrefillSpan,
+    build_welm_deferred_prefill_span,
+)
 from sglang.srt.models.welm_perf_opt import (
     get_welm_oe_hash_config,
     should_use_welm_oe_hash_kernel,
@@ -947,6 +952,80 @@ class OverEncodingContext:
         return None
 
 
+class WelmDeferredDecodePhase(str, Enum):
+    TRANSFER_PENDING = "transfer_pending"
+    READY = "ready"
+    INFLIGHT = "inflight"
+    CONSUMED = "consumed"
+
+
+@dataclasses.dataclass
+class WelmDeferredDecodeState:
+    phase: WelmDeferredDecodePhase
+    committed_kv_len: int
+    seed_position: int
+    seed_token_id: int
+    input_kind: DeferredDecodeInputKind
+
+    @classmethod
+    def from_prompt_tokens(
+        cls, prompt_token_ids: List[int]
+    ) -> "WelmDeferredDecodeState":
+        span = build_welm_deferred_prefill_span(prompt_token_ids)
+        return cls(
+            phase=WelmDeferredDecodePhase.TRANSFER_PENDING,
+            committed_kv_len=span.committed_kv_len,
+            seed_position=span.seed_position,
+            seed_token_id=span.seed_token_id,
+            input_kind=DeferredDecodeInputKind.TOKEN_ID,
+        )
+
+    def validate_prompt_tokens(self, prompt_token_ids: List[int]) -> None:
+        if len(prompt_token_ids) != self.committed_kv_len + 1:
+            raise RuntimeError(
+                "WeLM deferred decode prompt length changed after transfer "
+                f"admission: expected {self.committed_kv_len + 1}, "
+                f"got {len(prompt_token_ids)}"
+            )
+        if self.seed_position != self.committed_kv_len:
+            raise RuntimeError(
+                "WeLM deferred decode seed position must equal committed KV length"
+            )
+        if int(prompt_token_ids[self.seed_position]) != self.seed_token_id:
+            raise RuntimeError(
+                "WeLM deferred decode seed token changed after transfer admission"
+            )
+        if self.input_kind is not DeferredDecodeInputKind.TOKEN_ID:
+            raise RuntimeError(
+                "WeLM deferred decode currently requires TOKEN_ID seed input"
+            )
+
+    def committed_token_ids(self, prompt_token_ids: List[int]) -> List[int]:
+        self.validate_prompt_tokens(prompt_token_ids)
+        return list(prompt_token_ids[: self.committed_kv_len])
+
+    def transition_to(self, next_phase: WelmDeferredDecodePhase) -> None:
+        expected_next = {
+            WelmDeferredDecodePhase.TRANSFER_PENDING: WelmDeferredDecodePhase.READY,
+            WelmDeferredDecodePhase.READY: WelmDeferredDecodePhase.INFLIGHT,
+            WelmDeferredDecodePhase.INFLIGHT: WelmDeferredDecodePhase.CONSUMED,
+        }.get(self.phase)
+        if next_phase is not expected_next:
+            raise RuntimeError(
+                "invalid WeLM deferred decode transition: "
+                f"{self.phase.value} -> {next_phase.value}"
+            )
+        self.phase = next_phase
+
+    def rollback_inflight_to_ready(self) -> None:
+        if self.phase is not WelmDeferredDecodePhase.INFLIGHT:
+            raise RuntimeError(
+                "invalid WeLM deferred decode rollback: "
+                f"expected inflight, got {self.phase.value}"
+            )
+        self.phase = WelmDeferredDecodePhase.READY
+
+
 class Req(ReqDllmMixin):
     """The input and output status of a request."""
 
@@ -1010,6 +1089,8 @@ class Req(ReqDllmMixin):
         self._overlap_decode_count = 0
         # fill_ids = origin_input_ids + output_ids. Updated if chunked.
         self.fill_ids = []
+        self.welm_deferred_prefill_span: Optional[WelmDeferredPrefillSpan] = None
+        self.welm_deferred_decode_state: Optional[WelmDeferredDecodeState] = None
         self.session = session
         self.input_embeds = input_embeds
         self.positional_embed_overrides = positional_embed_overrides
@@ -1379,7 +1460,7 @@ class Req(ReqDllmMixin):
             self._init_fill_ids_for_dllm()
             self.determine_dllm_phase()
         else:
-            self.fill_ids = self.origin_input_ids + self.output_ids
+            self.fill_ids = self.prefill_kv_token_ids()
 
         input_len = len(self.fill_ids)
 
@@ -1465,11 +1546,52 @@ class Req(ReqDllmMixin):
         )
 
     def _compute_max_prefix_len(self, input_len: int) -> int:
+        if getattr(self, "welm_deferred_prefill_span", None) is not None:
+            return input_len
         # The matched length is at most 1 less than the input length to enable logprob computation.
         max_prefix_len = input_len - 1
         if self.return_logprob and self.logprob_start_len >= 0:
             max_prefix_len = min(max_prefix_len, self.logprob_start_len)
         return max(max_prefix_len, 0)
+
+    def prefill_kv_token_ids(self) -> List[int]:
+        span = getattr(self, "welm_deferred_prefill_span", None)
+        if span is None:
+            return self.origin_input_ids + self.output_ids
+        return span.committed_token_ids(self.origin_input_ids)
+
+    def prefill_kv_len(self) -> int:
+        span = getattr(self, "welm_deferred_prefill_span", None)
+        if span is None:
+            return len(self.origin_input_ids) + len(self.output_ids)
+        return span.committed_kv_len
+
+    def update_cached_token_stats(self, prefix_len: int, computed_len: int) -> None:
+        if self.retracted_stain:
+            return
+
+        self.cached_tokens += prefix_len - self.already_computed
+        if not self._cache_breakdown_computed:
+            host_total = self.host_hit_length
+            storage_portion = min(host_total, self.storage_hit_length)
+            self.cached_tokens_device = max(0, len(self.prefix_indices) - host_total)
+            self.cached_tokens_host = host_total - storage_portion
+            self.cached_tokens_storage = storage_portion
+            self._cache_breakdown_computed = True
+
+        self.already_computed = computed_len
+
+    def requires_prompt_logprobs(self) -> bool:
+        return (
+            self.return_logprob
+            and 0 <= self.logprob_start_len < len(self.origin_input_ids)
+        )
+
+    def requires_logprob_payload(self) -> bool:
+        return self.return_logprob and (
+            getattr(self, "welm_deferred_prefill_span", None) is None
+            or Req.requires_prompt_logprobs(self)
+        )
 
     # Based on https://github.com/vllm-project/vllm/blob/7a64d24aad69e4d2548aa0bf528d9fe63428ab01/vllm/transformers_utils/detokenizer.py#L194-L313
     def init_incremental_detokenize(self):
@@ -1605,6 +1727,18 @@ class Req(ReqDllmMixin):
         return False
 
     def check_finished(self, new_accepted_len: int = 1):
+        deferred_state = self.welm_deferred_decode_state
+        if (
+            isinstance(deferred_state, WelmDeferredDecodeState)
+            and deferred_state.phase is WelmDeferredDecodePhase.INFLIGHT
+        ):
+            if new_accepted_len != 1 or len(self.output_ids) != 1:
+                raise RuntimeError(
+                    "WeLM deferred seed must produce exactly one first output "
+                    "before becoming ordinary decode"
+                )
+            deferred_state.transition_to(WelmDeferredDecodePhase.CONSUMED)
+
         if self.finished():
             return
 
@@ -1635,6 +1769,47 @@ class Req(ReqDllmMixin):
 
         if self._check_str_based_finish():
             return
+
+    def prepare_for_retract(self) -> bool:
+        """Restore deferred seed state before releasing a decode row.
+
+        Returns whether release_kv_cache must reclaim one uncommitted KV tail.
+        """
+        state = self.welm_deferred_decode_state
+        if state is None:
+            return False
+        if not isinstance(state, WelmDeferredDecodeState):
+            raise RuntimeError(
+                "decode retraction received invalid WeLM deferred lifecycle state"
+            )
+        if state.phase is WelmDeferredDecodePhase.CONSUMED:
+            return False
+        if state.phase is not WelmDeferredDecodePhase.INFLIGHT:
+            raise RuntimeError(
+                "WeLM deferred decode retraction requires INFLIGHT or CONSUMED "
+                f"state, got {state.phase.value}"
+            )
+
+        state.validate_prompt_tokens(self.origin_input_ids)
+        if self.output_ids:
+            raise RuntimeError(
+                "WeLM deferred seed cannot be retracted after producing output"
+            )
+        expected_allocated_len = state.committed_kv_len + 1
+        if (
+            self.kv_committed_len != expected_allocated_len
+            or self.kv_allocated_len != expected_allocated_len
+        ):
+            raise RuntimeError(
+                "WeLM deferred seed KV accounting changed before retraction: "
+                f"committed={self.kv_committed_len}, "
+                f"allocated={self.kv_allocated_len}, "
+                f"expected={expected_allocated_len}"
+            )
+
+        state.rollback_inflight_to_ready()
+        self.kv_committed_len = state.committed_kv_len
+        return True
 
     def reset_for_retract(self):
         # Increment retraction count before resetting other state. We should not reset this
@@ -1951,7 +2126,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         chunked_req: Optional[Req] = None,
         dllm_config: Optional[DllmConfig] = None,
     ):
-        return_logprob = any(req.return_logprob for req in reqs)
+        return_logprob = any(Req.requires_logprob_payload(req) for req in reqs)
 
         is_hybrid_swa = False
         unwrapped_allocator = unwrap_cp_sharded_allocator(token_to_kv_pool_allocator)
@@ -2293,37 +2468,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
             multimodal_inputs.append(req.multimodal_inputs)
 
-            # Only calculate cached_tokens once. Once retracted, the 'retracted_stain'
-            # flag will always True
-            if not req.retracted_stain:
-                new_cached = pre_len - req.already_computed
-                req.cached_tokens += new_cached
-
-                # Calculate detailed breakdown of cached tokens by source (for HiCache)
-                # Only compute once on FIRST chunk - subsequent chunks in chunked prefill
-                # would incorrectly count previously computed tokens as cache hits.
-                if not req._cache_breakdown_computed:
-                    # At this point, prefix_indices has been extended with host data
-                    # via init_load_back in schedule_policy, so:
-                    # - len(prefix_indices) = device_original + host_loaded
-                    # - host_hit_length = total tokens from host cache (including storage-prefetched)
-                    # - storage_hit_length = tokens loaded from storage backend (L3 hits)
-                    # - device_portion = len(prefix_indices) - host_hit_length
-                    #
-                    # Storage hits are now tracked via scheduler after prefetch completes.
-                    # storage_hit_length is set by scheduler.pop_prefetch_loaded_tokens()
-                    host_total = req.host_hit_length
-                    # Clamp storage to host_total to handle edge cases
-                    storage_portion = min(host_total, req.storage_hit_length)
-                    host_portion = host_total - storage_portion
-                    device_portion = max(0, len(req.prefix_indices) - host_total)
-
-                    req.cached_tokens_device = device_portion
-                    req.cached_tokens_host = host_portion
-                    req.cached_tokens_storage = storage_portion
-                    req._cache_breakdown_computed = True
-
-                req.already_computed = seq_len
+            # This also owns the first-chunk HiCache source breakdown.
+            req.update_cached_token_stats(pre_len, seq_len)
             req.is_retracted = False
 
             if get_global_server_args().enable_mamba_extra_buffer():
@@ -2775,6 +2921,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     def release_req(self, idx: int, remaing_req_count: int, server_args: ServerArgs):
         req = self.reqs[idx]
+        allow_uncommitted_tail = req.prepare_for_retract()
 
         if self.hisparse_coordinator is not None and not req.finished():
             self.hisparse_coordinator.retract_req(req)
@@ -2784,7 +2931,15 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 self.req_to_token_pool, self.token_to_kv_pool_allocator
             )
         # TODO (csy): for preempted requests, we may want to insert into the tree
-        release_kv_cache(req, self.tree_cache, is_insert=False)
+        if allow_uncommitted_tail:
+            release_kv_cache(
+                req,
+                self.tree_cache,
+                is_insert=False,
+                allow_uncommitted_tail=True,
+            )
+        else:
+            release_kv_cache(req, self.tree_cache, is_insert=False)
         # NOTE(lsyin): we should use the newly evictable memory instantly.
         num_tokens = remaing_req_count * envs.SGLANG_RETRACT_DECODE_STEPS.get()
         evict_from_tree_cache(self.tree_cache, num_tokens)
@@ -2824,6 +2979,38 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         scale = self._get_scale_seq_factor()
         self.forward_mode = ForwardMode.DECODE
         bs = len(self.reqs)
+        deferred_seed_states = []
+        deferred_penalty_active_mask = []
+        has_inactive_deferred_penalty_row = False
+        for req in self.reqs:
+            state = vars(req).get("welm_deferred_decode_state")
+            if state is None:
+                deferred_penalty_active_mask.append(True)
+                continue
+            if not isinstance(state, WelmDeferredDecodeState):
+                raise RuntimeError(
+                    "decode batch received invalid WeLM deferred lifecycle state"
+                )
+            if state.phase is WelmDeferredDecodePhase.TRANSFER_PENDING:
+                raise RuntimeError(
+                    "WeLM deferred seed entered decode before transfer completion"
+                )
+            is_ready_seed = state.phase is WelmDeferredDecodePhase.READY
+            penalty_active = state.phase is WelmDeferredDecodePhase.CONSUMED
+            deferred_penalty_active_mask.append(penalty_active)
+            has_inactive_deferred_penalty_row |= not penalty_active
+            if is_ready_seed:
+                state.validate_prompt_tokens(req.origin_input_ids)
+                if req.output_ids:
+                    raise RuntimeError(
+                        "WeLM deferred seed entered decode with generated output"
+                    )
+                if req.kv_committed_len != state.committed_kv_len:
+                    raise RuntimeError(
+                        "WeLM deferred seed committed length changed before decode"
+                    )
+                deferred_seed_states.append(state)
+
         # Decode embeds the last output token via embed_tokens; clear the stale
         # prefill-time tensor so it doesn't leak into ForwardBatch.
         self.input_embeds = None
@@ -2844,6 +3031,15 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             return
 
         if self.sampling_info.penalizer_orchestrator.is_required:
+            penalty_active_mask = (
+                torch.tensor(
+                    deferred_penalty_active_mask,
+                    dtype=torch.bool,
+                    device=self.device,
+                )
+                if has_inactive_deferred_penalty_row
+                else None
+            )
             if self.enable_overlap:
                 # TODO: this can be slow, optimize this.
                 delayed_output_ids = torch.tensor(
@@ -2859,11 +3055,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     device=self.device,
                 )
                 self.sampling_info.penalizer_orchestrator.cumulate_output_tokens(
-                    delayed_output_ids
+                    delayed_output_ids,
+                    row_active_mask=penalty_active_mask,
                 )
             else:
                 self.sampling_info.penalizer_orchestrator.cumulate_output_tokens(
-                    self.output_ids.to(torch.int64)
+                    self.output_ids.to(torch.int64),
+                    row_active_mask=penalty_active_mask,
                 )
 
         # Update fields
@@ -2976,6 +3174,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.extend_logprob_start_lens = [0] * bs
             self.extend_input_logprob_token_ids = None
 
+        for state in deferred_seed_states:
+            state.transition_to(WelmDeferredDecodePhase.INFLIGHT)
+
     def maybe_evict_swa(self):
         if self.tree_cache.supports_swa():
             sliding_window_size = self.tree_cache.sliding_window_size
@@ -3049,6 +3250,59 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 and self.reqs[i] not in chunked_req_to_exclude
             ]
 
+        prebuilt_filter_state = None
+        if (
+            self.forward_mode is not None
+            and self.forward_mode.is_prebuilt()
+            and keep_indices
+            and len(keep_indices) < len(self.reqs)
+        ):
+            extend_lens = list(self.extend_lens)
+            packed_num_tokens = sum(extend_lens)
+            if self.input_ids is None or self.input_ids.numel() != packed_num_tokens:
+                raise RuntimeError(
+                    "Cannot filter PREBUILT batch with invalid packed input_ids: "
+                    f"input_tokens={None if self.input_ids is None else self.input_ids.numel()}, "
+                    f"extend_tokens={packed_num_tokens}."
+                )
+            if (
+                self.out_cache_loc is None
+                or self.out_cache_loc.numel() != packed_num_tokens
+            ):
+                raise RuntimeError(
+                    "Cannot filter PREBUILT batch with invalid packed KV slots: "
+                    f"kv_slots={None if self.out_cache_loc is None else self.out_cache_loc.numel()}, "
+                    f"extend_tokens={packed_num_tokens}."
+                )
+
+            input_chunks = self.input_ids.split(extend_lens)
+            cache_chunks = self.out_cache_loc.split(extend_lens)
+            prebuilt_filter_state = {
+                "input_ids": torch.cat([input_chunks[i] for i in keep_indices]),
+                "out_cache_loc": torch.cat(
+                    [cache_chunks[i] for i in keep_indices]
+                ),
+                "prefix_lens": [self.prefix_lens[i] for i in keep_indices],
+                "extend_lens": [extend_lens[i] for i in keep_indices],
+                "extend_logprob_start_lens": [
+                    self.extend_logprob_start_lens[i] for i in keep_indices
+                ],
+            }
+
+            if self.oe_context is not None:
+                hash_prefixes = self.oe_context.hash_prefixes
+                prebuilt_filter_state["oe_hash_prefixes"] = (
+                    None
+                    if hash_prefixes is None
+                    else [[row[i] for i in keep_indices] for row in hash_prefixes]
+                )
+                legacy_prefixes = self.oe_context.legacy_prefixes
+                prebuilt_filter_state["oe_legacy_prefixes"] = (
+                    None
+                    if legacy_prefixes is None
+                    else [[row[i] for i in keep_indices] for row in legacy_prefixes]
+                )
+
         if keep_indices is None or len(keep_indices) == 0:
             # Filter out all requests
             self.reqs = []
@@ -3090,7 +3344,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.mamba_track_seqlens = None
         self.router_replay_topk_ids = None
         self.router_replay_mask = None
-        self.return_logprob = any(req.return_logprob for req in self.reqs)
+        self.return_logprob = any(
+            Req.requires_logprob_payload(req) for req in self.reqs
+        )
         if self.return_logprob:
             self.top_logprobs_nums = [self.top_logprobs_nums[i] for i in keep_indices]
             self.token_ids_logprobs = [self.token_ids_logprobs[i] for i in keep_indices]
@@ -3112,6 +3368,26 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 new_indices=keep_indices_device,
                 has_been_filtered=has_been_filtered,
             )
+
+        if prebuilt_filter_state is not None:
+            self.input_ids = prebuilt_filter_state["input_ids"]
+            self.out_cache_loc = prebuilt_filter_state["out_cache_loc"]
+            self.prefix_lens = prebuilt_filter_state["prefix_lens"]
+            self.extend_lens = prebuilt_filter_state["extend_lens"]
+            self.extend_num_tokens = sum(self.extend_lens)
+            self.extend_logprob_start_lens = prebuilt_filter_state[
+                "extend_logprob_start_lens"
+            ]
+            if self.oe_context is not None:
+                oe_hash_prefixes = prebuilt_filter_state["oe_hash_prefixes"]
+                self.oe_context.input_ids_buffer = (
+                    None
+                    if oe_hash_prefixes is None
+                    else HashInputIdsBuffer(oe_hash_prefixes)
+                )
+                self.oe_context.legacy_prefixes = prebuilt_filter_state[
+                    "oe_legacy_prefixes"
+                ]
 
     def merge_batch(self, other: "ScheduleBatch"):
         # In the regular scheduler path:
@@ -3283,6 +3559,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             mamba_track_indices=self.mamba_track_indices,
             mamba_track_mask=self.mamba_track_mask,
             mamba_track_seqlens=self.mamba_track_seqlens,
+            forward_iter=self.forward_iter,
         )
 
     def _get_welm_kv_mirror_last_q_indices(
@@ -3514,7 +3791,6 @@ class ModelWorkerBatch:
     extend_input_logprob_token_ids: Optional[torch.Tensor]
     router_replay_topk_ids: Optional[torch.Tensor]
     router_replay_mask: Optional[torch.Tensor]
-
     # For multimodal
     multimodal_inputs: Optional[List[MultimodalInputs]]
 
@@ -3590,3 +3866,6 @@ class ModelWorkerBatch:
     mamba_track_indices: Optional[torch.Tensor] = None  # shape: [b], int64
     mamba_track_mask: Optional[torch.Tensor] = None  # shape: [b], bool
     mamba_track_seqlens: Optional[torch.Tensor] = None  # shape: [b], int64
+
+    # Scheduler-wide forward order, shared by every TP/CP rank.
+    forward_iter: Optional[int] = None

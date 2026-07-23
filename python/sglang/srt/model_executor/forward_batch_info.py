@@ -287,6 +287,11 @@ class NgramEmbeddingInfo:
         )
 
 
+@dataclass(frozen=True)
+class WelmDeferredPrefillCompletion:
+    """Typed in-process marker for Prefill completion without model outputs."""
+
+
 @dataclass
 class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     """Store all inputs of a forward pass."""
@@ -356,6 +361,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     attn_cp_prefill_swa_kv_gather_plans: Optional[
         Dict[tuple, CPPrefillSWAKVGatherPlan]
     ] = None
+    forward_iter: Optional[int] = None
     extend_input_logprob_token_ids_gpu: Optional[torch.Tensor] = None
     welm_kv_mirror_last_q_indices: Optional[torch.Tensor] = None
     welm_kv_mirror_active_batch_indices: Optional[torch.Tensor] = None
@@ -543,6 +549,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             ),
             oe_context=batch.oe_context,
             scale_seq_factor=batch.scale_seq_factor,
+            forward_iter=batch.forward_iter,
             rids=[req.rid for req in batch.reqs],
         )
         device = model_runner.device
@@ -1145,7 +1152,6 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             self.router_replay_mask = self._pad_tensor_to_size(
                 self.router_replay_mask, num_tokens, value=0
             )
-
         welm_oe_hash = getattr(self, "welm_oe_decode_hashed_inputs", None)
         if welm_oe_hash is not None and welm_oe_hash.shape[1] < num_tokens:
             self.welm_oe_decode_hashed_inputs = torch.cat(
@@ -1226,11 +1232,27 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         tokens_padded = (tokens + rank_size - 1) // rank_size * rank_size
         self._pad_inputs_to_size(model_runner, tokens_padded, self.batch_size)
 
-    def post_forward_mlp_sync_batch(self, logits_output: LogitsProcessorOutput):
+    def post_forward_mlp_sync_batch(
+        self,
+        logits_output: Union[
+            LogitsProcessorOutput, WelmDeferredPrefillCompletion
+        ],
+    ):
 
         self.forward_mode = getattr(self, "_original_forward_mode", self.forward_mode)
         self.batch_size = getattr(self, "_original_batch_size", self.batch_size)
         bs = self.batch_size
+
+        if isinstance(logits_output, WelmDeferredPrefillCompletion):
+            if self.spec_info is not None:
+                raise RuntimeError(
+                    "WeLM deferred Prefill completion does not support speculative execution"
+                )
+            if not self.forward_mode.is_extend():
+                raise RuntimeError(
+                    "WeLM deferred Prefill completion requires an extend forward"
+                )
+            return
 
         if self.spec_info is not None:
             if self.forward_mode.is_decode():  # draft

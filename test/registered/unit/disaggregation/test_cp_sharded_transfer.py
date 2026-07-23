@@ -19,6 +19,7 @@ from sglang.srt.disaggregation.mooncake.conn import (
 )
 from sglang.srt.disaggregation.prefill import SchedulerDisaggregationPrefillMixin
 from sglang.srt.disaggregation.utils import resolve_cp_sharded_transfer_page_runs
+from sglang.srt.managers import schedule_batch as schedule_batch_module
 from sglang.srt.mem_cache.allocator import PagedTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import InsertParams, MatchPrefixParams
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
@@ -27,6 +28,7 @@ from sglang.srt.mem_cache.cp_sharded_allocator import CPShardedKVPoolAllocator
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey
 from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
+from sglang.srt.models.welm_deferred_mirror import WelmPDExecutionMode
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=2, suite="stage-a-test-cpu")
@@ -533,6 +535,86 @@ class TestCPShardedTransfer(unittest.TestCase):
                 self.assertEqual(allocator.available_size(), 128)
                 self.assertEqual(base.full_attn_allocator.available_size(), 64)
                 self.assertEqual(base.swa_attn_allocator.available_size(), 64)
+
+    def test_deferred_decode_cp_preallocates_only_committed_prefix_with_fragmentation(
+        self,
+    ):
+        page_size = 4
+        prompt = list(range(17))
+        base = PagedTokenToKVPoolAllocator(
+            size=64,
+            page_size=page_size,
+            dtype=torch.float32,
+            device="cpu",
+            kvcache=None,
+            need_sort=False,
+        )
+        base.free_pages = torch.tensor(
+            [7, 2, 9, 4, 1, 3, 5, 8, 10, 12, 14, 16, 6, 11, 13, 15],
+            dtype=torch.int64,
+        )
+        allocator = CPShardedKVPoolAllocator(
+            base,
+            cp_rank=0,
+            cp_size=2,
+            cp_kv_chunk_size=8,
+            logical_size=128,
+            use_decode_owner_layout=True,
+        )
+        allocator.logical_free_pages = torch.tensor(
+            [9, 2, 12, 5, 11, 3, 10, 4, 1, 6, 7, 8, 13, 14, 15, 16],
+            dtype=torch.int64,
+        )
+        queue = object.__new__(DecodePreallocQueue)
+        queue.token_to_kv_pool_allocator = allocator
+        queue.req_to_token_pool = ReqToTokenPool(
+            size=2,
+            max_context_len=64,
+            device="cpu",
+            enable_memory_saver=False,
+        )
+        queue.scheduler = SimpleNamespace(
+            server_args=SimpleNamespace(
+                welm_kv_mirror_pd_mode=(
+                    WelmPDExecutionMode.DEFERRED_LAST_PROMPT.value
+                ),
+                disaggregation_decode_enable_radix_cache=False,
+            ),
+            enable_hisparse=False,
+        )
+        queue.tree_cache = MagicMock()
+        queue._uses_swa_tail_prealloc = lambda: False
+        req = SimpleNamespace(
+            req_pool_idx=None,
+            is_chunked=0,
+            kv_committed_len=0,
+            origin_input_ids=prompt,
+            output_ids=[],
+            welm_deferred_decode_state=(
+                schedule_batch_module.WelmDeferredDecodeState.from_prompt_tokens(
+                    prompt
+                )
+            ),
+            rid="deferred-fragmented",
+            set_extend_input_len=MagicMock(),
+        )
+
+        physical_dst = queue._pre_alloc(req)
+        committed_len = len(prompt) - 1
+        logical_slots = queue.req_to_token_pool.req_to_token[
+            req.req_pool_idx, :committed_len
+        ].to(dtype=torch.int64)
+
+        self.assertEqual(req.kv_allocated_len, committed_len)
+        self.assertEqual(req.kv_committed_len, committed_len)
+        self.assertEqual(req.fill_ids, prompt[:-1])
+        self.assertEqual(logical_slots.numel(), committed_len)
+        self.assertEqual(torch.unique(logical_slots).numel(), committed_len)
+        self.assertFalse(torch.equal(physical_dst, logical_slots))
+        torch.testing.assert_close(
+            physical_dst,
+            allocator.logical_slots_to_physical(logical_slots),
+        )
 
     @staticmethod
     def _make_sender(allocator, logical_page_count, *, state_types=None):

@@ -3,10 +3,12 @@ from __future__ import annotations
 import pytest
 import torch
 
+import sglang.jit_kernel.prefill_cp_kv_source_push as source_push
 import sglang.srt.layers.attention.prefill_cp_kv_ipc as kv_ipc
 from sglang.srt.layers.attention.prefill_cp_kv_ipc import (
     CPKVIPCArenaLayout,
     CPKVIPCEpochTracker,
+    CPKVIPCForwardEpochSequencer,
     CPKVIPCSourcePushTransport,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -170,3 +172,73 @@ def test_epoch_tracker_rejects_invalid_masks(source_mask, destination_mask):
             source_mask=source_mask,
             destination_mask=destination_mask,
         )
+
+
+def test_forward_epoch_matches_after_one_rank_skips_earlier_forwards():
+    always_active = CPKVIPCForwardEpochSequencer(max_calls_per_forward=64)
+    newly_active = CPKVIPCForwardEpochSequencer(max_calls_per_forward=64)
+
+    for forward_iter in range(1, 26):
+        always_active.next_epoch(forward_iter=forward_iter, operation_index=0)
+
+    assert always_active.next_epoch(
+        forward_iter=26, operation_index=0
+    ) == newly_active.next_epoch(
+        forward_iter=26, operation_index=0
+    )
+
+
+def test_forward_epoch_preserves_call_order_within_one_forward():
+    left = CPKVIPCForwardEpochSequencer(max_calls_per_forward=64)
+    right = CPKVIPCForwardEpochSequencer(max_calls_per_forward=64)
+
+    assert [
+        left.next_epoch(forward_iter=7, operation_index=operation_index)
+        for operation_index in range(3)
+    ] == [
+        right.next_epoch(forward_iter=7, operation_index=operation_index)
+        for operation_index in range(3)
+    ]
+
+
+def test_forward_epoch_matches_when_one_rank_skips_an_earlier_operation():
+    always_active = CPKVIPCForwardEpochSequencer(max_calls_per_forward=64)
+    selectively_active = CPKVIPCForwardEpochSequencer(max_calls_per_forward=64)
+
+    always_active.next_epoch(forward_iter=7, operation_index=0)
+
+    assert always_active.next_epoch(
+        forward_iter=7, operation_index=5
+    ) == selectively_active.next_epoch(forward_iter=7, operation_index=5)
+
+
+def test_forward_epoch_supports_values_beyond_uint32():
+    sequencer = CPKVIPCForwardEpochSequencer(max_calls_per_forward=64)
+    first_forward_beyond_uint32 = (1 << 32) // 64 + 1
+
+    epoch = sequencer.next_epoch(
+        forward_iter=first_forward_beyond_uint32,
+        operation_index=0,
+    )
+
+    assert epoch == (1 << 32) + 1
+
+
+def test_epoch_tracker_supports_values_beyond_uint32():
+    tracker = CPKVIPCEpochTracker(cp_size=4, local_rank=0)
+
+    ticket = tracker.begin(
+        source_mask=0b0001,
+        destination_mask=0b0010,
+        epoch=(1 << 32) + 1,
+    )
+
+    assert ticket.epoch == (1 << 32) + 1
+
+
+def test_signal_metadata_supports_values_beyond_uint32():
+    source_push._validate_signal_metadata(
+        signal_offset_bytes=0,
+        signal_stride_bytes=128,
+        epoch=(1 << 32) + 1,
+    )

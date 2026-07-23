@@ -147,6 +147,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
     PPProxyTensors,
+    WelmDeferredPrefillCompletion,
 )
 from sglang.srt.model_executor.hook_manager import register_forward_hooks
 from sglang.srt.model_executor.model_runner_kv_cache_mixin import (
@@ -164,6 +165,11 @@ from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
 )
 from sglang.srt.model_loader.utils import set_default_torch_dtype
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.models.welm_deferred_mirror import (
+    WelmPDExecutionMode,
+    bind_welm_deferred_model_execution,
+    resolve_welm_deferred_mirror_plan,
+)
 from sglang.srt.models.welm_perf_opt import (
     get_welm_oe_hash_config,
     should_use_welm_oe_hash_kernel,
@@ -321,7 +327,9 @@ class RankZeroFilter(logging.Filter):
 
 @dataclass
 class ModelRunnerOutput:
-    logits_output: Union[LogitsProcessorOutput, PPProxyTensors]
+    logits_output: Union[
+        LogitsProcessorOutput, PPProxyTensors, WelmDeferredPrefillCompletion
+    ]
     can_run_graph: bool
     expert_distribution_metrics: Optional[ExpertDistributionMetrics] = None
     routed_experts_output: Optional[TopkCaptureOutput] = None
@@ -495,6 +503,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if server_args.show_time_cost:
             enable_show_time_cost()
 
+        self._init_welm_deferred_mirror_plan()
+
         # Model-specific adjustment
         self.model_specific_adjustment()
 
@@ -581,6 +591,52 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             model_revision=model_revision,
             is_draft_model=is_draft_model,
         )
+
+    def _init_welm_deferred_mirror_plan(self) -> None:
+        self.welm_deferred_mirror_plan = None
+        raw_mode = getattr(self.server_args, "welm_kv_mirror_pd_mode", "legacy")
+        if raw_mode == WelmPDExecutionMode.LEGACY.value:
+            return
+
+        from sglang.srt.layers.welmv4_op import welm_use_previous_precision
+
+        plan = resolve_welm_deferred_mirror_plan(
+            self.server_args,
+            self.model_config,
+            use_previous_precision=welm_use_previous_precision(),
+        )
+        if plan is None:
+            raise RuntimeError(
+                "non-legacy WeLM mirror P/D mode resolved without an execution plan"
+            )
+        self.welm_deferred_mirror_plan = plan
+        role = self.server_args.disaggregation_mode
+        bind_welm_deferred_model_execution(
+            self.model_config.hf_config,
+            plan,
+            role=role,
+        )
+        if self.model_config.hf_text_config is not self.model_config.hf_config:
+            bind_welm_deferred_model_execution(
+                self.model_config.hf_text_config,
+                plan,
+                role=role,
+            )
+
+        if self.tp_rank == 0 and self.pp_rank == 0:
+            logger.info(
+                "WeLM deferred mirror P/D enabled: role=%s cutoff=%d pairs=%d "
+                "fingerprint=%s topology=tp%d/dp%d/dp_attention=%s/attn_cp%d:%s",
+                self.server_args.disaggregation_mode,
+                plan.execution_end_layer,
+                len(plan.pairs),
+                plan.fingerprint,
+                self.tp_size,
+                self.dp_size,
+                self.server_args.enable_dp_attention,
+                self.attn_cp_size,
+                self.server_args.attn_cp_mode,
+            )
 
     def init_msprobe(self):
         # Init the msprobe
@@ -3252,6 +3308,16 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         if not self.is_generation:
             # TODO: Currently, cuda graph only captures decode steps, which only exists for generation models
+            return
+
+        if (
+            getattr(self, "welm_deferred_mirror_plan", None) is not None
+            and self.server_args.disaggregation_mode == "prefill"
+        ):
+            logger.info(
+                "Skip decode CUDA graph capture for WeLM deferred Prefill; "
+                "this worker only executes extend forwards."
+            )
             return
 
         if self.server_args.model_impl.lower() == ModelImpl.MINDSPORE:

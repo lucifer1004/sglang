@@ -40,6 +40,10 @@ from sglang.srt.disaggregation.common.conn import (
     CommonKVReceiver,
     _resolve_kv_transfer_parallel_info,
 )
+from sglang.srt.disaggregation.common.welm_deferred_protocol import (
+    WelmDeferredCompletion,
+    resolve_runtime_welm_deferred_mirror_capability,
+)
 from sglang.srt.disaggregation.utils import (
     FAKE_BOOTSTRAP_HOST,
     DisaggregationMode,
@@ -56,13 +60,19 @@ from sglang.srt.disaggregation.utils import (
     setup_state_kv_args,
 )
 from sglang.srt.environ import envs
-from sglang.srt.managers.schedule_batch import FINISH_ABORT, ScheduleBatch
+from sglang.srt.managers.schedule_batch import (
+    FINISH_ABORT,
+    ScheduleBatch,
+    WelmDeferredDecodePhase,
+    WelmDeferredDecodeState,
+)
 from sglang.srt.managers.schedule_policy import match_prefix_for_req
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, EvictParams
 from sglang.srt.mem_cache.common import (
     kv_to_page_indices,
+    maybe_cache_unfinished_req,
     page_align_floor,
     release_kv_cache,
 )
@@ -82,6 +92,10 @@ from sglang.srt.mem_cache.memory_pool import (
     ReqToTokenPool,
 )
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+from sglang.srt.models.welm_deferred_mirror import (
+    WelmPDExecutionMode,
+    get_welm_deferred_request_unsupported_reason,
+)
 from sglang.srt.managers.scheduler_decode_profile import (
     decode_scheduler_profile_enabled,
     record_decode_scheduler_event,
@@ -105,8 +119,9 @@ CLIP_MAX_NEW_TOKEN = envs.SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION.get()
 
 
 def _is_fake_transfer(req: Req, server_args: ServerArgs) -> bool:
-    return req.bootstrap_host == FAKE_BOOTSTRAP_HOST or (
-        req.bootstrap_host is None
+    bootstrap_host = getattr(req, "bootstrap_host", None)
+    return bootstrap_host == FAKE_BOOTSTRAP_HOST or (
+        bootstrap_host is None
         and server_args.disaggregation_transfer_backend == "fake"
     )
 
@@ -114,6 +129,68 @@ def _is_fake_transfer(req: Req, server_args: ServerArgs) -> bool:
 def _bootstrap_addr(req: Req) -> str:
     # FIXME: make a property of a req
     return NetworkAddress(req.bootstrap_host, req.bootstrap_port).to_host_port_str()
+
+
+def _welm_deferred_decode_enabled(server_args: ServerArgs) -> bool:
+    raw_mode = vars(server_args).get("welm_kv_mirror_pd_mode", "legacy")
+    try:
+        mode = WelmPDExecutionMode(raw_mode)
+    except ValueError as exc:
+        raise RuntimeError(f"unknown runtime WeLM mirror P/D mode {raw_mode!r}") from exc
+    return mode is WelmPDExecutionMode.DEFERRED_LAST_PROMPT
+
+
+def _get_welm_deferred_transfer_state(
+    req: Req, server_args: ServerArgs
+) -> Optional[WelmDeferredDecodeState]:
+    """Return state only while the request still uses deferred transfer semantics."""
+    enabled = _welm_deferred_decode_enabled(server_args)
+    state = vars(req).get("welm_deferred_decode_state")
+    if enabled:
+        if not isinstance(state, WelmDeferredDecodeState):
+            raise RuntimeError(
+                "WeLM deferred decode fast path is missing request lifecycle state"
+            )
+        if state.phase is WelmDeferredDecodePhase.CONSUMED:
+            return None
+        return state
+    if state is not None:
+        raise RuntimeError(
+            "legacy WeLM P/D mode received deferred decode lifecycle state"
+        )
+    return None
+
+
+def _decode_transfer_fill_ids(req: Req, server_args: ServerArgs) -> List[int]:
+    state = _get_welm_deferred_transfer_state(req, server_args)
+    if state is None:
+        return (req.origin_input_ids + req.output_ids)[
+            : len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0)
+        ]
+    if req.output_ids:
+        raise RuntimeError(
+            "WeLM deferred decode transfer must not contain generated output tokens"
+        )
+    return state.committed_token_ids(req.origin_input_ids)
+
+
+def _decode_transfer_fill_len(req: Req, server_args: ServerArgs) -> int:
+    state = _get_welm_deferred_transfer_state(req, server_args)
+    if state is None:
+        return len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0)
+    if req.output_ids:
+        raise RuntimeError(
+            "WeLM deferred decode transfer must not contain generated output tokens"
+        )
+    state.validate_prompt_tokens(req.origin_input_ids)
+    return state.committed_kv_len
+
+
+def _decode_transfer_prefix_ids(req: Req, server_args: ServerArgs) -> List[int]:
+    state = _get_welm_deferred_transfer_state(req, server_args)
+    if state is None:
+        return req.origin_input_ids
+    return state.committed_token_ids(req.origin_input_ids)
 
 
 class DecodeReqToTokenPool:
@@ -261,9 +338,26 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
 @dataclass
 class DecodeRequest:
     req: Req
-    kv_receiver: CommonKVReceiver
+    kv_receiver: Optional[CommonKVReceiver]
     waiting_for_input: bool = False
     metadata_buffer_index: int = -1
+    abort_requested: bool = False
+
+    def request_abort(self) -> bool:
+        receiver = getattr(self, "kv_receiver", None)
+        if getattr(self, "abort_requested", False) or receiver is None:
+            return False
+        self.abort_requested = True
+        receiver.abort()
+        return True
+
+    def clear_receiver(self) -> bool:
+        receiver = getattr(self, "kv_receiver", None)
+        if receiver is None:
+            return False
+        receiver.clear()
+        self.kv_receiver = None
+        return True
 
     @property
     def seqlen(self) -> int:
@@ -387,7 +481,9 @@ class DecodePreallocQueue:
         return self._swa_tail_len(len(req.origin_input_ids)) + len(req.output_ids)
 
     def _prealloc_kv_lens(self, req: Req) -> Tuple[int, int]:
-        allocated_kv_len = len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0)
+        allocated_kv_len = _decode_transfer_fill_len(
+            req, self.scheduler.server_args
+        )
         if self._uses_swa_tail_prealloc():
             return allocated_kv_len, self._swa_tail_len(allocated_kv_len)
         return allocated_kv_len, allocated_kv_len
@@ -462,8 +558,23 @@ class DecodePreallocQueue:
             1 if self.scheduler.enable_hisparse else self.token_to_kv_pool.page_size
         )
 
+        plan = getattr(
+            self.scheduler.tp_worker.model_runner,
+            "welm_deferred_mirror_plan",
+            None,
+        )
+        kv_args.welm_deferred_mirror_capability = (
+            resolve_runtime_welm_deferred_mirror_capability(
+                self.scheduler.server_args, self.scheduler.model_config, plan
+            )
+        )
+
         kv_args.aux_data_ptrs, kv_args.aux_data_lens, kv_args.aux_item_lens = (
-            self.metadata_buffers.get_buf_infos()
+            self.metadata_buffers.get_buf_infos(
+                include_welm_deferred_completion=(
+                    kv_args.welm_deferred_mirror_capability is not None
+                )
+            )
         )
 
         setup_state_kv_args(
@@ -503,6 +614,46 @@ class DecodePreallocQueue:
 
     def add(self, req: Req, is_retracted: bool = False) -> None:
         """Add a request to the pending queue."""
+        deferred_enabled = _welm_deferred_decode_enabled(self.scheduler.server_args)
+        deferred_state = vars(req).get("welm_deferred_decode_state")
+        if deferred_enabled:
+            unsupported_reason = get_welm_deferred_request_unsupported_reason(req)
+            if unsupported_reason is not None:
+                message = (
+                    "WeLM deferred mirror decode does not support "
+                    f"{unsupported_reason}"
+                )
+                logger.error(message)
+                prepare_abort(req, message, status_code=HTTPStatus.BAD_REQUEST)
+                self.scheduler.stream_output(
+                    [req], getattr(req, "return_logprob", False)
+                )
+                return
+            if deferred_state is None:
+                if is_retracted:
+                    raise RuntimeError(
+                        "retracted WeLM deferred decode request is missing lifecycle state"
+                    )
+                if req.output_ids:
+                    raise RuntimeError(
+                        "WeLM deferred decode admission requires an empty output"
+                    )
+                req.welm_deferred_decode_state = (
+                    WelmDeferredDecodeState.from_prompt_tokens(req.origin_input_ids)
+                )
+            elif not isinstance(deferred_state, WelmDeferredDecodeState):
+                raise RuntimeError(
+                    "WeLM deferred decode admission received invalid lifecycle state"
+                )
+            elif not is_retracted:
+                raise RuntimeError(
+                    "duplicate WeLM deferred decode preallocation admission"
+                )
+        elif deferred_state is not None:
+            raise RuntimeError(
+                "legacy WeLM P/D mode received deferred decode lifecycle state"
+            )
+
         if self._check_if_req_exceed_kv_capacity(req):
             return
 
@@ -534,7 +685,7 @@ class DecodePreallocQueue:
         result = match_prefix_for_req(
             self.tree_cache,
             req,
-            req.origin_input_ids,
+            _decode_transfer_prefix_ids(req, self.scheduler.server_args),
             cow_mamba=self.tree_cache.supports_mamba(),
             include_req=True,
         )
@@ -752,7 +903,7 @@ class DecodePreallocQueue:
                 error_msg = f"Could not fetch prefill parallel info from {bootstrap_addr} after {count} attempts"
                 logger.error(error_msg)
                 for decode_req in reqs:
-                    decode_req.kv_receiver.abort()
+                    DecodeRequest.request_abort(decode_req)
                 del self._ensure_retry_count[bootstrap_addr]
                 del self._ensure_last_attempt_time[bootstrap_addr]
             else:
@@ -768,6 +919,8 @@ class DecodePreallocQueue:
         # Group pending requests by bootstrap_addr
         addr_to_reqs: Dict[str, List[DecodeRequest]] = {}
         for decode_req in self.pending_reqs:
+            if decode_req.abort_requested:
+                continue
             addr = _bootstrap_addr(decode_req.req)
             addr_to_reqs.setdefault(addr, []).append(decode_req)
 
@@ -853,10 +1006,18 @@ class DecodePreallocQueue:
         for i, decode_req in enumerate(self.queue):
             if rids_to_check is not None and decode_req.req.rid not in rids_to_check:
                 continue
+            if getattr(decode_req, "abort_requested", False) and not isinstance(
+                decode_req.req.finished_reason, FINISH_ABORT
+            ):
+                prepare_abort(
+                    decode_req.req,
+                    "Decode preallocation aborted by AbortReq.",
+                )
             if isinstance(decode_req.req.finished_reason, FINISH_ABORT):
                 self.scheduler.stream_output(
                     [decode_req.req], decode_req.req.return_logprob
                 )
+                DecodeRequest.clear_receiver(decode_req)
                 failed_reqs.append(decode_req)
                 indices_to_remove.add(i)
 
@@ -898,8 +1059,8 @@ class DecodePreallocQueue:
             # Memory estimation: don't add if the projected memory cannot be met
             # TODO: add new_token ratio
             origin_input_len = len(decode_req.req.origin_input_ids)
-            fill_len = origin_input_len + max(
-                len(decode_req.req.output_ids) - 1, 0
+            fill_len = _decode_transfer_fill_len(
+                decode_req.req, self.scheduler.server_args
             )
             if self.scheduler.server_args.disaggregation_decode_enable_radix_cache:
                 # Match prefix against decode's radix cache.
@@ -925,7 +1086,7 @@ class DecodePreallocQueue:
             else:
                 prefix_indices = None
                 prefix_len = 0
-                required_alloc_tokens = origin_input_len
+                required_alloc_tokens = fill_len
 
             required_tokens_for_request = (
                 required_alloc_tokens + self.num_reserved_decode_tokens
@@ -1000,7 +1161,7 @@ class DecodePreallocQueue:
                 if self.scheduler.enable_hisparse:
                     # Must cast to int32 for ZMQ serialization -- from_zmq reads np.int32.
                     kv_indices = (
-                        dst_kv_indices[: origin_input_len - prefix_len]
+                        dst_kv_indices[: fill_len - prefix_len]
                         .cpu()
                         .numpy()
                         .astype(np.int32)
@@ -1013,7 +1174,7 @@ class DecodePreallocQueue:
                         CPShardedKVPoolAllocator,
                     ):
                         kv_indices = (
-                            dst_kv_indices[: origin_input_len - prefix_len]
+                            dst_kv_indices[: fill_len - prefix_len]
                             .cpu()
                             .numpy()
                             .astype(np.int32, copy=False)
@@ -1022,12 +1183,12 @@ class DecodePreallocQueue:
                         kv_indices = (
                             self.req_to_token_pool.req_to_token[
                                 decode_req.req.req_pool_idx
-                            ][prefix_len:origin_input_len]
+                            ][prefix_len:fill_len]
                             .cpu()
                             .numpy()
                         )
 
-                seq_len = len(decode_req.req.origin_input_ids)
+                seq_len = fill_len
 
                 def _mamba_payload():
                     return [
@@ -1155,8 +1316,14 @@ class DecodePreallocQueue:
                     ),
                 )
 
+        removed_entry_ids = {id(self.queue[i]) for i in indices_to_remove}
         self.queue = [
             entry for i, entry in enumerate(self.queue) if i not in indices_to_remove
+        ]
+        self.pending_reqs = [
+            entry
+            for entry in self.pending_reqs
+            if id(entry) not in removed_entry_ids
         ]
 
         return preallocated_reqs, failed_reqs
@@ -1364,7 +1531,8 @@ class DecodePreallocQueue:
             req_pool_indices is not None
         ), "req_pool_indices is full! There is a bug in memory estimation."
 
-        fill_len = len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0)
+        fill_ids = _decode_transfer_fill_ids(req, self.scheduler.server_args)
+        fill_len = len(fill_ids)
         req.kv_allocated_len = fill_len
         req.kv_committed_len = fill_len
 
@@ -1410,7 +1578,11 @@ class DecodePreallocQueue:
                 )
 
         logical_kv_loc = None
-        if self.scheduler.enable_hisparse:
+        host_indices = None
+        if delta_len == 0:
+            kv_loc = torch.empty((0,), dtype=torch.int64, device=device)
+            host_indices = kv_loc
+        elif self.scheduler.enable_hisparse:
             # HiSparse is incompatible with decode-side L1 radix cache. Keep
             # this path on the upstream full-allocation semantics.
             assert prefix_len == 0
@@ -1508,7 +1680,7 @@ class DecodePreallocQueue:
         # Truncate fill_ids to kv_committed_len so cache_unfinished_req only
         # inserts committed KV into the radix tree. The last output token
         # hasn't had KV committed yet (fill_ids is 1 ahead).
-        req.fill_ids = (req.origin_input_ids + req.output_ids)[: req.kv_committed_len]
+        req.fill_ids = fill_ids
         # Set prefix_indices so downstream consumers (init_next_round_input,
         # prepare_for_extend) see the correct prefix length. In the agg path
         # this is done inside init_next_round_input, but decode-disagg needs
@@ -1520,6 +1692,7 @@ class DecodePreallocQueue:
 
         # Return the transfer destination indices:
         if self.scheduler.enable_hisparse:
+            assert host_indices is not None
             return host_indices
         return kv_loc
 
@@ -1562,6 +1735,154 @@ class DecodeTransferQueue:
                 ):
                     self.staging_handler.register_decode_req(dr.req.bootstrap_room, dr)
 
+    def _abort_welm_deferred_transfer(
+        self, decode_req: DecodeRequest, error_message: str
+    ) -> bool:
+        logger.error(error_message)
+        prepare_abort(
+            decode_req.req,
+            error_message,
+            status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+        )
+        DecodeRequest.clear_receiver(decode_req)
+        return True
+
+    @staticmethod
+    def _commit_cached_token_stats(req: Req, cached_tokens: torch.Tensor) -> None:
+        req.cached_tokens = cached_tokens[0].item()
+        req.cached_tokens_device = cached_tokens[1].item()
+        req.cached_tokens_host = cached_tokens[2].item()
+        req.cached_tokens_storage = cached_tokens[3].item()
+
+    def _validate_welm_deferred_completion(
+        self,
+        decode_req: DecodeRequest,
+        completion: WelmDeferredCompletion,
+        state: WelmDeferredDecodeState,
+    ) -> List[int]:
+        req = decode_req.req
+        if state.phase is not WelmDeferredDecodePhase.TRANSFER_PENDING:
+            raise ValueError(
+                "duplicate or out-of-order WeLM deferred transfer completion: "
+                f"phase={state.phase.value}"
+            )
+        if not isinstance(completion, WelmDeferredCompletion):
+            raise ValueError(
+                "WeLM deferred transfer completion has an unexpected type"
+            )
+
+        expected_fields = (
+            state.committed_kv_len,
+            state.seed_position,
+            state.seed_token_id,
+            state.input_kind,
+        )
+        actual_fields = (
+            completion.committed_kv_len,
+            completion.seed_position,
+            completion.seed_token_id,
+            completion.input_kind,
+        )
+        if actual_fields != expected_fields:
+            raise ValueError(
+                "WeLM deferred transfer completion does not match decode "
+                f"request state: expected={expected_fields}, got={actual_fields}"
+            )
+        if req.output_ids:
+            raise ValueError(
+                "WeLM deferred transfer unexpectedly contains generated output"
+            )
+        if req.kv_allocated_len != state.committed_kv_len:
+            raise ValueError(
+                "WeLM deferred decode allocation length mismatch: "
+                f"allocated={req.kv_allocated_len}, "
+                f"committed={state.committed_kv_len}"
+            )
+        if req.kv_committed_len != state.committed_kv_len:
+            raise ValueError(
+                "WeLM deferred decode committed length mismatch: "
+                f"request={req.kv_committed_len}, "
+                f"completion={state.committed_kv_len}"
+            )
+        return state.committed_token_ids(req.origin_input_ids)
+
+    def _commit_welm_deferred_transfer_to_req(
+        self,
+        decode_req: DecodeRequest,
+        state: WelmDeferredDecodeState,
+    ) -> bool:
+        idx = decode_req.metadata_buffer_index
+        actual_room = int(self.metadata_buffers.bootstrap_room[idx, 0].item())
+        expected_room = (
+            decode_req.req.bootstrap_room
+            if decode_req.req.bootstrap_room is not None
+            else 0
+        )
+
+        is_fake_transfer = _is_fake_transfer(
+            decode_req.req, self.scheduler.server_args
+        )
+        if not is_fake_transfer:
+            if actual_room == 0:
+                return False
+            if actual_room != expected_room:
+                return self._abort_welm_deferred_transfer(
+                    decode_req,
+                    "Context corruption detected for WeLM deferred transfer: "
+                    f"request {decode_req.req.rid} expected bootstrap_room="
+                    f"{expected_room}, got {actual_room} at metadata index {idx}",
+                )
+
+        try:
+            completion = (
+                WelmDeferredCompletion(
+                    committed_kv_len=state.committed_kv_len,
+                    seed_position=state.seed_position,
+                    seed_token_id=state.seed_token_id,
+                    input_kind=state.input_kind,
+                )
+                if is_fake_transfer
+                else self.metadata_buffers.get_welm_deferred_completion(idx)
+            )
+            fill_ids = self._validate_welm_deferred_completion(
+                decode_req, completion, state
+            )
+            cached_tokens = (
+                None
+                if is_fake_transfer
+                else self.metadata_buffers.get_cached_token_stats(idx)
+            )
+        except (RuntimeError, ValueError) as exc:
+            return self._abort_welm_deferred_transfer(
+                decode_req,
+                "Invalid WeLM deferred transfer completion for request "
+                f"{decode_req.req.rid}: {exc}",
+            )
+
+        decode_req.req.fill_ids = fill_ids
+        if cached_tokens is not None:
+            self._commit_cached_token_stats(decode_req.req, cached_tokens)
+        maybe_cache_unfinished_req(decode_req.req, self.tree_cache)
+        state.transition_to(WelmDeferredDecodePhase.READY)
+
+        DecodeRequest.clear_receiver(decode_req)
+        decode_req.req.time_stats.set_wait_queue_entry_time()
+        if hicache_timing_enabled():
+            log_hicache_timing(
+                logger,
+                "pd_decode_kv_arrival",
+                **request_timing_fields(
+                    decode_req.req,
+                    start=decode_req.req.time_stats.decode_transfer_queue_entry_time,
+                    end=decode_req.req.time_stats.wait_queue_entry_time,
+                    role="decode",
+                    stage="kv_arrival",
+                    tp_rank=getattr(self, "tp_rank", None),
+                    metadata_buffer_index=idx,
+                ),
+            )
+        return True
+
     def _commit_transfer_to_req(self, decode_req: DecodeRequest) -> bool:
         """
         Returns:
@@ -1569,6 +1890,14 @@ class DecodeTransferQueue:
             False if metadata not ready yet (keep in queue for next poll)
         """
         idx = decode_req.metadata_buffer_index
+        deferred_state = _get_welm_deferred_transfer_state(
+            decode_req.req, self.scheduler.server_args
+        )
+        if deferred_state is not None:
+            return self._commit_welm_deferred_transfer_to_req(
+                decode_req, deferred_state
+            )
+
         (
             output_id,
             cached_tokens,
@@ -1612,16 +1941,12 @@ class DecodeTransferQueue:
                 "Metadata corruption detected - bootstrap_room mismatch",
                 status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
             )
-            decode_req.kv_receiver.clear()
-            decode_req.kv_receiver = None
+            DecodeRequest.clear_receiver(decode_req)
             return True
 
         # Case 3: Success - commit the transfer
         decode_req.req.output_ids.append(output_id[0].item())
-        decode_req.req.cached_tokens = cached_tokens[0].item()
-        decode_req.req.cached_tokens_device = cached_tokens[1].item()
-        decode_req.req.cached_tokens_host = cached_tokens[2].item()
-        decode_req.req.cached_tokens_storage = cached_tokens[3].item()
+        self._commit_cached_token_stats(decode_req.req, cached_tokens)
         if not self.spec_algorithm.is_none():
             decode_req.req.output_topk_p = output_topk_p
             decode_req.req.output_topk_index = output_topk_index
@@ -1641,8 +1966,7 @@ class DecodeTransferQueue:
                 output_top_logprobs_idx[: decode_req.req.top_logprobs_num].tolist()
             )
 
-        decode_req.kv_receiver.clear()
-        decode_req.kv_receiver = None
+        DecodeRequest.clear_receiver(decode_req)
         decode_req.req.time_stats.set_wait_queue_entry_time()
         if hicache_timing_enabled():
             log_hicache_timing(
@@ -1719,6 +2043,7 @@ class DecodeTransferQueue:
                     error_message,
                     status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
                 )
+                DecodeRequest.clear_receiver(decode_req)
                 self.scheduler.stream_output(
                     [decode_req.req], decode_req.req.return_logprob
                 )
@@ -1930,6 +2255,13 @@ class SchedulerDisaggregationDecodeMixin:
         self: Scheduler,
     ) -> Optional[ScheduleBatch]:
         """Process prebuilt batch and schedule the next decode batch."""
+        deferred_seed_batch = self.get_new_welm_deferred_seed_batch()
+        if deferred_seed_batch is not None:
+            if self.running_batch.is_empty():
+                self.running_batch = deferred_seed_batch
+            else:
+                self.running_batch.merge_batch(deferred_seed_batch)
+
         # Process pending prebuilt batch: output processing + filter + merge
         if (
             self._should_isolate_welm_mtp_prebuilt()
@@ -1964,6 +2296,64 @@ class SchedulerDisaggregationDecodeMixin:
             set_schedule_time_batch(ret)
         return ret
 
+    def get_new_welm_deferred_seed_batch(
+        self: Scheduler,
+    ) -> Optional[ScheduleBatch]:
+        if not _welm_deferred_decode_enabled(self.server_args):
+            return None
+        if len(self.waiting_queue) == 0:
+            return None
+
+        if self.enable_priority_scheduling:
+            self.policy.calc_priority(self.waiting_queue, self.running_batch)
+
+        batch_size = min(self.req_to_token_pool.size, self.max_running_requests)
+        active_running = sum(
+            not req.finished() and not getattr(req, "is_retracted", False)
+            for req in self.running_batch.reqs
+        )
+        available_rows = batch_size - active_running
+        if available_rows <= 0:
+            return None
+
+        can_run_list: List[Req] = []
+        waiting_queue: List[Req] = []
+        for req in self.waiting_queue:
+            state = vars(req).get("welm_deferred_decode_state")
+            if not isinstance(state, WelmDeferredDecodeState):
+                raise RuntimeError(
+                    "waiting WeLM deferred decode seed is missing lifecycle state"
+                )
+            if state.phase is WelmDeferredDecodePhase.CONSUMED:
+                waiting_queue.append(req)
+                continue
+            if state.phase is not WelmDeferredDecodePhase.READY:
+                raise RuntimeError(
+                    "waiting WeLM deferred decode seed is not READY: "
+                    f"rid={req.rid}, phase={state.phase.value}"
+                )
+            if len(can_run_list) < available_rows:
+                can_run_list.append(req)
+            else:
+                waiting_queue.append(req)
+
+        self.waiting_queue = waiting_queue
+        if len(can_run_list) == 0:
+            return None
+
+        set_time_batch(can_run_list, "set_forward_entry_time")
+        new_batch = ScheduleBatch.init_new(
+            can_run_list,
+            self.req_to_token_pool,
+            self.token_to_kv_pool_allocator,
+            self.tree_cache,
+            self.model_config,
+            self.enable_overlap,
+            self.spec_algorithm,
+        )
+        new_batch.prepare_for_welm_deferred_seed_decode()
+        return new_batch
+
     def get_new_prebuilt_batch(self: Scheduler) -> Optional[ScheduleBatch]:
         """Create a schedulebatch for fake completed prefill"""
         if self.grammar_manager.has_waiting_grammars():
@@ -1987,10 +2377,29 @@ class SchedulerDisaggregationDecodeMixin:
         can_run_list: List[Req] = []
         waiting_queue: List[Req] = []
 
-        for i in range(len(self.waiting_queue)):
-            req = self.waiting_queue[i]
+        deferred_enabled = _welm_deferred_decode_enabled(self.server_args)
+        for req in self.waiting_queue:
+            deferred_state = vars(req).get("welm_deferred_decode_state")
+            if deferred_enabled:
+                if not isinstance(deferred_state, WelmDeferredDecodeState):
+                    raise RuntimeError(
+                        "waiting WeLM deferred decode seed is missing lifecycle state"
+                    )
+                if deferred_state.phase is WelmDeferredDecodePhase.READY:
+                    waiting_queue.append(req)
+                    continue
+                if deferred_state.phase is not WelmDeferredDecodePhase.CONSUMED:
+                    raise RuntimeError(
+                        "waiting WeLM deferred decode request is not resumable: "
+                        f"rid={req.rid}, phase={deferred_state.phase.value}"
+                    )
+            elif isinstance(deferred_state, WelmDeferredDecodeState):
+                raise RuntimeError(
+                    "legacy WeLM P/D mode received a waiting deferred decode seed"
+                )
+
             # we can only add at least `num_not_used_batch` new batch to the running queue
-            if i < num_not_used_batch:
+            if len(can_run_list) < num_not_used_batch:
                 can_run_list.append(req)
                 # Decode-radix path: do NOT re-match prefix here.
                 # `pop_preallocated` already took a tree snapshot and used it

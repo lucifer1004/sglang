@@ -10,7 +10,10 @@ from sglang.srt.eplb.expert_distribution import ExpertDistributionMetrics
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.overlap_utils import FutureIndices
 from sglang.srt.managers.schedule_batch import Req
-from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
+from sglang.srt.model_executor.forward_batch_info import (
+    PPProxyTensors,
+    WelmDeferredPrefillCompletion,
+)
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.state_capturer.base import TopkCaptureOutput
 
@@ -84,6 +87,11 @@ class GenerationBatchResult:
     fpm_start_event: Optional[torch.cuda.Event] = None
     fpm_end_event: Optional[torch.cuda.Event] = None
 
+    # Appended to preserve the positional constructor contract above.
+    welm_deferred_prefill_completion: Optional[
+        WelmDeferredPrefillCompletion
+    ] = None
+
     def __post_init__(self, next_draft_input: Optional["EagleDraftInput"]) -> None:
         if next_draft_input is None:
             return
@@ -101,34 +109,52 @@ class GenerationBatchResult:
         Only the tensors which are needed for processing results are copied,
         e.g., next_token_ids, logits outputs
         """
-        if return_logprob:
-            if self.logits_output.next_token_logprobs is not None:
-                self.logits_output.next_token_logprobs = (
-                    self.logits_output.next_token_logprobs.to("cpu", non_blocking=True)
+        if self.welm_deferred_prefill_completion is not None:
+            if self.logits_output is not None:
+                raise RuntimeError(
+                    "WeLM deferred Prefill completion must not carry logits"
                 )
-            if self.logits_output.input_token_logprobs is not None:
-                self.logits_output.input_token_logprobs = (
-                    self.logits_output.input_token_logprobs.to("cpu", non_blocking=True)
+            if return_logprob or return_hidden_states:
+                raise RuntimeError(
+                    "WeLM deferred Prefill does not support an output payload"
                 )
-            if self.logits_output.next_token_top_logprobs_val is not None:
-                self.logits_output.next_token_top_logprobs_val = [
-                    v.to("cpu", non_blocking=True) if torch.is_tensor(v) else v
-                    for v in self.logits_output.next_token_top_logprobs_val
-                ]
-            if self.logits_output.next_token_top_logprobs_idx is not None:
-                self.logits_output.next_token_top_logprobs_idx = [
-                    x.to("cpu", non_blocking=True) if torch.is_tensor(x) else x
-                    for x in self.logits_output.next_token_top_logprobs_idx
-                ]
-            if self.logits_output.next_token_token_ids_logprobs_val is not None:
-                self.logits_output.next_token_token_ids_logprobs_val = [
-                    v.to("cpu", non_blocking=True) if torch.is_tensor(v) else v
-                    for v in self.logits_output.next_token_token_ids_logprobs_val
-                ]
-        if return_hidden_states and self.logits_output.hidden_states is not None:
-            self.logits_output.hidden_states = self.logits_output.hidden_states.to(
-                "cpu", non_blocking=True
-            )
+            if self.next_token_ids is None:
+                raise RuntimeError(
+                    "WeLM deferred Prefill completion requires internal bookkeeping IDs"
+                )
+        else:
+            if return_logprob:
+                if self.logits_output.next_token_logprobs is not None:
+                    self.logits_output.next_token_logprobs = (
+                        self.logits_output.next_token_logprobs.to(
+                            "cpu", non_blocking=True
+                        )
+                    )
+                if self.logits_output.input_token_logprobs is not None:
+                    self.logits_output.input_token_logprobs = (
+                        self.logits_output.input_token_logprobs.to(
+                            "cpu", non_blocking=True
+                        )
+                    )
+                if self.logits_output.next_token_top_logprobs_val is not None:
+                    self.logits_output.next_token_top_logprobs_val = [
+                        v.to("cpu", non_blocking=True) if torch.is_tensor(v) else v
+                        for v in self.logits_output.next_token_top_logprobs_val
+                    ]
+                if self.logits_output.next_token_top_logprobs_idx is not None:
+                    self.logits_output.next_token_top_logprobs_idx = [
+                        x.to("cpu", non_blocking=True) if torch.is_tensor(x) else x
+                        for x in self.logits_output.next_token_top_logprobs_idx
+                    ]
+                if self.logits_output.next_token_token_ids_logprobs_val is not None:
+                    self.logits_output.next_token_token_ids_logprobs_val = [
+                        v.to("cpu", non_blocking=True) if torch.is_tensor(v) else v
+                        for v in self.logits_output.next_token_token_ids_logprobs_val
+                    ]
+            if return_hidden_states and self.logits_output.hidden_states is not None:
+                self.logits_output.hidden_states = self.logits_output.hidden_states.to(
+                    "cpu", non_blocking=True
+                )
         self.next_token_ids = self.next_token_ids.to("cpu", non_blocking=True)
 
         if self.accept_lens is not None:

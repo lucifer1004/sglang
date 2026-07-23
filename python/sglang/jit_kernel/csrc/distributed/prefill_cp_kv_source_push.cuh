@@ -29,7 +29,7 @@ struct SourcePushParams {
   uint64_t signal_stride_bytes;
   uint32_t destination_mask;
   uint32_t source_rank;
-  uint32_t epoch;
+  uint64_t epoch;
   uint32_t num_tiles;
   bool publish_signal;
 };
@@ -48,7 +48,7 @@ struct IndexedSourcePushParams {
   uint64_t signal_stride_bytes;
   uint32_t destination_mask;
   uint32_t source_rank;
-  uint32_t epoch;
+  uint64_t epoch;
   uint32_t num_rows;
   uint32_t rows_per_block;
   uint32_t num_blocks;
@@ -62,7 +62,7 @@ struct PublishEpochParams {
   uint64_t signal_stride_bytes;
   uint32_t destination_mask;
   uint32_t publisher_rank;
-  uint32_t epoch;
+  uint64_t epoch;
 };
 
 template <typename T>
@@ -92,13 +92,13 @@ SGL_DEVICE void store_volatile_16b(void* address, const uint4& value) {
                : "memory");
 }
 
-SGL_DEVICE void store_release_system(uint32_t* address, uint32_t value) {
-  asm volatile("st.release.sys.global.u32 [%0], %1;" : : "l"(address), "r"(value) : "memory");
+SGL_DEVICE void store_release_system(uint64_t* address, uint64_t value) {
+  asm volatile("st.release.sys.global.u64 [%0], %1;" : : "l"(address), "l"(value) : "memory");
 }
 
-SGL_DEVICE uint32_t load_acquire_system(const uint32_t* address) {
-  uint32_t value;
-  asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(value) : "l"(address) : "memory");
+SGL_DEVICE uint64_t load_acquire_system(const uint64_t* address) {
+  uint64_t value;
+  asm volatile("ld.acquire.sys.global.u64 %0, [%1];" : "=l"(value) : "l"(address) : "memory");
   return value;
 }
 
@@ -147,7 +147,7 @@ __global__ void source_push_kernel(const SourcePushParams<kNumGPU> params) {
 #pragma unroll
   for (uint32_t destination = 0; destination < kNumGPU; ++destination) {
     if ((params.destination_mask & (1u << destination)) == 0) continue;
-    auto* signal = byte_offset<uint32_t>(
+    auto* signal = byte_offset<uint64_t>(
         params.peer_bases[destination],
         params.signal_offset_bytes +
             static_cast<uint64_t>(params.source_rank) * params.signal_stride_bytes);
@@ -210,7 +210,7 @@ __global__ void indexed_source_push_kernel(
 #pragma unroll
   for (uint32_t destination = 0; destination < kNumGPU; ++destination) {
     if ((params.destination_mask & (1u << destination)) == 0) continue;
-    auto* signal = byte_offset<uint32_t>(
+    auto* signal = byte_offset<uint64_t>(
         params.peer_bases[destination],
         params.signal_offset_bytes +
             static_cast<uint64_t>(params.source_rank) * params.signal_stride_bytes);
@@ -224,10 +224,10 @@ __global__ void wait_ready_kernel(
     uint32_t source_mask,
     uint64_t signal_offset_bytes,
     uint64_t signal_stride_bytes,
-    uint32_t epoch) {
+    uint64_t epoch) {
   const uint32_t source = threadIdx.x;
   if (source >= kNumGPU || (source_mask & (1u << source)) == 0) return;
-  const auto* signal = byte_offset<uint32_t>(
+  const auto* signal = byte_offset<uint64_t>(
       local_arena_base, signal_offset_bytes + static_cast<uint64_t>(source) * signal_stride_bytes);
   while (load_acquire_system(signal) != epoch) {
     __nanosleep(64);
@@ -242,7 +242,7 @@ __global__ void publish_epoch_kernel(
       (params.destination_mask & (1u << destination)) == 0) {
     return;
   }
-  auto* signal = byte_offset<uint32_t>(
+  auto* signal = byte_offset<uint64_t>(
       params.peer_bases[destination],
       params.signal_offset_bytes +
           static_cast<uint64_t>(params.publisher_rank) * params.signal_stride_bytes);
@@ -287,17 +287,17 @@ void prefill_cp_kv_source_push(
       destination_mask > 0 && destination_mask < (1ll << kNumGPU),
       "invalid destination mask");
   RuntimeCheck(source_rank >= 0 && source_rank < kNumGPU, "invalid source rank");
-  RuntimeCheck(epoch > 0 && epoch <= UINT32_MAX, "invalid epoch");
+  RuntimeCheck(epoch > 0, "invalid epoch");
   RuntimeCheck(
       num_threads == 64 || num_threads == 128 || num_threads == 256 || num_threads == 512,
       "invalid thread count");
   RuntimeCheck(k_offset_bytes >= 0 && k_offset_bytes % 16 == 0, "invalid K offset");
   RuntimeCheck(v_offset_bytes >= 0 && v_offset_bytes % 16 == 0, "invalid V offset");
   RuntimeCheck(
-      signal_offset_bytes >= 0 && signal_offset_bytes % sizeof(uint32_t) == 0,
+      signal_offset_bytes >= 0 && signal_offset_bytes % sizeof(uint64_t) == 0,
       "invalid signal offset");
   RuntimeCheck(
-      signal_stride_bytes >= sizeof(uint32_t) && signal_stride_bytes % sizeof(uint32_t) == 0,
+      signal_stride_bytes >= sizeof(uint64_t) && signal_stride_bytes % sizeof(uint64_t) == 0,
       "invalid signal stride");
 
   SourcePushParams<kNumGPU> params{};
@@ -316,7 +316,7 @@ void prefill_cp_kv_source_push(
   params.signal_stride_bytes = static_cast<uint64_t>(signal_stride_bytes);
   params.destination_mask = static_cast<uint32_t>(destination_mask);
   params.source_rank = static_cast<uint32_t>(source_rank);
-  params.epoch = static_cast<uint32_t>(epoch);
+  params.epoch = static_cast<uint64_t>(epoch);
   params.num_tiles = static_cast<uint32_t>(num_tiles_i64);
   params.publish_signal = publish_signal;
 
@@ -368,7 +368,7 @@ void prefill_cp_kv_source_push_indexed(
       destination_mask > 0 && destination_mask < (1ll << kNumGPU),
       "invalid destination mask");
   RuntimeCheck(source_rank >= 0 && source_rank < kNumGPU, "invalid source rank");
-  RuntimeCheck(epoch > 0 && epoch <= UINT32_MAX, "invalid epoch");
+  RuntimeCheck(epoch > 0, "invalid epoch");
   RuntimeCheck(rows_per_block > 0 && rows_per_block <= UINT32_MAX, "invalid rows per block");
   RuntimeCheck(
       num_threads == 64 || num_threads == 128 || num_threads == 256 || num_threads == 512,
@@ -376,10 +376,10 @@ void prefill_cp_kv_source_push_indexed(
   RuntimeCheck(k_offset_bytes >= 0 && k_offset_bytes % 16 == 0, "invalid K offset");
   RuntimeCheck(v_offset_bytes >= 0 && v_offset_bytes % 16 == 0, "invalid V offset");
   RuntimeCheck(
-      signal_offset_bytes >= 0 && signal_offset_bytes % sizeof(uint32_t) == 0,
+      signal_offset_bytes >= 0 && signal_offset_bytes % sizeof(uint64_t) == 0,
       "invalid signal offset");
   RuntimeCheck(
-      signal_stride_bytes >= sizeof(uint32_t) && signal_stride_bytes % sizeof(uint32_t) == 0,
+      signal_stride_bytes >= sizeof(uint64_t) && signal_stride_bytes % sizeof(uint64_t) == 0,
       "invalid signal stride");
 
   IndexedSourcePushParams<kNumGPU> params{};
@@ -399,7 +399,7 @@ void prefill_cp_kv_source_push_indexed(
   params.signal_stride_bytes = static_cast<uint64_t>(signal_stride_bytes);
   params.destination_mask = static_cast<uint32_t>(destination_mask);
   params.source_rank = static_cast<uint32_t>(source_rank);
-  params.epoch = static_cast<uint32_t>(epoch);
+  params.epoch = static_cast<uint64_t>(epoch);
   params.num_rows = static_cast<uint32_t>(rows_i64);
   params.rows_per_block = static_cast<uint32_t>(rows_per_block);
   params.num_blocks =
@@ -422,12 +422,12 @@ void prefill_cp_kv_wait_ready(
   RuntimeCheck(local_arena_base > 0 && local_arena_base % 16 == 0, "invalid local arena base");
   RuntimeCheck(source_mask > 0 && source_mask < (1ll << kNumGPU), "invalid source mask");
   RuntimeCheck(
-      signal_offset_bytes >= 0 && signal_offset_bytes % sizeof(uint32_t) == 0,
+      signal_offset_bytes >= 0 && signal_offset_bytes % sizeof(uint64_t) == 0,
       "invalid signal offset");
   RuntimeCheck(
-      signal_stride_bytes >= sizeof(uint32_t) && signal_stride_bytes % sizeof(uint32_t) == 0,
+      signal_stride_bytes >= sizeof(uint64_t) && signal_stride_bytes % sizeof(uint64_t) == 0,
       "invalid signal stride");
-  RuntimeCheck(epoch > 0 && epoch <= UINT32_MAX, "invalid epoch");
+  RuntimeCheck(epoch > 0, "invalid epoch");
   RuntimeCheck(device_id >= 0, "invalid CUDA device id");
 
   const DLDevice device{kDLCUDA, static_cast<int32_t>(device_id)};
@@ -437,7 +437,7 @@ void prefill_cp_kv_wait_ready(
       static_cast<uint32_t>(source_mask),
       static_cast<uint64_t>(signal_offset_bytes),
       static_cast<uint64_t>(signal_stride_bytes),
-      static_cast<uint32_t>(epoch));
+      static_cast<uint64_t>(epoch));
 }
 
 template <uint32_t kNumGPU>
@@ -455,12 +455,12 @@ void prefill_cp_kv_publish_epoch(
       destination_mask > 0 && destination_mask < (1ll << kNumGPU),
       "invalid destination mask");
   RuntimeCheck(publisher_rank >= 0 && publisher_rank < kNumGPU, "invalid publisher rank");
-  RuntimeCheck(epoch > 0 && epoch <= UINT32_MAX, "invalid epoch");
+  RuntimeCheck(epoch > 0, "invalid epoch");
   RuntimeCheck(
-      signal_offset_bytes >= 0 && signal_offset_bytes % sizeof(uint32_t) == 0,
+      signal_offset_bytes >= 0 && signal_offset_bytes % sizeof(uint64_t) == 0,
       "invalid signal offset");
   RuntimeCheck(
-      signal_stride_bytes >= sizeof(uint32_t) && signal_stride_bytes % sizeof(uint32_t) == 0,
+      signal_stride_bytes >= sizeof(uint64_t) && signal_stride_bytes % sizeof(uint64_t) == 0,
       "invalid signal stride");
   RuntimeCheck(device_id >= 0, "invalid CUDA device id");
 
@@ -475,7 +475,7 @@ void prefill_cp_kv_publish_epoch(
   params.signal_offset_bytes = static_cast<uint64_t>(signal_offset_bytes);
   params.signal_stride_bytes = static_cast<uint64_t>(signal_stride_bytes);
   params.publisher_rank = static_cast<uint32_t>(publisher_rank);
-  params.epoch = static_cast<uint32_t>(epoch);
+  params.epoch = static_cast<uint64_t>(epoch);
 
   const DLDevice device{kDLCUDA, static_cast<int32_t>(device_id)};
   LaunchKernel(1, 32, device)(

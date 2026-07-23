@@ -22,6 +22,9 @@ if TYPE_CHECKING:
         CommonKVReceiver,
         CommonKVSender,
     )
+    from sglang.srt.disaggregation.common.welm_deferred_protocol import (
+        WelmDeferredCompletion,
+    )
     from sglang.srt.managers.schedule_batch import Req
 
 #########################
@@ -149,6 +152,7 @@ class MetadataBuffers:
         max_top_logprobs_num: int = 128,
         custom_mem_pool: torch.cuda.MemPool = None,
     ):
+        self.size = size
         self.custom_mem_pool = custom_mem_pool
         bootstrap_room_dtype = torch.uint64
         device = "cpu"
@@ -201,8 +205,28 @@ class MetadataBuffers:
             self.bootstrap_room = torch.zeros(
                 (size, 8), dtype=bootstrap_room_dtype, device=device
             )
+        self._device = device
+        self.welm_deferred_completion: Optional[torch.Tensor] = None
 
-    def get_buf_infos(self):
+    def _ensure_welm_deferred_completion_buffer(self) -> None:
+        if self.welm_deferred_completion is not None:
+            return
+        from sglang.srt.disaggregation.common.welm_deferred_protocol import (
+            WELM_DEFERRED_COMPLETION_WORDS,
+        )
+
+        with (
+            torch.cuda.use_mem_pool(self.custom_mem_pool)
+            if self.custom_mem_pool
+            else nullcontext()
+        ):
+            self.welm_deferred_completion = torch.zeros(
+                (self.size, WELM_DEFERRED_COMPLETION_WORDS),
+                dtype=torch.int32,
+                device=self._device,
+            )
+
+    def get_buf_infos(self, *, include_welm_deferred_completion: bool = False):
         ptrs = [
             self.output_ids.data_ptr(),
             self.cached_tokens.data_ptr(),
@@ -239,12 +263,49 @@ class MetadataBuffers:
             self.output_hidden_states[0].nbytes,
             self.bootstrap_room[0].nbytes,
         ]
+        if include_welm_deferred_completion:
+            self._ensure_welm_deferred_completion_buffer()
+            ptrs.append(self.welm_deferred_completion.data_ptr())
+            data_lens.append(self.welm_deferred_completion.nbytes)
+            item_lens.append(self.welm_deferred_completion[0].nbytes)
         return ptrs, data_lens, item_lens
+
+    def set_welm_deferred_completion(
+        self, idx: int, completion: WelmDeferredCompletion
+    ) -> None:
+        from sglang.srt.disaggregation.common.welm_deferred_protocol import (
+            encode_welm_deferred_completion,
+        )
+
+        self._ensure_welm_deferred_completion_buffer()
+        encoded = encode_welm_deferred_completion(completion)
+        self.welm_deferred_completion[idx].copy_(
+            torch.as_tensor(encoded, dtype=torch.int32, device=self._device)
+        )
+
+    def get_welm_deferred_completion(self, idx: int) -> WelmDeferredCompletion:
+        from sglang.srt.disaggregation.common.welm_deferred_protocol import (
+            decode_welm_deferred_completion,
+        )
+
+        if self.welm_deferred_completion is None:
+            raise RuntimeError("WeLM deferred completion buffer is not enabled")
+        encoded = (
+            self.welm_deferred_completion[idx]
+            .detach()
+            .to(device="cpu")
+            .numpy()
+            .copy()
+        )
+        return decode_welm_deferred_completion(encoded)
+
+    def set_bootstrap_room(self, idx: int, bootstrap_room: Optional[int]) -> None:
+        self.bootstrap_room[idx, 0] = bootstrap_room if bootstrap_room is not None else 0
 
     def get_buf(self, idx: int):
         return (
             self.output_ids[idx].clone(),
-            self.cached_tokens[idx].clone(),
+            self.get_cached_token_stats(idx),
             self.output_token_logprobs_val[idx].clone(),
             self.output_token_logprobs_idx[idx].clone(),
             self.output_top_logprobs_val[idx].clone(),
@@ -255,13 +316,20 @@ class MetadataBuffers:
             self.bootstrap_room[idx].clone(),
         )
 
+    def get_cached_token_stats(self, idx: int) -> torch.Tensor:
+        return self.cached_tokens[idx].clone()
+
+    def set_cached_token_stats(self, req: Req) -> None:
+        idx = req.metadata_buffer_index
+        self.cached_tokens[idx][0] = req.cached_tokens
+        self.cached_tokens[idx][1] = req.cached_tokens_device
+        self.cached_tokens[idx][2] = req.cached_tokens_host
+        self.cached_tokens[idx][3] = req.cached_tokens_storage
+
     def set_buf(self, req: Req):
 
         self.output_ids[req.metadata_buffer_index][0] = req.output_ids[0]
-        self.cached_tokens[req.metadata_buffer_index][0] = req.cached_tokens
-        self.cached_tokens[req.metadata_buffer_index][1] = req.cached_tokens_device
-        self.cached_tokens[req.metadata_buffer_index][2] = req.cached_tokens_host
-        self.cached_tokens[req.metadata_buffer_index][3] = req.cached_tokens_storage
+        self.set_cached_token_stats(req)
         if req.return_logprob:
             if req.output_token_logprobs_val:  # not none or empty list
                 self.output_token_logprobs_val[req.metadata_buffer_index][0] = (
@@ -299,9 +367,7 @@ class MetadataBuffers:
                 req.hidden_states_tensor
             )
         # Store bootstrap_room for validation on decode side
-        self.bootstrap_room[req.metadata_buffer_index, 0] = (
-            req.bootstrap_room if req.bootstrap_room is not None else 0
-        )
+        self.set_bootstrap_room(req.metadata_buffer_index, req.bootstrap_room)
 
 
 #########################

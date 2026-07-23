@@ -29,6 +29,10 @@ import torch
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.base.conn import StateType
 from sglang.srt.disaggregation.common.conn import CommonKVManager
+from sglang.srt.disaggregation.common.welm_deferred_protocol import (
+    WelmDeferredCompletion,
+    resolve_runtime_welm_deferred_mirror_capability,
+)
 from sglang.srt.disaggregation.utils import (
     FAKE_BOOTSTRAP_HOST,
     DisaggregationMode,
@@ -63,6 +67,10 @@ from sglang.srt.mem_cache.hicache_storage import (
     log_hicache_timing,
     request_timing_fields,
 )
+from sglang.srt.models.welm_deferred_mirror import (
+    build_welm_deferred_prefill_span,
+    get_welm_deferred_request_unsupported_reason,
+)
 from sglang.srt.observability.req_time_stats import set_schedule_time_batch
 
 if TYPE_CHECKING:
@@ -72,6 +80,11 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import KVCache
 
 logger = logging.getLogger(__name__)
+
+
+def _prefill_committed_kv_len(req: Req) -> int:
+    span = getattr(req, "welm_deferred_prefill_span", None)
+    return span.committed_kv_len if span is not None else len(req.origin_input_ids)
 
 
 def release_req_to_metadata_buffer(
@@ -182,8 +195,23 @@ class PrefillBootstrapQueue:
             )
         kv_args.page_size = self.token_to_kv_pool.page_size
 
+        plan = getattr(
+            self.scheduler.tp_worker.model_runner,
+            "welm_deferred_mirror_plan",
+            None,
+        )
+        kv_args.welm_deferred_mirror_capability = (
+            resolve_runtime_welm_deferred_mirror_capability(
+                self.scheduler.server_args, self.scheduler.model_config, plan
+            )
+        )
+
         kv_args.aux_data_ptrs, kv_args.aux_data_lens, kv_args.aux_item_lens = (
-            self.metadata_buffers.get_buf_infos()
+            self.metadata_buffers.get_buf_infos(
+                include_welm_deferred_completion=(
+                    kv_args.welm_deferred_mirror_capability is not None
+                )
+            )
         )
         kv_args.ib_device = self.scheduler.server_args.disaggregation_ib_device
         kv_args.gpu_id = self.scheduler.gpu_id
@@ -233,6 +261,8 @@ class PrefillBootstrapQueue:
         return kv_manager
 
     def add(self, req: Req, num_kv_heads: int) -> None:
+        if not self._prepare_deferred_req(req):
+            return
         if self._check_if_req_exceed_kv_capacity(req):
             return
 
@@ -260,14 +290,44 @@ class PrefillBootstrapQueue:
             self.add(req, num_kv_heads)
 
     def _check_if_req_exceed_kv_capacity(self, req: Req) -> bool:
-        if len(req.origin_input_ids) > self.max_total_num_tokens:
-            message = f"Request {req.rid} exceeds the maximum number of tokens: {len(req.origin_input_ids)} > {self.max_total_num_tokens}"
+        committed_kv_len = _prefill_committed_kv_len(req)
+        if committed_kv_len > self.max_total_num_tokens:
+            message = (
+                f"Request {req.rid} exceeds the maximum number of tokens: "
+                f"{committed_kv_len} > {self.max_total_num_tokens}"
+            )
             logger.error(message)
             req.time_stats.trace_ctx.abort(abort_info={"reason": message})
             prepare_abort(req, message, status_code=HTTPStatus.BAD_REQUEST)
             self.scheduler.stream_output([req], req.return_logprob)
             return True
         return False
+
+    def _prepare_deferred_req(self, req: Req) -> bool:
+        if getattr(self.kv_manager, "welm_deferred_mirror_capability", None) is None:
+            return True
+
+        unsupported_reason = get_welm_deferred_request_unsupported_reason(req)
+
+        if unsupported_reason is not None:
+            message = (
+                "WeLM deferred mirror prefill does not support "
+                f"{unsupported_reason}"
+            )
+            logger.error(message)
+            trace_ctx = getattr(getattr(req, "time_stats", None), "trace_ctx", None)
+            if trace_ctx is not None:
+                trace_ctx.abort(abort_info={"reason": message})
+            prepare_abort(req, message, status_code=HTTPStatus.BAD_REQUEST)
+            self.scheduler.stream_output([req], req.return_logprob)
+            return False
+
+        span = build_welm_deferred_prefill_span(req.origin_input_ids)
+        existing = getattr(req, "welm_deferred_prefill_span", None)
+        if existing is not None and existing != span:
+            raise RuntimeError("WeLM deferred prefill span changed before bootstrap")
+        req.welm_deferred_prefill_span = span
+        return True
 
     def _process_req(self, req: Req) -> None:
         """
@@ -334,7 +394,17 @@ class PrefillBootstrapQueue:
 
             # KV.WaitingForInput - decode is ready to receive. initialize the kv sender
             req.time_stats.set_bootstrap_done_time()
-            num_kv_indices = len(req.origin_input_ids)
+            # Cal number of pages to send
+            # if decode has a cached prefix, we need to send the delta indices
+            # otherwise, send the entire request
+            num_kv_indices = _prefill_committed_kv_len(req)
+            decode_prefix_len = req.disagg_kv_sender.pop_decode_prefix_len()
+            if decode_prefix_len < 0 or decode_prefix_len > num_kv_indices:
+                raise RuntimeError(
+                    "Decode prefix is outside the Prefill committed span: "
+                    f"decode_prefix_len={decode_prefix_len}, "
+                    f"committed_kv_len={num_kv_indices}, rid={req.rid}"
+                )
             if self.req_to_metadata_buffer_idx_allocator.available_size() == 0:
                 break
 
@@ -343,10 +413,6 @@ class PrefillBootstrapQueue:
             )
             assert req.metadata_buffer_index is not None
 
-            # Cal number of pages to send
-            # if decode has a cached prefix, we need to send the delta indices
-            # otherwise, send the entire request
-            decode_prefix_len = req.disagg_kv_sender.pop_decode_prefix_len()
             req.start_send_idx = decode_prefix_len
             num_kv_indices_to_send = num_kv_indices - decode_prefix_len
             num_pages = kv_to_page_num(
@@ -511,6 +577,17 @@ class SchedulerDisaggregationPrefillMixin:
             result.indexer_topk_output.finalize()
             result.indexer_topk_output = None
 
+        if result.welm_deferred_prefill_completion is not None:
+            self._process_welm_deferred_prefill_completion(batch, result)
+            can_run_cuda_graph = getattr(result, "can_run_cuda_graph", False)
+            self.report_prefill_stats(
+                batch=batch,
+                prefill_stats=batch.prefill_stats,
+                can_run_cuda_graph=can_run_cuda_graph,
+                dp_cooperation_info=batch.dp_cooperation_info,
+            )
+            return
+
         logprob_pt = 0
         # Transfer kv for prefill completed requests and add it into disagg_prefill_inflight_queue
         next_token_ids = result.next_token_ids.tolist()
@@ -635,6 +712,95 @@ class SchedulerDisaggregationPrefillMixin:
             can_run_cuda_graph=can_run_cuda_graph,
             dp_cooperation_info=batch.dp_cooperation_info,
         )
+
+    def _process_welm_deferred_prefill_completion(
+        self: Scheduler,
+        batch: ScheduleBatch,
+        result: GenerationBatchResult,
+    ) -> None:
+        if result.logits_output is not None:
+            raise RuntimeError(
+                "WeLM deferred Prefill completion must not carry logits"
+            )
+        if batch.return_logprob or batch.return_hidden_states:
+            raise RuntimeError(
+                "WeLM deferred Prefill does not support an output payload"
+            )
+        if (
+            not torch.is_tensor(result.next_token_ids)
+            or result.next_token_ids.numel() != len(batch.reqs)
+        ):
+            raise RuntimeError(
+                "WeLM deferred Prefill completion requires request-aligned bookkeeping IDs"
+            )
+
+        for req in batch.reqs:
+            if getattr(req, "welm_deferred_prefill_span", None) is None:
+                raise RuntimeError(
+                    "WeLM deferred Prefill completion requires committed span metadata"
+                )
+            if req.output_ids:
+                raise RuntimeError(
+                    "WeLM deferred Prefill completion must not contain output tokens"
+                )
+
+            if req.is_chunked <= 0:
+                req.time_stats.set_prefill_finished_time()
+                forward_start = (
+                    req.time_stats.last_forward_entry_time
+                    or req.time_stats.forward_entry_time
+                )
+                if hicache_timing_enabled():
+                    log_hicache_timing(
+                        logger,
+                        "pd_prefill_forward",
+                        **request_timing_fields(
+                            req,
+                            start=forward_start,
+                            end=req.time_stats.prefill_finished_time,
+                            role="prefill",
+                            stage="forward",
+                            tp_rank=getattr(self, "tp_rank", None),
+                            pp_rank=getattr(self, "pp_rank", None),
+                            batch_size=len(batch.reqs),
+                            forward_mode=str(batch.forward_mode),
+                            can_run_cuda_graph=getattr(
+                                result, "can_run_cuda_graph", None
+                            ),
+                        ),
+                    )
+                maybe_cache_unfinished_req(req, self.tree_cache)
+                self.disagg_prefill_inflight_queue.append(req)
+                req.hidden_states_tensor = None
+                self.send_kv_chunk(req, last_chunk=True)
+                req.time_stats.set_prefill_transfer_queue_entry_time()
+            else:
+                req.is_chunked -= 1
+                if self.enable_overlap:
+                    self.send_kv_chunk(
+                        req,
+                        last_chunk=False,
+                        end_idx=req.tmp_end_idx,
+                    )
+                req.time_stats.set_last_chunked_prefill_finish_time()
+
+    def process_deferred_prefill_without_forward(
+        self: Scheduler, reqs: List[Req]
+    ) -> None:
+        for req in reqs:
+            span = getattr(req, "welm_deferred_prefill_span", None)
+            if span is None or req.extend_input_len != 0:
+                raise RuntimeError(
+                    "zero-forward Prefill completion requires a deferred full hit"
+                )
+            if req.output_ids:
+                raise RuntimeError(
+                    "zero-forward Prefill completion must not contain output tokens"
+                )
+            req.time_stats.set_prefill_finished_time()
+            self.send_kv_chunk(req, last_chunk=True)
+            req.time_stats.set_prefill_transfer_queue_entry_time()
+            self.disagg_prefill_inflight_queue.append(req)
 
     def process_disagg_prefill_inflight_queue(
         self: Scheduler, rids_to_check: Optional[List[str]] = None
@@ -820,7 +986,7 @@ class SchedulerDisaggregationPrefillMixin:
                 # Delay KV transfer to process_batch_result_disagg_prefill when overlap is enabled to ensure results are resolved
                 self.chunked_req.tmp_end_idx = min(
                     len(self.chunked_req.fill_ids),
-                    len(self.chunked_req.origin_input_ids),
+                    _prefill_committed_kv_len(self.chunked_req),
                 )
             else:
                 self.send_kv_chunk(self.chunked_req)
@@ -853,7 +1019,7 @@ class SchedulerDisaggregationPrefillMixin:
         end_idx = (
             end_idx
             if end_idx is not None
-            else min(len(req.fill_ids), len(req.origin_input_ids))
+            else min(len(req.fill_ids), _prefill_committed_kv_len(req))
         )
 
         if not last_chunk:
@@ -876,9 +1042,24 @@ class SchedulerDisaggregationPrefillMixin:
         )
         state_indices: Optional[List] = None
         if last_chunk:
-            self.disagg_metadata_buffers.set_buf(req)
+            span = getattr(req, "welm_deferred_prefill_span", None)
+            if span is None:
+                self.disagg_metadata_buffers.set_buf(req)
+            else:
+                self.disagg_metadata_buffers.set_cached_token_stats(req)
+                self.disagg_metadata_buffers.set_bootstrap_room(
+                    req.metadata_buffer_index, req.bootstrap_room
+                )
+                self.disagg_metadata_buffers.set_welm_deferred_completion(
+                    req.metadata_buffer_index,
+                    WelmDeferredCompletion(
+                        committed_kv_len=span.committed_kv_len,
+                        seed_position=span.seed_position,
+                        seed_token_id=span.seed_token_id,
+                    ),
+                )
 
-            seq_len = len(req.fill_ids)
+            seq_len = _prefill_committed_kv_len(req)
 
             def _mamba_payload():
                 return [

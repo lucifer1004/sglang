@@ -107,7 +107,12 @@ def match_prefix_for_req(
     include_req: bool = False,
 ):
     if token_ids is None:
-        token_ids = req.origin_input_ids + req.output_ids
+        prefill_kv_token_ids = getattr(req, "prefill_kv_token_ids", None)
+        token_ids = (
+            prefill_kv_token_ids()
+            if prefill_kv_token_ids is not None
+            else req.origin_input_ids + req.output_ids
+        )
 
     match_result = tree_cache.match_prefix(
         MatchPrefixParams(
@@ -254,7 +259,7 @@ class SchedulePolicy:
         self.waiting_queue_radix_tree.reset()
 
         for r in waiting_queue:
-            prefix_ids = r.origin_input_ids + r.output_ids
+            prefix_ids = r.prefill_kv_token_ids()
             extra_key = r.extra_key
             match_result = match_prefix_for_req(self.tree_cache, r, prefix_ids)
 
@@ -460,6 +465,7 @@ class PrefillAdder:
 
         self.req_states = None
         self.can_run_list = []
+        self.completed_without_forward_reqs = []
         self.preempt_list = []
         self.new_chunked_req = None
         self.log_hit_tokens = 0
@@ -872,6 +878,43 @@ class PrefillAdder:
         if self.is_hybrid_swa:
             req.swa_uuid_for_lock = result.swa_uuid_for_lock
 
+    def _admit_deferred_full_hit(self, req: Req) -> AddReqResult:
+        span = req.welm_deferred_prefill_span
+        if span is None or req.extend_input_len != 0:
+            raise RuntimeError("invalid deferred full-hit admission")
+        if len(req.prefix_indices) != span.committed_kv_len:
+            raise RuntimeError(
+                "WeLM deferred full hit must cover the complete committed span: "
+                f"prefix_len={len(req.prefix_indices)}, "
+                f"committed_kv_len={span.committed_kv_len}"
+            )
+        if req.cache_protected_len != span.committed_kv_len:
+            raise RuntimeError(
+                "WeLM deferred full hit has inconsistent cache protection: "
+                f"cache_protected_len={req.cache_protected_len}, "
+                f"committed_kv_len={span.committed_kv_len}"
+            )
+
+        req_pool_indices = self.tree_cache.req_to_token_pool.alloc([req])
+        if req_pool_indices is None:
+            return AddReqResult.NO_TOKEN
+        req.req_pool_idx = req_pool_indices[0]
+        try:
+            if span.committed_kv_len > 0:
+                self.tree_cache.req_to_token_pool.write(
+                    (req.req_pool_idx, slice(0, span.committed_kv_len)),
+                    req.prefix_indices,
+                )
+            req.kv_committed_len = span.committed_kv_len
+            req.kv_allocated_len = span.committed_kv_len
+            self._req_inc_lock_ref(req)
+        except Exception:
+            self.tree_cache.req_to_token_pool.free(req)
+            raise
+        req.update_cached_token_stats(span.committed_kv_len, span.committed_kv_len)
+        self.completed_without_forward_reqs.append(req)
+        return AddReqResult.CONTINUE
+
     def add_dllm_staging_req(self, req: Req):
         assert self.dllm_config is not None
         _rem_tokens = self._get_dllm_remain_tokens()
@@ -1133,6 +1176,12 @@ class PrefillAdder:
         # scheduler guard even though lower layers also fail fast on batch_size>1.
         if self.prefill_request_limit_reached():
             return AddReqResult.OTHER
+
+        if (
+            getattr(req, "welm_deferred_prefill_span", None) is not None
+            and req.extend_input_len == 0
+        ):
+            return self._admit_deferred_full_hit(req)
 
         if req.sampling_params.ignore_eos and getattr(self.tree_cache, "disable", True):
             return self.add_one_req_ignore_eos(req)

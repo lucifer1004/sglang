@@ -81,6 +81,32 @@ class _CPCompactKVTargetInterval:
         return self.logical_start + self.token_count
 
 
+def should_use_full_cp_kv_collective(
+    runtime_layout: CPPrefillRuntimeLayout,
+    *,
+    page_size: int,
+) -> bool:
+    """Allow bounded full participation when a short split leaves empty owners."""
+    if page_size <= 0:
+        raise ValueError("page_size must be positive")
+
+    owner_tokens_per_rank = tuple(
+        int(count) for count in runtime_layout.spec.per_rank_tokens
+    )
+    cp_size = len(owner_tokens_per_rank)
+    if cp_size == 0:
+        raise ValueError("split ownership must contain one entry per CP rank")
+    if any(count < 0 for count in owner_tokens_per_rank):
+        raise ValueError("split ownership counts must be non-negative")
+    if cp_size <= 1 or not any(count == 0 for count in owner_tokens_per_rank):
+        return False
+
+    logical_kv_tokens = (
+        runtime_layout.spec.extend_start + runtime_layout.spec.extend_len
+    )
+    return logical_kv_tokens <= page_size * cp_size
+
+
 class CPShardedKVPageTableResolver:
     """Resolve logical CP-sharded page tables for an attention backend."""
 

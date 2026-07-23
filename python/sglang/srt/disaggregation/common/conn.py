@@ -25,6 +25,10 @@ from sglang.srt.disaggregation.base.conn import (
     KVPoll,
     KVTransferMetric,
 )
+from sglang.srt.disaggregation.common.welm_deferred_protocol import (
+    WelmDeferredMirrorCapability,
+    validate_welm_deferred_mirror_capabilities,
+)
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.distributed import (
     get_pp_group,
@@ -104,6 +108,7 @@ class PrefillServerInfo:
     kv_cache_dtype: Optional[str]
     follow_bootstrap_room: bool
     all_cp_ranks_transfer: bool = False
+    welm_deferred_mirror: Optional[WelmDeferredMirrorCapability] = None
 
     # Pre-computed rank mapping (set by try_ensure_parallel_info on decode side)
     target_tp_rank: Optional[int] = None
@@ -124,6 +129,25 @@ class PrefillServerInfo:
         )
         self.follow_bootstrap_room = bool(self.follow_bootstrap_room)
         self.all_cp_ranks_transfer = bool(self.all_cp_ranks_transfer)
+        if isinstance(self.welm_deferred_mirror, dict):
+            self.welm_deferred_mirror = WelmDeferredMirrorCapability.from_wire(
+                self.welm_deferred_mirror
+            )
+        elif self.welm_deferred_mirror is not None and not isinstance(
+            self.welm_deferred_mirror, WelmDeferredMirrorCapability
+        ):
+            raise ValueError(
+                "welm_deferred_mirror must be a capability object or JSON object"
+            )
+
+
+def prefill_server_info_to_wire(info: PrefillServerInfo) -> dict:
+    payload = dataclasses.asdict(info)
+    if info.welm_deferred_mirror is None:
+        payload.pop("welm_deferred_mirror")
+    else:
+        payload["welm_deferred_mirror"] = info.welm_deferred_mirror.to_wire()
+    return payload
 
 
 @dataclasses.dataclass
@@ -197,6 +221,9 @@ class CommonKVManager(BaseKVManager):
         self.is_mla_backend = is_mla_backend
         self.disaggregation_mode = disaggregation_mode
         self.server_args = server_args
+        self.welm_deferred_mirror_capability = getattr(
+            args, "welm_deferred_mirror_capability", None
+        )
         # for p/d multi node infer
         self.bootstrap_host = server_args.host
         self.bootstrap_port = server_args.disaggregation_bootstrap_port
@@ -329,17 +356,29 @@ class CommonKVManager(BaseKVManager):
             response = requests.get(url, timeout=5)
             if response.status_code == 200:
                 data = response.json()
-                info = PrefillServerInfo(**data)
+                try:
+                    info = PrefillServerInfo(**data)
+                except (TypeError, ValueError) as exc:
+                    raise RuntimeError(
+                        "Invalid Prefill P/D capability response from "
+                        f"{bootstrap_addr}: {data!r}"
+                    ) from exc
             else:
                 logger.error(
                     f"Failed to get prefill server info: {response.status_code}, {response.text}"
                 )
                 return False
+        except RuntimeError:
+            raise
         except Exception as e:
             logger.error(f"Error fetching prefill server info from bootstrap: {e}")
             return False
 
         # Sanity checks
+        validate_welm_deferred_mirror_capabilities(
+            self.welm_deferred_mirror_capability,
+            info.welm_deferred_mirror,
+        )
         if info.page_size is not None and info.page_size != self.kv_args.page_size:
             if self.server_args.enable_hisparse:
                 # HiSparse: decode host pool page_size=1, prefill device pool page_size >= 1.
@@ -541,6 +580,10 @@ class CommonKVManager(BaseKVManager):
             "load_balance_method": self.server_args.load_balance_method,
             "all_cp_ranks_transfer": self.enable_all_cp_ranks_for_transfer,
         }
+        if self.welm_deferred_mirror_capability is not None:
+            payload["welm_deferred_mirror"] = (
+                self.welm_deferred_mirror_capability.to_wire()
+            )
 
         max_retries, initial_delay, max_delay = 5, 1.0, 30.0
         for attempt in range(max_retries):
@@ -549,9 +592,24 @@ class CommonKVManager(BaseKVManager):
                 if response.status_code == 200:
                     logger.debug("Prefill successfully registered to bootstrap server.")
                     return
+                if response.status_code == 409:
+                    raise RuntimeError(
+                        "Prefill bootstrap reported a WeLM deferred capability "
+                        f"conflict: response={response.text}"
+                    )
+                if (
+                    self.welm_deferred_mirror_capability is not None
+                    and response.status_code == 400
+                ):
+                    raise RuntimeError(
+                        "Prefill bootstrap rejected WeLM deferred capability: "
+                        f"status={response.status_code}, response={response.text}"
+                    )
                 logger.warning(
                     f"Prefill register attempt {attempt + 1}/{max_retries} failed: status {response.status_code}"
                 )
+            except RuntimeError:
+                raise
             except Exception as e:
                 # Walk to root cause to skip misleading urllib3 wrapper messages
                 cause = e
@@ -1087,6 +1145,8 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         self.kv_cache_dtype: Optional[str] = None
         self.follow_bootstrap_room: Optional[bool] = None
         self.all_cp_ranks_transfer: Optional[bool] = None
+        self.welm_deferred_mirror: Optional[WelmDeferredMirrorCapability] = None
+        self._welm_deferred_mirror_registered = False
         self.prefill_port_table: Dict[
             int, Dict[int, Dict[int, Dict[int, PrefillRankInfo]]]
         ] = {}
@@ -1154,6 +1214,38 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         page_size = int(data["page_size"])
         kv_cache_dtype = data["kv_cache_dtype"]
         all_cp_ranks_transfer = bool(data.get("all_cp_ranks_transfer", False))
+        try:
+            raw_welm_deferred_mirror = data.get("welm_deferred_mirror")
+            welm_deferred_mirror = (
+                WelmDeferredMirrorCapability.from_wire(raw_welm_deferred_mirror)
+                if raw_welm_deferred_mirror is not None
+                else None
+            )
+        except ValueError as exc:
+            return web.Response(text=str(exc), status=400)
+
+        async with self.lock:
+            if not self._welm_deferred_mirror_registered:
+                self.welm_deferred_mirror = welm_deferred_mirror
+                self._welm_deferred_mirror_registered = True
+            elif self.welm_deferred_mirror != welm_deferred_mirror:
+                local = (
+                    self.welm_deferred_mirror.to_wire()
+                    if self.welm_deferred_mirror is not None
+                    else None
+                )
+                remote = (
+                    welm_deferred_mirror.to_wire()
+                    if welm_deferred_mirror is not None
+                    else None
+                )
+                return web.Response(
+                    text=(
+                        "Inconsistent WeLM deferred capability across Prefill ranks: "
+                        f"registered={local!r}, incoming={remote!r}"
+                    ),
+                    status=409,
+                )
 
         if self.attn_tp_size is None:
             self.attn_tp_size = attn_tp_size
@@ -1250,8 +1342,9 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                     if self.all_cp_ranks_transfer is not None
                     else False
                 ),
+                welm_deferred_mirror=self.welm_deferred_mirror,
             )
-            return web.json_response(dataclasses.asdict(info), status=200)
+            return web.json_response(prefill_server_info_to_wire(info), status=200)
 
         if not self._is_ready():
             return web.Response(

@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+import sglang.srt.layers.attention.cp_sharded_kv as cp_sharded_kv
 from sglang.srt.context_parallel import (
     build_cp_prefill_split_spec,
     contract_cp_prefill_runtime_to_last_q,
@@ -155,6 +156,51 @@ def _runtime(spec, cp_rank: int):
             dtype=torch.int32,
         ),
         out_cache_loc=out_cache_loc,
+    )
+
+
+def test_short_empty_q_rank_can_use_bounded_full_cp_kv_participation():
+    spec = build_cp_prefill_split_spec(
+        extend_start=0,
+        extend_len=16,
+        cp_size=4,
+        page_size=16,
+        owner_rotation=0,
+    )
+
+    assert cp_sharded_kv.should_use_full_cp_kv_collective(
+        _runtime(spec, cp_rank=0), page_size=16
+    )
+
+
+def test_long_prefix_with_short_extend_keeps_selective_cp_kv_participation():
+    spec = build_cp_prefill_split_spec(
+        extend_start=64,
+        extend_len=16,
+        cp_size=4,
+        page_size=16,
+        owner_rotation=0,
+    )
+
+    assert not cp_sharded_kv.should_use_full_cp_kv_collective(
+        _runtime(spec, cp_rank=0), page_size=16
+    )
+
+
+def test_contracted_q_does_not_make_a_fully_owned_split_use_full_collective():
+    spec = build_cp_prefill_split_spec(
+        extend_start=0,
+        extend_len=64,
+        cp_size=4,
+        page_size=16,
+        owner_rotation=0,
+    )
+    runtime = contract_cp_prefill_runtime_to_last_q(_runtime(spec, cp_rank=0))
+
+    assert all(count > 0 for count in spec.per_rank_tokens)
+    assert any(count == 0 for count in runtime.active_tokens_per_cp_rank())
+    assert not cp_sharded_kv.should_use_full_cp_kv_collective(
+        runtime, page_size=16
     )
 
 

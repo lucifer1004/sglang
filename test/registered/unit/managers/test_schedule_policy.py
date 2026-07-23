@@ -15,11 +15,13 @@ from sglang.srt.managers.scheduler_output_processor_mixin import (
 )
 from sglang.srt.managers.schedule_policy import (
     AddReqResult,
+    CacheAwarePolicy,
     PrefillAdder,
     SchedulePolicy,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.mem_cache.cp_sharded_residency import CPLogicalOwnerPlan
+from sglang.srt.models.welm_deferred_mirror import build_welm_deferred_prefill_span
 
 
 def _make_prefill_adder(*, nsa_in_seq_cp: bool) -> PrefillAdder:
@@ -165,6 +167,7 @@ def _make_sharded_prefill_ordering_fixture(
     adder = SimpleNamespace(
         cp_sharded_allocator=object(),
         can_run_list=[],
+        completed_without_forward_reqs=[],
         prefill_request_limit_reached=MagicMock(return_value=False),
         preempt_list=[],
         new_chunked_req=None,
@@ -266,6 +269,56 @@ def test_scheduler_sharded_prefill_stops_before_second_prefix_match():
     tree_cache.match_prefix.assert_called_once()
     assert tree_cache.match_prefix.call_args.args[0].req is first
     adder.add_one_req.assert_called_once()
+
+
+def test_scheduler_completes_deferred_full_hit_without_gpu_batch():
+    scheduler, adder, new_batch, first, _, tree_cache = (
+        _make_sharded_prefill_ordering_fixture()
+    )
+    scheduler.waiting_queue = [first]
+    first.welm_deferred_prefill_span = build_welm_deferred_prefill_span(
+        first.origin_input_ids
+    )
+    scheduler.process_deferred_prefill_without_forward = MagicMock()
+
+    def complete_without_forward(req, **_kwargs):
+        adder.completed_without_forward_reqs.append(req)
+        return AddReqResult.CONTINUE
+
+    adder.add_one_req = MagicMock(side_effect=complete_without_forward)
+
+    result = _run_sharded_prefill_ordering_fixture(scheduler, adder, new_batch)
+
+    assert result is None
+    assert scheduler.waiting_queue == []
+    scheduler.process_deferred_prefill_without_forward.assert_called_once_with([first])
+    new_batch.prepare_for_extend.assert_not_called()
+
+
+def test_cache_aware_policy_uses_deferred_committed_token_ids():
+    req = Req.__new__(Req)
+    req.rid = "deferred"
+    req.origin_input_ids = [11, 22, 33, 44]
+    req.output_ids = []
+    req.welm_deferred_prefill_span = build_welm_deferred_prefill_span(
+        req.origin_input_ids
+    )
+    req.extra_key = None
+    req.prefix_indices = torch.arange(64)
+    policy = SchedulePolicy.__new__(SchedulePolicy)
+    policy.tree_cache = object()
+    policy.waiting_queue_radix_tree = MagicMock()
+    policy.waiting_queue_radix_tree.reset.return_value = None
+    match_result = SimpleNamespace(device_indices=req.prefix_indices)
+
+    with patch.object(
+        schedule_policy,
+        "match_prefix_for_req",
+        return_value=match_result,
+    ) as match_prefix:
+        policy._compute_prefix_matches([req], CacheAwarePolicy.LPM)
+
+    assert match_prefix.call_args.args[2] == [11, 22, 33]
 
 
 @pytest.mark.parametrize(

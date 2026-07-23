@@ -1187,6 +1187,48 @@ class WelmV4InplaceRotaryEmbedding(RotaryEmbedding):
         )
         return query, key
 
+    def forward_k_only_cuda(
+        self,
+        positions: torch.Tensor,
+        key: torch.Tensor,
+    ) -> torch.Tensor:
+        if key.shape[0] != positions.shape[0]:
+            raise ValueError(
+                "WeLM K-only RoPE requires one position per key row: "
+                f"{positions.shape[0]} vs {key.shape[0]}"
+            )
+        if key.shape[-1] % self.head_size != 0:
+            raise ValueError(
+                "WeLM K-only RoPE key width must be divisible by head_size: "
+                f"{key.shape[-1]} vs {self.head_size}"
+            )
+        if key.numel() == 0:
+            return key
+        key_num_heads = key.shape[-1] // self.head_size
+        key = key.view(key.shape[0], key_num_heads, self.head_size)
+        num_sms = min(positions.shape[0], self.num_sms)
+        _welmv4_inplace_rope_kernel[(num_sms,)](
+            key,
+            key,
+            positions,
+            self.cos_sin_cache,
+            None,
+            None,
+            positions.shape[0],
+            0,
+            key.stride(0),
+            key.stride(0),
+            self.head_size,
+            self.rotary_dim,
+            num_sms,
+            4,
+            0,
+            key.shape[-2],
+            1,
+            triton.next_power_of_2(key.shape[-2]),
+        )
+        return key
+
     def extra_repr(self) -> str:
         s = f"head_size={self.head_size}, rotary_dim={self.rotary_dim}"
         s += f", max_position_embeddings={self.max_position_embeddings}"

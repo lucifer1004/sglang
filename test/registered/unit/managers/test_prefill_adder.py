@@ -18,6 +18,7 @@ from sglang.srt.mem_cache.allocator import (
     TokenToKVPoolAllocator,
 )
 from sglang.srt.mem_cache.cp_sharded_allocator import CPShardedKVPoolAllocator
+from sglang.srt.models.welm_deferred_mirror import build_welm_deferred_prefill_span
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
@@ -104,6 +105,98 @@ class TestPrefillAdder(CustomTestCase):
         )
         defaults.update(kwargs)
         return PrefillAdder(**defaults)
+
+    def create_deferred_full_hit_req(self, token_ids=None):
+        req = Req.__new__(Req)
+        req.rid = "deferred-full-hit"
+        req.origin_input_ids = list(token_ids or [11, 22, 33, 44, 55])
+        req.output_ids = []
+        req.welm_deferred_prefill_span = build_welm_deferred_prefill_span(
+            req.origin_input_ids
+        )
+        req.prefix_indices = torch.tensor([101, 205, 309, 413])[
+            : req.welm_deferred_prefill_span.committed_kv_len
+        ]
+        req.extend_input_len = 0
+        req.attn_cp_prefill_split_spec = None
+        req.host_hit_length = 0
+        req.storage_hit_length = 0
+        req.cached_tokens = 0
+        req.cached_tokens_device = 0
+        req.cached_tokens_host = 0
+        req.cached_tokens_storage = 0
+        req.already_computed = 0
+        req.retracted_stain = False
+        req._cache_breakdown_computed = False
+        req.last_node = object()
+        req.cache_protected_len = req.welm_deferred_prefill_span.committed_kv_len
+        req.req_pool_idx = None
+        req.kv_committed_len = 0
+        req.kv_allocated_len = 0
+        req.swa_uuid_for_lock = None
+        req.sampling_params = SimpleNamespace(
+            ignore_eos=False,
+            max_new_tokens=1,
+        )
+        return req
+
+    def test_deferred_full_hit_reuses_logical_kv_without_page_allocation(self):
+        req_to_token_pool = MagicMock()
+        req_to_token_pool.alloc.side_effect = lambda reqs: [7]
+        self.mock_tree_cache.req_to_token_pool = req_to_token_pool
+        adder = self.create_adder(self.create_running_batch())
+        req = self.create_deferred_full_hit_req()
+
+        result = adder.add_one_req(req, False, None)
+
+        self.assertEqual(result, AddReqResult.CONTINUE)
+        self.assertEqual(adder.can_run_list, [])
+        self.assertEqual(adder.completed_without_forward_reqs, [req])
+        self.assertEqual(req.req_pool_idx, 7)
+        self.assertEqual(req.kv_committed_len, 4)
+        self.assertEqual(req.kv_allocated_len, 4)
+        self.assertEqual(req.cached_tokens, 4)
+        self.assertEqual(req.cached_tokens_device, 4)
+        self.assertEqual(req.cached_tokens_host, 0)
+        self.assertEqual(req.cached_tokens_storage, 0)
+        self.assertEqual(req.already_computed, 4)
+        req_to_token_pool.write.assert_called_once()
+        write_indices, write_values = req_to_token_pool.write.call_args.args
+        self.assertEqual(write_indices, (7, slice(0, 4)))
+        self.assertTrue(torch.equal(write_values, req.prefix_indices))
+        self.mock_tree_cache.inc_lock_ref.assert_called_once_with(req.last_node)
+        self.mock_token_allocator.alloc_extend.assert_not_called()
+        self.assertEqual(adder.next_attn_cp_owner_rotation, 0)
+
+    def test_deferred_zero_page_completion_allocates_no_kv_slot(self):
+        req_to_token_pool = MagicMock()
+        req_to_token_pool.alloc.return_value = [9]
+        self.mock_tree_cache.req_to_token_pool = req_to_token_pool
+        adder = self.create_adder(self.create_running_batch())
+        req = self.create_deferred_full_hit_req([77])
+
+        result = adder.add_one_req(req, False, None)
+
+        self.assertEqual(result, AddReqResult.CONTINUE)
+        self.assertEqual(adder.completed_without_forward_reqs, [req])
+        self.assertEqual(req.kv_committed_len, 0)
+        self.assertEqual(req.kv_allocated_len, 0)
+        req_to_token_pool.write.assert_not_called()
+        self.mock_token_allocator.alloc_extend.assert_not_called()
+
+    def test_deferred_full_hit_releases_req_slot_when_locking_fails(self):
+        req_to_token_pool = MagicMock()
+        req_to_token_pool.alloc.return_value = [7]
+        self.mock_tree_cache.req_to_token_pool = req_to_token_pool
+        self.mock_tree_cache.inc_lock_ref.side_effect = RuntimeError("lock failed")
+        adder = self.create_adder(self.create_running_batch())
+        req = self.create_deferred_full_hit_req()
+
+        with self.assertRaisesRegex(RuntimeError, "lock failed"):
+            adder.add_one_req(req, False, None)
+
+        req_to_token_pool.free.assert_called_once_with(req)
+        self.assertEqual(adder.completed_without_forward_reqs, [])
 
     def test_preempt_success_high_priority_values_first(self):
         params = [

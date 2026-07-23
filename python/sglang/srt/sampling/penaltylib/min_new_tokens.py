@@ -63,8 +63,15 @@ class BatchedMinNewTokensPenalizer(_BatchedPenalizer):
             device=self.orchestrator.device,
         )
 
-    def _cumulate_output_tokens(self, output_ids: torch.Tensor):
-        self.len_output_tokens += 1
+    def _cumulate_output_tokens(
+        self,
+        output_ids: torch.Tensor,
+        row_active_mask: torch.Tensor | None = None,
+    ):
+        if row_active_mask is None:
+            self.len_output_tokens += 1
+        else:
+            self.len_output_tokens += row_active_mask.unsqueeze(1)
 
     def _apply(self, logits: torch.Tensor):
         mask = (self.len_output_tokens < self.min_new_tokens).expand_as(logits)

@@ -226,7 +226,13 @@ def test_phase2_prefill_metadata_does_not_translate_logical_slots_as_swa_slots()
     forward_batch = SimpleNamespace(
         forward_mode=ForwardMode.EXTEND,
         attn_cp_prefill_split_specs=[object()],
-        attn_cp_prefill_runtime_layout=object(),
+        attn_cp_prefill_runtime_layout=SimpleNamespace(
+            spec=SimpleNamespace(
+                extend_start=0,
+                extend_len=8,
+                per_rank_tokens=(8,),
+            )
+        ),
         seq_lens=torch.tensor([8], dtype=torch.int64),
         seq_lens_cpu=torch.tensor([8], dtype=torch.int64),
         batch_size=1,
@@ -758,11 +764,11 @@ def test_phase2_swa_plan_is_cached_per_runtime_layout(monkeypatch):
     assert len(calls) == 1
 
 
-def test_phase2_empty_local_q_without_owned_kv_does_not_communicate(monkeypatch):
+def test_phase2_long_prefix_empty_owner_does_not_communicate(monkeypatch):
     backend = _make_backend(page_size=4)
     backend.kv_cache_dtype_str = "auto"
     spec = build_cp_prefill_split_spec(
-        extend_start=0,
+        extend_start=64,
         extend_len=1,
         cp_size=4,
         page_size=4,
@@ -777,10 +783,10 @@ def test_phase2_empty_local_q_without_owned_kv_does_not_communicate(monkeypatch)
     )
     gather_plan = CPPrefillKVGatherPlan(
         prefix=CPKVGatherSegmentPlan(
-            sizes=(0, 0, 0, 0),
+            sizes=(64, 0, 0, 0),
             local_physical_slots=torch.empty((0,), dtype=torch.int64),
-            rank_packed_to_logical=torch.empty((0,), dtype=torch.int64),
-            logical_token_count=0,
+            rank_packed_to_logical=torch.arange(64, dtype=torch.int64),
+            logical_token_count=64,
         ),
         extend=CPKVGatherSegmentPlan(
             sizes=spec.per_rank_tokens,
@@ -910,6 +916,7 @@ def test_phase2_full_attention_uses_ipc_source_push_and_releases_after_fa(
         local_k,
         local_v,
         SimpleNamespace(
+            layer_id=3,
             tp_q_head_num=1,
             tp_k_head_num=1,
             tp_v_head_num=1,
@@ -924,6 +931,7 @@ def test_phase2_full_attention_uses_ipc_source_push_and_releases_after_fa(
             attn_cp_prefill_kv_source_push_plan=SimpleNamespace(
                 logical_token_count=4
             ),
+            forward_iter=7,
         ),
         key_cache,
         value_cache,
@@ -941,6 +949,8 @@ def test_phase2_full_attention_uses_ipc_source_push_and_releases_after_fa(
     assert torch.equal(call["extend_key_rows"], full_k)
     assert torch.equal(call["extend_value_rows"], full_v)
     assert call["destination_ranks"] == (0,)
+    assert call["forward_iter"] == 7
+    assert call["operation_index"] == 3
     assert len(fa_calls) == 1
     assert torch.equal(fa_calls[0]["k"], local_k)
     assert torch.equal(fa_calls[0]["v"], local_v)
@@ -962,6 +972,7 @@ def test_phase2_full_attention_uses_ipc_source_push_and_releases_after_fa(
             local_k,
             local_v,
             SimpleNamespace(
+                layer_id=3,
                 tp_q_head_num=1,
                 tp_k_head_num=1,
                 tp_v_head_num=1,
@@ -976,6 +987,7 @@ def test_phase2_full_attention_uses_ipc_source_push_and_releases_after_fa(
                 attn_cp_prefill_kv_source_push_plan=SimpleNamespace(
                     logical_token_count=4
                 ),
+                forward_iter=7,
             ),
             key_cache,
             value_cache,
@@ -996,6 +1008,11 @@ def test_phase2_ipc_missing_source_push_plan_fails_without_gather(monkeypatch):
         active_local_tokens=0,
         kv_local_tokens=0,
         active_tokens_per_cp_rank=lambda: (0,),
+        spec=SimpleNamespace(
+            extend_start=0,
+            extend_len=0,
+            per_rank_tokens=(0,),
+        ),
     )
     monkeypatch.setattr(
         fa_backend,
@@ -1038,6 +1055,11 @@ def test_phase2_source_push_plan_without_transport_fails_without_gather(monkeypa
         active_local_tokens=0,
         kv_local_tokens=0,
         active_tokens_per_cp_rank=lambda: (0,),
+        spec=SimpleNamespace(
+            extend_start=0,
+            extend_len=0,
+            per_rank_tokens=(0,),
+        ),
     )
     monkeypatch.setattr(
         fa_backend,
@@ -1730,6 +1752,110 @@ def test_welm_dispatches_empty_q_only_for_owned_prefix_kv():
         0, mirror_batch, needs_empty_dp_collectives=False
     )
     assert not welmv4_model._welm_cp_prefill_prefix_send_only(0, mirror_batch)
+
+
+def test_welm_dispatches_bounded_short_empty_rank_but_not_long_empty_rank():
+    runtime = SimpleNamespace(active_local_tokens=0, kv_local_tokens=0)
+    gather_plan = SimpleNamespace(
+        prefix=SimpleNamespace(
+            local_physical_slots=torch.empty((0,), dtype=torch.int64)
+        )
+    )
+    short_batch = SimpleNamespace(
+        attn_cp_prefill_runtime_layout=runtime,
+        attn_cp_prefill_kv_gather_plan=gather_plan,
+        attn_cp_prefill_short_full_kv_collective=True,
+    )
+    long_batch = SimpleNamespace(
+        attn_cp_prefill_runtime_layout=runtime,
+        attn_cp_prefill_kv_gather_plan=gather_plan,
+        attn_cp_prefill_short_full_kv_collective=False,
+    )
+
+    assert _welm_should_dispatch_attention(
+        0, short_batch, needs_empty_dp_collectives=False
+    )
+    assert not _welm_should_dispatch_attention(
+        0, long_batch, needs_empty_dp_collectives=False
+    )
+
+
+def test_phase2_short_empty_q_rank_uses_existing_full_kv_collective(monkeypatch):
+    backend = _make_backend(page_size=4)
+    backend.kv_cache_dtype_str = "auto"
+    spec = build_cp_prefill_split_spec(
+        extend_start=0,
+        extend_len=1,
+        cp_size=4,
+        page_size=4,
+        owner_rotation=0,
+    )
+    runtime = materialize_cp_prefill_runtime_layout(
+        spec=spec,
+        cp_rank=3,
+        input_ids=torch.tensor([1]),
+        positions=torch.tensor([0], dtype=torch.int32),
+        out_cache_loc=torch.tensor([0]),
+    )
+    gather_plan = CPPrefillKVGatherPlan(
+        prefix=CPKVGatherSegmentPlan(
+            sizes=(0, 0, 0, 0),
+            local_physical_slots=torch.empty((0,), dtype=torch.int64),
+            rank_packed_to_logical=torch.empty((0,), dtype=torch.int64),
+            logical_token_count=0,
+        ),
+        extend=CPKVGatherSegmentPlan(
+            sizes=spec.per_rank_tokens,
+            local_physical_slots=runtime.local_out_cache_loc,
+            rank_packed_to_logical=torch.tensor([0]),
+            logical_token_count=1,
+        ),
+    )
+    cp_group = _FakeGatherCPGroup(
+        [
+            (torch.empty((0, 1, 2)), torch.empty((0, 1, 2))),
+            (torch.zeros((1, 1, 2)), torch.ones((1, 1, 2))),
+        ],
+        rank=3,
+        world_size=4,
+    )
+    monkeypatch.setattr(fa_backend, "get_sharded_kv_cp_group", lambda: cp_group)
+    monkeypatch.setattr(
+        fa_backend,
+        "flash_attn_varlen_func",
+        lambda **_kwargs: pytest.fail("empty local Q must not launch FA3"),
+    )
+
+    result = backend._forward_extend_sharded_kv_compact(
+        torch.empty((0, 2)),
+        torch.empty((0, 1, 2)),
+        torch.empty((0, 1, 2)),
+        SimpleNamespace(
+            layer_id=0,
+            tp_q_head_num=1,
+            tp_k_head_num=1,
+            tp_v_head_num=1,
+            head_dim=2,
+            v_head_dim=2,
+            scaling=1.0,
+            logit_cap=0.0,
+        ),
+        SimpleNamespace(
+            attn_cp_prefill_runtime_layout=runtime,
+            attn_cp_prefill_kv_gather_plan=gather_plan,
+            attn_cp_prefill_short_full_kv_collective=True,
+        ),
+        torch.empty((1, 4, 1, 2)),
+        torch.empty((1, 4, 1, 2)),
+        use_welm_custom_last_q=False,
+        window_size=(-1, -1),
+        causal=True,
+        kwargs={},
+    )
+
+    assert result.shape == (0, 2)
+    assert len(cp_group.calls) == 2
+    assert all(len(call) == 2 for call in cp_group.calls)
 
 
 def test_welm_prefix_owner_bypasses_zero_row_qkv_projection():

@@ -32,11 +32,23 @@ class BatchedPresencePenalizer(_BatchedPenalizer):
             )
         ).unsqueeze_(1)
 
-    def _cumulate_output_tokens(self, output_ids: torch.Tensor):
+    def _cumulate_output_tokens(
+        self,
+        output_ids: torch.Tensor,
+        row_active_mask: torch.Tensor | None = None,
+    ):
+        index = output_ids.unsqueeze(1)
+        src = self.presence_penalties
+        if row_active_mask is not None:
+            src = torch.where(
+                row_active_mask.unsqueeze(1),
+                src,
+                self.cumulated_presence_penalties.gather(1, index),
+            )
         self.cumulated_presence_penalties.scatter_(
             dim=1,
-            index=output_ids.unsqueeze(1),
-            src=self.presence_penalties,
+            index=index,
+            src=src,
         )
 
     def _apply(self, logits: torch.Tensor) -> torch.Tensor:
