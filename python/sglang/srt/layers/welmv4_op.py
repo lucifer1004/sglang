@@ -197,6 +197,172 @@ def mmq_style_router_linear(
     return _mmq_style_router_linear_triton(x, weight)
 
 
+def _router_matmul_v2_get_configs():
+    return [
+        triton.Config(
+            {
+                "BLOCK_SIZE_M": block_m,
+                "BLOCK_SIZE_N": block_n,
+                "BLOCK_SIZE_K": block_k,
+                "GROUP_SIZE_M": 8,
+            },
+            num_stages=3,
+            num_warps=num_warps,
+        )
+        for block_m in [16, 32, 64, 128]
+        for block_n in [16, 32, 64]
+        for block_k in [64, 128]
+        for num_warps in [4, 8]
+    ]
+
+
+def _router_matmul_v2_prune_configs(configs, named_args, **_kwargs):
+    m_bucket = named_args["M_BUCKET"]
+    if m_bucket <= 16:
+        block_m_candidates = {16}
+    elif m_bucket <= 32:
+        block_m_candidates = {16, 32}
+    elif m_bucket <= 64:
+        block_m_candidates = {32, 64}
+    else:
+        block_m_candidates = {64, 128}
+    return [
+        config
+        for config in configs
+        if config.kwargs["BLOCK_SIZE_M"] in block_m_candidates
+    ]
+
+
+def _router_matmul_v2_m_bucket(tokens: int) -> int:
+    assert tokens > 0
+    return min(1 << (tokens - 1).bit_length(), 2048)
+
+
+@triton.autotune(
+    configs=_router_matmul_v2_get_configs(),
+    key=["M_BUCKET", "N", "K"],
+    prune_configs_by={"early_config_prune": _router_matmul_v2_prune_configs},
+    restore_value=["c_ptr"],
+)
+@triton.jit
+def mmq_style_router_linear_v2_kernel(  # pylint: disable=too-many-arguments,too-many-locals
+    a_ptr,
+    b_ptr,
+    c_ptr,
+    M,
+    M_BUCKET,
+    N,
+    K,
+    stride_am,
+    stride_ak,
+    stride_bk,
+    stride_bn,
+    stride_cm,
+    stride_cn,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+):
+    start_pid = tl.program_id(axis=0)
+    num_programs = tl.num_programs(axis=0)
+    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
+    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+    k_tiles = tl.cdiv(K, BLOCK_SIZE_K)
+    num_tiles = num_pid_m * num_pid_n
+
+    offs_k_for_mask = tl.arange(0, BLOCK_SIZE_K)
+    num_pid_in_group = GROUP_SIZE_M * num_pid_n
+
+    for tile_id in tl.range(start_pid, num_tiles, num_programs):
+        pid_m, pid_n = _router_matmul_compute_pid(
+            tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M, num_programs
+        )
+        start_m = pid_m * BLOCK_SIZE_M
+        start_n = pid_n * BLOCK_SIZE_N
+        offs_am = start_m + tl.arange(0, BLOCK_SIZE_M)
+        offs_bn = start_n + tl.arange(0, BLOCK_SIZE_N)
+
+        offs_cm = offs_am
+        offs_cn = offs_bn
+        c_ptrs = (
+            c_ptr
+            + stride_cm * offs_cm[:, None].to(tl.int64)
+            + stride_cn * offs_cn[None, :].to(tl.int64)
+        )
+        c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
+        accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+
+        for ki in tl.range(k_tiles):
+            offs_k = ki * BLOCK_SIZE_K + tl.arange(0, BLOCK_SIZE_K)
+            a_ptrs = a_ptr + (
+                offs_am[:, None].to(tl.int64) * stride_am
+                + offs_k[None, :].to(tl.int64) * stride_ak
+            )
+            b_ptrs = b_ptr + (
+                offs_k[:, None].to(tl.int64) * stride_bk
+                + offs_bn[None, :].to(tl.int64) * stride_bn
+            )
+            a_mask = (offs_am[:, None] < M) & (
+                offs_k_for_mask[None, :] < K - ki * BLOCK_SIZE_K
+            )
+            b_mask = (offs_bn[None, :] < N) & (
+                offs_k_for_mask[:, None] < K - ki * BLOCK_SIZE_K
+            )
+            a = tl.load(a_ptrs, mask=a_mask, other=0.0).to(tl.float32)
+            b = tl.load(b_ptrs, mask=b_mask, other=0.0).to(tl.float32)
+            accumulator = tl.dot(a, b, accumulator)
+
+        tl.store(c_ptrs, accumulator, mask=c_mask)
+
+
+def _mmq_style_router_linear_v2_triton(
+    x: torch.Tensor, weight: torch.Tensor
+) -> torch.Tensor:
+    assert x.is_cuda and weight.is_cuda
+    assert x.dtype == torch.bfloat16
+    assert weight.dtype == torch.bfloat16
+    output = torch.empty(
+        (x.shape[0], weight.shape[0]), device=x.device, dtype=torch.float32
+    )
+    tokens, hidden_size = x.shape
+    num_experts = weight.shape[0]
+    weight_t = weight.t()
+    m_bucket = _router_matmul_v2_m_bucket(tokens)
+
+    def grid(meta):
+        num_tiles = triton.cdiv(tokens, meta["BLOCK_SIZE_M"]) * triton.cdiv(
+            num_experts, meta["BLOCK_SIZE_N"]
+        )
+        return (min(_get_num_sms(), num_tiles),)
+
+    mmq_style_router_linear_v2_kernel[grid](
+        x,
+        weight_t,
+        output,
+        tokens,
+        m_bucket,
+        num_experts,
+        hidden_size,
+        x.stride(0),
+        x.stride(1),
+        weight_t.stride(0),
+        weight_t.stride(1),
+        output.stride(0),
+        output.stride(1),
+    )
+    return output
+
+
+def mmq_style_router_linear_v2(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    assert x.dim() == 2
+    assert weight.dim() == 2
+    assert x.shape[1] == weight.shape[1]
+    assert x.dtype == weight.dtype == torch.bfloat16
+    assert x.is_cuda and weight.is_cuda
+    return _mmq_style_router_linear_v2_triton(x, weight)
+
+
 @triton.jit
 def mmq_style_expert_bias_topk_kernel(
     scores_ptr,

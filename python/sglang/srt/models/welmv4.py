@@ -115,6 +115,7 @@ from sglang.srt.layers.welmv4_op import (
     mmq_style_k_rms_norm,
     mmq_style_norm_after_attn,
     mmq_style_router_linear,
+    mmq_style_router_linear_v2,
     welm_use_previous_precision,
 )
 from sglang.srt.model_executor.forward_batch_context import get_current_forward_batch
@@ -141,6 +142,39 @@ from sglang.srt.utils import (
 
 logger = logging.getLogger(__name__)
 _WELM_CP_FUSED_NORM_FALLBACK_WARNED = False
+
+
+def _select_welm_router_linear_mode(
+    *, use_mxfp8: bool, has_quant_config: bool
+) -> Tuple[str, torch.dtype, Optional[str]]:
+    use_previous_precision = welm_use_previous_precision()
+    use_v2 = get_bool_env_var("WELM_USE_MMQ_ROUTER_LINEAR_V2", "false")
+    if use_previous_precision:
+        warning = (
+            "WELM_USE_MMQ_ROUTER_LINEAR_V2 is ignored because "
+            "WELM_USE_PREVIOUS_PRECISION takes priority."
+            if use_v2
+            else None
+        )
+        return "previous", torch.float32, warning
+    if not use_v2:
+        return "v1", torch.float32, None
+    if use_mxfp8:
+        return (
+            "v1",
+            torch.float32,
+            "WELM_USE_MMQ_ROUTER_LINEAR_V2 is not validated with MXFP8; "
+            "falling back to the existing Router implementation.",
+        )
+    if has_quant_config:
+        return (
+            "v1",
+            torch.float32,
+            "WELM_USE_MMQ_ROUTER_LINEAR_V2 is not validated with quantized "
+            "models; falling back to the existing Router implementation.",
+        )
+    return "v2", torch.bfloat16, None
+
 
 _is_cuda = is_cuda()
 if _is_cuda:
@@ -2367,12 +2401,42 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         self.config_layer_id = layer_id if config_layer_id is None else config_layer_id
         self.alt_stream = alt_stream
         self.use_mxfp8 = bool(getattr(quant_config, "use_mxfp8", False))
+        self.mk_moe_router_mode = get_mk_moe_router_mode()
+        (
+            self.router_linear_version,
+            self.router_gate_dtype,
+            router_linear_warning,
+        ) = _select_welm_router_linear_mode(
+            use_mxfp8=self.use_mxfp8,
+            has_quant_config=quant_config is not None,
+        )
+        if (
+            self.mk_moe_router_mode is not MkMoeRouterMode.OFF
+            and self.router_linear_version != "previous"
+        ):
+            mk_gate_dtype = self.mk_moe_router_mode.gate_weight_dtype
+            if (
+                self.router_linear_version == "v2"
+                and mk_gate_dtype is not torch.bfloat16
+            ):
+                self.router_linear_version = "v1"
+                router_linear_warning = (
+                    "WELM_USE_MMQ_ROUTER_LINEAR_V2 is ignored because "
+                    "SGLANG_WELM_V45_80A3_MK_MOE_ROUTER_MODE="
+                    f"{self.mk_moe_router_mode.value} requires "
+                    f"{mk_gate_dtype} gate weights."
+                )
+            self.router_gate_dtype = mk_gate_dtype
+        self.use_previous_precision_router = self.router_linear_version == "previous"
+        self.use_mmq_router_linear_v2 = self.router_linear_version == "v2"
         if self.layer_id == 0:
             logger.info(
                 "WeLM router mode: backend=%s topk_ids_dtype=%s",
                 "cublas" if self.use_mxfp8 else "triton",
                 "int32" if self.use_mxfp8 else "int64",
             )
+            if router_linear_warning is not None:
+                logger.warning(router_linear_warning)
         if self.tp_size > config.num_experts:
             raise ValueError(
                 f"Tensor parallel size {self.tp_size} is greater than "
@@ -2447,15 +2511,31 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             ),
         )
 
-        mk_moe_router_mode = get_mk_moe_router_mode()
         self.gate = ReplicatedLinear(
             config.hidden_size,
             config.num_experts,
             bias=False,
-            params_dtype=mk_moe_router_mode.gate_weight_dtype,
+            params_dtype=self.router_gate_dtype,
             quant_config=None,
             prefix=add_prefix("gate", prefix),
         )
+        self.gate.weight.weight_loader = self._router_gate_weight_loader
+        if self.layer_id == 0:
+            gate_bytes_per_layer = (
+                self.gate.weight.numel() * self.gate.weight.element_size()
+            )
+            logger.info(
+                "WeLM Router linear: version=%s gate_dtype=%s",
+                self.router_linear_version,
+                self.gate.weight.dtype,
+            )
+            logger.info(
+                "WeLM Router gate storage: layers=%d bytes_per_layer=%d "
+                "total_bytes_per_rank=%d",
+                config.num_hidden_layers,
+                gate_bytes_per_layer,
+                config.num_hidden_layers * gate_bytes_per_layer,
+            )
         if config.shared_expert_intermediate_size > 0:
             self.shared_expert = Qwen2MoeMLP(
                 hidden_size=config.hidden_size,
@@ -2479,6 +2559,23 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
 
         self._mk_moe_router = None
         self._mk_moe_router_slot_id = -1
+
+    def _router_gate_weight_loader(
+        self, param: torch.nn.Parameter, loaded_weight: torch.Tensor
+    ) -> None:
+        if param.dtype != self.router_gate_dtype:
+            raise RuntimeError(
+                "WeLM Router gate dtype changed before weight load: "
+                f"version={self.router_linear_version} "
+                f"expected={self.router_gate_dtype} actual={param.dtype}"
+            )
+        self.gate.weight_loader(param, loaded_weight)
+        if param.dtype != self.router_gate_dtype:
+            raise RuntimeError(
+                "WeLM Router gate dtype changed during weight load: "
+                f"version={self.router_linear_version} "
+                f"expected={self.router_gate_dtype} actual={param.dtype}"
+            )
 
     def set_mk_moe_router(self, adapter, slot_id: int) -> None:
         self._mk_moe_router = adapter
@@ -2562,7 +2659,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             if mk_topk_output is not None:
                 topk_output = mk_topk_output
                 router_logits = topk_output.router_logits
-            elif welm_use_previous_precision():
+            elif self.use_previous_precision_router:
                 if router_hidden_states_fp32 is None:
                     raise RuntimeError("previous-precision Router requires FP32 hidden")
                 router_logits = F.linear(
@@ -2570,11 +2667,16 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 )
                 topk_output = self.topk(router_hidden_states, router_logits)
             else:
-                router_logits = mmq_style_router_linear(
-                    router_hidden_states,
-                    self.gate.weight,
-                    use_mxfp8=self.use_mxfp8,
-                )
+                if self.use_mmq_router_linear_v2:
+                    router_logits = mmq_style_router_linear_v2(
+                        router_hidden_states, self.gate.weight
+                    )
+                else:
+                    router_logits = mmq_style_router_linear(
+                        router_hidden_states,
+                        self.gate.weight,
+                        use_mxfp8=self.use_mxfp8,
+                    )
                 topk_output = self.topk(router_hidden_states, router_logits)
         if dump_this_layer:
             _welm_dump_tensor(f"{dump_prefix}.router.logits", router_logits)
