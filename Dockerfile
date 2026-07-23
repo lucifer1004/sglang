@@ -282,6 +282,7 @@ PY
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv pip install --python "${VENV_PATH}/bin/python" \
         --index-url "${SGLANG_KERNEL_INDEX_URL}" \
+        --allow-insecure-host docs.sglang.ai \
         "sglang-kernel==0.4.2.post2+cu129"
 
 RUN "${VENV_PATH}/bin/python" - <<'PY' > /tmp/sglang-runtime-requirements.txt
