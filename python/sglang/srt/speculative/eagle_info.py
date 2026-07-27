@@ -843,7 +843,14 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
         )
         return kv_indices, cum_kv_seq_len, qo_indptr, None
 
+    def _invalidate_welm_mtp_prebuilt_verify(self) -> None:
+        # Batch size alone cannot detect row changes after filtering or merging.
+        self.welm_mtp_linear_verify_ready = False
+        self.welm_mtp_prebuilt_verify_input = None
+        self.welm_mtp_prebuilt_verify_bs = -1
+
     def filter_batch(self, new_indices: torch.Tensor, has_been_filtered: bool = True):
+        self._invalidate_welm_mtp_prebuilt_verify()
         if self.future_indices is not None:
             self.future_indices.indices = self.future_indices.indices[new_indices]
             self._filter_welm_mtp_local_future_state(new_indices)
@@ -981,6 +988,7 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
         self._sync_welm_mtp_deferred_prefill_draft_from_mask()
 
     def merge_batch(self, spec_info: "EagleDraftInput"):
+        self._invalidate_welm_mtp_prebuilt_verify()
         if self.future_indices is not None:
             assert spec_info.future_indices is not None
             self.future_indices = FutureIndices(

@@ -1,13 +1,17 @@
 import unittest
 from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 import torch
 
 import sglang.srt.managers.overlap_utils as overlap_utils
-from sglang.srt.managers.overlap_utils import FutureMap
+from sglang.srt.managers.overlap_utils import FutureIndices, FutureMap
 from sglang.srt.speculative.eagle_info import EagleDraftInput
 from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.speculative.welmv4_mtp_draft_proposal_cuda_graph_runner import (
+    WelmMTPDraftProposalCudaGraphRunner,
+)
 
 
 def _make_draft_input(batch_size=2, has_sampling_state=True):
@@ -16,9 +20,9 @@ def _make_draft_input(batch_size=2, has_sampling_state=True):
         hidden_states=torch.arange(batch_size * 4, dtype=torch.float32).reshape(
             batch_size, 4
         ),
-        verified_id=torch.arange(batch_size, dtype=torch.int64),
         topk_p=torch.ones((batch_size, topk), dtype=torch.float32),
         topk_index=torch.arange(batch_size, dtype=torch.int64).reshape(batch_size, 1),
+        bonus_tokens=torch.arange(batch_size, dtype=torch.int32),
         new_seq_lens=torch.arange(batch_size, dtype=torch.int32) + 8,
         num_tokens_per_req=1,
         num_tokens_for_logprob_per_req=1,
@@ -43,11 +47,19 @@ def _make_draft_input(batch_size=2, has_sampling_state=True):
 
 
 def _attach_oe_history(draft_input):
-    batch_size = int(draft_input.verified_id.numel())
+    batch_size = int(draft_input.bonus_tokens.numel())
     draft_input.welm_mtp_oe_history_state = (
         torch.arange(batch_size * 3, dtype=torch.int64).reshape(batch_size, 3) + 1000
     )
     return draft_input
+
+
+def _attach_prebuilt_verify(draft_input):
+    prebuilt_verify = object()
+    draft_input.welm_mtp_linear_verify_ready = True
+    draft_input.welm_mtp_prebuilt_verify_input = prebuilt_verify
+    draft_input.welm_mtp_prebuilt_verify_bs = len(draft_input.topk_p)
+    return prebuilt_verify
 
 
 class TestWelmMTPOverlapFutureMap(unittest.TestCase):
@@ -172,6 +184,106 @@ class TestWelmMTPOverlapFutureMap(unittest.TestCase):
             resolved.welm_mtp_oe_history_state[1],
             torch.zeros_like(resolved.welm_mtp_oe_history_state[1]),
         )
+
+    def test_filter_then_merge_same_bs_invalidates_prebuilt_verify(self):
+        draft_input = _make_draft_input()
+        original_bs = len(draft_input.topk_p)
+        _attach_prebuilt_verify(draft_input)
+
+        draft_input.filter_batch(
+            torch.tensor([1], dtype=torch.int64), has_been_filtered=False
+        )
+        draft_input.merge_batch(_make_draft_input(batch_size=1))
+
+        self.assertEqual(len(draft_input.topk_p), original_bs)
+        self.assertFalse(draft_input.welm_mtp_linear_verify_ready)
+        self.assertIsNone(draft_input.welm_mtp_prebuilt_verify_input)
+        self.assertEqual(draft_input.welm_mtp_prebuilt_verify_bs, -1)
+
+    def test_overlap_filter_invalidates_prebuilt_verify(self):
+        draft_input = _make_draft_input()
+        draft_input.future_indices = FutureIndices(
+            indices=torch.tensor([10, 11], dtype=torch.int64)
+        )
+        _attach_prebuilt_verify(draft_input)
+
+        draft_input.filter_batch(torch.tensor([0], dtype=torch.int64))
+
+        self.assertFalse(draft_input.welm_mtp_linear_verify_ready)
+        self.assertIsNone(draft_input.welm_mtp_prebuilt_verify_input)
+        self.assertEqual(draft_input.welm_mtp_prebuilt_verify_bs, -1)
+
+    def test_merge_invalidates_prebuilt_verify(self):
+        draft_input = _make_draft_input()
+        _attach_prebuilt_verify(draft_input)
+
+        draft_input.merge_batch(_make_draft_input(batch_size=1))
+
+        self.assertFalse(draft_input.welm_mtp_linear_verify_ready)
+        self.assertIsNone(draft_input.welm_mtp_prebuilt_verify_input)
+        self.assertEqual(draft_input.welm_mtp_prebuilt_verify_bs, -1)
+
+    def test_overlap_does_not_return_runner_owned_prebuilt_verify(self):
+        draft_input = _make_draft_input()
+        prebuilt_verify = _attach_prebuilt_verify(draft_input)
+        worker = EagleDraftWorker.__new__(EagleDraftWorker)
+        worker._is_welmv4_mtp_draft_model = Mock(
+            side_effect=RuntimeError("continued past prebuilt verify")
+        )
+        model_worker_batch = SimpleNamespace(
+            spec_info=draft_input,
+            forward_mode=SimpleNamespace(is_idle=lambda: False),
+            seq_lens=torch.ones((2,), dtype=torch.int32),
+        )
+
+        self.assertIs(worker.draft(model_worker_batch), prebuilt_verify)
+
+        draft_input.future_indices = FutureIndices(
+            indices=torch.tensor([10, 11], dtype=torch.int64)
+        )
+        with self.assertRaisesRegex(RuntimeError, "continued past prebuilt verify"):
+            worker.draft(model_worker_batch)
+
+    def test_overlap_rebuilds_linear_verify_inputs_from_resolved_rows(self):
+        runner = WelmMTPDraftProposalCudaGraphRunner.__new__(
+            WelmMTPDraftProposalCudaGraphRunner
+        )
+        runner.linear_verify_prepare = True
+        runner.fused_linear_graph_outputs = True
+        runner.max_bs = 4
+        runner.num_tokens_per_bs = 4
+        runner.buffers = SimpleNamespace(
+            linear_verify_mask=torch.empty((4 * 4 * 4,), dtype=torch.bool),
+            linear_verify_positions=torch.empty((4 * 4,), dtype=torch.int64),
+            linear_verify_retrieve_index=torch.empty((4, 4), dtype=torch.int64),
+            linear_verify_retrieve_next_token=torch.empty(
+                (4, 4), dtype=torch.int64
+            ),
+            linear_verify_retrieve_next_sibling=torch.empty(
+                (4, 4), dtype=torch.int64
+            ),
+            linear_verify_tokens=torch.empty((4 * 4,), dtype=torch.int64),
+            linear_verify_hash_seq_lens=torch.empty((4,), dtype=torch.int32),
+        )
+        draft_input = _make_draft_input()
+        draft_input.draft_proposal_tokens = torch.zeros((2, 3), dtype=torch.int64)
+        draft_input.welm_mtp_linear_verify_ready = True
+        seq_lens = torch.tensor([8, 9], dtype=torch.int32)
+
+        builder_path = (
+            "sglang.srt.speculative.welmv4_mtp_staging."
+            "build_welm_mtp_linear_verify_inputs"
+        )
+        with patch(builder_path) as build_linear_verify:
+            runner.build_linear_verify_inputs(draft_input, seq_lens)
+            build_linear_verify.assert_not_called()
+
+        draft_input.future_indices = FutureIndices(
+            indices=torch.tensor([10, 11], dtype=torch.int64)
+        )
+        with patch(builder_path) as build_linear_verify:
+            runner.build_linear_verify_inputs(draft_input, seq_lens)
+            build_linear_verify.assert_called_once()
 
 
 class TestWelmMTPPrefillDefer(unittest.TestCase):

@@ -3285,14 +3285,16 @@ class EagleDraftWorker(BaseDraftWorker):
         if (
             prebuilt_verify is not None
             and not model_worker_batch.forward_mode.is_idle()
+            and getattr(draft_input, "future_indices", None) is None
             and int(getattr(draft_input, "welm_mtp_prebuilt_verify_bs", -1))
             == int(model_worker_batch.seq_lens.shape[0])
         ):
             # The previous verify->proposal phase assembled this immutable
             # top-k=1 verify object while its CUDA graph was executing.  All
-            # tensors are persistent runner-owned views, so the next cycle has
-            # no tree bookkeeping or Python dataclass construction on its
-            # critical path. Batch changes deliberately fall through.
+            # tensors are persistent runner-owned views, so non-overlap
+            # scheduling can avoid tree bookkeeping and Python dataclass
+            # construction. Overlap scheduling resolves proposal rows through
+            # FutureMap, so it must rebuild verify inputs from those rows.
             return prebuilt_verify
         is_welmv4_mtp = self._is_welmv4_mtp_draft_model()
         use_welmv4_mtp_draft_proposal = (

@@ -610,6 +610,7 @@ class WelmMTPDraftProposalCudaGraphRunner:
         graph_verify_ready = bool(
             self.fused_linear_graph_outputs
             and getattr(draft_input, "welm_mtp_linear_verify_ready", False)
+            and getattr(draft_input, "future_indices", None) is None
         )
         if not graph_verify_ready:
             build_welm_mtp_linear_verify_inputs(
