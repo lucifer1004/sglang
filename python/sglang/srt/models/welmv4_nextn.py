@@ -19,6 +19,11 @@ from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
+from sglang.srt.layers.moe.mk_moe_router import (
+    MkMoeRouterMode,
+    WelmV45_80A3MkMoeRouterAdapter,
+    get_mk_moe_router_mode,
+)
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -28,6 +33,7 @@ from sglang.srt.models.welm_perf_opt import (
 )
 from sglang.srt.models.welmv4 import (
     Qwen2MoeDecoderLayer,
+    Qwen2MoeSparseMoeBlock,
     WelmV4FusedRMSNorm,
     WeLMV4MoeForCausalLM,
     _get_welm_kv_mirror_states,
@@ -358,6 +364,26 @@ class WeLMV4ModelNextN(nn.Module):
                 for i in range(self.num_physical_mtp_layers)
             ]
         )
+        self.mk_moe_router = None
+        mk_moe_router_mode = get_mk_moe_router_mode()
+        if mk_moe_router_mode is not MkMoeRouterMode.OFF:
+            moe_blocks = [
+                layer.mlp
+                for layer in self.decoder_layers
+                if isinstance(layer.mlp, Qwen2MoeSparseMoeBlock)
+            ]
+            # A NextN forward executes one physical MTP layer, so every layer
+            # can reuse the same workspace slot after begin_forward resets it.
+            self.mk_moe_router = WelmV45_80A3MkMoeRouterAdapter(
+                mode=mk_moe_router_mode,
+                config=config,
+                server_args=get_global_server_args(),
+                slot_count=1,
+                use_previous_precision=welm_use_previous_precision(),
+                use_mxfp8=any(block.use_mxfp8 for block in moe_blocks),
+            )
+            for block in moe_blocks:
+                block.set_mk_moe_router(self.mk_moe_router, 0)
         if self.fuse_embedding_allreduce:
             logger.info(
                 "%s=1: MTP base-token and OE partials will share one TP "
@@ -711,6 +737,12 @@ class WeLMV4ModelNextN(nn.Module):
         final_shared_output = None
         physical_step_idx = self._get_physical_step_idx(mtp_step_idx)
         layer = self.decoder_layers[physical_step_idx]
+        if self.mk_moe_router is not None:
+            self.mk_moe_router.begin_forward(
+                forward_batch=forward_batch,
+                num_tokens=hidden_states.shape[0],
+                allow_fused_router=not _MTP_DUMP_ENABLED,
+            )
         _welm_mtp_trace(
             "nextn_before_layer "
             f"step={mtp_step_idx} mode={forward_batch.forward_mode} "

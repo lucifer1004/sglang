@@ -74,9 +74,7 @@ def _reference(hidden_states, gate_weight, expert_bias):
 def test_native_kernel_matches_sglang(m: int):
     plan_fn, init_fn, run_fn = _mk_api()
     hidden_states, gate_weight, expert_bias = _inputs(m, seed=1700 + m)
-    expected_weights, expected_ids = _reference(
-        hidden_states, gate_weight, expert_bias
-    )
+    expected_weights, expected_ids = _reference(hidden_states, gate_weight, expert_bias)
     actual_weights = torch.empty((m, 10), device="cuda", dtype=torch.float32)
     actual_ids = torch.empty((m, 10), device="cuda", dtype=torch.int32)
     plan = plan_fn(m=m, slot_count=1, device="cuda")
@@ -94,18 +92,14 @@ def test_native_kernel_matches_sglang(m: int):
     torch.cuda.synchronize()
 
     assert torch.equal(actual_ids, expected_ids.to(torch.int32))
-    torch.testing.assert_close(
-        actual_weights, expected_weights, rtol=3e-6, atol=3e-6
-    )
+    torch.testing.assert_close(actual_weights, expected_weights, rtol=3e-6, atol=3e-6)
 
 
 def test_native_kernel_cuda_graph_replay_matches_sglang():
     plan_fn, init_fn, run_fn = _mk_api()
     m = 8
     hidden_states, gate_weight, expert_bias = _inputs(m, seed=1808)
-    expected_weights, expected_ids = _reference(
-        hidden_states, gate_weight, expert_bias
-    )
+    expected_weights, expected_ids = _reference(hidden_states, gate_weight, expert_bias)
     actual_weights = torch.empty((m, 10), device="cuda", dtype=torch.float32)
     actual_ids = torch.empty((m, 10), device="cuda", dtype=torch.int32)
     plan = plan_fn(m=m, slot_count=1, device="cuda")
@@ -292,19 +286,25 @@ def test_adapter_validation_rejects_incompatible_server_features(feature: str):
         )
 
 
-@pytest.mark.parametrize("m", [16, 32, 128, 512])
-def test_adapter_does_not_fallback_by_decode_batch_size(m: int):
+def _stub_adapter():
     adapter = object.__new__(WelmV45_80A3MkMoeRouterAdapter)
     adapter._active_state = None
     adapter._active_m = 0
+    adapter._active_forward_mode = ""
     adapter._states = {}
     adapter._logged_fallbacks = set()
     state = object()
     adapter._create_state = lambda num_tokens: state
     adapter._is_capturing = lambda: False
     adapter._init_workspace_fn = lambda *args, **kwargs: None
+    return adapter, state
+
+
+@pytest.mark.parametrize("m", [16, 32, 128, 512])
+def test_adapter_does_not_fallback_by_decode_batch_size(m: int):
+    adapter, state = _stub_adapter()
     forward_batch = SimpleNamespace(
-        forward_mode=SimpleNamespace(is_decode=lambda: True),
+        forward_mode=ForwardMode.DECODE,
         can_run_tbo=False,
     )
 
@@ -316,6 +316,51 @@ def test_adapter_does_not_fallback_by_decode_batch_size(m: int):
 
     assert adapter._active_state is state
     assert adapter._active_m == m
+
+
+@pytest.mark.parametrize(
+    "forward_mode",
+    [
+        ForwardMode.DECODE,
+        ForwardMode.TARGET_VERIFY,
+        ForwardMode.DRAFT_EXTEND,
+        ForwardMode.DRAFT_EXTEND_V2,
+    ],
+)
+def test_adapter_supports_decode_and_mtp_forward_modes(forward_mode: ForwardMode):
+    adapter, state = _stub_adapter()
+    forward_batch = SimpleNamespace(
+        forward_mode=forward_mode,
+        can_run_tbo=False,
+    )
+
+    adapter.begin_forward(
+        forward_batch=forward_batch,
+        num_tokens=16,
+        allow_fused_router=True,
+    )
+
+    assert adapter._active_state is state
+    assert adapter._active_m == 16
+    assert adapter._active_forward_mode == forward_mode.name
+
+
+def test_adapter_falls_back_above_kernel_limit():
+    adapter, _ = _stub_adapter()
+    adapter._create_state = lambda num_tokens: pytest.fail("must not create a plan")
+    forward_batch = SimpleNamespace(
+        forward_mode=ForwardMode.TARGET_VERIFY,
+        can_run_tbo=False,
+    )
+
+    adapter.begin_forward(
+        forward_batch=forward_batch,
+        num_tokens=513,
+        allow_fused_router=True,
+    )
+
+    assert adapter._active_state is None
+    assert adapter._active_m == 0
 
 
 def test_adapter_logs_actual_dispatch_once(caplog):
@@ -330,7 +375,8 @@ def test_adapter_logs_actual_dispatch_once(caplog):
     )
     adapter._run_fn = lambda *args, **kwargs: None
     adapter.mode = MkMoeRouterMode.TF32
-    adapter._logged_dispatch_ms = set()
+    adapter._active_forward_mode = ForwardMode.TARGET_VERIFY.name
+    adapter._logged_dispatches = set()
     adapter._logged_fallbacks = set()
     hidden_states = torch.empty((m, 2048), device="cuda", dtype=torch.bfloat16)
     gate_weight = torch.empty((512, 2048), device="cuda", dtype=torch.float32)
@@ -351,7 +397,8 @@ def test_adapter_logs_actual_dispatch_once(caplog):
         if "MK WeLM MoE router ACTIVE" in record.message
     ]
     assert active_logs == [
-        "MK WeLM MoE router ACTIVE: fused kernel dispatched for M=1; "
+        "MK WeLM MoE router ACTIVE: mode=TARGET_VERIFY "
+        "fused kernel dispatched for M=1; "
         "native Router bypassed"
     ]
 
@@ -381,4 +428,4 @@ def test_adapter_logs_native_fallback_once(caplog):
     ]
     assert len(fallback_logs) == 1
     assert "native SGLang Router" in fallback_logs[0]
-    assert "forward_mode=EXTEND is not decode" in fallback_logs[0]
+    assert "forward_mode=EXTEND is not a supported decode/MTP mode" in fallback_logs[0]

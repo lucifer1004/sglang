@@ -17,6 +17,7 @@ logger = logging.getLogger(__name__)
 _HIDDEN_SIZE = 2048
 _NUM_EXPERTS = 512
 _TOP_K = 10
+_MAX_M = 512
 _MODE_ENV = "SGLANG_WELM_V45_80A3_MK_MOE_ROUTER_MODE"
 
 
@@ -101,7 +102,7 @@ def _load_mk_router_ops(mode: MkMoeRouterMode) -> _MkRouterOps:
 
 
 class WelmV45_80A3MkMoeRouterAdapter:
-    """Decode-only adapter for the fused WeLM MK router and TopK kernel."""
+    """Adapter for the fused WeLM decode and MTP Router/TopK kernel."""
 
     def __init__(
         self,
@@ -162,7 +163,8 @@ class WelmV45_80A3MkMoeRouterAdapter:
         self._states: dict[int, _MkRouterPlanState] = {}
         self._active_state: Optional[_MkRouterPlanState] = None
         self._active_m = 0
-        self._logged_dispatch_ms: set[int] = set()
+        self._active_forward_mode = ""
+        self._logged_dispatches: set[tuple[str, int]] = set()
         self._logged_fallbacks: set[str] = set()
 
         logger.info(
@@ -256,22 +258,33 @@ class WelmV45_80A3MkMoeRouterAdapter:
     ) -> None:
         self._active_state = None
         self._active_m = 0
+        self._active_forward_mode = ""
 
         if not allow_fused_router:
             self._log_fallback_once("debug", "WeLM tensor dumping is enabled")
             return
-        if not forward_batch.forward_mode.is_decode():
-            forward_mode = forward_batch.forward_mode
+        forward_mode = forward_batch.forward_mode
+        if not (
+            forward_mode.is_decode()
+            or forward_mode.is_target_verify()
+            or forward_mode.is_draft_extend(include_v2=True)
+        ):
             self._log_fallback_once(
                 "forward_mode",
                 f"forward_mode={getattr(forward_mode, 'name', forward_mode)!s} "
-                "is not decode",
+                "is not a supported decode/MTP mode",
             )
             return
         if getattr(forward_batch, "can_run_tbo", False):
             self._log_fallback_once("tbo", "the current batch uses TBO")
             return
         if num_tokens <= 0:
+            return
+        if num_tokens > _MAX_M:
+            self._log_fallback_once(
+                "max_m",
+                f"M={num_tokens} exceeds the MK kernel limit {_MAX_M}",
+            )
             return
 
         state = self._states.get(num_tokens)
@@ -288,6 +301,7 @@ class WelmV45_80A3MkMoeRouterAdapter:
 
         self._active_state = state
         self._active_m = num_tokens
+        self._active_forward_mode = getattr(forward_mode, "name", str(forward_mode))
 
     def route(
         self,
@@ -331,7 +345,7 @@ class WelmV45_80A3MkMoeRouterAdapter:
             topk_weights=topk_weights,
             topk_ids=topk_ids,
         )
-        self._log_dispatch_once(self._active_m)
+        self._log_dispatch_once(self._active_forward_mode, self._active_m)
         return StandardTopKOutput(
             topk_weights=topk_weights,
             topk_ids=topk_ids,
@@ -394,12 +408,14 @@ class WelmV45_80A3MkMoeRouterAdapter:
             "MK WeLM MoE router FALLBACK -> native SGLang Router: %s", reason
         )
 
-    def _log_dispatch_once(self, num_tokens: int) -> None:
-        if num_tokens in self._logged_dispatch_ms:
+    def _log_dispatch_once(self, forward_mode: str, num_tokens: int) -> None:
+        key = (forward_mode, num_tokens)
+        if key in self._logged_dispatches:
             return
-        self._logged_dispatch_ms.add(num_tokens)
+        self._logged_dispatches.add(key)
         logger.info(
-            "MK WeLM MoE router ACTIVE: fused kernel dispatched for M=%d; "
+            "MK WeLM MoE router ACTIVE: mode=%s fused kernel dispatched for M=%d; "
             "native Router bypassed",
+            forward_mode,
             num_tokens,
         )
