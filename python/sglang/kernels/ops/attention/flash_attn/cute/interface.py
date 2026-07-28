@@ -625,13 +625,10 @@ def _flash_attn_fwd(
     fwd_cfg = FwdConfig(128, 128, True, True)  # default
     if tile_mn is None:
         if arch // 10 == 12:
-            # SM120 tile sizes tuned for 99 KB SMEM capacity:
-            # D<=64:  128x128 → 48 KB (good occupancy)
-            # D>64:   128x64  → 64 KB (128x128 would use 96 KB, hurting occupancy)
-            if head_dim <= 64:
-                fwd_cfg = FwdConfig(128, 128, True, True)
-            else:
-                fwd_cfg = FwdConfig(128, 64, True, True)
+            tile_m, tile_n = FlashAttentionForwardSm120.get_fwd_tile_size(
+                head_dim, head_dim_v
+            )
+            fwd_cfg = FwdConfig(tile_m, tile_n, True, True)
         elif arch // 10 == 8:
             fwd_cfg = FwdConfig(128, 64, True, True)  # SM80, should tune
         elif arch // 10 == 9:
@@ -1357,10 +1354,25 @@ def _flash_attn_fwd(
                     ),
                 )
         elif arch // 10 == 12:
-            # SM120 (Blackwell GeForce / DGX Spark): uses SM80 MMA with SM120 SMEM capacity
+            # SM120 uses SM80 MMA instructions, but owns its feature and SMEM policy.
             assert not use_block_sparsity, "Block sparsity not supported on SM 12.0"
             assert page_table is None, "Paged KV not supported on SM 12.0 in this PR"
             assert not is_split_kv, "SplitKV not supported on SM 12.0 in this PR"
+            if not FlashAttentionForwardSm120.can_implement(
+                dtype,
+                head_dim,
+                head_dim_v,
+                tile_m,
+                tile_n,
+                num_stages=1,
+                num_threads=num_threads,
+                is_causal=causal,
+                Q_in_regs=False,
+            ):
+                raise ValueError(
+                    "The requested FlashAttention forward configuration exceeds "
+                    "SM120 kernel constraints or shared-memory capacity"
+                )
             fa_fwd = FlashAttentionForwardSm120(
                 dtype,
                 head_dim,
