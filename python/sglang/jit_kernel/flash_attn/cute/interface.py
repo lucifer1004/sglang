@@ -618,15 +618,29 @@ def _flash_attn_fwd(
 
     current_stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
 
-    # SM80/SM120: uses SM80 MMA, 128 threads (4 warps)
+    # Initialize the legacy warp-MMA default. SM120 specializes this after
+    # selecting a tile from the actual device's SM count and query workload.
     if arch // 10 in [8, 12]:
         num_threads = 128
+    num_SMs = (
+        132
+        if is_fake_mode()
+        else torch.cuda.get_device_properties(device).multi_processor_count
+    )
+    # The fake-mode fallback is a generic scheduling placeholder, not a
+    # property of the eventual SM120 target. Do not use it for device-specific
+    # SM120 tile selection.
+    sm120_num_sms = None if is_fake_mode() else num_SMs
 
     fwd_cfg = FwdConfig(128, 128, True, True)  # default
     if tile_mn is None:
         if arch // 10 == 12:
             tile_m, tile_n = FlashAttentionForwardSm120.get_fwd_tile_size(
-                head_dim, head_dim_v
+                head_dim,
+                head_dim_v,
+                total_q_rows=total_q * num_head,
+                num_sms=sm120_num_sms,
+                num_batch=batch_size,
             )
             fwd_cfg = FwdConfig(tile_m, tile_n, True, True)
         elif arch // 10 == 8:
@@ -641,6 +655,14 @@ def _flash_attn_fwd(
             tile_mn[0], tile_mn[1], fwd_cfg.mma_pv_is_rs, fwd_cfg.intra_wg_overlap
         )
     tile_m, tile_n = fwd_cfg.m_block_size, fwd_cfg.n_block_size
+    sm120_num_stages = 1
+    if arch // 10 == 12:
+        sm120_num_stages = FlashAttentionForwardSm120.get_fwd_num_stages(
+            head_dim, head_dim_v, tile_m, tile_n
+        )
+        num_threads = FlashAttentionForwardSm120.get_fwd_num_threads(
+            head_dim, head_dim_v, tile_m, tile_n
+        )
     if mma_pv_is_rs is None:
         mma_pv_is_rs = fwd_cfg.mma_pv_is_rs
     if intra_wg_overlap is None:
@@ -679,11 +701,6 @@ def _flash_attn_fwd(
     ) // m_block_size_effective
     total_mblocks = batch_size * num_head_kv * num_m_blocks
     num_n_blocks = (seqlen_k_loaded + tile_n - 1) // tile_n
-    num_SMs = (
-        132
-        if is_fake_mode()
-        else torch.cuda.get_device_properties(device).multi_processor_count
-    )
     if num_splits < 1:
         num_splits = num_splits_heuristic(total_mblocks, num_SMs, num_n_blocks, 128)
 
@@ -1359,7 +1376,7 @@ def _flash_attn_fwd(
                 head_dim_v,
                 tile_m,
                 tile_n,
-                num_stages=1,
+                num_stages=sm120_num_stages,
                 num_threads=num_threads,
                 is_causal=causal,
                 Q_in_regs=False,
@@ -1378,7 +1395,7 @@ def _flash_attn_fwd(
                 pack_gqa=pack_gqa,
                 tile_m=tile_m,
                 tile_n=tile_n,
-                num_stages=1,
+                num_stages=sm120_num_stages,
                 num_threads=num_threads,
                 Q_in_regs=False,
                 score_mod=score_mod,
