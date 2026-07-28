@@ -15,7 +15,6 @@ import cutlass
 import cutlass.cute as cute
 import cutlass.utils as utils_basic
 from cutlass import Float32, Int32, const_expr
-from cutlass.base_dsl.arch import Arch
 from cutlass.cute.nvgpu import cpasync, warp
 from cutlass.cutlass_dsl import BaseDSL
 from quack import copy_utils, layout_utils
@@ -31,7 +30,10 @@ from sglang.jit_kernel.flash_attn.cute.cute_dsl_utils import (
 )
 from sglang.jit_kernel.flash_attn.cute.mask import AttentionMask
 from sglang.jit_kernel.flash_attn.cute.named_barrier import NamedBarrierFwd
-from sglang.jit_kernel.flash_attn.cute.pack_gqa import PackGQA
+from sglang.jit_kernel.flash_attn.cute.pack_gqa import (
+    PackGQA,
+    pack_gqa_layout,
+)
 from sglang.jit_kernel.flash_attn.cute.seqlen_info import SeqlenInfoQK
 from sglang.jit_kernel.flash_attn.cute.softmax import (
     Softmax,
@@ -764,6 +766,8 @@ class FlashAttentionForwardBase:
 
 
 class FlashAttentionForwardSm80(FlashAttentionForwardBase):
+    supports_learnable_sink = False
+
     def _get_smem_layout_atom(self):
         sQ_layout_atom = sm80_utils.get_smem_layout_atom(self.dtype, self.tile_hdim)
         sK_layout_atom = sQ_layout_atom
@@ -834,8 +838,8 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         mSeqUsedQ: Optional[cute.Tensor] = None,
         mSeqUsedK: Optional[cute.Tensor] = None,
         mPageTable: Optional[cute.Tensor] = None,
-        window_size_left: Optional[Int32] = None,
-        window_size_right: Optional[Int32] = None,
+        window_size_left: Int32 | int | None = None,
+        window_size_right: Int32 | int | None = None,
         learnable_sink: Optional[cute.Tensor] = None,
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
         aux_data: AuxData = AuxData(),
@@ -847,7 +851,10 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         mQ/mK/mV/mO has same data types(supports fp16 and bf16) and same layout:
         (batch_size, seqlen_q, num_head, head_dim):(_, _, _, 1)
         """
-        assert learnable_sink is None, "Learnable sink is not supported in this kernel"
+        if const_expr(not self.supports_learnable_sink):
+            assert (
+                learnable_sink is None
+            ), "Learnable sink is not supported on SM80"
         self._check_type(
             *(
                 t.element_type if t is not None else None
@@ -869,8 +876,9 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         self.num_producer_threads = self.num_threads
         self.num_Q_load_threads = self.num_threads
         self.num_epilogue_threads = self.num_threads
-        # self.use_tma_O = self.arch >= 90 and mCuSeqlensQ is None
-        self.use_tma_O = self.arch >= Arch.sm_90
+        # This implementation uses the SM80 cp.async epilogue. Architectures
+        # with a TMA epilogue use their own forward-kernel classes.
+        self.use_tma_O = False
         self._setup_attributes()
         SharedStorage = self._get_shared_storage_cls()
         mQ, mK, mV, mO = [assume_tensor_aligned(t) for t in (mQ, mK, mV, mO)]
@@ -900,6 +908,18 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             mLSE = cute.make_tensor(
                 mLSE.iterator, cute.select(mLSE.layout, mode=LSE_layout_transpose)
             )
+        if const_expr(self.pack_gqa):
+            nheads_kv = mK.shape[2]
+            mQ = pack_gqa_layout(
+                mQ, self.qhead_per_kvhead, nheads_kv, head_idx=2
+            )
+            mO = pack_gqa_layout(
+                mO, self.qhead_per_kvhead, nheads_kv, head_idx=2
+            )
+            if const_expr(mLSE is not None):
+                mLSE = pack_gqa_layout(
+                    mLSE, self.qhead_per_kvhead, nheads_kv, head_idx=1
+                )
         # TileScheduler for varlen, simple grid for non-varlen
         if const_expr(mCuSeqlensQ is not None or mSeqUsedQ is not None):
             TileScheduler = SingleTileVarlenScheduler
@@ -908,10 +928,10 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         num_batch = (
             mCuSeqlensQ.shape[0] - 1
             if const_expr(mCuSeqlensQ is not None)
-            else mQ.shape[3]
+            else cute.size(mQ.shape[3])
         )
         tile_sched_args = TileSchedulerArguments(
-            num_block=cute.ceil_div(mQ.shape[0], self.tile_m),
+            num_block=cute.ceil_div(cute.size(mQ.shape[0]), self.tile_m),
             num_head=cute.size(mQ.shape[2]),
             num_batch=num_batch,
             num_splits=1,
@@ -935,6 +955,12 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         softmax_scale_log2, softmax_scale = utils.compute_softmax_scale_log2(
             softmax_scale, self.score_mod
         )
+        window_size_left = (
+            Int32(window_size_left) if window_size_left is not None else None
+        )
+        window_size_right = (
+            Int32(window_size_right) if window_size_right is not None else None
+        )
         fastdiv_mods = utils.compute_fastdiv_mods(
             mQ, mK, self.qhead_per_kvhead, self.pack_gqa, aux_data.tensors
         )
@@ -953,6 +979,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             softmax_scale,
             window_size_left,
             window_size_right,
+            learnable_sink,
             self.sQ_layout,
             self.sK_layout,
             self.sV_layout,
@@ -992,6 +1019,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         softmax_scale: Optional[Float32],
         window_size_left: Optional[Int32],
         window_size_right: Optional[Int32],
+        learnable_sink: Optional[cute.Tensor],
         sQ_layout: cute.ComposedLayout,
         sK_layout: cute.ComposedLayout,
         sV_layout: cute.ComposedLayout,
@@ -1030,7 +1058,11 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         )
         seqlen = SeqlenInfoQK.create(
             batch_idx=batch_size,
-            seqlen_q_static=mQ.shape[0],
+            seqlen_q_static=(
+                mQ.shape[0]
+                if const_expr(not self.pack_gqa)
+                else mQ.shape[0][1]
+            ),
             seqlen_k_static=mK.shape[0],
             mCuSeqlensQ=mCuSeqlensQ,
             mCuSeqlensK=mCuSeqlensK,
@@ -1050,11 +1082,14 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         blkQ_shape = (self.tile_m, self.tile_hdim)
         blkK_shape = (self.tile_n, self.tile_hdim)
         blkV_shape = (self.tile_n, self.tile_hdimv)
-        num_head_kv = num_head // self.qhead_per_kvhead
-        if const_expr(not seqlen.has_cu_seqlens_q):
-            mQ_cur = mQ[None, None, num_head, batch_size]
-        else:
-            mQ_cur = cute.domain_offset((seqlen.offset_q, 0), mQ[None, None, num_head])
+        num_head_kv = (
+            num_head
+            if const_expr(self.pack_gqa)
+            else num_head // self.qhead_per_kvhead
+        )
+        mQ_cur = seqlen.offset_batch_Q(mQ, batch_size, dim=3)[
+            None, None, num_head
+        ]
         if const_expr(not seqlen.has_cu_seqlens_k):
             mK_cur = mK[None, None, num_head_kv, batch_size]
             mV_cur = mV[None, None, num_head_kv, batch_size]
@@ -1065,7 +1100,8 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             mV_cur = cute.domain_offset(
                 (seqlen.offset_k, 0), mV[None, None, num_head_kv]
             )
-        gQ = cute.local_tile(mQ_cur, blkQ_shape, (m_block, 0))
+        if const_expr(not self.pack_gqa):
+            gQ = cute.local_tile(mQ_cur, blkQ_shape, (m_block, 0))
         gK = cute.local_tile(mK_cur, blkK_shape, (None, 0))
         gV = cute.local_tile(mV_cur, blkV_shape, (None, 0))
 
@@ -1219,14 +1255,30 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         # ///////////////////////////////////////////////////////////////////////////////
         # Start async loads of the last mn-tile, where we take care of the mn residue
         gmem_thr_copy_Q = gmem_tiled_copy_Q.get_slice(tidx)
-        self.load_Q(
-            gmem_thr_copy_Q,
-            gQ,
-            sQ,
-            m_block,
-            seqlen=seqlen.seqlen_q,
-            headdim=mQ.shape[1],
-        )
+        if const_expr(not self.pack_gqa):
+            self.load_Q(
+                gmem_thr_copy_Q,
+                gQ,
+                sQ,
+                m_block,
+                seqlen=seqlen.seqlen_q,
+                headdim=mQ.shape[1],
+            )
+        else:
+            pack_gqa = PackGQA(
+                self.tile_m,
+                self.tile_hdim,
+                self.check_hdim_oob,
+                self.qhead_per_kvhead,
+            )
+            pack_gqa.load_Q(
+                mQ_cur,
+                sQ,
+                gmem_tiled_copy_Q,
+                tidx,
+                m_block,
+                seqlen.seqlen_q,
+            )
         cute.arch.cp_async_commit_group()
 
         def preprocess_Q():
@@ -1342,8 +1394,29 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             smem_pipe_write = self.advance_pipeline(smem_pipe_write)
         # TODO: local
 
-        # normalize acc_O by row_sum and calculate the lse
-        row_scale = softmax.finalize()
+        sink_val = None
+        if const_expr(learnable_sink is not None):
+            if const_expr(not self.pack_gqa):
+                sink_val = Float32(learnable_sink[num_head])
+            else:
+                # Pack-GQA folds query heads into the row dimension, so each
+                # accumulator row can select a different per-query-head sink.
+                sink_val = cute.make_rmem_tensor_like(softmax.row_max, Float32)
+                cS = cute.make_identity_tensor((self.tile_m, self.tile_n))
+                tScS_mn = layout_utils.reshape_acc_to_mn(
+                    thr_mma_qk.partition_C(cS)
+                )
+                for r in cutlass.range(cute.size(sink_val), unroll_full=True):
+                    row = m_block * self.tile_m + tScS_mn[r][0]
+                    q_head_idx = (
+                        row % self.qhead_per_kvhead
+                        + num_head * self.qhead_per_kvhead
+                    )
+                    sink_val[r] = Float32(learnable_sink[q_head_idx])
+
+        # Normalize acc_O by row_sum and include the zero-value sink logit in
+        # the denominator before calculating LSE.
+        row_scale = softmax.finalize(sink_val=sink_val)
         softmax.rescale_O(acc_O, row_scale)
 
         # ///////////////////////////////////////////////////////////////////////////////
