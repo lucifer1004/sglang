@@ -169,6 +169,7 @@ class TileSchedulerArguments(ParamsBase):
     element_size: cutlass.Constexpr[int] = 2
     is_persistent: cutlass.Constexpr[bool] = False
     lpt: cutlass.Constexpr[bool] = False
+    direct_single_batch: cutlass.Constexpr[bool] = False
     is_split_kv: cutlass.Constexpr[bool] = False
     head_swizzle: cutlass.Constexpr[bool] = False
     use_cluster_idx: cutlass.Constexpr[bool] = False
@@ -824,6 +825,7 @@ class SingleTileVarlenScheduler:
         mSeqUsedQ: Optional[cute.Tensor] = None
         qhead_per_kvhead_packgqa: cutlass.Constexpr[int] = 1
         lpt: cutlass.Constexpr[bool] = False
+        direct_single_batch: cutlass.Constexpr[bool] = False
         is_split_kv: cutlass.Constexpr[bool] = False
         head_swizzle: cutlass.Constexpr[bool] = False
         cluster_shape_m: cutlass.Constexpr[int] = 1
@@ -875,6 +877,7 @@ class SingleTileVarlenScheduler:
                 mSeqUsedQ=args.mSeqUsedQ,
                 qhead_per_kvhead_packgqa=args.qhead_per_kvhead_packgqa,
                 lpt=args.lpt,
+                direct_single_batch=args.direct_single_batch,
                 is_split_kv=args.is_split_kv,
                 head_swizzle=args.head_swizzle,
                 cluster_shape_m=args.cluster_shape_mn[0],
@@ -984,9 +987,27 @@ class SingleTileVarlenScheduler:
         )
 
     @cute.jit
+    def _single_batch_direct_coord_map(self) -> WorkTileInfo:
+        """Map an exact single-batch grid without varlen prefix-sum discovery."""
+        params = self.params
+        flat_tile = self._tile_idx // params.cluster_shape_m
+        block = flat_tile // params.num_head
+        head_idx = flat_tile - block * params.num_head
+        if cutlass.const_expr(params.cluster_shape_m > 1):
+            bidx_in_cluster = cute.arch.block_in_cluster_idx()
+            block = block * params.cluster_shape_m + bidx_in_cluster[0]
+        split_idx = self._split_idx if const_expr(params.is_split_kv) else Int32(0)
+        return WorkTileInfo(
+            (Int32(block), Int32(head_idx), Int32(0), split_idx),
+            self._is_first_block,
+        )
+
+    @cute.jit
     def _varlen_coord_map(self) -> WorkTileInfo:
         """Map self._tile_idx to (block, head, batch) via warp-level prefix sums."""
         params = self.params
+        if cutlass.const_expr(params.direct_single_batch):
+            return self._single_batch_direct_coord_map()
         lane_idx = cute.arch.lane_idx()
         num_m_blocks = self._get_num_m_blocks(lane_idx, bidb_start=0)
         num_m_blocks_cumulative = utils.warp_prefix_sum(num_m_blocks, lane_idx)

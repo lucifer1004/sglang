@@ -3,6 +3,7 @@
 
 import math
 import os
+from collections import OrderedDict
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import Callable, Optional, Tuple
@@ -97,6 +98,12 @@ def _get_device_arch():
         return _parse_arch_str(arch_override)
     major, minor = torch.cuda.get_device_capability()
     return major * 10 + int(minor)
+
+
+@lru_cache(maxsize=None)
+def _get_device_num_sms(device: torch.device) -> int:
+    """Return the stable SM count without querying CUDA on every launch."""
+    return torch.cuda.get_device_properties(device).multi_processor_count
 
 
 def _validate_head_dims(
@@ -277,6 +284,138 @@ def _resolve_causal_local_window(
     return causal, local, window_size_left, window_size_right
 
 
+_SM120_VARLEN_HOST_PLAN_CAPACITY = 4096
+_sm120_varlen_host_plans: OrderedDict[tuple, Callable] = OrderedDict()
+_empty_aux_data = AuxData(None, None)
+
+
+def _sm120_varlen_host_signature(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    causal: bool,
+    window_size_left: Optional[int],
+    window_size_right: Optional[int],
+    learnable_sink: Optional[torch.Tensor],
+    pack_gqa: bool,
+) -> tuple:
+    """Describe every runtime property covered by a validated host plan."""
+    tensor_signatures = tuple(
+        (
+            type(tensor),
+            tensor.device,
+            tensor.dtype,
+            tensor.shape,
+            tensor.stride(),
+            tensor.requires_grad,
+        )
+        for tensor in (q, k, v, cu_seqlens_q, cu_seqlens_k)
+    )
+    sink_signature = (
+        None
+        if learnable_sink is None
+        else (
+            type(learnable_sink),
+            learnable_sink.device,
+            learnable_sink.dtype,
+            learnable_sink.shape,
+            learnable_sink.stride(),
+            learnable_sink.requires_grad,
+        )
+    )
+    return (
+        tensor_signatures,
+        sink_signature,
+        max_seqlen_q,
+        max_seqlen_k,
+        causal,
+        window_size_left,
+        window_size_right,
+        pack_gqa,
+        FlashAttentionForwardSm120.get_fwd_tile_size,
+        fa_logging.get_fa_log_level(),
+    )
+
+
+def _cache_sm120_varlen_host_plan(key: tuple, fn: Callable) -> None:
+    _sm120_varlen_host_plans[key] = fn
+    _sm120_varlen_host_plans.move_to_end(key)
+    while len(_sm120_varlen_host_plans) > _SM120_VARLEN_HOST_PLAN_CAPACITY:
+        _sm120_varlen_host_plans.popitem(last=False)
+
+
+def _try_sm120_varlen_host_plan(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    max_seqlen_q: Optional[int],
+    max_seqlen_k: Optional[int],
+    softmax_scale: Optional[float],
+    causal: bool,
+    window_size: Tuple[Optional[int], Optional[int]],
+    learnable_sink: Optional[torch.Tensor],
+    pack_gqa: Optional[bool],
+) -> Optional[tuple[torch.Tensor, None]]:
+    """Launch a cached simple SM120 varlen plan, or return None on a guard miss."""
+    if q.ndim != 3 or k.ndim != 3 or k.shape[1] == 0:
+        return None
+    actual_pack_gqa = q.shape[1] // k.shape[1] > 1 if pack_gqa is None else pack_gqa
+    actual_max_seqlen_q = q.shape[0] if max_seqlen_q is None else max_seqlen_q
+    actual_max_seqlen_k = k.shape[0] if max_seqlen_k is None else max_seqlen_k
+    causal, _, window_size_left, window_size_right = _resolve_causal_local_window(
+        causal, window_size[0], window_size[1]
+    )
+    key = _sm120_varlen_host_signature(
+        q,
+        k,
+        v,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        actual_max_seqlen_q,
+        actual_max_seqlen_k,
+        causal,
+        window_size_left,
+        window_size_right,
+        learnable_sink,
+        actual_pack_gqa,
+    )
+    fn = _sm120_varlen_host_plans.get(key)
+    if fn is None:
+        return None
+    _sm120_varlen_host_plans.move_to_end(key)
+    out = torch.empty(
+        (*q.shape[:-1], v.shape[-1]),
+        dtype=q.dtype,
+        device=q.device,
+    )
+    scale = 1.0 / math.sqrt(q.shape[-1]) if softmax_scale is None else softmax_scale
+    fn(
+        q,
+        k,
+        v,
+        out,
+        None,
+        scale,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        None,
+        None,
+        None,
+        window_size_left,
+        window_size_right,
+        learnable_sink,
+        None,
+        _empty_aux_data,
+    )
+    return out, None
+
+
 def _group_tile_bias(qhead_per_kvhead_packgqa=1):
     return 128
 
@@ -342,6 +481,7 @@ def _flash_attn_fwd(
         aux_scalars: Runtime scalar captures used by score_mod or mask_mod.
     """
     aux_scalars = tuple(aux_scalars) if aux_scalars else None
+    fake_mode = is_fake_mode()
     q, k, v, qv = [maybe_contiguous(t) for t in (q, k, v, qv)]
     assert q is not None or qv is not None
     assert v is not None
@@ -477,7 +617,7 @@ def _flash_attn_fwd(
         assert learnable_sink.shape == (num_head,)
         assert learnable_sink.dtype == torch.bfloat16, "learnable_sink must be bfloat16"
 
-    if not is_fake_mode():
+    if not fake_mode:
         assert all(
             t is None or t.is_cuda
             for t in (
@@ -622,15 +762,11 @@ def _flash_attn_fwd(
     # selecting a tile from the actual device's SM count and query workload.
     if arch // 10 in [8, 12]:
         num_threads = 128
-    num_SMs = (
-        132
-        if is_fake_mode()
-        else torch.cuda.get_device_properties(device).multi_processor_count
-    )
+    num_SMs = 132 if fake_mode else _get_device_num_sms(device)
     # The fake-mode fallback is a generic scheduling placeholder, not a
     # property of the eventual SM120 target. Do not use it for device-specific
     # SM120 tile selection.
-    sm120_num_sms = None if is_fake_mode() else num_SMs
+    sm120_num_sms = None if fake_mode else num_SMs
 
     fwd_cfg = FwdConfig(128, 128, True, True)  # default
     if tile_mn is None:
@@ -641,12 +777,8 @@ def _flash_attn_fwd(
                 total_q_rows=total_q * num_head,
                 num_sms=sm120_num_sms,
                 num_batch=batch_size,
-                seqlen_q=(
-                    max_seqlen_q if max_seqlen_q is not None else seqlen_q
-                ),
-                seqlen_k=(
-                    max_seqlen_k if max_seqlen_k is not None else seqlen_k
-                ),
+                seqlen_q=(max_seqlen_q if max_seqlen_q is not None else seqlen_q),
+                seqlen_k=(max_seqlen_k if max_seqlen_k is not None else seqlen_k),
                 num_head_kv=num_head_kv,
                 qhead_per_kvhead=qhead_per_kvhead,
                 is_causal=causal,
@@ -728,6 +860,16 @@ def _flash_attn_fwd(
             num_splits = 1
 
     is_split_kv = num_splits > 1
+    sm120_direct_single_wave = (
+        arch // 10 == 12
+        and batch_size == 1
+        and pack_gqa
+        and cu_seqlens_q is not None
+        and seqused_q is None
+        and total_q == max_seqlen_q
+        and num_splits == 1
+        and total_mblocks <= num_SMs
+    )
     if is_split_kv:
         out_partial = torch.empty(
             num_splits,
@@ -992,7 +1134,7 @@ def _flash_attn_fwd(
                         current_stream,
                         options="--enable-tvm-ffi",
                     )
-                if not is_fake_mode():
+                if not fake_mode:
                     _flash_attn_fwd.compile_cache_prepare_shear_bias[
                         compile_key_prepare
                     ](
@@ -1074,7 +1216,7 @@ def _flash_attn_fwd(
                 current_stream,
                 options="--enable-tvm-ffi",
             )
-        if not is_fake_mode():
+        if not fake_mode:
             _flash_attn_fwd.compile_cache_shear_bias[shear_compile_key](
                 rel_bias,
                 bias,
@@ -1127,6 +1269,7 @@ def _flash_attn_fwd(
         is_split_kv,
         pack_gqa,
         arch,
+        sm120_direct_single_wave,
         page_size not in [None, tile_n],  # paged KV non-TMA
         use_2cta_instrs,
         q_subtile_factor,
@@ -1414,6 +1557,7 @@ def _flash_attn_fwd(
                 score_mod=score_mod,
                 mask_mod=mask_mod,
                 has_aux_tensors=aux_tensors is not None,
+                direct_single_wave=sm120_direct_single_wave,
             )
         else:
             raise ValueError(
@@ -1487,7 +1631,7 @@ def _flash_attn_fwd(
                 *compile_args, options="--enable-tvm-ffi"
             )
 
-    if not is_fake_mode():
+    if not fake_mode:
         q_call, k_call, v_call, qv_call = [
             t.detach() if t is not None else None for t in (q, k, v, qv)
         ]
@@ -1585,7 +1729,51 @@ def _flash_attn_fwd(
                             sfv_call,  # mSFV (None unless v_blockscaled)
                         ]
                     )
-            _flash_attn_fwd.compile_cache[compile_key](*call_args)
+            compiled_fwd = _flash_attn_fwd.compile_cache[compile_key]
+            if (
+                arch // 10 == 12
+                and batch_size == 1
+                and pack_gqa
+                and cu_seqlens_q is not None
+                and cu_seqlens_k is not None
+                and seqused_q is None
+                and seqused_k is None
+                and not is_split_kv
+                and not requires_grad
+                and (learnable_sink is None or not learnable_sink.requires_grad)
+                and lse is None
+                and softcap is None
+                and score_mod is None
+                and mask_mod is None
+                and block_sparse_tensors is None
+                and aux_tensors is None
+                and aux_scalars is None
+                and q_descale is None
+                and k_descale is None
+                and v_descale is None
+                and rel_bias is None
+                and sfq is None
+                and sfk is None
+                and sfv is None
+            ):
+                _cache_sm120_varlen_host_plan(
+                    _sm120_varlen_host_signature(
+                        q,
+                        k,
+                        v,
+                        cu_seqlens_q,
+                        cu_seqlens_k,
+                        max_seqlen_q,
+                        max_seqlen_k,
+                        causal,
+                        window_size_left,
+                        window_size_right,
+                        learnable_sink,
+                        pack_gqa,
+                    ),
+                    compiled_fwd,
+                )
+            compiled_fwd(*call_args)
     if is_split_kv:
         _flash_attn_fwd_combine(
             out_partial,
@@ -1766,31 +1954,32 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             v_sf_vec_size=v_sf_vec_size,
             rel_bias_prep_cache=rel_bias_prep_cache,
         )
-        ctx.save_for_backward(
-            q,
-            k,
-            v,
-            out,
-            lse,
-            cu_seqlens_q,
-            cu_seqlens_k,
-            seqused_q,
-            seqused_k,
-            *(aux_tensors or ()),
-        )
-        ctx.softmax_scale = softmax_scale
-        ctx.causal = causal
-        ctx.window_size = window_size
-        ctx.softcap = softcap
-        ctx.deterministic = deterministic
-        ctx.max_seqlen_q = max_seqlen_q
-        ctx.max_seqlen_k = max_seqlen_k
-        ctx.return_lse = return_lse
-        ctx.score_mod = score_mod
-        ctx.score_mod_bwd = score_mod_bwd
-        ctx.mask_mod = mask_mod
-        ctx.aux_scalars = aux_scalars
-        ctx.set_materialize_grads(False)
+        if ctx is not None:
+            ctx.save_for_backward(
+                q,
+                k,
+                v,
+                out,
+                lse,
+                cu_seqlens_q,
+                cu_seqlens_k,
+                seqused_q,
+                seqused_k,
+                *(aux_tensors or ()),
+            )
+            ctx.softmax_scale = softmax_scale
+            ctx.causal = causal
+            ctx.window_size = window_size
+            ctx.softcap = softcap
+            ctx.deterministic = deterministic
+            ctx.max_seqlen_q = max_seqlen_q
+            ctx.max_seqlen_k = max_seqlen_k
+            ctx.return_lse = return_lse
+            ctx.score_mod = score_mod
+            ctx.score_mod_bwd = score_mod_bwd
+            ctx.mask_mod = mask_mod
+            ctx.aux_scalars = aux_scalars
+            ctx.set_materialize_grads(False)
         return out, lse
 
 
@@ -1920,7 +2109,54 @@ def flash_attn_varlen_func(
         qk_sf_vec_size = 32
     if v_sf_vec_size is None and sfv is not None and sfv.dtype == torch.float8_e8m0fnu:
         v_sf_vec_size = 32
-    return FlashAttnVarlenFunc.apply(
+    if (
+        q is not None
+        and k is not None
+        and cu_seqlens_q is not None
+        and cu_seqlens_k is not None
+        and num_splits == 1
+        and softcap in (None, 0.0)
+        and not return_lse
+        and all(
+            value is None
+            for value in (
+                qv,
+                seqused_q,
+                seqused_k,
+                gather_kv_indices,
+                page_table,
+                score_mod,
+                mask_mod,
+                block_sparse_tensors,
+                aux_tensors,
+                aux_scalars,
+                q_descale,
+                k_descale,
+                v_descale,
+                rel_bias,
+                sfq,
+                sfk,
+                sfv,
+            )
+        )
+    ):
+        fast_result = _try_sm120_varlen_host_plan(
+            q,
+            k,
+            v,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            max_seqlen_q,
+            max_seqlen_k,
+            softmax_scale,
+            causal,
+            window_size,
+            learnable_sink,
+            pack_gqa,
+        )
+        if fast_result is not None:
+            return fast_result
+    autograd_args = (
         q,
         k,
         v,
@@ -1960,6 +2196,27 @@ def flash_attn_varlen_func(
         rel_bias_prep_cache,
         return_lse,
     )
+    differentiable_tensors = (
+        q,
+        k,
+        v,
+        qv,
+        learnable_sink,
+        q_descale,
+        k_descale,
+        v_descale,
+        rel_bias,
+        sfq,
+        sfk,
+        sfv,
+        *(aux_tensors or ()),
+    )
+    needs_autograd = torch.is_grad_enabled() and any(
+        tensor is not None and tensor.requires_grad for tensor in differentiable_tensors
+    )
+    if not needs_autograd:
+        return FlashAttnVarlenFunc.forward(None, *autograd_args)
+    return FlashAttnVarlenFunc.apply(*autograd_args)
 
 
 def _compile_fwd_combine(
