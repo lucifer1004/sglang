@@ -70,7 +70,7 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
         (256, 256, 48, 64): (221, 99, 74),
         (256, 256, 64, 64): (212, 101, 67),
     }
-    _lpt_tie_margin = 12
+    _lpt_tie_margin = 1
 
     @staticmethod
     def _estimate_lpt_makespan(
@@ -223,6 +223,14 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
                     (48, 64, 1),
                     (32, 64, 1),
                 )
+        elif (head_dim, head_dim_v) in ((64, 64), (128, 128)):
+            # The larger SM120 warp-MMA shapes are register-bound at these
+            # head dimensions. M128N128 at HD64 and M128N64 at HD128 spill,
+            # while M64N64 remains spill-free and dominates across wave counts.
+            fallback_candidates = (
+                (64, 64, 1),
+                (128, 64, 1),
+            ) + (((128, 128, 1),) if head_dim == 64 else ())
         else:
             fallback_candidates = (
                 (((128, 128, 1),) if max(head_dim, head_dim_v) <= 64 else ())

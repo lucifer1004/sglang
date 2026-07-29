@@ -77,8 +77,8 @@ def test_sm120_owns_learnable_sink_capability():
 @pytest.mark.parametrize(
     ("head_dim", "expected"),
     [
-        (64, (128, 128)),
-        (128, (128, 64)),
+        (64, (64, 64)),
+        (128, (64, 64)),
         (192, (128, 64)),
         (224, (64, 64)),
         (256, (64, 64)),
