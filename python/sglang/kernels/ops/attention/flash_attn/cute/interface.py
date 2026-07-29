@@ -3,7 +3,6 @@
 
 import math
 import os
-from collections import OrderedDict
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import Callable, Optional, Tuple
@@ -58,8 +57,8 @@ from sglang.kernels.ops.attention.flash_attn.cute.flash_fwd_sm100 import (
     DescaleTensors,
     FlashAttentionForwardSm100,
 )
-from sglang.kernels.ops.attention.flash_attn.cute.flash_fwd_sm120 import (
-    FlashAttentionForwardSm120,
+from sglang.kernels.ops.attention.flash_attn.cute.flash_fwd_sm120_host import (
+    sm120_forward_host,
 )
 from sglang.kernels.ops.attention.flash_attn.cute.shearing_bias import ShearingBias
 
@@ -104,12 +103,6 @@ def _get_device_arch():
 def _get_device_num_sms(device: torch.device) -> int:
     """Return the stable SM count without querying CUDA on every launch."""
     return torch.cuda.get_device_properties(device).multi_processor_count
-
-
-@lru_cache(maxsize=None)
-def _get_device_memory_bus_width(device: torch.device) -> int:
-    """Return the stable DRAM bus width in bits."""
-    return torch.cuda.get_device_properties(device).memory_bus_width
 
 
 def _validate_head_dims(
@@ -290,506 +283,6 @@ def _resolve_causal_local_window(
     return causal, local, window_size_left, window_size_right
 
 
-_FORWARD_LAUNCH_PLAN_CAPACITY = 4096
-_FORWARD_LAUNCH_PLAN_ARCHES = frozenset({12})
-_empty_aux_data = AuxData(None, None)
-
-
-@dataclass(frozen=True)
-class ForwardLaunchPlan:
-    """A compiled forward specialization paired with its runtime ABI adapter."""
-
-    compiled_fn: Callable
-    compile_key: tuple
-    launcher: Callable
-
-
-@dataclass
-class PagedForwardLaunchPlan:
-    """Compiled paged forward ABI and its SplitKV reduction specialization."""
-
-    compiled_fn: Callable
-    compile_key: tuple
-    actual_num_splits: int
-    compiled_combine: Optional[Callable] = None
-
-
-_forward_launch_plans: OrderedDict[tuple, ForwardLaunchPlan] = OrderedDict()
-_paged_forward_launch_plans: OrderedDict[tuple, PagedForwardLaunchPlan] = (
-    OrderedDict()
-)
-_paged_forward_plan_tiles: dict[tuple, tuple[int, int]] = {}
-_paged_forward_workspaces: dict[
-    tuple[torch.device, int], tuple[torch.Tensor, torch.Tensor]
-] = {}
-_paged_forward_workspace_views: dict[
-    tuple[torch.device, int, int, tuple[int, ...], int],
-    tuple[torch.Tensor, torch.Tensor, torch.Tensor],
-] = {}
-
-
-def _forward_plan_implementation_token(arch: int):
-    """Return mutable implementation identity needed by the host-plan key."""
-    if arch // 10 == 12:
-        return (
-            FlashAttentionForwardSm120,
-            FlashAttentionForwardSm120.get_fwd_tile_size,
-        )
-    return arch
-
-
-def _tensor_launch_plan_signature(tensor: torch.Tensor) -> tuple:
-    return (
-        type(tensor),
-        tensor.device,
-        tensor.dtype,
-        tensor.shape,
-        tensor.stride(),
-        tensor.requires_grad,
-    )
-
-
-def _forward_varlen_plan_key(
-    arch: int,
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    cu_seqlens_q: torch.Tensor,
-    cu_seqlens_k: torch.Tensor,
-    max_seqlen_q: int,
-    max_seqlen_k: int,
-    causal: bool,
-    window_size_left: Optional[int],
-    window_size_right: Optional[int],
-    learnable_sink: Optional[torch.Tensor],
-    pack_gqa: bool,
-) -> tuple:
-    """Describe every runtime property covered by a validated host plan."""
-    tensor_signatures = (
-        _tensor_launch_plan_signature(q),
-        _tensor_launch_plan_signature(k),
-        _tensor_launch_plan_signature(v),
-        _tensor_launch_plan_signature(cu_seqlens_q),
-        _tensor_launch_plan_signature(cu_seqlens_k),
-    )
-    sink_signature = (
-        None
-        if learnable_sink is None
-        else _tensor_launch_plan_signature(learnable_sink)
-    )
-    return (
-        "basic-varlen",
-        arch,
-        tensor_signatures,
-        sink_signature,
-        max_seqlen_q,
-        max_seqlen_k,
-        causal,
-        window_size_left,
-        window_size_right,
-        pack_gqa,
-        _forward_plan_implementation_token(arch),
-        fa_logging.get_fa_log_level(),
-    )
-
-
-def _cache_forward_launch_plan(key: tuple, plan: ForwardLaunchPlan) -> None:
-    _forward_launch_plans[key] = plan
-    _forward_launch_plans.move_to_end(key)
-    while len(_forward_launch_plans) > _FORWARD_LAUNCH_PLAN_CAPACITY:
-        _forward_launch_plans.popitem(last=False)
-
-
-def _paged_forward_plan_key(
-    arch: int,
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    cu_seqlens_q: torch.Tensor,
-    seqused_k: torch.Tensor,
-    page_table: torch.Tensor,
-    max_seqlen_q: int,
-    causal: bool,
-    window_size_left: Optional[int],
-    window_size_right: Optional[int],
-    learnable_sink: Optional[torch.Tensor],
-    pack_gqa: bool,
-    requested_num_splits: int,
-) -> tuple:
-    tensor_signatures = tuple(
-        _tensor_launch_plan_signature(t)
-        for t in (q, k, v, cu_seqlens_q, seqused_k, page_table)
-    )
-    sink_signature = (
-        None
-        if learnable_sink is None
-        else _tensor_launch_plan_signature(learnable_sink)
-    )
-    return (
-        "paged-forward",
-        arch,
-        tensor_signatures,
-        sink_signature,
-        max_seqlen_q,
-        causal,
-        window_size_left,
-        window_size_right,
-        pack_gqa,
-        requested_num_splits,
-        _forward_plan_implementation_token(arch),
-        fa_logging.get_fa_log_level(),
-    )
-
-
-def _paged_forward_selection_key(
-    base_key: tuple,
-    tile_m: int,
-    tile_n: int,
-    max_seqlen_k: int,
-    window_size_left: Optional[int],
-    window_size_right: Optional[int],
-) -> tuple:
-    is_local = window_size_left is not None or window_size_right is not None
-    seqlen_k_loaded = (
-        max_seqlen_k
-        if not is_local
-        else max(
-            0,
-            min(
-                max_seqlen_k,
-                (window_size_right or max_seqlen_k)
-                + (window_size_left or max_seqlen_k)
-                + 1
-                + tile_m,
-            ),
-        )
-    )
-    num_n_blocks = (seqlen_k_loaded + tile_n - 1) // tile_n
-    return (*base_key, (tile_m, tile_n, num_n_blocks))
-
-
-def _cache_paged_forward_launch_plan(
-    base_key: tuple,
-    selection_key: tuple,
-    tile_mn: tuple[int, int],
-    plan: PagedForwardLaunchPlan,
-) -> None:
-    _paged_forward_plan_tiles[base_key] = tile_mn
-    _paged_forward_launch_plans[selection_key] = plan
-    _paged_forward_launch_plans.move_to_end(selection_key)
-    while len(_paged_forward_launch_plans) > _FORWARD_LAUNCH_PLAN_CAPACITY:
-        _paged_forward_launch_plans.popitem(last=False)
-
-
-def _paged_workspace(
-    plan: PagedForwardLaunchPlan,
-    q: torch.Tensor,
-    v: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    stream_key = torch.cuda.current_stream(q.device).cuda_stream
-    key = (q.device, stream_key)
-    view_key = (
-        q.device,
-        stream_key,
-        plan.actual_num_splits,
-        tuple(q.shape[:-1]),
-        v.shape[-1],
-    )
-    cached_view = _paged_forward_workspace_views.get(view_key)
-    if cached_view is not None:
-        return cached_view
-    out_numel = (
-        plan.actual_num_splits
-        * math.prod(q.shape[:-1])
-        * v.shape[-1]
-    )
-    lse_numel = plan.actual_num_splits * q.shape[-2] * q.shape[0]
-    workspace = _paged_forward_workspaces.get(key)
-    if (
-        workspace is None
-        or workspace[0].numel() < out_numel
-        or workspace[1].numel() < lse_numel
-    ):
-        stale_view_keys = [
-            candidate
-            for candidate in _paged_forward_workspace_views
-            if candidate[:2] == key
-        ]
-        for stale_key in stale_view_keys:
-            del _paged_forward_workspace_views[stale_key]
-        workspace = (
-            torch.empty(out_numel, dtype=torch.float32, device=q.device),
-            torch.empty(lse_numel, dtype=torch.float32, device=q.device),
-        )
-        _paged_forward_workspaces[key] = workspace
-    out_partial = workspace[0][:out_numel].view(
-        plan.actual_num_splits,
-        *q.shape[:-1],
-        v.shape[-1],
-    )
-    lse_partial = workspace[1][:lse_numel].view(
-        plan.actual_num_splits,
-        q.shape[-2],
-        q.shape[0],
-    )
-    result = (out_partial, lse_partial, lse_partial.transpose(-1, -2))
-    _paged_forward_workspace_views[view_key] = result
-    return result
-
-
-def _try_paged_forward_launch_plan(
-    q: Optional[torch.Tensor],
-    k: Optional[torch.Tensor],
-    v: torch.Tensor,
-    cu_seqlens_q: Optional[torch.Tensor],
-    cu_seqlens_k: Optional[torch.Tensor],
-    seqused_q: Optional[torch.Tensor],
-    seqused_k: Optional[torch.Tensor],
-    page_table: Optional[torch.Tensor],
-    max_seqlen_q: Optional[int],
-    max_seqlen_k: Optional[int],
-    softmax_scale: Optional[float],
-    causal: bool,
-    window_size_left: Optional[int],
-    window_size_right: Optional[int],
-    learnable_sink: Optional[torch.Tensor],
-    requested_num_splits: int,
-    pack_gqa: Optional[bool],
-    out: Optional[torch.Tensor],
-) -> Optional[tuple[torch.Tensor, None]]:
-    if (
-        q is None
-        or k is None
-        or q.ndim != 3
-        or k.ndim != 4
-        or cu_seqlens_q is None
-        or cu_seqlens_k is not None
-        or seqused_q is not None
-        or seqused_k is None
-        or page_table is None
-        or torch.cuda.is_current_stream_capturing()
-    ):
-        return None
-    arch = _get_device_arch()
-    if arch // 10 not in _FORWARD_LAUNCH_PLAN_ARCHES:
-        return None
-    if any(t.requires_grad for t in (q, k, v)):
-        return None
-    if learnable_sink is not None and learnable_sink.requires_grad:
-        return None
-    expected_out_shape = (*q.shape[:-1], v.shape[-1])
-    if out is not None and (
-        out.shape != expected_out_shape
-        or out.dtype != q.dtype
-        or out.device != q.device
-        or not out.is_contiguous()
-    ):
-        return None
-
-    actual_pack_gqa = q.shape[1] // k.shape[-2] > 1 if pack_gqa is None else pack_gqa
-    actual_max_seqlen_q = q.shape[0] if max_seqlen_q is None else max_seqlen_q
-    actual_max_seqlen_k = (
-        k.shape[0] * k.shape[1] if max_seqlen_k is None else max_seqlen_k
-    )
-    if (
-        q.shape[-1] != 256
-        or v.shape[-1] != 256
-        or not actual_pack_gqa
-        or actual_max_seqlen_q * (q.shape[-2] // v.shape[-2]) > 16
-    ):
-        return None
-    causal, _, window_size_left, window_size_right = _resolve_causal_local_window(
-        causal, window_size_left, window_size_right
-    )
-    base_key = _paged_forward_plan_key(
-        arch,
-        q,
-        k,
-        v,
-        cu_seqlens_q,
-        seqused_k,
-        page_table,
-        actual_max_seqlen_q,
-        causal,
-        window_size_left,
-        window_size_right,
-        learnable_sink,
-        actual_pack_gqa,
-        requested_num_splits,
-    )
-    tile_mn = _paged_forward_plan_tiles.get(base_key)
-    if tile_mn is None:
-        return None
-    selection_key = _paged_forward_selection_key(
-        base_key,
-        *tile_mn,
-        actual_max_seqlen_k,
-        window_size_left,
-        window_size_right,
-    )
-    plan = _paged_forward_launch_plans.get(selection_key)
-    if plan is None:
-        return None
-    _paged_forward_launch_plans.move_to_end(selection_key)
-    if out is None:
-        out = torch.empty(
-            expected_out_shape,
-            dtype=q.dtype,
-            device=q.device,
-        )
-    scale = 1.0 / math.sqrt(q.shape[-1]) if softmax_scale is None else softmax_scale
-    kernel_out = out
-    kernel_lse = None
-    lse_partial_transposed = None
-    if plan.actual_num_splits > 1:
-        if plan.compiled_combine is None:
-            return None
-        kernel_out, kernel_lse, lse_partial_transposed = _paged_workspace(
-            plan, q, v
-        )
-    plan.compiled_fn(
-        q,
-        k,
-        v,
-        kernel_out,
-        kernel_lse,
-        scale,
-        cu_seqlens_q,
-        None,
-        None,
-        seqused_k,
-        page_table,
-        window_size_left,
-        window_size_right,
-        learnable_sink,
-        None,
-        _empty_aux_data,
-    )
-    if plan.actual_num_splits > 1:
-        plan.compiled_combine(
-            kernel_out,
-            lse_partial_transposed,
-            out,
-            None,
-            cu_seqlens_q,
-            None,
-            None,
-            None,
-            None,
-        )
-    return out, None
-
-
-def _launch_basic_varlen_forward(
-    compiled_fn: Callable,
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    cu_seqlens_q: torch.Tensor,
-    cu_seqlens_k: torch.Tensor,
-    softmax_scale: float,
-    window_size_left: Optional[int],
-    window_size_right: Optional[int],
-    learnable_sink: Optional[torch.Tensor],
-    out: Optional[torch.Tensor],
-) -> tuple[torch.Tensor, None]:
-    """Launch the basic varlen TVM-FFI ABI shared by SM80 and SM120."""
-    if out is None:
-        out = torch.empty(
-            (*q.shape[:-1], v.shape[-1]),
-            dtype=q.dtype,
-            device=q.device,
-        )
-    compiled_fn(
-        q,
-        k,
-        v,
-        out,
-        None,
-        softmax_scale,
-        cu_seqlens_q,
-        cu_seqlens_k,
-        None,
-        None,
-        None,
-        window_size_left,
-        window_size_right,
-        learnable_sink,
-        None,
-        _empty_aux_data,
-    )
-    return out, None
-
-
-def _try_forward_varlen_launch_plan(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    cu_seqlens_q: torch.Tensor,
-    cu_seqlens_k: torch.Tensor,
-    max_seqlen_q: Optional[int],
-    max_seqlen_k: Optional[int],
-    softmax_scale: Optional[float],
-    causal: bool,
-    window_size: Tuple[Optional[int], Optional[int]],
-    learnable_sink: Optional[torch.Tensor],
-    pack_gqa: Optional[bool],
-    out: Optional[torch.Tensor],
-) -> Optional[tuple[torch.Tensor, None]]:
-    """Launch a cached varlen plan, or return None when no arch registered one."""
-    if q.ndim != 3 or k.ndim != 3 or k.shape[1] == 0:
-        return None
-    arch = _get_device_arch()
-    if arch // 10 not in _FORWARD_LAUNCH_PLAN_ARCHES:
-        return None
-    if out is not None and (
-        out.shape != (*q.shape[:-1], v.shape[-1])
-        or out.dtype != q.dtype
-        or out.device != q.device
-        or not out.is_contiguous()
-    ):
-        return None
-    actual_pack_gqa = q.shape[1] // k.shape[1] > 1 if pack_gqa is None else pack_gqa
-    actual_max_seqlen_q = q.shape[0] if max_seqlen_q is None else max_seqlen_q
-    actual_max_seqlen_k = k.shape[0] if max_seqlen_k is None else max_seqlen_k
-    causal, _, window_size_left, window_size_right = _resolve_causal_local_window(
-        causal, window_size[0], window_size[1]
-    )
-    key = _forward_varlen_plan_key(
-        arch,
-        q,
-        k,
-        v,
-        cu_seqlens_q,
-        cu_seqlens_k,
-        actual_max_seqlen_q,
-        actual_max_seqlen_k,
-        causal,
-        window_size_left,
-        window_size_right,
-        learnable_sink,
-        actual_pack_gqa,
-    )
-    plan = _forward_launch_plans.get(key)
-    if plan is None:
-        return None
-    _forward_launch_plans.move_to_end(key)
-    scale = 1.0 / math.sqrt(q.shape[-1]) if softmax_scale is None else softmax_scale
-    return plan.launcher(
-        plan.compiled_fn,
-        q,
-        k,
-        v,
-        cu_seqlens_q,
-        cu_seqlens_k,
-        scale,
-        window_size_left,
-        window_size_right,
-        learnable_sink,
-        out,
-    )
-
-
 def _group_tile_bias(qhead_per_kvhead_packgqa=1):
     return 128
 
@@ -879,25 +372,26 @@ def _flash_attn_fwd(
             )
         )
     ):
-        fast_result = _try_paged_forward_launch_plan(
-            q,
-            k,
-            v,
-            cu_seqlens_q,
-            cu_seqlens_k,
-            seqused_q,
-            seqused_k,
-            page_table,
-            max_seqlen_q,
-            max_seqlen_k,
-            softmax_scale,
-            causal,
-            window_size_left,
-            window_size_right,
-            learnable_sink,
-            requested_num_splits,
-            pack_gqa,
-            out,
+        fast_result = sm120_forward_host.try_paged_decode(
+            arch=_get_device_arch(),
+            q=q,
+            k=k,
+            v=v,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            seqused_q=seqused_q,
+            seqused_k=seqused_k,
+            page_table=page_table,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            window_size_left=window_size_left,
+            window_size_right=window_size_right,
+            learnable_sink=learnable_sink,
+            requested_num_splits=requested_num_splits,
+            pack_gqa=pack_gqa,
+            out=out,
         )
         if fast_result is not None:
             return fast_result
@@ -1059,6 +553,9 @@ def _flash_attn_fwd(
             )
         ), "inputs must be on CUDA device"
     arch = _get_device_arch() if _arch is None else _arch
+    arch_forward_host = (
+        sm120_forward_host if sm120_forward_host.supports_arch(arch) else None
+    )
     assert arch // 10 in [
         8,
         9,
@@ -1180,37 +677,40 @@ def _flash_attn_fwd(
 
     current_stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
 
-    # Initialize the legacy warp-MMA default. SM120 specializes this after
-    # selecting a tile from the actual device's SM count and query workload.
-    if arch // 10 in [8, 12]:
+    if arch // 10 == 8:
         num_threads = 128
     num_SMs = 132 if fake_mode else _get_device_num_sms(device)
-    # The fake-mode fallback is a generic scheduling placeholder, not a
-    # property of the eventual SM120 target. Do not use it for device-specific
-    # SM120 tile selection.
-    sm120_num_sms = None if fake_mode else num_SMs
 
     fwd_cfg = FwdConfig(128, 128, True, True)  # default
-    if tile_mn is None:
-        if arch // 10 == 12:
-            tile_m, tile_n = FlashAttentionForwardSm120.get_fwd_tile_size(
-                head_dim,
-                head_dim_v,
-                total_q_rows=total_q * num_head,
-                num_sms=sm120_num_sms,
-                num_batch=batch_size,
-                seqlen_q=(max_seqlen_q if max_seqlen_q is not None else seqlen_q),
-                seqlen_k=(max_seqlen_k if max_seqlen_k is not None else seqlen_k),
-                num_head_kv=num_head_kv,
-                qhead_per_kvhead=qhead_per_kvhead,
-                is_causal=causal,
-                is_local=local,
-                window_size_left=window_size_left,
-                window_size_right=window_size_right,
-                pack_gqa=pack_gqa,
-            )
-            fwd_cfg = FwdConfig(tile_m, tile_n, True, True)
-        elif arch // 10 == 8:
+    arch_forward_config = None
+    if arch_forward_host is not None:
+        arch_forward_config = arch_forward_host.select_config(
+            head_dim=head_dim,
+            head_dim_v=head_dim_v,
+            tile_mn=tile_mn,
+            total_q_rows=total_q * num_head,
+            num_sms=None if fake_mode else num_SMs,
+            num_batch=batch_size,
+            seqlen_q=(max_seqlen_q if max_seqlen_q is not None else seqlen_q),
+            seqlen_k=(max_seqlen_k if max_seqlen_k is not None else seqlen_k),
+            num_head_kv=num_head_kv,
+            qhead_per_kvhead=qhead_per_kvhead,
+            is_causal=causal,
+            is_local=local,
+            window_size_left=window_size_left,
+            window_size_right=window_size_right,
+            pack_gqa=pack_gqa,
+            paged_kv=page_table is not None,
+        )
+        fwd_cfg = FwdConfig(
+            arch_forward_config.tile_m,
+            arch_forward_config.tile_n,
+            True,
+            True,
+        )
+        num_threads = arch_forward_config.num_threads
+    elif tile_mn is None:
+        if arch // 10 == 8:
             fwd_cfg = FwdConfig(128, 64, True, True)  # SM80, should tune
         elif arch // 10 == 9:
             sparse_q = get_sparse_q_block_size(block_sparse_tensors, seqlen_q)
@@ -1222,18 +722,6 @@ def _flash_attn_fwd(
             tile_mn[0], tile_mn[1], fwd_cfg.mma_pv_is_rs, fwd_cfg.intra_wg_overlap
         )
     tile_m, tile_n = fwd_cfg.m_block_size, fwd_cfg.n_block_size
-    sm120_num_stages = 1
-    if arch // 10 == 12:
-        sm120_num_stages = FlashAttentionForwardSm120.get_fwd_num_stages(
-            head_dim, head_dim_v, tile_m, tile_n
-        )
-        num_threads = FlashAttentionForwardSm120.get_fwd_num_threads(
-            head_dim,
-            head_dim_v,
-            tile_m,
-            tile_n,
-            paged_kv=page_table is not None,
-        )
     if mma_pv_is_rs is None:
         mma_pv_is_rs = fwd_cfg.mma_pv_is_rs
     if intra_wg_overlap is None:
@@ -1272,60 +760,28 @@ def _flash_attn_fwd(
     ) // m_block_size_effective
     total_mblocks = batch_size * num_head_kv * num_m_blocks
     num_n_blocks = (seqlen_k_loaded + tile_n - 1) // tile_n
-    if num_splits < 1:
-        sm120_hd256_paged_decode = (
-            arch // 10 == 12
-            and head_dim == 256
-            and head_dim_v == 256
-            and page_table is not None
-            and max_seqlen_q == 1
-            and pack_gqa
+    if arch_forward_host is not None:
+        num_splits = arch_forward_host.select_num_splits(
+            requested_num_splits=num_splits,
+            head_dim=head_dim,
+            head_dim_v=head_dim_v,
+            paged_kv=page_table is not None,
+            max_seqlen_q=max_seqlen_q,
+            pack_gqa=pack_gqa,
+            total_mblocks=total_mblocks,
+            num_sms=num_SMs,
+            num_n_blocks=num_n_blocks,
+            device=device,
+            fake_mode=fake_mode,
+            generic_heuristic=num_splits_heuristic,
         )
-        # HD256 paged decode crosses over at 12 N tiles in eager execution.
-        # Under a static max-context CUDA graph, three independent CTAs per
-        # 32-bit DRAM channel saturate both qualified SM120 devices (48 CTAs on
-        # a 512-bit bus, 36 on 384-bit). Beyond that point SplitKV only adds
-        # partial writes and reduction work. Below it, fill one hardware wave.
-        sm120_decode_saturation_ctas = (
-            max(1, 3 * _get_device_memory_bus_width(device) // 32)
-            if not fake_mode
-            else max(1, num_SMs // 4)
+    elif num_splits < 1:
+        num_splits = num_splits_heuristic(
+            total_mblocks,
+            num_SMs,
+            num_n_blocks,
+            128,
         )
-        # Keep the B1 graph/reduction specialization power-of-two sized while
-        # never pretending a smaller SM120 has the 128 workers of the 188-SM SKU.
-        sm120_decode_max_splits = (
-            min(128, 1 << (num_SMs.bit_length() - 1))
-            if sm120_hd256_paged_decode
-            else 128
-        )
-        num_splits = (
-            1
-            if sm120_hd256_paged_decode
-            and (
-                num_n_blocks < 12
-                or total_mblocks >= sm120_decode_saturation_ctas
-            )
-            else num_splits_heuristic(
-                total_mblocks,
-                num_SMs,
-                num_n_blocks,
-                sm120_decode_max_splits,
-            )
-        )
-    if arch // 10 == 12 and num_splits > 1:
-        if num_n_blocks == 0:
-            num_splits = 1
-        else:
-            # BlockInfo assigns a uniform ceil-div chunk to every split. Normalize
-            # the requested count to the number of non-empty chunks so the SM120
-            # pipeline never launches a tail CTA with no K/V block to consume.
-            requested_splits = min(num_splits, num_n_blocks)
-            blocks_per_split = (
-                num_n_blocks + requested_splits - 1
-            ) // requested_splits
-            num_splits = (
-                num_n_blocks + blocks_per_split - 1
-            ) // blocks_per_split
 
     # SplitKV uses float32 partial output, which doubles the O buffer size
     # in shared memory, causing OOM for diff-headdim (192, 128)
@@ -1343,14 +799,17 @@ def _flash_attn_fwd(
             num_splits = 1
 
     is_split_kv = num_splits > 1
-    sm120_direct_single_wave = (
-        arch // 10 == 12
-        and batch_size == 1
-        and pack_gqa
-        and cu_seqlens_q is not None
-        and seqused_q is None
-        and total_q == max_seqlen_q
-        and total_mblocks <= num_SMs
+    direct_single_wave = arch_forward_host is not None and (
+        arch_forward_host.use_direct_single_wave(
+            batch_size=batch_size,
+            pack_gqa=pack_gqa,
+            has_cu_seqlens_q=cu_seqlens_q is not None,
+            has_seqused_q=seqused_q is not None,
+            total_q=total_q,
+            max_seqlen_q=max_seqlen_q,
+            total_mblocks=total_mblocks,
+            num_sms=num_SMs,
+        )
     )
     if is_split_kv:
         out_partial = torch.empty(
@@ -1751,7 +1210,7 @@ def _flash_attn_fwd(
         is_split_kv,
         pack_gqa,
         arch,
-        sm120_direct_single_wave,
+        direct_single_wave,
         page_size not in [None, tile_n],  # paged KV non-TMA
         use_2cta_instrs,
         q_subtile_factor,
@@ -2003,43 +1462,24 @@ def _flash_attn_fwd(
                         )
                     ),
                 )
-        elif arch // 10 == 12:
-            # SM120 uses SM80 MMA instructions, but owns its feature and SMEM policy.
+        elif arch_forward_host is not None:
             assert not use_block_sparsity, "Block sparsity not supported on SM 12.0"
-            if not FlashAttentionForwardSm120.can_implement(
-                dtype,
-                head_dim,
-                head_dim_v,
-                tile_m,
-                tile_n,
-                num_stages=sm120_num_stages,
-                num_threads=num_threads,
-                is_causal=causal,
-                Q_in_regs=False,
-                paged_kv=page_table is not None,
-            ):
-                raise ValueError(
-                    "The requested FlashAttention forward configuration exceeds "
-                    "SM120 kernel constraints or shared-memory capacity"
-                )
-            fa_fwd = FlashAttentionForwardSm120(
-                dtype,
-                head_dim,
-                head_dim_v,
-                qhead_per_kvhead,
+            assert arch_forward_config is not None
+            fa_fwd = arch_forward_host.make_kernel(
+                dtype=dtype,
+                head_dim=head_dim,
+                head_dim_v=head_dim_v,
+                qhead_per_kvhead=qhead_per_kvhead,
                 is_causal=causal,
                 is_local=local,
                 pack_gqa=pack_gqa,
-                tile_m=tile_m,
-                tile_n=tile_n,
-                num_stages=sm120_num_stages,
-                num_threads=num_threads,
-                Q_in_regs=False,
+                config=arch_forward_config,
+                paged_kv=page_table is not None,
                 score_mod=score_mod,
                 mask_mod=mask_mod,
                 has_aux_tensors=aux_tensors is not None,
                 is_split_kv=is_split_kv,
-                direct_single_wave=sm120_direct_single_wave,
+                direct_single_wave=direct_single_wave,
             )
         else:
             raise ValueError(
@@ -2213,7 +1653,7 @@ def _flash_attn_fwd(
                     )
             compiled_fwd = _flash_attn_fwd.compile_cache[compile_key]
             if (
-                arch // 10 in _FORWARD_LAUNCH_PLAN_ARCHES
+                arch_forward_host is not None
                 and batch_size == 1
                 and pack_gqa
                 and cu_seqlens_q is not None
@@ -2238,27 +1678,22 @@ def _flash_attn_fwd(
                 and sfk is None
                 and sfv is None
             ):
-                _cache_forward_launch_plan(
-                    _forward_varlen_plan_key(
-                        arch,
-                        q,
-                        k,
-                        v,
-                        cu_seqlens_q,
-                        cu_seqlens_k,
-                        max_seqlen_q,
-                        max_seqlen_k,
-                        causal,
-                        window_size_left,
-                        window_size_right,
-                        learnable_sink,
-                        pack_gqa,
-                    ),
-                    ForwardLaunchPlan(
-                        compiled_fn=compiled_fwd,
-                        compile_key=compile_key,
-                        launcher=_launch_basic_varlen_forward,
-                    ),
+                arch_forward_host.register_varlen(
+                    arch=arch,
+                    compiled_fn=compiled_fwd,
+                    compile_key=compile_key,
+                    q=q,
+                    k=k,
+                    v=v,
+                    cu_seqlens_q=cu_seqlens_q,
+                    cu_seqlens_k=cu_seqlens_k,
+                    max_seqlen_q=max_seqlen_q,
+                    max_seqlen_k=max_seqlen_k,
+                    causal=causal,
+                    window_size_left=window_size_left,
+                    window_size_right=window_size_right,
+                    learnable_sink=learnable_sink,
+                    pack_gqa=pack_gqa,
                 )
             compiled_fwd(*call_args)
     if is_split_kv:
@@ -2273,7 +1708,7 @@ def _flash_attn_fwd(
     if (
         not fake_mode
         and not torch.cuda.is_current_stream_capturing()
-        and arch // 10 in _FORWARD_LAUNCH_PLAN_ARCHES
+        and arch_forward_host is not None
         and batch_size == 1
         and pack_gqa
         and q is not None
@@ -2316,94 +1751,36 @@ def _flash_attn_fwd(
                 None,
             )
             compiled_combine = _flash_attn_fwd_combine.compile_cache[combine_key]
-            stream_key = torch.cuda.current_stream(device).cuda_stream
-            workspace_key = (device, stream_key)
-            current_workspace = _paged_forward_workspaces.get(workspace_key)
-            if (
-                current_workspace is None
-                or current_workspace[0].numel() < out_partial.numel()
-                or current_workspace[1].numel() < lse_partial.numel()
-            ):
-                stale_view_keys = [
-                    candidate
-                    for candidate in _paged_forward_workspace_views
-                    if candidate[:2] == workspace_key
-                ]
-                for stale_key in stale_view_keys:
-                    del _paged_forward_workspace_views[stale_key]
-                _paged_forward_workspaces[workspace_key] = (
-                    out_partial.view(-1),
-                    lse_partial.view(-1),
-                )
-            view_key = (
-                device,
-                stream_key,
-                num_splits,
-                tuple(q.shape[:-1]),
-                v.shape[-1],
-            )
-            workspace = _paged_forward_workspaces[workspace_key]
-            out_partial_view = workspace[0][: out_partial.numel()].view(
-                out_partial.shape
-            )
-            lse_partial_view = workspace[1][: lse_partial.numel()].view(
-                lse_partial.shape
-            )
-            _paged_forward_workspace_views[view_key] = (
-                out_partial_view,
-                lse_partial_view,
-                lse_partial_view.transpose(-1, -2),
-            )
-        plan_base_key = _paged_forward_plan_key(
-            arch,
-            q,
-            k,
-            v,
-            cu_seqlens_q,
-            seqused_k,
-            page_table,
-            max_seqlen_q,
-            causal,
-            window_size_left,
-            window_size_right,
-            learnable_sink,
-            pack_gqa,
-            requested_num_splits,
-        )
-        plan_selection_key = _paged_forward_selection_key(
-            plan_base_key,
-            tile_m,
-            tile_n,
-            max_seqlen_k,
-            window_size_left,
-            window_size_right,
-        )
-        _cache_paged_forward_launch_plan(
-            plan_base_key,
-            plan_selection_key,
-            (tile_m, tile_n),
-            PagedForwardLaunchPlan(
-                compiled_fn=compiled_fwd,
-                compile_key=compile_key,
-                actual_num_splits=num_splits,
-                compiled_combine=compiled_combine,
-            ),
+        arch_forward_host.register_paged_decode(
+            arch=arch,
+            compiled_fn=compiled_fwd,
+            compile_key=compile_key,
+            compiled_combine=compiled_combine,
+            actual_num_splits=num_splits,
+            tile_m=tile_m,
+            tile_n=tile_n,
+            q=q,
+            k=k,
+            v=v,
+            cu_seqlens_q=cu_seqlens_q,
+            seqused_k=seqused_k,
+            page_table=page_table,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            causal=causal,
+            window_size_left=window_size_left,
+            window_size_right=window_size_right,
+            learnable_sink=learnable_sink,
+            pack_gqa=pack_gqa,
+            requested_num_splits=requested_num_splits,
+            out_partial=out_partial if is_split_kv else None,
+            lse_partial=lse_partial if is_split_kv else None,
         )
     return out, lse
 
 
 _flash_attn_fwd.compile_cache = get_jit_cache("fwd")
-
-
-def _clear_forward_launch_plans() -> None:
-    _forward_launch_plans.clear()
-    _paged_forward_launch_plans.clear()
-    _paged_forward_plan_tiles.clear()
-    _paged_forward_workspaces.clear()
-    _paged_forward_workspace_views.clear()
-
-
-_flash_attn_fwd.compile_cache.register_clear_hook(_clear_forward_launch_plans)
+_flash_attn_fwd.compile_cache.register_clear_hook(sm120_forward_host.clear_launch_plans)
 _flash_attn_fwd.compile_cache_shear_bias = get_jit_cache("fwd_shear_bias")
 _flash_attn_fwd.compile_cache_prepare_shear_bias = get_jit_cache(
     "fwd_prepare_shear_bias"
@@ -2780,20 +2157,21 @@ def flash_attn_varlen_func(
             )
         )
     ):
-        fast_result = _try_forward_varlen_launch_plan(
-            q,
-            k,
-            v,
-            cu_seqlens_q,
-            cu_seqlens_k,
-            max_seqlen_q,
-            max_seqlen_k,
-            softmax_scale,
-            causal,
-            window_size,
-            learnable_sink,
-            pack_gqa,
-            out,
+        fast_result = sm120_forward_host.try_varlen(
+            arch=_get_device_arch(),
+            q=q,
+            k=k,
+            v=v,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            window_size=window_size,
+            learnable_sink=learnable_sink,
+            pack_gqa=pack_gqa,
+            out=out,
         )
         if fast_result is not None:
             return fast_result

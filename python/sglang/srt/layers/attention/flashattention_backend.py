@@ -251,13 +251,16 @@ class FlashAttentionBackend(AttentionBackend):
             )
 
             self._get_scheduler_metadata = get_scheduler_metadata
+            self._get_fa_runtime_policy = None
         elif self.fa_impl_ver == 4:
             from sglang.kernels.ops.attention.flash_attention_v4 import (
                 flash_attn_varlen_func,
                 flash_attn_with_kvcache,
+                get_flash_attention_v4_runtime_policy,
             )
 
             self._get_scheduler_metadata = None
+            self._get_fa_runtime_policy = get_flash_attention_v4_runtime_policy
         else:
             raise ValueError(f"Invalid version: {self.fa_impl_ver=}")
 
@@ -278,30 +281,24 @@ class FlashAttentionBackend(AttentionBackend):
         )
         self.has_softcap = _softcapping is not None and _softcapping > 0.0
 
-        # If num_splits == 0, we use a heuristic to automatically determine the number of splits.
-        # We set nums splits to 1 if deterministic inference is enabled.
-        # See https://thinkingmachines.ai/blog/defeating-nondeterminism-in-llm-inference/ for more details.
+        # num_splits == 0 delegates SplitKV sizing to the selected FA runtime.
         device_capability = get_device_capability()
-        fa4_no_splitkv = self.fa_impl_ver == 4 and (
-            device_capability < (9, 0) or device_capability >= (12, 0)
-        )
-        self.num_splits = (
-            1
-            if model_runner.server_args.enable_deterministic_inference or fa4_no_splitkv
-            else 0
-        )
-        self._use_sm120_fa4_decode_splitkv = (
-            not model_runner.server_args.enable_deterministic_inference
-            and self.fa_impl_ver == 4
-            and device_capability[0] == 12
-            and self.head_dim == 256
-        )
-        # Let FA4 size the SplitKV grid from the captured batch/head geometry
-        # and the actual SM count. A device-sized split count per request would
-        # massively oversubscribe larger decode batches.
-        self.decode_num_splits = (
-            0 if self._use_sm120_fa4_decode_splitkv else self.num_splits
-        )
+        deterministic = model_runner.server_args.enable_deterministic_inference
+        if self._get_fa_runtime_policy is None:
+            self.num_splits = 1 if deterministic else 0
+            self.decode_num_splits = self.num_splits
+            self._decode_uses_static_max_seqlen_k = False
+        else:
+            runtime_policy = self._get_fa_runtime_policy(
+                device_capability=device_capability,
+                head_dim=self.head_dim,
+                deterministic=deterministic,
+            )
+            self.num_splits = runtime_policy.num_splits
+            self.decode_num_splits = runtime_policy.decode_num_splits
+            self._decode_uses_static_max_seqlen_k = (
+                runtime_policy.decode_uses_static_max_seqlen_k
+            )
         # Set (never getattr'd) so forward_extend can identity-check "is this the
         # full-CG prefill metadata?" to disable the pointer-keyed shear-bias
         # block-schedule cache (see forward_extend rel_bias handling).
@@ -504,7 +501,7 @@ class FlashAttentionBackend(AttentionBackend):
                 # Local attention and scheduler metadata require capture-time slice sizing.
                 # Both depend on data already filled by replay above.
                 metadata = self.decode_cuda_graph_metadata[bs]
-                if self._use_sm120_fa4_decode_splitkv:
+                if self._decode_uses_static_max_seqlen_k:
                     # FA4 bakes its N-tile grid and SplitKV specialization into
                     # the graph. Capture against the full replay bound, not the
                     # padded seq-len fill value (1), or a later long-context
