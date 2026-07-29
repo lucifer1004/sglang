@@ -60,6 +60,92 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
 
     supports_learnable_sink = True
     num_dma_threads = 32
+    # Relative CTA critical-path costs keyed by the complete kernel config:
+    # (fixed work, work per N block, extra local-mask work). Sequence length,
+    # window, packed heads, and SM count remain analytic inputs to the generic
+    # LPT model below. New head dimensions can be added after calibrating only
+    # these three config-local weights.
+    _lpt_cost_by_config = {
+        (256, 256, 32, 64): (213, 95, 95),
+        (256, 256, 48, 64): (221, 99, 74),
+        (256, 256, 64, 64): (212, 101, 67),
+    }
+    _lpt_tie_margin = 12
+
+    @staticmethod
+    def _estimate_lpt_makespan(
+        tile_m: int,
+        tile_n: int,
+        cost: tuple[int, int, int],
+        *,
+        seqlen_q: int,
+        seqlen_k: int,
+        num_sms: int,
+        num_head_kv: int,
+        qhead_per_kvhead: int,
+        is_causal: bool,
+        is_local: bool,
+        window_size_left: int | None,
+        window_size_right: int | None,
+    ) -> int | None:
+        """Estimate the one- or two-wave LPT critical path in relative units."""
+        if (
+            seqlen_q <= 0
+            or seqlen_k <= 0
+            or num_sms <= 0
+            or num_head_kv <= 0
+            or qhead_per_kvhead <= 0
+        ):
+            return None
+
+        packed_q = seqlen_q * qhead_per_kvhead
+        num_m_blocks = (packed_q + tile_m - 1) // tile_m
+        num_ctas = num_m_blocks * num_head_kv
+        # Beyond two waves the largest tile is preferable for this bounded-SMEM
+        # pipeline.  Returning None also keeps this O(1).
+        if num_ctas > 2 * num_sms:
+            return None
+
+        fixed_cost, n_block_cost, local_mask_cost = cost
+        fixed_cost += local_mask_cost if is_local else 0
+        num_k_blocks = (seqlen_k + tile_n - 1) // tile_n
+        seqlen_delta = seqlen_k - seqlen_q
+
+        def cta_cost(launch_idx: int) -> int:
+            # SingleTileVarlenScheduler repeats each reversed (LPT) M block
+            # across the packed KV heads before advancing to the next block.
+            m_block = num_m_blocks - 1 - launch_idx // num_head_kv
+            m_idx_min = m_block * tile_m // qhead_per_kvhead
+            m_idx_max = (
+                (m_block + 1) * tile_m + qhead_per_kvhead - 1
+            ) // qhead_per_kvhead
+
+            if is_causal or (is_local and window_size_right is not None):
+                n_idx_right = m_idx_max + seqlen_delta
+                if not is_causal:
+                    n_idx_right += window_size_right
+                n_block_max = min(
+                    num_k_blocks,
+                    max(0, (n_idx_right + tile_n - 1) // tile_n),
+                )
+            else:
+                n_block_max = num_k_blocks
+
+            n_block_min = 0
+            if is_local and window_size_left is not None:
+                n_idx_left = m_idx_min + seqlen_delta - window_size_left
+                n_block_min = max(n_idx_left // tile_n, 0)
+            num_n_blocks = max(n_block_max - n_block_min, 0)
+            return fixed_cost + n_block_cost * num_n_blocks
+
+        heaviest_cta = cta_cost(0)
+        if num_ctas <= num_sms:
+            return heaviest_cta
+        # With at most two waves, the first tail CTA is paired with the lightest
+        # CTA in the first hardware wave.  This captures the discrete tail that
+        # an average-work occupancy model misses.
+        wave_boundary = cta_cost(num_sms - 1) + cta_cost(num_sms)
+        return max(heaviest_cta, wave_boundary)
 
     @staticmethod
     def _smem_usage_in_bytes(
@@ -103,45 +189,137 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
         total_q_rows: int | None = None,
         num_sms: int | None = None,
         num_batch: int | None = None,
+        seqlen_q: int | None = None,
+        seqlen_k: int | None = None,
+        num_head_kv: int | None = None,
+        qhead_per_kvhead: int | None = None,
+        is_causal: bool = False,
+        is_local: bool = False,
+        window_size_left: int | None = None,
+        window_size_right: int | None = None,
+        pack_gqa: bool = False,
     ) -> tuple[int, int]:
         """Select an SM120 tile that fits the architecture's 99 KB SMEM."""
         smem_capacity = utils_basic.get_smem_capacity_in_bytes("sm_120")
         if (head_dim, head_dim_v) == (256, 256):
-            # M64N64 is the zero-spill default: it spends the full 99 KiB SMEM
-            # budget to reduce the number of K/V iterations.  For one long
-            # sequence, M32 wins only in the narrow band where its shorter CTA
-            # critical path produces two balanced waves.  Multiple varlen
-            # sequences restart the causal/LPT pattern per batch, so total rows
-            # alone is not predictive for that specialization.
-            use_m32 = (
-                total_q_rows is not None
-                and num_sms is not None
-                and total_q_rows > 52 * num_sms
-                and total_q_rows <= 64 * num_sms
-                and (num_batch is None or num_batch == 1)
-            )
-            # M48 wins a second, hardware-normalized wave band.  Outside it,
-            # M64N64's lower per-CTA and per-N-block overhead is preferable.
-            use_m48 = (
+            if (
                 total_q_rows is not None
                 and num_sms is not None
                 and total_q_rows > 76 * num_sms
                 and total_q_rows <= 92 * num_sms
-            )
-            candidates = (
-                ((32, 64, 1), (64, 64, 1), (64, 48, 1))
-                if use_m32
-                else (
-                    ((48, 64, 1), (64, 64, 1), (64, 48, 1))
-                    if use_m48
-                    else ((64, 64, 1), (64, 48, 1), (48, 64, 1))
+            ):
+                # Preserve the previous multi-batch/non-packed fallback where
+                # per-sequence LPT costs are unavailable on the host.
+                fallback_candidates = (
+                    (48, 64, 1),
+                    (64, 64, 1),
+                    (64, 48, 1),
+                    (32, 64, 1),
                 )
-            )
+            else:
+                fallback_candidates = (
+                    (64, 64, 1),
+                    (64, 48, 1),
+                    (48, 64, 1),
+                    (32, 64, 1),
+                )
         else:
-            candidates = (
+            fallback_candidates = (
                 (((128, 128, 1),) if max(head_dim, head_dim_v) <= 64 else ())
                 + ((128, 64, 1), (64, 64, 1))
             )
+
+        # The scheduling equation is independent of HD. Pipeline-specific work
+        # stays in a compact cost table keyed by the complete kernel config, so
+        # another HD can be enabled without duplicating the sequence/window
+        # policy. Shapes without calibrated configs retain the fallback above.
+        model_candidates = tuple(
+            (config[2], config[3], 1)
+            for config in FlashAttentionForwardSm120._lpt_cost_by_config
+            if config[:2] == (head_dim, head_dim_v)
+            and FlashAttentionForwardSm120._smem_usage_in_bytes(
+                *config, 1
+            )
+            <= smem_capacity
+        )
+        can_model_lpt = (
+            len(model_candidates) >= 2
+            and num_batch == 1
+            and pack_gqa
+            and total_q_rows is not None
+            and num_sms is not None
+            and seqlen_q is not None
+            and seqlen_k is not None
+            and num_head_kv is not None
+            and qhead_per_kvhead is not None
+            and total_q_rows
+            == seqlen_q * num_head_kv * qhead_per_kvhead
+            and (is_causal or is_local)
+        )
+        candidates = fallback_candidates
+        if can_model_lpt:
+            scores = {
+                candidate: FlashAttentionForwardSm120._estimate_lpt_makespan(
+                    candidate[0],
+                    candidate[1],
+                    FlashAttentionForwardSm120._lpt_cost_by_config[
+                        (head_dim, head_dim_v, candidate[0], candidate[1])
+                    ],
+                    seqlen_q=seqlen_q,
+                    seqlen_k=seqlen_k,
+                    num_sms=num_sms,
+                    num_head_kv=num_head_kv,
+                    qhead_per_kvhead=qhead_per_kvhead,
+                    is_causal=is_causal,
+                    is_local=is_local,
+                    window_size_left=window_size_left,
+                    window_size_right=window_size_right,
+                )
+                for candidate in model_candidates
+            }
+            valid_scores = {
+                candidate: score
+                for candidate, score in scores.items()
+                if score is not None
+            }
+            if valid_scores:
+                exact_best = min(valid_scores, key=valid_scores.get)
+                packed_q = seqlen_q * qhead_per_kvhead
+
+                def num_ctas(candidate: tuple[int, int, int]) -> int:
+                    return (
+                        (packed_q + candidate[0] - 1) // candidate[0]
+                    ) * num_head_kv
+
+                max_model_ctas = max(
+                    num_ctas(candidate) for candidate in model_candidates
+                )
+                if num_ctas(exact_best) == max_model_ctas:
+                    # Keep a genuinely faster high-parallelism tile. Once that
+                    # tile loses outright, a near tie favors fewer CTAs.
+                    preferred = exact_best
+                else:
+                    cutoff = (
+                        valid_scores[exact_best]
+                        + FlashAttentionForwardSm120._lpt_tie_margin
+                    )
+                    near = tuple(
+                        candidate
+                        for candidate, score in valid_scores.items()
+                        if score <= cutoff
+                    )
+                    preferred = min(
+                        near,
+                        key=lambda candidate: (
+                            num_ctas(candidate),
+                            -(candidate[0] * candidate[1]),
+                        ),
+                    )
+                candidates = (preferred,) + tuple(
+                    candidate
+                    for candidate in fallback_candidates
+                    if candidate != preferred
+                )
         for tile_m, tile_n, num_stages in candidates:
             if (
                 FlashAttentionForwardSm120._smem_usage_in_bytes(
