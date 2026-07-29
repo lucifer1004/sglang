@@ -11,6 +11,7 @@ import cutlass
 import cutlass.cute as cute
 import cutlass.utils as utils_basic
 from cutlass import Float32, Int32, const_expr
+from cutlass.cute import FastDivmodDivisor
 from cutlass.cute.nvgpu import cpasync, warp
 from cutlass.pipeline import (
     Agent,
@@ -23,6 +24,7 @@ from cutlass.pipeline import (
 )
 from quack import copy_utils, layout_utils
 
+from sglang.jit_kernel.flash_attn.cute import pipeline as pipeline_custom
 from sglang.jit_kernel.flash_attn.cute import utils
 from sglang.jit_kernel.flash_attn.cute.block_info import BlockInfo
 from sglang.jit_kernel.flash_attn.cute.block_sparsity import (
@@ -40,6 +42,7 @@ from sglang.jit_kernel.flash_attn.cute.pack_gqa import (
     PackGQA,
     pack_gqa_layout,
 )
+from sglang.jit_kernel.flash_attn.cute.paged_kv import PagedKVManager
 from sglang.jit_kernel.flash_attn.cute.seqlen_info import SeqlenInfoQK
 from sglang.jit_kernel.flash_attn.cute.softmax import (
     Softmax,
@@ -353,9 +356,18 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
 
     @staticmethod
     def get_fwd_num_threads(
-        head_dim: int, head_dim_v: int, tile_m: int, tile_n: int
+        head_dim: int,
+        head_dim_v: int,
+        tile_m: int,
+        tile_n: int,
+        paged_kv: bool = False,
     ) -> int:
         """Return the number of warp-MMA consumer threads for an SM120 tile."""
+        if paged_kv and head_dim == 256 and head_dim_v == 256:
+            # The contiguous HD256 path assigns distinct QK and PV warp sets.
+            # Paged KV instead reserves one DMA warp for gather and has each
+            # consumer warp own the same 16 rows through both MMA phases.
+            return tile_m * 2
         config = (head_dim, head_dim_v, tile_m, tile_n)
         if config == (256, 256, 32, 64):
             return 128
@@ -422,6 +434,7 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
         num_threads,
         is_causal,
         Q_in_regs=False,
+        paged_kv=False,
     ) -> bool:
         """Check the constraints of the dedicated SM120 TMA kernel."""
         if dtype not in [cutlass.Float16, cutlass.BFloat16]:
@@ -435,7 +448,7 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
         ):
             return False
         if num_threads != FlashAttentionForwardSm120.get_fwd_num_threads(
-            head_dim, head_dim_v, tile_m, tile_n
+            head_dim, head_dim_v, tile_m, tile_n, paged_kv=paged_kv
         ):
             return False
         if Q_in_regs:
@@ -620,8 +633,10 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
         aux_data: AuxData = AuxData(),
         stream: cuda.CUstream = None,
     ):
-        assert mPageTable is None, "Paged KV is not supported on SM120"
         assert blocksparse_tensors is None, "Block sparsity is not supported on SM120"
+        assert mPageTable is None or not self._uses_split_pv_warps(), (
+            "SM120 paged KV requires the dedicated DMA-warp specialization"
+        )
         self._check_type(
             *(
                 t.element_type if t is not None else None
@@ -671,12 +686,13 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
             )
             for t in (mK, mV)
         ]
-        V_layout_transpose = (
-            [1, 0, 2, 3] if const_expr(mCuSeqlensK is None) else [1, 0, 2]
-        )
-        mV = cute.make_tensor(
-            mV.iterator, cute.select(mV.layout, mode=V_layout_transpose)
-        )
+        if const_expr(mPageTable is None):
+            V_layout_transpose = (
+                [1, 0, 2, 3] if const_expr(mCuSeqlensK is None) else [1, 0, 2]
+            )
+            mV = cute.make_tensor(
+                mV.iterator, cute.select(mV.layout, mode=V_layout_transpose)
+            )
         if const_expr(mLSE is not None):
             LSE_layout_transpose = (
                 [2, 1, 0] if const_expr(mCuSeqlensQ is None) else [1, 0]
@@ -693,27 +709,33 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
                     mLSE, self.qhead_per_kvhead, nheads_kv, head_idx=1
                 )
 
-        tma_copy_op = cpasync.CopyBulkTensorTileG2SOp()
-        tma_atom_K, tma_tensor_K = cpasync.make_tiled_tma_atom(
-            tma_copy_op,
-            mK,
-            cute.select(self.sK_layout, mode=[0, 1]),
-            (self.tile_n, self.tile_hdim),
-            1,
-        )
-        tma_atom_V, tma_tensor_V = cpasync.make_tiled_tma_atom(
-            tma_copy_op,
-            mV,
-            cute.select(self.sV_layout, mode=[0, 1]),
-            (self.tile_hdimv, self.tile_n),
-            1,
-        )
-        self.tma_copy_bytes_K = cute.size_in_bytes(
-            mK.element_type, cute.select(self.sK_layout, mode=[0, 1])
-        )
-        self.tma_copy_bytes_V = cute.size_in_bytes(
-            mV.element_type, cute.select(self.sV_layout, mode=[0, 1])
-        )
+        if const_expr(mPageTable is None):
+            tma_copy_op = cpasync.CopyBulkTensorTileG2SOp()
+            tma_atom_K, tma_tensor_K = cpasync.make_tiled_tma_atom(
+                tma_copy_op,
+                mK,
+                cute.select(self.sK_layout, mode=[0, 1]),
+                (self.tile_n, self.tile_hdim),
+                1,
+            )
+            tma_atom_V, tma_tensor_V = cpasync.make_tiled_tma_atom(
+                tma_copy_op,
+                mV,
+                cute.select(self.sV_layout, mode=[0, 1]),
+                (self.tile_hdimv, self.tile_n),
+                1,
+            )
+            self.tma_copy_bytes_K = cute.size_in_bytes(
+                mK.element_type, cute.select(self.sK_layout, mode=[0, 1])
+            )
+            self.tma_copy_bytes_V = cute.size_in_bytes(
+                mV.element_type, cute.select(self.sV_layout, mode=[0, 1])
+            )
+        else:
+            tma_atom_K = None
+            tma_atom_V = None
+            tma_tensor_K = mK
+            tma_tensor_V = mV
 
         is_varlen = const_expr(mCuSeqlensQ is not None or mSeqUsedQ is not None)
         num_batch = (
@@ -760,7 +782,12 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
             Int32(window_size_right) if window_size_right is not None else None
         )
         fastdiv_mods = utils.compute_fastdiv_mods(
-            mQ, mK, self.qhead_per_kvhead, self.pack_gqa, aux_data.tensors
+            mQ,
+            mK,
+            self.qhead_per_kvhead,
+            self.pack_gqa,
+            aux_data.tensors,
+            mPageTable,
         )
 
         self.kernel(
@@ -773,6 +800,7 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
             mCuSeqlensK,
             mSeqUsedQ,
             mSeqUsedK,
+            mPageTable,
             tma_atom_K,
             tma_atom_V,
             softmax_scale_log2,
@@ -814,8 +842,9 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
         mCuSeqlensK: Optional[cute.Tensor],
         mSeqUsedQ: Optional[cute.Tensor],
         mSeqUsedK: Optional[cute.Tensor],
-        tma_atom_K: cute.CopyAtom,
-        tma_atom_V: cute.CopyAtom,
+        mPageTable: Optional[cute.Tensor],
+        tma_atom_K: Optional[cute.CopyAtom],
+        tma_atom_V: Optional[cute.CopyAtom],
         softmax_scale_log2: Float32,
         softmax_scale: Optional[Float32],
         window_size_left: Optional[Int32],
@@ -839,9 +868,10 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
         tidx, _, _ = cute.arch.thread_idx()
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
 
-        if warp_idx == 0:
-            cpasync.prefetch_descriptor(tma_atom_K)
-            cpasync.prefetch_descriptor(tma_atom_V)
+        if const_expr(mPageTable is None):
+            if warp_idx == 0:
+                cpasync.prefetch_descriptor(tma_atom_K)
+                cpasync.prefetch_descriptor(tma_atom_V)
 
         smem = cutlass.utils.SmemAllocator()
         storage = smem.allocate(SharedStorage)
@@ -872,22 +902,40 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
         pv_group = CooperativeGroup(
             Agent.Thread, self.num_mma_threads // cute.arch.WARP_SIZE
         )
-        pipeline_k = PipelineTmaAsync.create(
-            num_stages=self._num_k_stages(),
-            producer_group=tma_group,
-            consumer_group=qk_group,
-            tx_count=self.tma_copy_bytes_K,
-            barrier_storage=storage.mbar_K.data_ptr(),
-            defer_sync=True,
-        )
-        pipeline_v = PipelineTmaAsync.create(
-            num_stages=self._num_v_stages(),
-            producer_group=tma_group,
-            consumer_group=pv_group,
-            tx_count=self.tma_copy_bytes_V,
-            barrier_storage=storage.mbar_V.data_ptr(),
-            defer_sync=True,
-        )
+        if const_expr(mPageTable is None):
+            pipeline_k = PipelineTmaAsync.create(
+                num_stages=self._num_k_stages(),
+                producer_group=tma_group,
+                consumer_group=qk_group,
+                tx_count=self.tma_copy_bytes_K,
+                barrier_storage=storage.mbar_K.data_ptr(),
+                defer_sync=True,
+            )
+            pipeline_v = PipelineTmaAsync.create(
+                num_stages=self._num_v_stages(),
+                producer_group=tma_group,
+                consumer_group=pv_group,
+                tx_count=self.tma_copy_bytes_V,
+                barrier_storage=storage.mbar_V.data_ptr(),
+                defer_sync=True,
+            )
+        else:
+            dma_group = CooperativeGroup(Agent.Thread, self.num_dma_threads)
+            mma_group = CooperativeGroup(Agent.Thread, self.num_threads)
+            pipeline_k = pipeline_custom.PipelineCpAsync.create(
+                num_stages=self._num_k_stages(),
+                producer_group=dma_group,
+                consumer_group=mma_group,
+                barrier_storage=storage.mbar_K.data_ptr(),
+                defer_sync=True,
+            )
+            pipeline_v = pipeline_custom.PipelineCpAsync.create(
+                num_stages=self._num_v_stages(),
+                producer_group=dma_group,
+                consumer_group=mma_group,
+                barrier_storage=storage.mbar_V.data_ptr(),
+                defer_sync=True,
+            )
         pipeline_p = None
         pipeline_final = None
         if const_expr(sP_layout is not None):
@@ -978,24 +1026,43 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
                 cute.experimental.iket.range_pop()
             elif warp_idx == 0:
                 cute.experimental.iket.range_push("producer")
-                self.load_tma_persistent(
-                    mK,
-                    mV,
-                    sK,
-                    sV,
-                    tma_atom_K,
-                    tma_atom_V,
-                    pipeline_k,
-                    pipeline_v,
-                    tile_scheduler,
-                    mQ,
-                    mCuSeqlensQ,
-                    mCuSeqlensK,
-                    mSeqUsedQ,
-                    mSeqUsedK,
-                    window_size_left,
-                    window_size_right,
-                )
+                if const_expr(mPageTable is None):
+                    self.load_tma_persistent(
+                        mK,
+                        mV,
+                        sK,
+                        sV,
+                        tma_atom_K,
+                        tma_atom_V,
+                        pipeline_k,
+                        pipeline_v,
+                        tile_scheduler,
+                        mQ,
+                        mCuSeqlensQ,
+                        mCuSeqlensK,
+                        mSeqUsedQ,
+                        mSeqUsedK,
+                        window_size_left,
+                        window_size_right,
+                    )
+                else:
+                    self.load_paged_persistent(
+                        mK,
+                        mV,
+                        mPageTable,
+                        sK,
+                        sV,
+                        pipeline_k,
+                        pipeline_v,
+                        tile_scheduler,
+                        mQ,
+                        mCuSeqlensQ,
+                        mSeqUsedQ,
+                        mSeqUsedK,
+                        window_size_left,
+                        window_size_right,
+                        tidx,
+                    )
                 cute.experimental.iket.range_pop()
             elif warp_idx <= self.num_threads // cute.arch.WARP_SIZE:
                 cute.experimental.iket.range_push("consumer")
@@ -1026,6 +1093,7 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
                     mCuSeqlensK,
                     mSeqUsedQ,
                     mSeqUsedK,
+                    mPageTable,
                     window_size_left,
                     window_size_right,
                     True,
@@ -1108,6 +1176,106 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
             head_idx_kv,
             batch_idx,
         )
+
+        pipeline_k.producer_tail(producer_state_k)
+        pipeline_v.producer_tail(producer_state_v)
+
+    @cute.jit
+    def load_paged_persistent(
+        self,
+        mK: cute.Tensor,
+        mV: cute.Tensor,
+        mPageTable: cute.Tensor,
+        sK: cute.Tensor,
+        sV: cute.Tensor,
+        pipeline_k: PipelineAsync,
+        pipeline_v: PipelineAsync,
+        tile_scheduler: TileSchedulerProtocol,
+        mQ: cute.Tensor,
+        mCuSeqlensQ: Optional[cute.Tensor],
+        mSeqUsedQ: Optional[cute.Tensor],
+        mSeqUsedK: Optional[cute.Tensor],
+        window_size_left: Optional[Int32],
+        window_size_right: Optional[Int32],
+        tidx: Int32,
+    ):
+        producer_state_k = PipelineState(
+            self._num_k_stages(), Int32(0), Int32(0), Int32(1)
+        )
+        producer_state_v = PipelineState(
+            self._num_v_stages(), Int32(0), Int32(0), Int32(1)
+        )
+        block_info = BlockInfo(
+            self.tile_m,
+            self.tile_n,
+            self.is_causal,
+            self.is_local,
+            False,
+            window_size_left,
+            window_size_right,
+            qhead_per_kvhead_packgqa=(
+                self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1
+            ),
+        )
+        work_tile = tile_scheduler.initial_work_tile_info()
+        m_block, head_idx, batch_idx, _ = work_tile.tile_idx
+        seqlen = SeqlenInfoQK.create(
+            batch_idx=batch_idx,
+            seqlen_q_static=(
+                mQ.shape[0] if const_expr(not self.pack_gqa) else mQ.shape[0][1]
+            ),
+            seqlen_k_static=mK.shape[0] * mPageTable.shape[1],
+            mCuSeqlensQ=mCuSeqlensQ,
+            mCuSeqlensK=None,
+            mSeqUsedQ=mSeqUsedQ,
+            mSeqUsedK=mSeqUsedK,
+            tile_m=self.tile_m,
+            tile_n=self.tile_n,
+        )
+        n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen, m_block)
+        head_idx_kv = (
+            head_idx if const_expr(self.pack_gqa) else head_idx // self.qhead_per_kvhead
+        )
+        paged_kv_manager = PagedKVManager.create(
+            mPageTable,
+            mK,
+            mV,
+            FastDivmodDivisor(mK.shape[0]),
+            batch_idx,
+            head_idx_kv,
+            tidx,
+            seqlen.seqlen_k,
+            0,
+            self.tile_n,
+            self.tile_hdim,
+            self.tile_hdimv,
+            self.num_dma_threads,
+            mK.element_type,
+            arch=120,
+        )
+        num_n_blocks = cutlass.max(n_block_max - n_block_min, 1)
+        for n_tile in cutlass.range(num_n_blocks, unroll=1):
+            n_block = cutlass.max(n_block_max - 1 - n_tile, n_block_min)
+            paged_kv_manager.load_page_table(n_block)
+
+            pipeline_k.producer_acquire(producer_state_k)
+            paged_kv_manager.load_KV(
+                n_block,
+                sK[None, None, producer_state_k.index],
+                "K",
+            )
+            cute.arch.cp_async_commit_group()
+            pipeline_k.producer_commit(producer_state_k)
+            producer_state_k.advance()
+
+            pipeline_v.producer_acquire(producer_state_v)
+            sV_stage = layout_utils.transpose_view(
+                sV[None, None, producer_state_v.index]
+            )
+            paged_kv_manager.load_KV(n_block, sV_stage, "V")
+            cute.arch.cp_async_commit_group()
+            pipeline_v.producer_commit(producer_state_v)
+            producer_state_v.advance()
 
         pipeline_k.producer_tail(producer_state_k)
         pipeline_v.producer_tail(producer_state_v)
@@ -1892,6 +2060,7 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
         mCuSeqlensK: Optional[cute.Tensor],
         mSeqUsedQ: Optional[cute.Tensor],
         mSeqUsedK: Optional[cute.Tensor],
+        mPageTable: Optional[cute.Tensor],
         window_size_left: Optional[Int32],
         window_size_right: Optional[Int32],
         is_qk_owner: cutlass.Constexpr[bool],
@@ -1918,7 +2087,11 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
             seqlen_q_static=(
                 mQ.shape[0] if const_expr(not self.pack_gqa) else mQ.shape[0][1]
             ),
-            seqlen_k_static=mK.shape[0],
+            seqlen_k_static=(
+                mK.shape[0]
+                if const_expr(mPageTable is None)
+                else mK.shape[0] * mPageTable.shape[1]
+            ),
             mCuSeqlensQ=mCuSeqlensQ,
             mCuSeqlensK=mCuSeqlensK,
             mSeqUsedQ=mSeqUsedQ,

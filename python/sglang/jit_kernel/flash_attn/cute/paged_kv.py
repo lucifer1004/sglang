@@ -65,9 +65,9 @@ class PagedKVManager(ParamsBase):
         mSFV_paged: Optional[cute.Tensor] = None,
         arch: cutlass.Constexpr[int] = 100,
     ):
-        # SM100 transposes V in gmem to (dv, page_size, num_pages);
-        # SM90 keeps V as (page_size, dv, num_pages), same layout as K.
-        v_gmem_transposed = arch != 90
+        # SM100 transposes V in gmem to (dv, page_size, num_pages).
+        # SM90 and SM120 keep V as (page_size, dv, num_pages), same as K.
+        v_gmem_transposed = arch not in (90, 120)
         universal_copy_bits = 128
         async_copy_elems = universal_copy_bits // dtype.width
         dtype_bytes = dtype.width // 8
@@ -93,7 +93,9 @@ class PagedKVManager(ParamsBase):
             atom_async_copy, thr_layout, val_layout
         )
         gmem_thr_copy_KV = gmem_tiled_copy_KV.get_slice(thread_idx)
-        page_entry_per_thread = n_block_size // num_threads
+        page_entry_per_thread = max(
+            1, (n_block_size + num_threads - 1) // num_threads
+        )
 
         if const_expr(mSFK_paged is not None or mSFV_paged is not None):
             atom_async_copy_sf = cute.make_copy_atom(
@@ -171,28 +173,33 @@ class PagedKVManager(ParamsBase):
         )
 
     @cute.jit
+    def _load_page_table_entry(self, i: Int32, n_block: Int32):
+        row = (
+            i * self.num_threads
+            + (self.thread_idx % self.gmem_threads_per_row)
+            * (self.num_threads // self.gmem_threads_per_row)
+            + (self.thread_idx // self.gmem_threads_per_row)
+        )
+        row_idx = n_block * self.n_block_size + row
+        page_idx, page_offset = divmod(
+            row_idx + self.leftpad_k, self.page_size_divmod
+        )
+        is_valid = (
+            (i + 1) * self.num_threads <= self.n_block_size
+            or row < self.n_block_size
+        ) and row_idx < self.seqlen_k
+        page = self.mPageTable[page_idx] if is_valid else 0
+        self.tPrPage[i] = page
+        self.tPrPageOffset[i] = page_offset
+
+    @cute.jit
     def load_page_table(self, n_block: Int32):
-        for i in cutlass.range(self.page_entry_per_thread, unroll=1):
-            row = (
-                i * self.num_threads
-                + (self.thread_idx % self.gmem_threads_per_row)
-                * (self.num_threads // self.gmem_threads_per_row)
-                + (self.thread_idx // self.gmem_threads_per_row)
-            )
-            row_idx = n_block * self.n_block_size + row
-
-            page_idx, page_offset = divmod(
-                row_idx + self.leftpad_k, self.page_size_divmod
-            )
-
-            is_valid = (
-                (i + 1) * self.num_threads <= self.n_block_size
-                or row < self.n_block_size
-            ) and row_idx < self.seqlen_k
-            page = self.mPageTable[page_idx] if is_valid else 0
-
-            self.tPrPage[i] = page
-            self.tPrPageOffset[i] = page_offset
+        if const_expr(self.arch == 120):
+            for i in cutlass.range_constexpr(self.page_entry_per_thread):
+                self._load_page_table_entry(i, n_block)
+        else:
+            for i in cutlass.range(self.page_entry_per_thread, unroll=1):
+                self._load_page_table_entry(i, n_block)
 
     @cute.jit
     def compute_X_ptr(self, K_or_V: str, d_offset: int = 0):
@@ -276,11 +283,11 @@ class PagedKVManager(ParamsBase):
 
         tPrXPtr = self.compute_X_ptr(K_or_V)
 
-        if const_expr(self.arch == 90):
-            # SM90: sX is already stage-sliced by caller (sK[None, None, stage]).
+        if const_expr(self.arch in (90, 120)):
+            # SM90/SM120: sX is already stage-sliced by the caller.
             # Flatten hierarchical modes to get (n_block_size, head_dim).
             sX_pi = cute.group_modes(sX, 0, 1)
-            # SM90 does NOT transpose V here (it's transposed via utils.transpose_view before MMA)
+            # V is transposed by the caller's view before MMA.
         else:
             sX_pi = self._flatten_smem_sm100(sX, K_or_V)
 
