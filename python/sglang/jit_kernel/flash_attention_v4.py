@@ -44,6 +44,8 @@ def flash_attn_varlen_func(
     score_mod: Optional[Callable] = None,
     aux_tensors: Optional[list] = None,
     return_softmax_lse: bool = False,
+    out: Optional[torch.Tensor] = None,
+    **_: object,
 ):
     if _flash_attn_varlen_func is None:  # pragma: no cover
         raise ImportError(
@@ -85,6 +87,7 @@ def flash_attn_varlen_func(
         score_mod=score_mod,
         aux_tensors=aux_tensors,
         return_lse=return_softmax_lse,
+        out=out,
     )
 
     if return_softmax_lse:
@@ -129,6 +132,7 @@ def flash_attn_with_kvcache(
     score_mod: Optional[Callable] = None,
     aux_tensors: Optional[list] = None,
     return_softmax_lse: bool = False,
+    out: Optional[torch.Tensor] = None,
     **_: object,
 ):
     if k is not None or v is not None or qv is not None:
@@ -165,6 +169,7 @@ def flash_attn_with_kvcache(
         score_mod=score_mod,
         aux_tensors=aux_tensors,
         return_softmax_lse=True,
+        out=out,
     )
 
     if return_softmax_lse:

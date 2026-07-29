@@ -311,6 +311,17 @@ def _forward_plan_implementation_token(arch: int):
     return arch
 
 
+def _tensor_launch_plan_signature(tensor: torch.Tensor) -> tuple:
+    return (
+        type(tensor),
+        tensor.device,
+        tensor.dtype,
+        tensor.shape,
+        tensor.stride(),
+        tensor.requires_grad,
+    )
+
+
 def _forward_varlen_plan_key(
     arch: int,
     q: torch.Tensor,
@@ -327,28 +338,17 @@ def _forward_varlen_plan_key(
     pack_gqa: bool,
 ) -> tuple:
     """Describe every runtime property covered by a validated host plan."""
-    tensor_signatures = tuple(
-        (
-            type(tensor),
-            tensor.device,
-            tensor.dtype,
-            tensor.shape,
-            tensor.stride(),
-            tensor.requires_grad,
-        )
-        for tensor in (q, k, v, cu_seqlens_q, cu_seqlens_k)
+    tensor_signatures = (
+        _tensor_launch_plan_signature(q),
+        _tensor_launch_plan_signature(k),
+        _tensor_launch_plan_signature(v),
+        _tensor_launch_plan_signature(cu_seqlens_q),
+        _tensor_launch_plan_signature(cu_seqlens_k),
     )
     sink_signature = (
         None
         if learnable_sink is None
-        else (
-            type(learnable_sink),
-            learnable_sink.device,
-            learnable_sink.dtype,
-            learnable_sink.shape,
-            learnable_sink.stride(),
-            learnable_sink.requires_grad,
-        )
+        else _tensor_launch_plan_signature(learnable_sink)
     )
     return (
         "basic-varlen",
@@ -384,13 +384,15 @@ def _launch_basic_varlen_forward(
     window_size_left: Optional[int],
     window_size_right: Optional[int],
     learnable_sink: Optional[torch.Tensor],
+    out: Optional[torch.Tensor],
 ) -> tuple[torch.Tensor, None]:
     """Launch the basic varlen TVM-FFI ABI shared by SM80 and SM120."""
-    out = torch.empty(
-        (*q.shape[:-1], v.shape[-1]),
-        dtype=q.dtype,
-        device=q.device,
-    )
+    if out is None:
+        out = torch.empty(
+            (*q.shape[:-1], v.shape[-1]),
+            dtype=q.dtype,
+            device=q.device,
+        )
     compiled_fn(
         q,
         k,
@@ -425,12 +427,20 @@ def _try_forward_varlen_launch_plan(
     window_size: Tuple[Optional[int], Optional[int]],
     learnable_sink: Optional[torch.Tensor],
     pack_gqa: Optional[bool],
+    out: Optional[torch.Tensor],
 ) -> Optional[tuple[torch.Tensor, None]]:
     """Launch a cached varlen plan, or return None when no arch registered one."""
     if q.ndim != 3 or k.ndim != 3 or k.shape[1] == 0:
         return None
     arch = _get_device_arch()
     if arch // 10 not in _FORWARD_LAUNCH_PLAN_ARCHES:
+        return None
+    if out is not None and (
+        out.shape != (*q.shape[:-1], v.shape[-1])
+        or out.dtype != q.dtype
+        or out.device != q.device
+        or not out.is_contiguous()
+    ):
         return None
     actual_pack_gqa = q.shape[1] // k.shape[1] > 1 if pack_gqa is None else pack_gqa
     actual_max_seqlen_q = q.shape[0] if max_seqlen_q is None else max_seqlen_q
@@ -469,6 +479,7 @@ def _try_forward_varlen_launch_plan(
         window_size_left,
         window_size_right,
         learnable_sink,
+        out,
     )
 
 
@@ -1968,6 +1979,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         v_sf_vec_size: Optional[int] = None,
         rel_bias_prep_cache: Optional[dict] = None,
         return_lse: bool = False,
+        out: Optional[torch.Tensor] = None,
     ):
         aux_scalars = tuple(aux_scalars) if aux_scalars else None
         shared_kv = k is v
@@ -2015,6 +2027,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             qk_sf_vec_size=qk_sf_vec_size,
             v_sf_vec_size=v_sf_vec_size,
             rel_bias_prep_cache=rel_bias_prep_cache,
+            out=out,
         )
         if ctx is not None:
             ctx.save_for_backward(
@@ -2132,6 +2145,7 @@ def flash_attn_varlen_func(
     v_sf_vec_size: Optional[int] = None,
     rel_bias_prep_cache: Optional[dict] = None,
     return_lse: bool = False,
+    out: Optional[torch.Tensor] = None,
 ):
     """
     Tensor arguments:
@@ -2171,6 +2185,8 @@ def flash_attn_varlen_func(
         qk_sf_vec_size = 32
     if v_sf_vec_size is None and sfv is not None and sfv.dtype == torch.float8_e8m0fnu:
         v_sf_vec_size = 32
+    if out is not None and out.requires_grad:
+        raise ValueError("out must not require gradients")
     if (
         q is not None
         and k is not None
@@ -2215,6 +2231,7 @@ def flash_attn_varlen_func(
             window_size,
             learnable_sink,
             pack_gqa,
+            out,
         )
         if fast_result is not None:
             return fast_result
@@ -2257,6 +2274,7 @@ def flash_attn_varlen_func(
         v_sf_vec_size,
         rel_bias_prep_cache,
         return_lse,
+        out,
     )
     differentiable_tensors = (
         q,
@@ -2276,6 +2294,8 @@ def flash_attn_varlen_func(
     needs_autograd = torch.is_grad_enabled() and any(
         tensor is not None and tensor.requires_grad for tensor in differentiable_tensors
     )
+    if needs_autograd and out is not None:
+        raise ValueError("out is only supported for forward-only inference")
     if not needs_autograd:
         return FlashAttnVarlenFunc.forward(None, *autograd_args)
     return FlashAttnVarlenFunc.apply(*autograd_args)
