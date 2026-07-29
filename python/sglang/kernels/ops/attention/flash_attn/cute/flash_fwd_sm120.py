@@ -177,6 +177,8 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
         )
         smem_usage = smem_usage_QV + smem_usage_K
         if (head_dim, head_dim_v, tile_m, tile_n) in (
+            (256, 256, 16, 64),
+            (256, 256, 16, 80),
             (256, 256, 32, 64),
             (256, 256, 48, 64),
             (256, 256, 64, 48),
@@ -209,8 +211,21 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
     ) -> tuple[int, int]:
         """Select an SM120 tile that fits the architecture's 99 KB SMEM."""
         smem_capacity = utils_basic.get_smem_capacity_in_bytes("sm_120")
+        is_short_packed_q = (
+            pack_gqa
+            and seqlen_q is not None
+            and qhead_per_kvhead is not None
+            and seqlen_q * qhead_per_kvhead <= 16
+        )
         if (head_dim, head_dim_v) == (256, 256):
-            if (
+            if is_short_packed_q:
+                fallback_candidates = (
+                    (16, 64, 1),
+                    (16, 80, 1),
+                    (32, 64, 1),
+                    (64, 64, 1),
+                )
+            elif (
                 total_q_rows is not None
                 and num_sms is not None
                 and total_q_rows > 76 * num_sms
@@ -267,6 +282,7 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
             and qhead_per_kvhead is not None
             and total_q_rows == seqlen_q * num_head_kv * qhead_per_kvhead
             and (is_causal or is_local)
+            and not is_short_packed_q
         )
         candidates = fallback_candidates
         if can_model_lpt:
@@ -369,6 +385,8 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
             # consumer warp own the same 16 rows through both MMA phases.
             return tile_m * 2
         config = (head_dim, head_dim_v, tile_m, tile_n)
+        if config in ((256, 256, 16, 64), (256, 256, 16, 80)):
+            return 64
         if config == (256, 256, 32, 64):
             return 128
         if config == (256, 256, 48, 64):
@@ -389,6 +407,8 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
             self.num_threads,
         )
         return config in (
+            (256, 256, 16, 64, 64),
+            (256, 256, 16, 80, 64),
             (256, 256, 32, 64, 128),
             (256, 256, 48, 64, 192),
             (256, 256, 64, 48, 256),
@@ -405,6 +425,8 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
             self.num_threads,
         )
         return config in (
+            (256, 256, 16, 64, 64),
+            (256, 256, 16, 80, 64),
             (256, 256, 32, 64, 128),
             (256, 256, 48, 64, 192),
             (256, 256, 64, 48, 256),
@@ -464,6 +486,8 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
         if smem_usage > utils_basic.get_smem_capacity_in_bytes("sm_120"):
             return False
         if (head_dim, head_dim_v, tile_m, tile_n, num_threads) in (
+            (256, 256, 16, 64, 64),
+            (256, 256, 16, 80, 64),
             (256, 256, 32, 64, 128),
             (256, 256, 48, 64, 192),
             (256, 256, 64, 48, 256),
@@ -668,18 +692,15 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
         SharedStorage = self._get_shared_storage_cls()
 
         mQ, mK, mV, mO = [assume_tensor_aligned(t) for t in (mQ, mK, mV, mO)]
-        QO_layout_transpose = (
+        Q_layout_transpose = (
             [1, 3, 2, 0] if const_expr(mCuSeqlensQ is None) else [0, 2, 1]
         )
         KV_layout_transpose = (
             [1, 3, 2, 0] if const_expr(mCuSeqlensK is None) else [0, 2, 1]
         )
-        mQ, mO = [
-            cute.make_tensor(
-                t.iterator, cute.select(t.layout, mode=QO_layout_transpose)
-            )
-            for t in (mQ, mO)
-        ]
+        mQ = cute.make_tensor(
+            mQ.iterator, cute.select(mQ.layout, mode=Q_layout_transpose)
+        )
         mK, mV = [
             cute.make_tensor(
                 t.iterator, cute.select(t.layout, mode=KV_layout_transpose)
@@ -693,10 +714,30 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
             mV = cute.make_tensor(
                 mV.iterator, cute.select(mV.layout, mode=V_layout_transpose)
             )
-        if const_expr(mLSE is not None):
+        if const_expr(self.is_split_kv):
+            num_splits = mO.shape[0]
+            O_layout_transpose = (
+                [2, 4, 3, 1, 0]
+                if const_expr(mCuSeqlensQ is None)
+                else [1, 3, 2, 0]
+            )
+            LSE_layout_transpose = (
+                [3, 2, 1, 0]
+                if const_expr(mCuSeqlensQ is None)
+                else [2, 1, 0]
+            )
+        else:
+            num_splits = Int32(1)
+            O_layout_transpose = (
+                [1, 3, 2, 0] if const_expr(mCuSeqlensQ is None) else [0, 2, 1]
+            )
             LSE_layout_transpose = (
                 [2, 1, 0] if const_expr(mCuSeqlensQ is None) else [1, 0]
             )
+        mO = cute.make_tensor(
+            mO.iterator, cute.select(mO.layout, mode=O_layout_transpose)
+        )
+        if const_expr(mLSE is not None):
             mLSE = cute.make_tensor(
                 mLSE.iterator, cute.select(mLSE.layout, mode=LSE_layout_transpose)
             )
@@ -748,7 +789,7 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
             num_block=cute.ceil_div(cute.size(mQ.shape[0]), self.tile_m),
             num_head=cute.size(mQ.shape[2]),
             num_batch=num_batch,
-            num_splits=1,
+            num_splits=num_splits,
             seqlen_k=0,
             headdim=mQ.shape[1],
             headdim_v=mO.shape[1],
@@ -766,6 +807,7 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
             mCuSeqlensQ=mCuSeqlensQ,
             mSeqUsedQ=mSeqUsedQ,
             is_persistent=False,
+            is_split_kv=self.is_split_kv,
         )
         tile_sched_params = TileScheduler.to_underlying_arguments(
             tile_sched_args,
@@ -958,33 +1000,207 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
         tile_scheduler = TileScheduler.create(tile_sched_params)
         work_tile = tile_scheduler.initial_work_tile_info()
         if work_tile.is_valid_tile:
-            pipeline_init_arrive(cluster_shape_mn=(1, 1), is_relaxed=True)
-            pipeline_init_wait(cluster_shape_mn=(1, 1))
+            m_block, head_idx, batch_idx, split_idx = work_tile.tile_idx
+            seqlen = SeqlenInfoQK.create(
+                batch_idx=batch_idx,
+                seqlen_q_static=(
+                    mQ.shape[0]
+                    if const_expr(not self.pack_gqa)
+                    else mQ.shape[0][1]
+                ),
+                seqlen_k_static=(
+                    mK.shape[0]
+                    if const_expr(mPageTable is None)
+                    else mK.shape[0] * mPageTable.shape[1]
+                ),
+                mCuSeqlensQ=mCuSeqlensQ,
+                mCuSeqlensK=mCuSeqlensK,
+                mSeqUsedQ=mSeqUsedQ,
+                mSeqUsedK=mSeqUsedK,
+                tile_m=self.tile_m,
+                tile_n=self.tile_n,
+            )
+            run_mainloop = True
+            if const_expr(self.is_split_kv):
+                block_info = BlockInfo(
+                    self.tile_m,
+                    self.tile_n,
+                    self.is_causal,
+                    self.is_local,
+                    self.is_split_kv,
+                    window_size_left,
+                    window_size_right,
+                    qhead_per_kvhead_packgqa=(
+                        self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1
+                    ),
+                )
+                n_block_min, n_block_max = block_info.get_n_block_min_max(
+                    seqlen,
+                    m_block,
+                    split_idx,
+                    tile_scheduler.params.num_splits,
+                )
+                is_empty_split = n_block_min >= n_block_max
+                if is_empty_split:
+                    if const_expr(self._uses_split_pv_warps()):
+                        if warp_idx >= self.num_qk_threads // cute.arch.WARP_SIZE:
+                            self.epilogue_empty_split(
+                                mO,
+                                mLSE,
+                                learnable_sink,
+                                seqlen,
+                                tiled_mma_pv,
+                                tidx - self.num_qk_threads,
+                                m_block,
+                                head_idx,
+                                batch_idx,
+                                split_idx,
+                            )
+                    else:
+                        if 0 < warp_idx <= self.num_threads // cute.arch.WARP_SIZE:
+                            self.epilogue_empty_split(
+                                mO,
+                                mLSE,
+                                learnable_sink,
+                                seqlen,
+                                tiled_mma_pv,
+                                tidx - self.num_dma_threads,
+                                m_block,
+                                head_idx,
+                                batch_idx,
+                                split_idx,
+                            )
+                run_mainloop = not is_empty_split
 
-            if const_expr(self._uses_split_pv_warps()):
-                cute.experimental.iket.range_push("consumer")
-                if warp_idx < self.num_qk_threads // cute.arch.WARP_SIZE:
-                    self.mma_qk_pipeline_persistent(
+            if run_mainloop:
+                pipeline_init_arrive(cluster_shape_mn=(1, 1), is_relaxed=True)
+                pipeline_init_wait(cluster_shape_mn=(1, 1))
+
+                if const_expr(self._uses_split_pv_warps()):
+                    cute.experimental.iket.range_push("consumer")
+                    if warp_idx < self.num_qk_threads // cute.arch.WARP_SIZE:
+                        self.mma_qk_pipeline_persistent(
+                            mQ,
+                            mK,
+                            mV,
+                            sQ,
+                            sK,
+                            sV,
+                            tma_atom_K,
+                            tma_atom_V,
+                            sP,
+                            sRowScale,
+                            sFinalScale,
+                            sLSE,
+                            learnable_sink,
+                            pipeline_k,
+                            pipeline_v,
+                            pipeline_p,
+                            pipeline_final,
+                            gmem_tiled_copy_Q,
+                            tiled_mma_qk,
+                            tidx,
+                            softmax_scale_log2,
+                            softmax_scale,
+                            tile_scheduler,
+                            mCuSeqlensQ,
+                            mCuSeqlensK,
+                            mSeqUsedQ,
+                            mSeqUsedK,
+                            window_size_left,
+                            window_size_right,
+                            aux_data,
+                            fastdiv_mods,
+                        )
+                    else:
+                        self.mma_pv_pipeline_persistent(
+                            mQ,
+                            mK,
+                            mO,
+                            mLSE,
+                            sV,
+                            sO,
+                            sP,
+                            sRowScale,
+                            sFinalScale,
+                            sLSE,
+                            pipeline_v,
+                            pipeline_p,
+                            pipeline_final,
+                            gmem_tiled_copy_O,
+                            tiled_mma_pv,
+                            tidx - self.num_qk_threads,
+                            tile_scheduler,
+                            mCuSeqlensQ,
+                            mCuSeqlensK,
+                            mSeqUsedQ,
+                            mSeqUsedK,
+                            window_size_left,
+                            window_size_right,
+                        )
+                    cute.experimental.iket.range_pop()
+                elif warp_idx == 0:
+                    cute.experimental.iket.range_push("producer")
+                    if const_expr(mPageTable is None):
+                        self.load_tma_persistent(
+                            mK,
+                            mV,
+                            sK,
+                            sV,
+                            tma_atom_K,
+                            tma_atom_V,
+                            pipeline_k,
+                            pipeline_v,
+                            tile_scheduler,
+                            mQ,
+                            mCuSeqlensQ,
+                            mCuSeqlensK,
+                            mSeqUsedQ,
+                            mSeqUsedK,
+                            window_size_left,
+                            window_size_right,
+                        )
+                    else:
+                        self.load_paged_persistent(
+                            mK,
+                            mV,
+                            mPageTable,
+                            sK,
+                            sV,
+                            pipeline_k,
+                            pipeline_v,
+                            tile_scheduler,
+                            mQ,
+                            mCuSeqlensQ,
+                            mSeqUsedQ,
+                            mSeqUsedK,
+                            window_size_left,
+                            window_size_right,
+                            tidx,
+                        )
+                    cute.experimental.iket.range_pop()
+                elif warp_idx <= self.num_threads // cute.arch.WARP_SIZE:
+                    cute.experimental.iket.range_push("consumer")
+                    self.mma_persistent(
                         mQ,
                         mK,
-                        mV,
+                        mO,
+                        mLSE,
                         sQ,
                         sK,
                         sV,
-                        tma_atom_K,
-                        tma_atom_V,
+                        sO,
                         sP,
                         sRowScale,
-                        sFinalScale,
                         sLSE,
                         learnable_sink,
                         pipeline_k,
                         pipeline_v,
-                        pipeline_p,
-                        pipeline_final,
                         gmem_tiled_copy_Q,
+                        gmem_tiled_copy_O,
                         tiled_mma_qk,
-                        tidx,
+                        tiled_mma_pv,
+                        tidx - self.num_dma_threads,
                         softmax_scale_log2,
                         softmax_scale,
                         tile_scheduler,
@@ -992,115 +1208,78 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
                         mCuSeqlensK,
                         mSeqUsedQ,
                         mSeqUsedK,
+                        mPageTable,
                         window_size_left,
                         window_size_right,
+                        True,
                         aux_data,
                         fastdiv_mods,
                     )
-                else:
-                    self.mma_pv_pipeline_persistent(
-                        mQ,
-                        mK,
-                        mO,
-                        mLSE,
-                        sV,
-                        sO,
-                        sP,
-                        sRowScale,
-                        sFinalScale,
-                        sLSE,
-                        pipeline_v,
-                        pipeline_p,
-                        pipeline_final,
-                        gmem_tiled_copy_O,
-                        tiled_mma_pv,
-                        tidx - self.num_qk_threads,
-                        tile_scheduler,
-                        mCuSeqlensQ,
-                        mCuSeqlensK,
-                        mSeqUsedQ,
-                        mSeqUsedK,
-                        window_size_left,
-                        window_size_right,
-                    )
-                cute.experimental.iket.range_pop()
-            elif warp_idx == 0:
-                cute.experimental.iket.range_push("producer")
-                if const_expr(mPageTable is None):
-                    self.load_tma_persistent(
-                        mK,
-                        mV,
-                        sK,
-                        sV,
-                        tma_atom_K,
-                        tma_atom_V,
-                        pipeline_k,
-                        pipeline_v,
-                        tile_scheduler,
-                        mQ,
-                        mCuSeqlensQ,
-                        mCuSeqlensK,
-                        mSeqUsedQ,
-                        mSeqUsedK,
-                        window_size_left,
-                        window_size_right,
-                    )
-                else:
-                    self.load_paged_persistent(
-                        mK,
-                        mV,
-                        mPageTable,
-                        sK,
-                        sV,
-                        pipeline_k,
-                        pipeline_v,
-                        tile_scheduler,
-                        mQ,
-                        mCuSeqlensQ,
-                        mSeqUsedQ,
-                        mSeqUsedK,
-                        window_size_left,
-                        window_size_right,
-                        tidx,
-                    )
-                cute.experimental.iket.range_pop()
-            elif warp_idx <= self.num_threads // cute.arch.WARP_SIZE:
-                cute.experimental.iket.range_push("consumer")
-                self.mma_persistent(
-                    mQ,
-                    mK,
-                    mO,
-                    mLSE,
-                    sQ,
-                    sK,
-                    sV,
-                    sO,
-                    sP,
-                    sRowScale,
-                    sLSE,
-                    learnable_sink,
-                    pipeline_k,
-                    pipeline_v,
-                    gmem_tiled_copy_Q,
-                    gmem_tiled_copy_O,
-                    tiled_mma_qk,
-                    tiled_mma_pv,
-                    tidx - self.num_dma_threads,
-                    softmax_scale_log2,
-                    softmax_scale,
-                    tile_scheduler,
-                    mCuSeqlensQ,
-                    mCuSeqlensK,
-                    mSeqUsedQ,
-                    mSeqUsedK,
-                    mPageTable,
-                    window_size_left,
-                    window_size_right,
-                    True,
-                    aux_data,
-                    fastdiv_mods,
-                )
-                cute.experimental.iket.range_pop()
+                    cute.experimental.iket.range_pop()
+
+    @cute.jit
+    def epilogue_empty_split(
+        self,
+        mO: cute.Tensor,
+        mLSE: Optional[cute.Tensor],
+        learnable_sink: Optional[cute.Tensor],
+        seqlen: SeqlenInfoQK,
+        tiled_mma_pv: cute.TiledMma,
+        tidx: Int32,
+        m_block: Int32,
+        head_idx: Int32,
+        batch_idx: Int32,
+        split_idx: Int32,
+    ):
+        """Write the reduction identity for a split with no visible K/V tile."""
+        thr_mma_pv = tiled_mma_pv.get_slice(tidx)
+        cO = cute.make_identity_tensor((self.tile_m, self.tile_hdimv))
+        tOcO_mn = layout_utils.reshape_acc_to_mn(thr_mma_pv.partition_C(cO))
+        qhead_pack = self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1
+        row_limit = seqlen.seqlen_q * qhead_pack
+        row_offset = (
+            seqlen.offset_q * qhead_pack
+            if const_expr(seqlen.has_cu_seqlens_q)
+            else Int32(0)
+        )
+
+        if const_expr(mLSE is not None):
+            if tOcO_mn[0][1] == 0:
+                for r in cutlass.range(
+                    cute.size(tOcO_mn, mode=[0]), unroll_full=True
+                ):
+                    row = m_block * self.tile_m + tOcO_mn[r, 0][0]
+                    if row < row_limit:
+                        lse = -Float32.inf
+                        if const_expr(learnable_sink is not None):
+                            if split_idx == 0:
+                                q_head_idx = (
+                                    row % self.qhead_per_kvhead
+                                    + head_idx * self.qhead_per_kvhead
+                                    if const_expr(self.pack_gqa)
+                                    else head_idx
+                                )
+                                lse = Float32(learnable_sink[q_head_idx])
+                        if const_expr(seqlen.has_cu_seqlens_q):
+                            mLSE[row_offset + row, head_idx, split_idx] = lse
+                        else:
+                            mLSE[row, head_idx, batch_idx, split_idx] = lse
+
+        for r in cutlass.range(cute.size(tOcO_mn, mode=[0]), unroll_full=True):
+            row = m_block * self.tile_m + tOcO_mn[r, 0][0]
+            if row < row_limit:
+                for c in cutlass.range(
+                    cute.size(tOcO_mn, mode=[1]), unroll_full=True
+                ):
+                    col = tOcO_mn[r, c][1]
+                    if (
+                        const_expr(not self.check_hdim_v_oob)
+                        or col < mO.shape[1]
+                    ):
+                        if const_expr(seqlen.has_cu_seqlens_q):
+                            mO[row_offset + row, col, head_idx, split_idx] = 0.0
+                        else:
+                            mO[row, col, head_idx, batch_idx, split_idx] = 0.0
 
     @cute.jit
     def load_tma_persistent(
@@ -1133,7 +1312,7 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
             self.tile_n,
             self.is_causal,
             self.is_local,
-            False,
+            self.is_split_kv,
             window_size_left,
             window_size_right,
             qhead_per_kvhead_packgqa=(
@@ -1141,7 +1320,7 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
             ),
         )
         work_tile = tile_scheduler.initial_work_tile_info()
-        m_block, head_idx, batch_idx, _ = work_tile.tile_idx
+        m_block, head_idx, batch_idx, split_idx = work_tile.tile_idx
         seqlen = SeqlenInfoQK.create(
             batch_idx=batch_idx,
             seqlen_q_static=(
@@ -1155,7 +1334,9 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
             tile_m=self.tile_m,
             tile_n=self.tile_n,
         )
-        n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen, m_block)
+        n_block_min, n_block_max = block_info.get_n_block_min_max(
+            seqlen, m_block, split_idx, tile_scheduler.params.num_splits
+        )
         head_idx_kv = (
             head_idx if const_expr(self.pack_gqa) else head_idx // self.qhead_per_kvhead
         )
@@ -1210,7 +1391,7 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
             self.tile_n,
             self.is_causal,
             self.is_local,
-            False,
+            self.is_split_kv,
             window_size_left,
             window_size_right,
             qhead_per_kvhead_packgqa=(
@@ -1218,7 +1399,7 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
             ),
         )
         work_tile = tile_scheduler.initial_work_tile_info()
-        m_block, head_idx, batch_idx, _ = work_tile.tile_idx
+        m_block, head_idx, batch_idx, split_idx = work_tile.tile_idx
         seqlen = SeqlenInfoQK.create(
             batch_idx=batch_idx,
             seqlen_q_static=(
@@ -1232,7 +1413,9 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
             tile_m=self.tile_m,
             tile_n=self.tile_n,
         )
-        n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen, m_block)
+        n_block_min, n_block_max = block_info.get_n_block_min_max(
+            seqlen, m_block, split_idx, tile_scheduler.params.num_splits
+        )
         head_idx_kv = (
             head_idx if const_expr(self.pack_gqa) else head_idx // self.qhead_per_kvhead
         )
@@ -1320,7 +1503,7 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
             self.tile_n,
             self.is_causal,
             self.is_local,
-            False,
+            self.is_split_kv,
             window_size_left,
             window_size_right,
             qhead_per_kvhead_packgqa=(
@@ -1328,7 +1511,7 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
             ),
         )
         work_tile = tile_scheduler.initial_work_tile_info()
-        m_block, head_idx, batch_idx, _ = work_tile.tile_idx
+        m_block, head_idx, batch_idx, split_idx = work_tile.tile_idx
         seqlen = SeqlenInfoQK.create(
             batch_idx=batch_idx,
             seqlen_q_static=(
@@ -1342,7 +1525,9 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
             tile_m=self.tile_m,
             tile_n=self.tile_n,
         )
-        n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen, m_block)
+        n_block_min, n_block_max = block_info.get_n_block_min_max(
+            seqlen, m_block, split_idx, tile_scheduler.params.num_splits
+        )
         head_idx_kv = (
             head_idx if const_expr(self.pack_gqa) else head_idx // self.qhead_per_kvhead
         )
@@ -1377,6 +1562,7 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
             head_idx,
             head_idx_kv,
             batch_idx,
+            split_idx,
             aux_data,
             fastdiv_mods,
         )
@@ -1413,7 +1599,7 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
             self.tile_n,
             self.is_causal,
             self.is_local,
-            False,
+            self.is_split_kv,
             window_size_left,
             window_size_right,
             qhead_per_kvhead_packgqa=(
@@ -1421,7 +1607,7 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
             ),
         )
         work_tile = tile_scheduler.initial_work_tile_info()
-        m_block, head_idx, batch_idx, _ = work_tile.tile_idx
+        m_block, head_idx, batch_idx, split_idx = work_tile.tile_idx
         seqlen = SeqlenInfoQK.create(
             batch_idx=batch_idx,
             seqlen_q_static=(
@@ -1435,7 +1621,9 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
             tile_m=self.tile_m,
             tile_n=self.tile_n,
         )
-        n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen, m_block)
+        n_block_min, n_block_max = block_info.get_n_block_min_max(
+            seqlen, m_block, split_idx, tile_scheduler.params.num_splits
+        )
         self.mma_pv_pipeline(
             mO,
             mLSE,
@@ -1458,6 +1646,7 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
             m_block,
             head_idx,
             batch_idx,
+            split_idx,
         )
 
     @cute.jit
@@ -1559,6 +1748,7 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
         head_idx: Int32,
         head_idx_kv: Int32,
         batch_idx: Int32,
+        split_idx: Int32,
         aux_data: AuxData = AuxData(),
         fastdiv_mods=None,
     ):
@@ -1735,6 +1925,11 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
                         row % self.qhead_per_kvhead + head_idx * self.qhead_per_kvhead
                     )
                     sink_val[r] = Float32(learnable_sink[q_head_idx])
+        if const_expr(self.is_split_kv and learnable_sink is not None):
+            if const_expr(not self.pack_gqa):
+                sink_val = sink_val if split_idx == 0 else -Float32.inf
+            elif split_idx != 0:
+                sink_val.fill(-Float32.inf)
         row_scale = softmax.finalize(sink_val=sink_val)
         final_state = PipelineState(1, Int32(0), Int32(0), Int32(1))
         pipeline_final.producer_acquire(final_state)
@@ -1895,6 +2090,7 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
         m_block: Int32,
         head_idx: Int32,
         batch_idx: Int32,
+        split_idx: Int32,
     ):
         thr_mma_pv = tiled_mma_pv.get_slice(tidx)
         acc_shape_o = thr_mma_pv.partition_shape_C((self.tile_m, self.tile_hdimv))
@@ -1975,6 +2171,7 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
             m_block,
             head_idx,
             batch_idx,
+            split_idx,
         )
         cute.experimental.iket.range_pop()
 
@@ -2073,7 +2270,7 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
             self.tile_n,
             self.is_causal,
             self.is_local,
-            False,
+            self.is_split_kv,
             window_size_left,
             window_size_right,
             qhead_per_kvhead_packgqa=(
@@ -2081,7 +2278,7 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
             ),
         )
         work_tile = tile_scheduler.initial_work_tile_info()
-        m_block, head_idx, batch_idx, _ = work_tile.tile_idx
+        m_block, head_idx, batch_idx, split_idx = work_tile.tile_idx
         seqlen = SeqlenInfoQK.create(
             batch_idx=batch_idx,
             seqlen_q_static=(
@@ -2099,7 +2296,9 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
             tile_m=self.tile_m,
             tile_n=self.tile_n,
         )
-        n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen, m_block)
+        n_block_min, n_block_max = block_info.get_n_block_min_max(
+            seqlen, m_block, split_idx, tile_scheduler.params.num_splits
+        )
         self.mma(
             mQ,
             mO,
@@ -2129,6 +2328,7 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
             m_block,
             head_idx,
             batch_idx,
+            split_idx,
             is_qk_owner,
             aux_data,
             fastdiv_mods,
@@ -2224,6 +2424,7 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
         m_block: Int32,
         head_idx: Int32,
         batch_idx: Int32,
+        split_idx: Int32,
         is_qk_owner: cutlass.Constexpr[bool],
         aux_data: AuxData = AuxData(),
         fastdiv_mods=None,
@@ -2519,6 +2720,11 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
                                 + head_idx * self.qhead_per_kvhead
                             )
                             sink_val[r] = Float32(learnable_sink[q_head_idx])
+                if const_expr(self.is_split_kv and learnable_sink is not None):
+                    if const_expr(not self.pack_gqa):
+                        sink_val = sink_val if split_idx == 0 else -Float32.inf
+                    elif split_idx != 0:
+                        sink_val.fill(-Float32.inf)
                 row_scale_qk = softmax.finalize(sink_val=sink_val)
                 cS = cute.make_identity_tensor((self.tile_m, self.tile_n))
                 tScS_mn_finalize = layout_utils.reshape_acc_to_mn(
@@ -2564,6 +2770,11 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
                             + head_idx * self.qhead_per_kvhead
                         )
                         sink_val[r] = Float32(learnable_sink[q_head_idx])
+            if const_expr(self.is_split_kv and learnable_sink is not None):
+                if const_expr(not self.pack_gqa):
+                    sink_val = sink_val if split_idx == 0 else -Float32.inf
+                elif split_idx != 0:
+                    sink_val.fill(-Float32.inf)
             row_scale = softmax.finalize(sink_val=sink_val)
             softmax.rescale_O(acc_O, row_scale)
             lse = softmax.row_sum
@@ -2582,6 +2793,7 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
             m_block,
             head_idx,
             batch_idx,
+            split_idx,
         )
         cute.experimental.iket.range_pop()
         return consumer_state

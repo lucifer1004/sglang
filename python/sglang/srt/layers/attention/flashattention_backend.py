@@ -290,6 +290,18 @@ class FlashAttentionBackend(AttentionBackend):
             if model_runner.server_args.enable_deterministic_inference or fa4_no_splitkv
             else 0
         )
+        self._use_sm120_fa4_decode_splitkv = (
+            not model_runner.server_args.enable_deterministic_inference
+            and self.fa_impl_ver == 4
+            and device_capability[0] == 12
+            and self.head_dim == 256
+        )
+        # Let FA4 size the SplitKV grid from the captured batch/head geometry
+        # and the actual SM count. A device-sized split count per request would
+        # massively oversubscribe larger decode batches.
+        self.decode_num_splits = (
+            0 if self._use_sm120_fa4_decode_splitkv else self.num_splits
+        )
         # Set (never getattr'd) so forward_extend can identity-check "is this the
         # full-CG prefill metadata?" to disable the pointer-keyed shear-bias
         # block-schedule cache (see forward_extend rel_bias handling).
@@ -492,6 +504,12 @@ class FlashAttentionBackend(AttentionBackend):
                 # Local attention and scheduler metadata require capture-time slice sizing.
                 # Both depend on data already filled by replay above.
                 metadata = self.decode_cuda_graph_metadata[bs]
+                if self._use_sm120_fa4_decode_splitkv:
+                    # FA4 bakes its N-tile grid and SplitKV specialization into
+                    # the graph. Capture against the full replay bound, not the
+                    # padded seq-len fill value (1), or a later long-context
+                    # replay would leave K/V tiles uncovered.
+                    metadata.max_seq_len_k = self.max_context_len
                 self._maybe_update_local_attn_metadata_for_capture(metadata, bs)
                 if self._sched_meta_buf is not None:
                     sched = self._compute_scheduler_metadata(
@@ -1831,6 +1849,7 @@ class FlashAttentionBackend(AttentionBackend):
                     cu_seqlens_q=metadata.cu_seqlens_q,
                     cu_seqlens_k_new=metadata.encoder_cu_seqlens_k,
                     max_seqlen_q=1,
+                    max_seqlen_k=metadata.encoder_max_seq_len_k,
                     softmax_scale=layer.scaling,
                     causal=False,
                     window_size=(-1, -1),
@@ -1849,6 +1868,7 @@ class FlashAttentionBackend(AttentionBackend):
                     cu_seqlens_q=local_attn_metadata.local_query_start_loc,
                     cu_seqlens_k_new=None,
                     max_seqlen_q=local_attn_metadata.local_max_query_len,
+                    max_seqlen_k=local_attn_metadata.local_max_seq_len,
                     softmax_scale=layer.scaling,
                     causal=True,
                     window_size=(-1, -1),
@@ -1900,12 +1920,19 @@ class FlashAttentionBackend(AttentionBackend):
                     cache_seqlens=cache_seqlens,
                     cu_seqlens_q=metadata.cu_seqlens_q,
                     max_seqlen_q=max_seqlen_q,
+                    max_seqlen_k=metadata.max_seq_len_k,
                     softmax_scale=layer.scaling,
                     causal=False if use_cascade_attn else causal,
                     window_size=window_size,
                     softcap=layer.logit_cap,
                     return_softmax_lse=use_cascade_attn,
-                    num_splits=self.num_splits,
+                    num_splits=(
+                        self.decode_num_splits
+                        if not is_swa_layer
+                        and not use_cascade_attn
+                        and not pa_swa_active
+                        else self.num_splits
+                    ),
                     out=_fa_out,
                     scheduler_metadata=sched_meta,
                     **kwargs,

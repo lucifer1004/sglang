@@ -106,6 +106,12 @@ def _get_device_num_sms(device: torch.device) -> int:
     return torch.cuda.get_device_properties(device).multi_processor_count
 
 
+@lru_cache(maxsize=None)
+def _get_device_memory_bus_width(device: torch.device) -> int:
+    """Return the stable DRAM bus width in bits."""
+    return torch.cuda.get_device_properties(device).memory_bus_width
+
+
 def _validate_head_dims(
     head_dim: int, head_dim_v: int, compute_capability: int, alignment: int
 ) -> None:
@@ -298,7 +304,28 @@ class ForwardLaunchPlan:
     launcher: Callable
 
 
+@dataclass
+class PagedForwardLaunchPlan:
+    """Compiled paged forward ABI and its SplitKV reduction specialization."""
+
+    compiled_fn: Callable
+    compile_key: tuple
+    actual_num_splits: int
+    compiled_combine: Optional[Callable] = None
+
+
 _forward_launch_plans: OrderedDict[tuple, ForwardLaunchPlan] = OrderedDict()
+_paged_forward_launch_plans: OrderedDict[tuple, PagedForwardLaunchPlan] = (
+    OrderedDict()
+)
+_paged_forward_plan_tiles: dict[tuple, tuple[int, int]] = {}
+_paged_forward_workspaces: dict[
+    tuple[torch.device, int], tuple[torch.Tensor, torch.Tensor]
+] = {}
+_paged_forward_workspace_views: dict[
+    tuple[torch.device, int, int, tuple[int, ...], int],
+    tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+] = {}
 
 
 def _forward_plan_implementation_token(arch: int):
@@ -371,6 +398,286 @@ def _cache_forward_launch_plan(key: tuple, plan: ForwardLaunchPlan) -> None:
     _forward_launch_plans.move_to_end(key)
     while len(_forward_launch_plans) > _FORWARD_LAUNCH_PLAN_CAPACITY:
         _forward_launch_plans.popitem(last=False)
+
+
+def _paged_forward_plan_key(
+    arch: int,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    seqused_k: torch.Tensor,
+    page_table: torch.Tensor,
+    max_seqlen_q: int,
+    causal: bool,
+    window_size_left: Optional[int],
+    window_size_right: Optional[int],
+    learnable_sink: Optional[torch.Tensor],
+    pack_gqa: bool,
+    requested_num_splits: int,
+) -> tuple:
+    tensor_signatures = tuple(
+        _tensor_launch_plan_signature(t)
+        for t in (q, k, v, cu_seqlens_q, seqused_k, page_table)
+    )
+    sink_signature = (
+        None
+        if learnable_sink is None
+        else _tensor_launch_plan_signature(learnable_sink)
+    )
+    return (
+        "paged-forward",
+        arch,
+        tensor_signatures,
+        sink_signature,
+        max_seqlen_q,
+        causal,
+        window_size_left,
+        window_size_right,
+        pack_gqa,
+        requested_num_splits,
+        _forward_plan_implementation_token(arch),
+        fa_logging.get_fa_log_level(),
+    )
+
+
+def _paged_forward_selection_key(
+    base_key: tuple,
+    tile_m: int,
+    tile_n: int,
+    max_seqlen_k: int,
+    window_size_left: Optional[int],
+    window_size_right: Optional[int],
+) -> tuple:
+    is_local = window_size_left is not None or window_size_right is not None
+    seqlen_k_loaded = (
+        max_seqlen_k
+        if not is_local
+        else max(
+            0,
+            min(
+                max_seqlen_k,
+                (window_size_right or max_seqlen_k)
+                + (window_size_left or max_seqlen_k)
+                + 1
+                + tile_m,
+            ),
+        )
+    )
+    num_n_blocks = (seqlen_k_loaded + tile_n - 1) // tile_n
+    return (*base_key, (tile_m, tile_n, num_n_blocks))
+
+
+def _cache_paged_forward_launch_plan(
+    base_key: tuple,
+    selection_key: tuple,
+    tile_mn: tuple[int, int],
+    plan: PagedForwardLaunchPlan,
+) -> None:
+    _paged_forward_plan_tiles[base_key] = tile_mn
+    _paged_forward_launch_plans[selection_key] = plan
+    _paged_forward_launch_plans.move_to_end(selection_key)
+    while len(_paged_forward_launch_plans) > _FORWARD_LAUNCH_PLAN_CAPACITY:
+        _paged_forward_launch_plans.popitem(last=False)
+
+
+def _paged_workspace(
+    plan: PagedForwardLaunchPlan,
+    q: torch.Tensor,
+    v: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    stream_key = torch.cuda.current_stream(q.device).cuda_stream
+    key = (q.device, stream_key)
+    view_key = (
+        q.device,
+        stream_key,
+        plan.actual_num_splits,
+        tuple(q.shape[:-1]),
+        v.shape[-1],
+    )
+    cached_view = _paged_forward_workspace_views.get(view_key)
+    if cached_view is not None:
+        return cached_view
+    out_numel = (
+        plan.actual_num_splits
+        * math.prod(q.shape[:-1])
+        * v.shape[-1]
+    )
+    lse_numel = plan.actual_num_splits * q.shape[-2] * q.shape[0]
+    workspace = _paged_forward_workspaces.get(key)
+    if (
+        workspace is None
+        or workspace[0].numel() < out_numel
+        or workspace[1].numel() < lse_numel
+    ):
+        stale_view_keys = [
+            candidate
+            for candidate in _paged_forward_workspace_views
+            if candidate[:2] == key
+        ]
+        for stale_key in stale_view_keys:
+            del _paged_forward_workspace_views[stale_key]
+        workspace = (
+            torch.empty(out_numel, dtype=torch.float32, device=q.device),
+            torch.empty(lse_numel, dtype=torch.float32, device=q.device),
+        )
+        _paged_forward_workspaces[key] = workspace
+    out_partial = workspace[0][:out_numel].view(
+        plan.actual_num_splits,
+        *q.shape[:-1],
+        v.shape[-1],
+    )
+    lse_partial = workspace[1][:lse_numel].view(
+        plan.actual_num_splits,
+        q.shape[-2],
+        q.shape[0],
+    )
+    result = (out_partial, lse_partial, lse_partial.transpose(-1, -2))
+    _paged_forward_workspace_views[view_key] = result
+    return result
+
+
+def _try_paged_forward_launch_plan(
+    q: Optional[torch.Tensor],
+    k: Optional[torch.Tensor],
+    v: torch.Tensor,
+    cu_seqlens_q: Optional[torch.Tensor],
+    cu_seqlens_k: Optional[torch.Tensor],
+    seqused_q: Optional[torch.Tensor],
+    seqused_k: Optional[torch.Tensor],
+    page_table: Optional[torch.Tensor],
+    max_seqlen_q: Optional[int],
+    max_seqlen_k: Optional[int],
+    softmax_scale: Optional[float],
+    causal: bool,
+    window_size_left: Optional[int],
+    window_size_right: Optional[int],
+    learnable_sink: Optional[torch.Tensor],
+    requested_num_splits: int,
+    pack_gqa: Optional[bool],
+    out: Optional[torch.Tensor],
+) -> Optional[tuple[torch.Tensor, None]]:
+    if (
+        q is None
+        or k is None
+        or q.ndim != 3
+        or k.ndim != 4
+        or cu_seqlens_q is None
+        or cu_seqlens_k is not None
+        or seqused_q is not None
+        or seqused_k is None
+        or page_table is None
+        or torch.cuda.is_current_stream_capturing()
+    ):
+        return None
+    arch = _get_device_arch()
+    if arch // 10 not in _FORWARD_LAUNCH_PLAN_ARCHES:
+        return None
+    if any(t.requires_grad for t in (q, k, v)):
+        return None
+    if learnable_sink is not None and learnable_sink.requires_grad:
+        return None
+    expected_out_shape = (*q.shape[:-1], v.shape[-1])
+    if out is not None and (
+        out.shape != expected_out_shape
+        or out.dtype != q.dtype
+        or out.device != q.device
+        or not out.is_contiguous()
+    ):
+        return None
+
+    actual_pack_gqa = q.shape[1] // k.shape[-2] > 1 if pack_gqa is None else pack_gqa
+    actual_max_seqlen_q = q.shape[0] if max_seqlen_q is None else max_seqlen_q
+    actual_max_seqlen_k = (
+        k.shape[0] * k.shape[1] if max_seqlen_k is None else max_seqlen_k
+    )
+    if (
+        q.shape[-1] != 256
+        or v.shape[-1] != 256
+        or not actual_pack_gqa
+        or actual_max_seqlen_q * (q.shape[-2] // v.shape[-2]) > 16
+    ):
+        return None
+    causal, _, window_size_left, window_size_right = _resolve_causal_local_window(
+        causal, window_size_left, window_size_right
+    )
+    base_key = _paged_forward_plan_key(
+        arch,
+        q,
+        k,
+        v,
+        cu_seqlens_q,
+        seqused_k,
+        page_table,
+        actual_max_seqlen_q,
+        causal,
+        window_size_left,
+        window_size_right,
+        learnable_sink,
+        actual_pack_gqa,
+        requested_num_splits,
+    )
+    tile_mn = _paged_forward_plan_tiles.get(base_key)
+    if tile_mn is None:
+        return None
+    selection_key = _paged_forward_selection_key(
+        base_key,
+        *tile_mn,
+        actual_max_seqlen_k,
+        window_size_left,
+        window_size_right,
+    )
+    plan = _paged_forward_launch_plans.get(selection_key)
+    if plan is None:
+        return None
+    _paged_forward_launch_plans.move_to_end(selection_key)
+    if out is None:
+        out = torch.empty(
+            expected_out_shape,
+            dtype=q.dtype,
+            device=q.device,
+        )
+    scale = 1.0 / math.sqrt(q.shape[-1]) if softmax_scale is None else softmax_scale
+    kernel_out = out
+    kernel_lse = None
+    lse_partial_transposed = None
+    if plan.actual_num_splits > 1:
+        if plan.compiled_combine is None:
+            return None
+        kernel_out, kernel_lse, lse_partial_transposed = _paged_workspace(
+            plan, q, v
+        )
+    plan.compiled_fn(
+        q,
+        k,
+        v,
+        kernel_out,
+        kernel_lse,
+        scale,
+        cu_seqlens_q,
+        None,
+        None,
+        seqused_k,
+        page_table,
+        window_size_left,
+        window_size_right,
+        learnable_sink,
+        None,
+        _empty_aux_data,
+    )
+    if plan.actual_num_splits > 1:
+        plan.compiled_combine(
+            kernel_out,
+            lse_partial_transposed,
+            out,
+            None,
+            cu_seqlens_q,
+            None,
+            None,
+            None,
+            None,
+        )
+    return out, None
 
 
 def _launch_basic_varlen_forward(
@@ -547,6 +854,54 @@ def _flash_attn_fwd(
         aux_tensors: Some score_mods will want to read from global aux_tensors. This is how we thread them through to the inner kernel.
         aux_scalars: Runtime scalar captures used by score_mod or mask_mod.
     """
+    requested_num_splits = num_splits
+    if (
+        not return_lse
+        and lse is None
+        and softcap in (None, 0.0)
+        and all(
+            value is None
+            for value in (
+                qv,
+                gather_kv_indices,
+                score_mod,
+                mask_mod,
+                block_sparse_tensors,
+                aux_tensors,
+                aux_scalars,
+                q_descale,
+                k_descale,
+                v_descale,
+                rel_bias,
+                sfq,
+                sfk,
+                sfv,
+            )
+        )
+    ):
+        fast_result = _try_paged_forward_launch_plan(
+            q,
+            k,
+            v,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            seqused_q,
+            seqused_k,
+            page_table,
+            max_seqlen_q,
+            max_seqlen_k,
+            softmax_scale,
+            causal,
+            window_size_left,
+            window_size_right,
+            learnable_sink,
+            requested_num_splits,
+            pack_gqa,
+            out,
+        )
+        if fast_result is not None:
+            return fast_result
+
     aux_scalars = tuple(aux_scalars) if aux_scalars else None
     fake_mode = is_fake_mode()
     q, k, v, qv = [maybe_contiguous(t) for t in (q, k, v, qv)]
@@ -918,7 +1273,59 @@ def _flash_attn_fwd(
     total_mblocks = batch_size * num_head_kv * num_m_blocks
     num_n_blocks = (seqlen_k_loaded + tile_n - 1) // tile_n
     if num_splits < 1:
-        num_splits = num_splits_heuristic(total_mblocks, num_SMs, num_n_blocks, 128)
+        sm120_hd256_paged_decode = (
+            arch // 10 == 12
+            and head_dim == 256
+            and head_dim_v == 256
+            and page_table is not None
+            and max_seqlen_q == 1
+            and pack_gqa
+        )
+        # HD256 paged decode crosses over at 12 N tiles in eager execution.
+        # Under a static max-context CUDA graph, three independent CTAs per
+        # 32-bit DRAM channel saturate both qualified SM120 devices (48 CTAs on
+        # a 512-bit bus, 36 on 384-bit). Beyond that point SplitKV only adds
+        # partial writes and reduction work. Below it, fill one hardware wave.
+        sm120_decode_saturation_ctas = (
+            max(1, 3 * _get_device_memory_bus_width(device) // 32)
+            if not fake_mode
+            else max(1, num_SMs // 4)
+        )
+        # Keep the B1 graph/reduction specialization power-of-two sized while
+        # never pretending a smaller SM120 has the 128 workers of the 188-SM SKU.
+        sm120_decode_max_splits = (
+            min(128, 1 << (num_SMs.bit_length() - 1))
+            if sm120_hd256_paged_decode
+            else 128
+        )
+        num_splits = (
+            1
+            if sm120_hd256_paged_decode
+            and (
+                num_n_blocks < 12
+                or total_mblocks >= sm120_decode_saturation_ctas
+            )
+            else num_splits_heuristic(
+                total_mblocks,
+                num_SMs,
+                num_n_blocks,
+                sm120_decode_max_splits,
+            )
+        )
+    if arch // 10 == 12 and num_splits > 1:
+        if num_n_blocks == 0:
+            num_splits = 1
+        else:
+            # BlockInfo assigns a uniform ceil-div chunk to every split. Normalize
+            # the requested count to the number of non-empty chunks so the SM120
+            # pipeline never launches a tail CTA with no K/V block to consume.
+            requested_splits = min(num_splits, num_n_blocks)
+            blocks_per_split = (
+                num_n_blocks + requested_splits - 1
+            ) // requested_splits
+            num_splits = (
+                num_n_blocks + blocks_per_split - 1
+            ) // blocks_per_split
 
     # SplitKV uses float32 partial output, which doubles the O buffer size
     # in shared memory, causing OOM for diff-headdim (192, 128)
@@ -943,7 +1350,6 @@ def _flash_attn_fwd(
         and cu_seqlens_q is not None
         and seqused_q is None
         and total_q == max_seqlen_q
-        and num_splits == 1
         and total_mblocks <= num_SMs
     )
     if is_split_kv:
@@ -1600,7 +2006,6 @@ def _flash_attn_fwd(
         elif arch // 10 == 12:
             # SM120 uses SM80 MMA instructions, but owns its feature and SMEM policy.
             assert not use_block_sparsity, "Block sparsity not supported on SM 12.0"
-            assert not is_split_kv, "SplitKV not supported on SM 12.0 in this PR"
             if not FlashAttentionForwardSm120.can_implement(
                 dtype,
                 head_dim,
@@ -1633,6 +2038,7 @@ def _flash_attn_fwd(
                 score_mod=score_mod,
                 mask_mod=mask_mod,
                 has_aux_tensors=aux_tensors is not None,
+                is_split_kv=is_split_kv,
                 direct_single_wave=sm120_direct_single_wave,
             )
         else:
@@ -1864,11 +2270,140 @@ def _flash_attn_fwd(
             cu_seqlens_q,
             seqused_q,
         )
+    if (
+        not fake_mode
+        and not torch.cuda.is_current_stream_capturing()
+        and arch // 10 in _FORWARD_LAUNCH_PLAN_ARCHES
+        and batch_size == 1
+        and pack_gqa
+        and q is not None
+        and k is not None
+        and qv is None
+        and cu_seqlens_q is not None
+        and cu_seqlens_k is None
+        and seqused_q is None
+        and seqused_k is not None
+        and page_table is not None
+        and head_dim == 256
+        and head_dim_v == 256
+        and max_seqlen_q * qhead_per_kvhead <= 16
+        and not requires_grad
+        and (learnable_sink is None or not learnable_sink.requires_grad)
+        and lse is None
+        and softcap is None
+        and score_mod is None
+        and mask_mod is None
+        and block_sparse_tensors is None
+        and aux_tensors is None
+        and aux_scalars is None
+        and q_descale is None
+        and k_descale is None
+        and v_descale is None
+        and rel_bias is None
+        and sfq is None
+        and sfk is None
+        and sfv is None
+    ):
+        compiled_combine = None
+        if is_split_kv:
+            lse_partial_transposed = lse_partial.transpose(-1, -2)
+            combine_key = _fwd_combine_compile_key(
+                out_partial,
+                out,
+                None,
+                cu_seqlens_q,
+                None,
+                None,
+            )
+            compiled_combine = _flash_attn_fwd_combine.compile_cache[combine_key]
+            stream_key = torch.cuda.current_stream(device).cuda_stream
+            workspace_key = (device, stream_key)
+            current_workspace = _paged_forward_workspaces.get(workspace_key)
+            if (
+                current_workspace is None
+                or current_workspace[0].numel() < out_partial.numel()
+                or current_workspace[1].numel() < lse_partial.numel()
+            ):
+                stale_view_keys = [
+                    candidate
+                    for candidate in _paged_forward_workspace_views
+                    if candidate[:2] == workspace_key
+                ]
+                for stale_key in stale_view_keys:
+                    del _paged_forward_workspace_views[stale_key]
+                _paged_forward_workspaces[workspace_key] = (
+                    out_partial.view(-1),
+                    lse_partial.view(-1),
+                )
+            view_key = (
+                device,
+                stream_key,
+                num_splits,
+                tuple(q.shape[:-1]),
+                v.shape[-1],
+            )
+            workspace = _paged_forward_workspaces[workspace_key]
+            out_partial_view = workspace[0][: out_partial.numel()].view(
+                out_partial.shape
+            )
+            lse_partial_view = workspace[1][: lse_partial.numel()].view(
+                lse_partial.shape
+            )
+            _paged_forward_workspace_views[view_key] = (
+                out_partial_view,
+                lse_partial_view,
+                lse_partial_view.transpose(-1, -2),
+            )
+        plan_base_key = _paged_forward_plan_key(
+            arch,
+            q,
+            k,
+            v,
+            cu_seqlens_q,
+            seqused_k,
+            page_table,
+            max_seqlen_q,
+            causal,
+            window_size_left,
+            window_size_right,
+            learnable_sink,
+            pack_gqa,
+            requested_num_splits,
+        )
+        plan_selection_key = _paged_forward_selection_key(
+            plan_base_key,
+            tile_m,
+            tile_n,
+            max_seqlen_k,
+            window_size_left,
+            window_size_right,
+        )
+        _cache_paged_forward_launch_plan(
+            plan_base_key,
+            plan_selection_key,
+            (tile_m, tile_n),
+            PagedForwardLaunchPlan(
+                compiled_fn=compiled_fwd,
+                compile_key=compile_key,
+                actual_num_splits=num_splits,
+                compiled_combine=compiled_combine,
+            ),
+        )
     return out, lse
 
 
 _flash_attn_fwd.compile_cache = get_jit_cache("fwd")
-_flash_attn_fwd.compile_cache.register_clear_hook(_forward_launch_plans.clear)
+
+
+def _clear_forward_launch_plans() -> None:
+    _forward_launch_plans.clear()
+    _paged_forward_launch_plans.clear()
+    _paged_forward_plan_tiles.clear()
+    _paged_forward_workspaces.clear()
+    _paged_forward_workspace_views.clear()
+
+
+_flash_attn_fwd.compile_cache.register_clear_hook(_clear_forward_launch_plans)
 _flash_attn_fwd.compile_cache_shear_bias = get_jit_cache("fwd_shear_bias")
 _flash_attn_fwd.compile_cache_prepare_shear_bias = get_jit_cache(
     "fwd_prepare_shear_bias"
@@ -2196,6 +2731,24 @@ def flash_attn_varlen_func(
         v_sf_vec_size = 32
     if out is not None and out.requires_grad:
         raise ValueError("out must not require gradients")
+    differentiable_tensors = (
+        q,
+        k,
+        v,
+        qv,
+        learnable_sink,
+        q_descale,
+        k_descale,
+        v_descale,
+        rel_bias,
+        sfq,
+        sfk,
+        sfv,
+        *(aux_tensors or ()),
+    )
+    needs_autograd = torch.is_grad_enabled() and any(
+        tensor is not None and tensor.requires_grad for tensor in differentiable_tensors
+    )
     if (
         q is not None
         and k is not None
@@ -2284,24 +2837,6 @@ def flash_attn_varlen_func(
         rel_bias_prep_cache,
         return_lse,
         out,
-    )
-    differentiable_tensors = (
-        q,
-        k,
-        v,
-        qv,
-        learnable_sink,
-        q_descale,
-        k_descale,
-        v_descale,
-        rel_bias,
-        sfq,
-        sfk,
-        sfv,
-        *(aux_tensors or ()),
-    )
-    needs_autograd = torch.is_grad_enabled() and any(
-        tensor is not None and tensor.requires_grad for tensor in differentiable_tensors
     )
     if needs_autograd and out is not None:
         raise ValueError("out is only supported for forward-only inference")
@@ -2416,6 +2951,35 @@ def _compile_fwd_combine(
     )
 
 
+def _fwd_combine_compile_key(
+    out_partial: torch.Tensor,
+    out: torch.Tensor,
+    lse: Optional[torch.Tensor],
+    cu_seqlens: Optional[torch.Tensor],
+    seqused: Optional[torch.Tensor],
+    varlen_batch_idx: Optional[torch.Tensor],
+) -> tuple:
+    head_dim = out_partial.shape[-1]
+    num_splits = out_partial.shape[0]
+    k_block_size = 64 if head_dim <= 64 else 128
+    tile_m = 8 if k_block_size % 128 == 0 else (16 if k_block_size % 64 == 0 else 32)
+    log_max_splits = max(math.ceil(math.log2(num_splits)), 4)
+    if tile_m == 8:
+        log_max_splits = max(log_max_splits, 5)
+    return (
+        torch2cute_dtype_map[out.dtype],
+        torch2cute_dtype_map[out_partial.dtype],
+        head_dim,
+        tile_m,
+        k_block_size,
+        log_max_splits,
+        cu_seqlens is not None,
+        seqused is not None,
+        lse is not None,
+        varlen_batch_idx is not None,
+    )
+
+
 def _flash_attn_fwd_combine(
     out_partial: torch.Tensor,
     lse_partial: torch.Tensor,
@@ -2469,38 +3033,18 @@ def _flash_attn_fwd_combine(
             if not is_fake_mode():
                 assert t.is_cuda, f"{name} must be on CUDA device"
             assert t.is_contiguous(), f"{name} must be contiguous"
-    head_dim = out_partial.shape[-1]
     num_splits = out_partial.shape[0]
     assert num_splits <= 256
-    # If hdim is 96 or 192, it's faster to round them to 128 or 256 respectively
-    # so that kBlockM is smaller and we have more parallelism.
-    k_block_size = 64 if head_dim <= 64 else 128
-    # We want kBlockM to be as small as possible to maximize parallelism.
-    # E.g., if hdim is 64, we want kBlockM to be 16 so that we can use 256 threads, each reading 4 elements (floats).
-    tile_m = 8 if k_block_size % 128 == 0 else (16 if k_block_size % 64 == 0 else 32)
-    log_max_splits = max(math.ceil(math.log2(num_splits)), 4)
-    if tile_m == 8:
-        # If kBlockM == 8 then the minimum number of splits is 32.
-        # TODO: we can deal w this by using 128 threads instead
-        log_max_splits = max(log_max_splits, 5)
-
-    # Create combine kernel configuration
-    dtype = torch2cute_dtype_map[out.dtype]
-    dtype_partial = torch2cute_dtype_map[out_partial.dtype]
     # Device architecture is invariant for the lifetime of this server/JIT
     # cache, so PDL does not belong in the compile key.
     use_pdl = is_arch_support_pdl()
-    compile_key = (
-        dtype,
-        dtype_partial,
-        head_dim,
-        tile_m,
-        k_block_size,
-        log_max_splits,
-        cu_seqlens is not None,
-        seqused is not None,
-        lse is not None,
-        varlen_batch_idx is not None,
+    compile_key = _fwd_combine_compile_key(
+        out_partial,
+        out,
+        lse,
+        cu_seqlens,
+        seqused,
+        varlen_batch_idx,
     )
     if compile_key not in _flash_attn_fwd_combine.compile_cache:
         _flash_attn_fwd_combine.compile_cache[compile_key] = _compile_fwd_combine(

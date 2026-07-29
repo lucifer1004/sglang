@@ -12,11 +12,17 @@ try:
         # A/B debug escape hatch: route through the pip flash-attn-4 package
         # (dev's stack). rel_bias is vendored-only, so SHEARED must be 0.
         from flash_attn.cute import flash_attn_varlen_func as _flash_attn_varlen_func
+
+        _flash_attn_fwd = None
     else:
         from sglang.kernels.ops.attention.flash_attn.cute import (
             flash_attn_varlen_func as _flash_attn_varlen_func,
         )
+        from sglang.kernels.ops.attention.flash_attn.cute.interface import (
+            _flash_attn_fwd,
+        )
 except Exception as _e:  # pragma: no cover
+    _flash_attn_fwd = None
     _flash_attn_varlen_func = None
     _flash_attn_import_error = _e
 else:
@@ -162,6 +168,7 @@ def flash_attn_with_kvcache(
     cu_seqlens_q: Optional[torch.Tensor] = None,
     cu_seqlens_k_new: Optional[torch.Tensor] = None,
     max_seqlen_q: Optional[int] = None,
+    max_seqlen_k: Optional[int] = None,
     rotary_seqlens: Optional[torch.Tensor] = None,
     q_descale: Optional[torch.Tensor] = None,
     k_descale: Optional[torch.Tensor] = None,
@@ -188,6 +195,12 @@ def flash_attn_with_kvcache(
     out: Optional[torch.Tensor] = None,
     **_: object,
 ):
+    if _flash_attn_varlen_func is None:  # pragma: no cover
+        raise ImportError(
+            "FlashAttention-4 CUTE is not available. Install flash-attn-4 with "
+            "its CUDA/CUTE dependencies, or run from a source tree where the "
+            "vendored FA4 package is importable."
+        ) from _flash_attn_import_error
     if k is not None or v is not None:
         raise NotImplementedError("FA4 does not support updating KV cache in-place.")
     if rotary_cos is not None or rotary_sin is not None or rotary_seqlens is not None:
@@ -201,35 +214,96 @@ def flash_attn_with_kvcache(
             (k_cache.shape[0],), cache_seqlens, dtype=torch.int32, device=k_cache.device
         )
 
-    result = flash_attn_varlen_func(
-        q=q,
-        k=k_cache,
-        v=v_cache,
-        qv=qv,
-        cu_seqlens_q=cu_seqlens_q,
-        seqused_k=cache_seqlens,
-        max_seqlen_q=max_seqlen_q,
-        page_table=page_table,
-        softmax_scale=softmax_scale,
-        causal=causal,
-        softcap=softcap if softcap != 0.0 else None,
-        window_size=window_size,
-        num_splits=num_splits,
-        pack_gqa=pack_gqa,
-        learnable_sink=sinks,
-        score_mod=score_mod,
-        aux_tensors=aux_tensors,
-        q_descale=q_descale,
-        k_descale=k_descale,
-        v_descale=v_descale,
-        sfq=sfq,
-        sfk=sfk,
-        sfv=sfv,
-        rel_bias=rel_bias,
-        rel_bias_prep_cache=rel_bias_prep_cache,
-        return_softmax_lse=True,
-        out=out,
+    q, k_cache, v_cache, qv = [_maybe_contiguous(t) for t in (q, k_cache, v_cache, qv)]
+    cu_seqlens_q, cache_seqlens, page_table = [
+        _maybe_contiguous(t) for t in (cu_seqlens_q, cache_seqlens, page_table)
+    ]
+    if window_size == (-1, -1):
+        window_size = (None, None)
+
+    differentiable_tensors = (
+        q,
+        k_cache,
+        v_cache,
+        qv,
+        sinks,
+        q_descale,
+        k_descale,
+        v_descale,
+        rel_bias,
+        sfq,
+        sfk,
+        sfv,
+        *(aux_tensors or ()),
     )
+    needs_autograd = torch.is_grad_enabled() and any(
+        tensor is not None and tensor.requires_grad for tensor in differentiable_tensors
+    )
+    if _flash_attn_fwd is not None and not needs_autograd:
+        result = _flash_attn_fwd(
+            q,
+            k_cache,
+            v_cache,
+            qv=qv,
+            cu_seqlens_q=cu_seqlens_q,
+            seqused_k=cache_seqlens,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            page_table=page_table,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            softcap=softcap if softcap != 0.0 else None,
+            window_size_left=window_size[0],
+            window_size_right=window_size[1],
+            learnable_sink=sinks,
+            num_splits=num_splits,
+            pack_gqa=pack_gqa,
+            score_mod=score_mod,
+            aux_tensors=aux_tensors,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
+            rel_bias=rel_bias,
+            sfq=sfq,
+            sfk=sfk,
+            sfv=sfv,
+            qk_sf_vec_size=32 if sfq is not None else None,
+            v_sf_vec_size=32 if sfv is not None else None,
+            rel_bias_prep_cache=rel_bias_prep_cache,
+            return_lse=return_softmax_lse,
+            out=out,
+        )
+    else:
+        result = _flash_attn_varlen_func(
+            q=q,
+            k=k_cache,
+            v=v_cache,
+            qv=qv,
+            cu_seqlens_q=cu_seqlens_q,
+            seqused_k=cache_seqlens,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            page_table=page_table,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            softcap=softcap if softcap != 0.0 else None,
+            window_size=window_size,
+            num_splits=num_splits,
+            pack_gqa=pack_gqa,
+            learnable_sink=sinks,
+            score_mod=score_mod,
+            aux_tensors=aux_tensors,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
+            sfq=sfq,
+            sfk=sfk,
+            sfv=sfv,
+            rel_bias=rel_bias,
+            rel_bias_prep_cache=rel_bias_prep_cache,
+            return_lse=return_softmax_lse,
+            out=out,
+        )
 
     if return_softmax_lse:
         return result
