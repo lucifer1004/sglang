@@ -284,12 +284,35 @@ def _resolve_causal_local_window(
     return causal, local, window_size_left, window_size_right
 
 
-_SM120_VARLEN_HOST_PLAN_CAPACITY = 4096
-_sm120_varlen_host_plans: OrderedDict[tuple, Callable] = OrderedDict()
+_FORWARD_LAUNCH_PLAN_CAPACITY = 4096
+_FORWARD_LAUNCH_PLAN_ARCHES = frozenset({12})
 _empty_aux_data = AuxData(None, None)
 
 
-def _sm120_varlen_host_signature(
+@dataclass(frozen=True)
+class ForwardLaunchPlan:
+    """A compiled forward specialization paired with its runtime ABI adapter."""
+
+    compiled_fn: Callable
+    compile_key: tuple
+    launcher: Callable
+
+
+_forward_launch_plans: OrderedDict[tuple, ForwardLaunchPlan] = OrderedDict()
+
+
+def _forward_plan_implementation_token(arch: int):
+    """Return mutable implementation identity needed by the host-plan key."""
+    if arch // 10 == 12:
+        return (
+            FlashAttentionForwardSm120,
+            FlashAttentionForwardSm120.get_fwd_tile_size,
+        )
+    return arch
+
+
+def _forward_varlen_plan_key(
+    arch: int,
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -328,6 +351,8 @@ def _sm120_varlen_host_signature(
         )
     )
     return (
+        "basic-varlen",
+        arch,
         tensor_signatures,
         sink_signature,
         max_seqlen_q,
@@ -336,19 +361,58 @@ def _sm120_varlen_host_signature(
         window_size_left,
         window_size_right,
         pack_gqa,
-        FlashAttentionForwardSm120.get_fwd_tile_size,
+        _forward_plan_implementation_token(arch),
         fa_logging.get_fa_log_level(),
     )
 
 
-def _cache_sm120_varlen_host_plan(key: tuple, fn: Callable) -> None:
-    _sm120_varlen_host_plans[key] = fn
-    _sm120_varlen_host_plans.move_to_end(key)
-    while len(_sm120_varlen_host_plans) > _SM120_VARLEN_HOST_PLAN_CAPACITY:
-        _sm120_varlen_host_plans.popitem(last=False)
+def _cache_forward_launch_plan(key: tuple, plan: ForwardLaunchPlan) -> None:
+    _forward_launch_plans[key] = plan
+    _forward_launch_plans.move_to_end(key)
+    while len(_forward_launch_plans) > _FORWARD_LAUNCH_PLAN_CAPACITY:
+        _forward_launch_plans.popitem(last=False)
 
 
-def _try_sm120_varlen_host_plan(
+def _launch_basic_varlen_forward(
+    compiled_fn: Callable,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    softmax_scale: float,
+    window_size_left: Optional[int],
+    window_size_right: Optional[int],
+    learnable_sink: Optional[torch.Tensor],
+) -> tuple[torch.Tensor, None]:
+    """Launch the basic varlen TVM-FFI ABI shared by SM80 and SM120."""
+    out = torch.empty(
+        (*q.shape[:-1], v.shape[-1]),
+        dtype=q.dtype,
+        device=q.device,
+    )
+    compiled_fn(
+        q,
+        k,
+        v,
+        out,
+        None,
+        softmax_scale,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        None,
+        None,
+        None,
+        window_size_left,
+        window_size_right,
+        learnable_sink,
+        None,
+        _empty_aux_data,
+    )
+    return out, None
+
+
+def _try_forward_varlen_launch_plan(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -362,8 +426,11 @@ def _try_sm120_varlen_host_plan(
     learnable_sink: Optional[torch.Tensor],
     pack_gqa: Optional[bool],
 ) -> Optional[tuple[torch.Tensor, None]]:
-    """Launch a cached simple SM120 varlen plan, or return None on a guard miss."""
+    """Launch a cached varlen plan, or return None when no arch registered one."""
     if q.ndim != 3 or k.ndim != 3 or k.shape[1] == 0:
+        return None
+    arch = _get_device_arch()
+    if arch // 10 not in _FORWARD_LAUNCH_PLAN_ARCHES:
         return None
     actual_pack_gqa = q.shape[1] // k.shape[1] > 1 if pack_gqa is None else pack_gqa
     actual_max_seqlen_q = q.shape[0] if max_seqlen_q is None else max_seqlen_q
@@ -371,7 +438,8 @@ def _try_sm120_varlen_host_plan(
     causal, _, window_size_left, window_size_right = _resolve_causal_local_window(
         causal, window_size[0], window_size[1]
     )
-    key = _sm120_varlen_host_signature(
+    key = _forward_varlen_plan_key(
+        arch,
         q,
         k,
         v,
@@ -385,35 +453,23 @@ def _try_sm120_varlen_host_plan(
         learnable_sink,
         actual_pack_gqa,
     )
-    fn = _sm120_varlen_host_plans.get(key)
-    if fn is None:
+    plan = _forward_launch_plans.get(key)
+    if plan is None:
         return None
-    _sm120_varlen_host_plans.move_to_end(key)
-    out = torch.empty(
-        (*q.shape[:-1], v.shape[-1]),
-        dtype=q.dtype,
-        device=q.device,
-    )
+    _forward_launch_plans.move_to_end(key)
     scale = 1.0 / math.sqrt(q.shape[-1]) if softmax_scale is None else softmax_scale
-    fn(
+    return plan.launcher(
+        plan.compiled_fn,
         q,
         k,
         v,
-        out,
-        None,
-        scale,
         cu_seqlens_q,
         cu_seqlens_k,
-        None,
-        None,
-        None,
+        scale,
         window_size_left,
         window_size_right,
         learnable_sink,
-        None,
-        _empty_aux_data,
     )
-    return out, None
 
 
 def _group_tile_bias(qhead_per_kvhead_packgqa=1):
@@ -1731,7 +1787,7 @@ def _flash_attn_fwd(
                     )
             compiled_fwd = _flash_attn_fwd.compile_cache[compile_key]
             if (
-                arch // 10 == 12
+                arch // 10 in _FORWARD_LAUNCH_PLAN_ARCHES
                 and batch_size == 1
                 and pack_gqa
                 and cu_seqlens_q is not None
@@ -1756,8 +1812,9 @@ def _flash_attn_fwd(
                 and sfk is None
                 and sfv is None
             ):
-                _cache_sm120_varlen_host_plan(
-                    _sm120_varlen_host_signature(
+                _cache_forward_launch_plan(
+                    _forward_varlen_plan_key(
+                        arch,
                         q,
                         k,
                         v,
@@ -1771,7 +1828,11 @@ def _flash_attn_fwd(
                         learnable_sink,
                         pack_gqa,
                     ),
-                    compiled_fwd,
+                    ForwardLaunchPlan(
+                        compiled_fn=compiled_fwd,
+                        compile_key=compile_key,
+                        launcher=_launch_basic_varlen_forward,
+                    ),
                 )
             compiled_fwd(*call_args)
     if is_split_kv:
@@ -1787,6 +1848,7 @@ def _flash_attn_fwd(
 
 
 _flash_attn_fwd.compile_cache = get_jit_cache("fwd")
+_flash_attn_fwd.compile_cache.register_clear_hook(_forward_launch_plans.clear)
 _flash_attn_fwd.compile_cache_shear_bias = get_jit_cache("fwd_shear_bias")
 _flash_attn_fwd.compile_cache_prepare_shear_bias = get_jit_cache(
     "fwd_prepare_shear_bias"
@@ -2140,7 +2202,7 @@ def flash_attn_varlen_func(
             )
         )
     ):
-        fast_result = _try_sm120_varlen_host_plan(
+        fast_result = _try_forward_varlen_launch_plan(
             q,
             k,
             v,
