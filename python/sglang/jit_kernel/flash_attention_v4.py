@@ -7,7 +7,9 @@ import torch
 from sglang.kernel_api_logging import debug_kernel_api
 
 try:
-    from flash_attn.cute import flash_attn_varlen_func as _flash_attn_varlen_func
+    from sglang.jit_kernel.flash_attn.cute import (
+        flash_attn_varlen_func as _flash_attn_varlen_func,
+    )
 except Exception as _e:  # pragma: no cover
     _flash_attn_varlen_func = None
     _flash_attn_import_error = _e
