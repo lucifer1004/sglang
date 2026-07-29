@@ -213,6 +213,7 @@ def flash_attn_with_kvcache(
             rel_bias=rel_bias,
             rel_bias_prep_cache=rel_bias_prep_cache,
             return_softmax_lse=return_softmax_lse,
+            out=out,
         )
     else:
         raise RuntimeError(f"Unknown flash attention version {ver}")
@@ -319,6 +320,7 @@ def flash_attn_varlen_func(
             rel_bias=rel_bias,
             rel_bias_prep_cache=rel_bias_prep_cache,
             return_softmax_lse=return_softmax_lse,
+            out=out,
         )
     else:
         raise RuntimeError(f"Unknown flash attention version {ver}")

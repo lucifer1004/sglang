@@ -67,6 +67,7 @@ def flash_attn_varlen_func(
     rel_bias: Optional[torch.Tensor] = None,
     rel_bias_prep_cache: Optional[dict] = None,
     return_softmax_lse: bool = False,
+    out: Optional[torch.Tensor] = None,
     **_: object,
 ):
     if _flash_attn_varlen_func is None:  # pragma: no cover
@@ -94,27 +95,23 @@ def flash_attn_varlen_func(
     # FP8 descale scalars (kv_cache_dtype fp8_e4m3/fp8_e5m2). Only one group is
     # ever populated for a given call. Non-None kwargs only, so bf16/other calls
     # don't hand these to the kernel.
-    sf_kwargs = {}
+    extra_kwargs = {}
     if sfq is not None:
-        sf_kwargs["sfq"] = sfq
+        extra_kwargs["sfq"] = sfq
     if sfk is not None:
-        sf_kwargs["sfk"] = sfk
+        extra_kwargs["sfk"] = sfk
     if sfv is not None:
-        sf_kwargs["sfv"] = sfv
-
-    descale_kwargs = {}
+        extra_kwargs["sfv"] = sfv
     if q_descale is not None:
-        descale_kwargs["q_descale"] = q_descale
+        extra_kwargs["q_descale"] = q_descale
     if k_descale is not None:
-        descale_kwargs["k_descale"] = k_descale
+        extra_kwargs["k_descale"] = k_descale
     if v_descale is not None:
-        descale_kwargs["v_descale"] = v_descale
-
-    rel_bias_kwargs = {}
+        extra_kwargs["v_descale"] = v_descale
     if rel_bias is not None:
-        rel_bias_kwargs["rel_bias"] = rel_bias
+        extra_kwargs["rel_bias"] = rel_bias
     if rel_bias_prep_cache is not None:
-        rel_bias_kwargs["rel_bias_prep_cache"] = rel_bias_prep_cache
+        extra_kwargs["rel_bias_prep_cache"] = rel_bias_prep_cache
     result = _flash_attn_varlen_func(
         q=q,
         k=k,
@@ -137,9 +134,8 @@ def flash_attn_varlen_func(
         score_mod=score_mod,
         aux_tensors=aux_tensors,
         return_lse=return_softmax_lse,
-        **sf_kwargs,
-        **descale_kwargs,
-        **rel_bias_kwargs,
+        out=out,
+        **extra_kwargs,
     )
 
     if return_softmax_lse:
@@ -189,6 +185,7 @@ def flash_attn_with_kvcache(
     rel_bias: Optional[torch.Tensor] = None,
     rel_bias_prep_cache: Optional[dict] = None,
     return_softmax_lse: bool = False,
+    out: Optional[torch.Tensor] = None,
     **_: object,
 ):
     if k is not None or v is not None:
@@ -231,6 +228,7 @@ def flash_attn_with_kvcache(
         rel_bias=rel_bias,
         rel_bias_prep_cache=rel_bias_prep_cache,
         return_softmax_lse=True,
+        out=out,
     )
 
     if return_softmax_lse:
