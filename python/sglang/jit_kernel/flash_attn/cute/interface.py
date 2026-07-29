@@ -641,6 +641,19 @@ def _flash_attn_fwd(
                 total_q_rows=total_q * num_head,
                 num_sms=sm120_num_sms,
                 num_batch=batch_size,
+                seqlen_q=(
+                    max_seqlen_q if max_seqlen_q is not None else seqlen_q
+                ),
+                seqlen_k=(
+                    max_seqlen_k if max_seqlen_k is not None else seqlen_k
+                ),
+                num_head_kv=num_head_kv,
+                qhead_per_kvhead=qhead_per_kvhead,
+                is_causal=causal,
+                is_local=local,
+                window_size_left=window_size_left,
+                window_size_right=window_size_right,
+                pack_gqa=pack_gqa,
             )
             fwd_cfg = FwdConfig(tile_m, tile_n, True, True)
         elif arch // 10 == 8:
