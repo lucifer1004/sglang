@@ -873,7 +873,11 @@ def _flash_attn_fwd(
             head_dim, head_dim_v, tile_m, tile_n
         )
         num_threads = FlashAttentionForwardSm120.get_fwd_num_threads(
-            head_dim, head_dim_v, tile_m, tile_n
+            head_dim,
+            head_dim_v,
+            tile_m,
+            tile_n,
+            paged_kv=page_table is not None,
         )
     if mma_pv_is_rs is None:
         mma_pv_is_rs = fwd_cfg.mma_pv_is_rs
@@ -1596,7 +1600,6 @@ def _flash_attn_fwd(
         elif arch // 10 == 12:
             # SM120 uses SM80 MMA instructions, but owns its feature and SMEM policy.
             assert not use_block_sparsity, "Block sparsity not supported on SM 12.0"
-            assert page_table is None, "Paged KV not supported on SM 12.0 in this PR"
             assert not is_split_kv, "SplitKV not supported on SM 12.0 in this PR"
             if not FlashAttentionForwardSm120.can_implement(
                 dtype,
@@ -1608,6 +1611,7 @@ def _flash_attn_fwd(
                 num_threads=num_threads,
                 is_causal=causal,
                 Q_in_regs=False,
+                paged_kv=page_table is not None,
             ):
                 raise ValueError(
                     "The requested FlashAttention forward configuration exceeds "
