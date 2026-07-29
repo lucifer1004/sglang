@@ -144,13 +144,9 @@ def test_sm120_varlen_padding_ctas_are_inert_across_tile_specializations():
             device="cuda",
             dtype=torch.bfloat16,
         )
-        k = torch.randn(
-            total, 1, head_dim, device="cuda", dtype=torch.bfloat16
-        )
+        k = torch.randn(total, 1, head_dim, device="cuda", dtype=torch.bfloat16)
         v = torch.randn_like(k)
-        sinks = torch.randn(
-            num_q_heads, device="cuda", dtype=torch.bfloat16
-        )
+        sinks = torch.randn(num_q_heads, device="cuda", dtype=torch.bfloat16)
         cuts = [0]
         for length in lengths:
             cuts.append(cuts[-1] + length)

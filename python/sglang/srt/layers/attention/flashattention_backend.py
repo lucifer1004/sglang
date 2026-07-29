@@ -52,8 +52,6 @@ if TYPE_CHECKING:
 
 from sgl_kernel import merge_state_v2
 
-from sglang.jit_kernel.flash_attention import flash_attn_varlen_func
-
 _WELM_V4_MODEL_TYPES = {"welmv4_moe"}
 _WELM_V4_ARCHITECTURES = {
     "WeLMV4MoeForCausalLM",
@@ -4117,10 +4115,7 @@ class FlashAttentionBackend(AttentionBackend):
                     "fa_skip_kv_cache uses raw K/V tensors, "
                     "FP8 KV cache descaling is not supported in this mode"
                 )
-                # This optimization is currently qualified only for FA3. Keep
-                # the version-agnostic dispatcher's default instead of changing
-                # its implementation as part of the backend-call overhead work.
-                result = flash_attn_varlen_func(
+                result = self.flash_attn_varlen_func(
                     q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
                     k=k.view(-1, layer.tp_k_head_num, layer.head_dim),
                     v=v.view(-1, layer.tp_v_head_num, layer.v_head_dim),

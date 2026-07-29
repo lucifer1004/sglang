@@ -93,9 +93,7 @@ class PagedKVManager(ParamsBase):
             atom_async_copy, thr_layout, val_layout
         )
         gmem_thr_copy_KV = gmem_tiled_copy_KV.get_slice(thread_idx)
-        page_entry_per_thread = max(
-            1, (n_block_size + num_threads - 1) // num_threads
-        )
+        page_entry_per_thread = max(1, (n_block_size + num_threads - 1) // num_threads)
 
         if const_expr(mSFK_paged is not None or mSFV_paged is not None):
             atom_async_copy_sf = cute.make_copy_atom(
@@ -181,12 +179,9 @@ class PagedKVManager(ParamsBase):
             + (self.thread_idx // self.gmem_threads_per_row)
         )
         row_idx = n_block * self.n_block_size + row
-        page_idx, page_offset = divmod(
-            row_idx + self.leftpad_k, self.page_size_divmod
-        )
+        page_idx, page_offset = divmod(row_idx + self.leftpad_k, self.page_size_divmod)
         is_valid = (
-            (i + 1) * self.num_threads <= self.n_block_size
-            or row < self.n_block_size
+            (i + 1) * self.num_threads <= self.n_block_size or row < self.n_block_size
         ) and row_idx < self.seqlen_k
         page = self.mPageTable[page_idx] if is_valid else 0
         self.tPrPage[i] = page

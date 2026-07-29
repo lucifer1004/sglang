@@ -634,9 +634,9 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
         stream: cuda.CUstream = None,
     ):
         assert blocksparse_tensors is None, "Block sparsity is not supported on SM120"
-        assert mPageTable is None or not self._uses_split_pv_warps(), (
-            "SM120 paged KV requires the dedicated DMA-warp specialization"
-        )
+        assert (
+            mPageTable is None or not self._uses_split_pv_warps()
+        ), "SM120 paged KV requires the dedicated DMA-warp specialization"
         self._check_type(
             *(
                 t.element_type if t is not None else None

@@ -65,7 +65,7 @@ class ShearingBias:
 
         # only used with block packed scheduling
         self.tile_m = tile_m
-        # Shrink the subtile grid dim to the rows a block can actually hold
+        # Shrink the subtile grid dim to the rows a block can actually hold.  # codespell:ignore
         # (decode blocks hold qhead_per_kvhead*seqlen_q rows, not tile_m).
         self.clamp_subtiles = clamp_subtiles
 
@@ -206,7 +206,7 @@ class ShearingBias:
         if const_expr(not self.use_block_packed_scheduling):
             batch_size_for_sched = batch_size
         elif const_expr(self.clamp_subtiles):
-            # A block covers at most min(tile_m, eff_seqlen_q) valid rows; subtiles
+            # A block covers at most min(tile_m, eff_seqlen_q) valid rows; subtiles  # codespell:ignore
             # past that would fail the per-row seqlen guards and exit immediately.
             batch_size_for_sched = cute.ceil_div(
                 min(self.tile_m, eff_seqlen_q), self.rows_per_cta

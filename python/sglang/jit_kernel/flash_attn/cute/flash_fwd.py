@@ -852,9 +852,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         (batch_size, seqlen_q, num_head, head_dim):(_, _, _, 1)
         """
         if const_expr(not self.supports_learnable_sink):
-            assert (
-                learnable_sink is None
-            ), "Learnable sink is not supported on SM80"
+            assert learnable_sink is None, "Learnable sink is not supported on SM80"
         self._check_type(
             *(
                 t.element_type if t is not None else None
@@ -910,12 +908,8 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             )
         if const_expr(self.pack_gqa):
             nheads_kv = mK.shape[2]
-            mQ = pack_gqa_layout(
-                mQ, self.qhead_per_kvhead, nheads_kv, head_idx=2
-            )
-            mO = pack_gqa_layout(
-                mO, self.qhead_per_kvhead, nheads_kv, head_idx=2
-            )
+            mQ = pack_gqa_layout(mQ, self.qhead_per_kvhead, nheads_kv, head_idx=2)
+            mO = pack_gqa_layout(mO, self.qhead_per_kvhead, nheads_kv, head_idx=2)
             if const_expr(mLSE is not None):
                 mLSE = pack_gqa_layout(
                     mLSE, self.qhead_per_kvhead, nheads_kv, head_idx=1
@@ -1059,9 +1053,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         seqlen = SeqlenInfoQK.create(
             batch_idx=batch_size,
             seqlen_q_static=(
-                mQ.shape[0]
-                if const_expr(not self.pack_gqa)
-                else mQ.shape[0][1]
+                mQ.shape[0] if const_expr(not self.pack_gqa) else mQ.shape[0][1]
             ),
             seqlen_k_static=mK.shape[0],
             mCuSeqlensQ=mCuSeqlensQ,
@@ -1083,13 +1075,9 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         blkK_shape = (self.tile_n, self.tile_hdim)
         blkV_shape = (self.tile_n, self.tile_hdimv)
         num_head_kv = (
-            num_head
-            if const_expr(self.pack_gqa)
-            else num_head // self.qhead_per_kvhead
+            num_head if const_expr(self.pack_gqa) else num_head // self.qhead_per_kvhead
         )
-        mQ_cur = seqlen.offset_batch_Q(mQ, batch_size, dim=3)[
-            None, None, num_head
-        ]
+        mQ_cur = seqlen.offset_batch_Q(mQ, batch_size, dim=3)[None, None, num_head]
         if const_expr(not seqlen.has_cu_seqlens_k):
             mK_cur = mK[None, None, num_head_kv, batch_size]
             mV_cur = mV[None, None, num_head_kv, batch_size]
@@ -1403,14 +1391,11 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
                 # accumulator row can select a different per-query-head sink.
                 sink_val = cute.make_rmem_tensor_like(softmax.row_max, Float32)
                 cS = cute.make_identity_tensor((self.tile_m, self.tile_n))
-                tScS_mn = layout_utils.reshape_acc_to_mn(
-                    thr_mma_qk.partition_C(cS)
-                )
+                tScS_mn = layout_utils.reshape_acc_to_mn(thr_mma_qk.partition_C(cS))
                 for r in cutlass.range(cute.size(sink_val), unroll_full=True):
                     row = m_block * self.tile_m + tScS_mn[r][0]
                     q_head_idx = (
-                        row % self.qhead_per_kvhead
-                        + num_head * self.qhead_per_kvhead
+                        row % self.qhead_per_kvhead + num_head * self.qhead_per_kvhead
                     )
                     sink_val[r] = Float32(learnable_sink[q_head_idx])
 
