@@ -10,7 +10,7 @@ import time
 from functools import lru_cache
 from getpass import getuser
 from pathlib import Path
-from typing import Callable, Hashable, TypeAlias
+from typing import Hashable, TypeAlias
 
 import cutlass
 import cutlass.cute as cute
@@ -159,7 +159,6 @@ class JITCache:
 
     def __init__(self):
         self.cache: dict[CompileKeyType, CallableFunction] = {}
-        self._clear_hooks: list[Callable[[], None]] = []
 
     def __setitem__(self, key: CompileKeyType, fn: JitCompiledFunction) -> None:
         self.cache[key] = fn
@@ -170,18 +169,11 @@ class JITCache:
     def __contains__(self, key: CompileKeyType) -> bool:
         return key in self.cache
 
-    def register_clear_hook(self, hook: Callable[[], None]) -> None:
-        """Clear dependent host-side state whenever compiled functions are cleared."""
-        if hook not in self._clear_hooks:
-            self._clear_hooks.append(hook)
-
     def clear(self) -> None:
         """
         Clear in-memory cache of compiled functions
         """
         self.cache.clear()
-        for hook in self._clear_hooks:
-            hook()
 
 
 class JITPersistentCache(JITCache):

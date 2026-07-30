@@ -25,10 +25,16 @@ from cutlass import Int32
 from sglang.kernels.ops.attention.fa4_sm120.flash_fwd import (
     FlashAttentionForwardSm120,
 )
+from sglang.kernels.ops.attention.fa4_sm120.policy import (
+    is_low_hd_paged_decode_tile,
+    visible_decode_seqlen_k,
+)
 from sglang.kernels.ops.attention.flash_attn.cute import fa_logging
 from sglang.kernels.ops.attention.flash_attn.cute.utils import AuxData
 
 _LAUNCH_PLAN_CAPACITY = 4096
+_WORKSPACE_CAPACITY = 64
+_WORKSPACE_VIEW_CAPACITY = 512
 _EMPTY_AUX_DATA = AuxData(None, None)
 _DECODE_REFERENCE_CORE_GHZ = 2.4
 _DECODE_POWER_OF_TWO_SPLITS = (1, 2, 4, 8, 16, 32, 64, 128)
@@ -46,14 +52,6 @@ _DECODE_COMBINE_FIXED_US = 3.654860520719416
 _DECODE_COMBINE_SPLIT_TO_8_US = 0.015181182195831644
 _DECODE_COMBINE_SPLIT_ABOVE_8_US = 0.12157753908563328
 _DECODE_COMBINE_OUTPUT_CTA_US = 0.019185022429169515
-
-
-def supports_sm120_paged_decode(
-    device_capability: tuple[int, int],
-    head_dim: int,
-) -> bool:
-    """Return whether the qualified SM120 paged-decode path applies."""
-    return device_capability[0] == 12 and head_dim == 256
 
 
 @dataclass(frozen=True)
@@ -231,6 +229,19 @@ def _select_decode_num_splits(
         for splits in candidates
         if splits == 1 or total_mblocks * splits <= hardware.num_sms
     }
+    # A 160-thread HD256 CTA has enough independent QK/PV work that roughly
+    # two thirds of an SM wave saturates both qualified SM120 SKUs. The fitted
+    # latency/bandwidth model is useful above that floor, but underestimates
+    # the cost of sparse grids at larger batch/head-group counts.
+    target_main_ctas = (2 * hardware.num_sms + 2) // 3
+    fill_splits = min(
+        max_one_wave_splits,
+        max(1, (target_main_ctas + total_mblocks - 1) // total_mblocks),
+    )
+    min_fill_splits = _normalize_num_splits(fill_splits, num_n_blocks)
+    filled_candidates = {splits for splits in candidates if splits >= min_fill_splits}
+    if filled_candidates:
+        candidates = filled_candidates
     return min(
         candidates,
         key=lambda splits: _predict_decode_split_us(
@@ -245,6 +256,42 @@ def _select_decode_num_splits(
             element_size=element_size,
             hardware=hardware,
         ),
+    )
+
+
+def _select_low_hd_decode_num_splits(
+    *,
+    max_head_dim: int,
+    packed_q_rows: int,
+    total_mblocks: int,
+    num_sms: int,
+    num_n_blocks: int,
+) -> int:
+    """Overschedule the short-M low-HD decode kernel by bounded waves.
+
+    One hardware wave leaves each CTA with too long a serial K loop for this
+    one-warp kernel. For short KV, use the fewest splits that approximately
+    fill one device-specific SM wave; more waves only add combine work. For
+    longer KV, bound the launch to roughly three waves and size its KV grain
+    from the active packed rows and head width. Once the unsplit grid already
+    fills the machine, only the middle regime benefits from one extra split.
+    """
+    if num_n_blocks <= 4 or total_mblocks <= 0:
+        return 1
+    if total_mblocks >= num_sms and (num_n_blocks <= 8 or num_n_blocks >= 64):
+        return 1
+    max_three_wave_splits = max(1, (3 * num_sms) // total_mblocks)
+    if num_n_blocks <= 8:
+        one_wave_splits = max(1, (num_sms + total_mblocks - 1) // total_mblocks)
+        kv_grain_splits = min(8, one_wave_splits)
+    else:
+        blocks_per_cta_floor = (
+            8 if max_head_dim >= 128 and 2 <= packed_q_rows <= 4 else 4
+        )
+        kv_grain_splits = min(8, num_n_blocks // blocks_per_cta_floor)
+    return _normalize_num_splits(
+        min(max_three_wave_splits, kv_grain_splits),
+        num_n_blocks,
     )
 
 
@@ -316,7 +363,6 @@ class Sm120ForwardPolicy:
             FlashAttentionForwardSm120DecodeTranspose,
             FlashAttentionForwardSm120DecodeTranspose.paged_tma,
             FlashAttentionForwardSm120DecodeTranspose.query_in_regs,
-            FlashAttentionForwardSm120DecodeTranspose.transpose_pv,
         )
 
     @classmethod
@@ -360,12 +406,9 @@ class Sm120ForwardPolicy:
         """Resolve all SM120 dataflow decisions behind one host-side boundary."""
         split_num_n_blocks = cls.split_num_n_blocks(
             generic_num_n_blocks=generic_num_n_blocks,
-            head_dim=head_dim,
-            head_dim_v=head_dim_v,
             paged_kv=paged_kv,
             max_seqlen_q=max_seqlen_q,
             max_seqlen_k=max_seqlen_k,
-            pack_gqa=pack_gqa,
             is_local=is_local,
             window_size_left=window_size_left,
             window_size_right=window_size_right,
@@ -531,6 +574,7 @@ class Sm120ForwardPolicy:
                 window_size_left=window_size_left,
                 window_size_right=window_size_right,
                 pack_gqa=pack_gqa,
+                paged_kv=paged_kv,
             )
         else:
             tile_m, tile_n = tile_mn
@@ -578,7 +622,23 @@ class Sm120ForwardPolicy:
                 and max_seqlen_q == 1
                 and pack_gqa
             )
-            if is_hd256_paged_decode:
+            is_low_hd_paged_decode = is_low_hd_paged_decode_tile(
+                head_dim=head_dim,
+                head_dim_v=head_dim_v,
+                paged_kv=paged_kv,
+                seqlen_q=max_seqlen_q,
+                tile_m=tile_m,
+                tile_n=tile_n,
+            )
+            if is_low_hd_paged_decode and tile_m == 16:
+                num_splits = _select_low_hd_decode_num_splits(
+                    max_head_dim=max(head_dim, head_dim_v),
+                    packed_q_rows=packed_q_rows,
+                    total_mblocks=total_mblocks,
+                    num_sms=num_sms,
+                    num_n_blocks=num_n_blocks,
+                )
+            elif is_hd256_paged_decode:
                 if fake_mode:
                     max_splits = min(128, 1 << (num_sms.bit_length() - 1))
                     num_splits = generic_heuristic(
@@ -618,12 +678,9 @@ class Sm120ForwardPolicy:
     def split_num_n_blocks(
         *,
         generic_num_n_blocks: int,
-        head_dim: int,
-        head_dim_v: int,
         paged_kv: bool,
         max_seqlen_q: int,
         max_seqlen_k: int,
-        pack_gqa: bool,
         is_local: bool,
         window_size_left: Optional[int],
         window_size_right: Optional[int],
@@ -636,19 +693,13 @@ class Sm120ForwardPolicy:
         query position regardless of how many GQA heads occupy the M tile, so
         its exact visible span is just left + current + right.
         """
-        is_hd256_paged_decode = (
-            (head_dim, head_dim_v) == (256, 256)
-            and paged_kv
-            and max_seqlen_q == 1
-            and pack_gqa
-        )
-        if not (is_hd256_paged_decode and is_local):
+        if not (paged_kv and max_seqlen_q == 1 and is_local):
             return generic_num_n_blocks
-        visible_seqlen_k = min(
+        visible_seqlen_k = visible_decode_seqlen_k(
             max_seqlen_k,
-            (max_seqlen_k if window_size_left is None else window_size_left)
-            + 1
-            + (max_seqlen_k if window_size_right is None else window_size_right),
+            is_local=True,
+            window_size_left=window_size_left,
+            window_size_right=window_size_right,
         )
         return max(0, (visible_seqlen_k + tile_n - 1) // tile_n)
 
@@ -893,14 +944,14 @@ class Sm120ForwardHost(Sm120ForwardPolicy):
     def __init__(self) -> None:
         self._varlen_plans: OrderedDict[tuple, _VarlenLaunchPlan] = OrderedDict()
         self._paged_plans: OrderedDict[tuple, _PagedDecodeLaunchPlan] = OrderedDict()
-        self._paged_plan_tiles: dict[tuple, tuple[int, int]] = {}
-        self._paged_workspaces: dict[
+        self._paged_plan_tiles: OrderedDict[tuple, tuple[int, int]] = OrderedDict()
+        self._paged_workspaces: OrderedDict[
             tuple[torch.device, int], tuple[torch.Tensor, torch.Tensor]
-        ] = {}
-        self._paged_workspace_views: dict[
+        ] = OrderedDict()
+        self._paged_workspace_views: OrderedDict[
             tuple[torch.device, int, int, tuple[int, ...], int, torch.dtype],
             tuple[torch.Tensor, torch.Tensor, torch.Tensor],
-        ] = {}
+        ] = OrderedDict()
 
     def _varlen_key(
         self,
@@ -1144,10 +1195,13 @@ class Sm120ForwardHost(Sm120ForwardPolicy):
         )
         cached_view = self._paged_workspace_views.get(view_key)
         if cached_view is not None:
+            self._paged_workspace_views.move_to_end(view_key)
             return cached_view
         out_numel = plan.actual_num_splits * math.prod(q.shape[:-1]) * v.shape[-1]
         lse_numel = plan.actual_num_splits * q.shape[-2] * q.shape[0]
         workspace = self._paged_workspaces.get(key)
+        if workspace is not None:
+            self._paged_workspaces.move_to_end(key)
         if (
             workspace is None
             or workspace[0].numel() < out_numel
@@ -1159,7 +1213,7 @@ class Sm120ForwardHost(Sm120ForwardPolicy):
                 torch.empty(out_numel, dtype=plan.partial_dtype, device=q.device),
                 torch.empty(lse_numel, dtype=torch.float32, device=q.device),
             )
-            self._paged_workspaces[key] = workspace
+            self._cache_workspace(key, workspace)
         out_partial = workspace[0][:out_numel].view(
             plan.actual_num_splits,
             *q.shape[:-1],
@@ -1171,7 +1225,7 @@ class Sm120ForwardHost(Sm120ForwardPolicy):
             q.shape[0],
         )
         result = (out_partial, lse_partial, lse_partial.transpose(-1, -2))
-        self._paged_workspace_views[view_key] = result
+        self._cache_workspace_view(view_key, result)
         return result
 
     def try_paged_decode(
@@ -1228,12 +1282,11 @@ class Sm120ForwardHost(Sm120ForwardPolicy):
         actual_max_seqlen_k = (
             k.shape[0] * k.shape[1] if max_seqlen_k is None else max_seqlen_k
         )
-        if (
-            q.shape[-1] != 256
-            or v.shape[-1] != 256
-            or not actual_pack_gqa
-            or actual_max_seqlen_q * (q.shape[-2] // v.shape[-2]) > 16
-        ):
+        qhead_per_kvhead = q.shape[1] // k.shape[-2]
+        effective_q_rows = actual_max_seqlen_q * (
+            qhead_per_kvhead if actual_pack_gqa else 1
+        )
+        if q.shape[-1] != 256 or v.shape[-1] != 256 or effective_q_rows > 16:
             return None
         causal, window_size_left, window_size_right = _resolve_causal_local_window(
             causal,
@@ -1259,6 +1312,7 @@ class Sm120ForwardHost(Sm120ForwardPolicy):
         tile_mn = self._paged_plan_tiles.get(base_key)
         if tile_mn is None:
             return None
+        self._paged_plan_tiles.move_to_end(base_key)
         selection_key = self._paged_selection_key(
             base_key,
             *tile_mn,
@@ -1372,6 +1426,14 @@ class Sm120ForwardHost(Sm120ForwardPolicy):
             window_size_right,
         )
         self._paged_plan_tiles[base_key] = (tile_m, tile_n)
+        self._paged_plan_tiles.move_to_end(base_key)
+        while len(self._paged_plan_tiles) > _LAUNCH_PLAN_CAPACITY:
+            stale_base_key, _ = self._paged_plan_tiles.popitem(last=False)
+            stale_selection_keys = [
+                key for key in self._paged_plans if key[:-1] == stale_base_key
+            ]
+            for key in stale_selection_keys:
+                del self._paged_plans[key]
         self._paged_plans[selection_key] = _PagedDecodeLaunchPlan(
             compiled_fn=compiled_fn,
             compile_key=compile_key,
@@ -1388,6 +1450,8 @@ class Sm120ForwardHost(Sm120ForwardPolicy):
         stream_key = torch.cuda.current_stream(q.device).cuda_stream
         workspace_key = (q.device, stream_key)
         current_workspace = self._paged_workspaces.get(workspace_key)
+        if current_workspace is not None:
+            self._paged_workspaces.move_to_end(workspace_key)
         if (
             current_workspace is None
             or current_workspace[0].numel() < out_partial.numel()
@@ -1395,9 +1459,12 @@ class Sm120ForwardHost(Sm120ForwardPolicy):
             or current_workspace[0].dtype != out_partial.dtype
         ):
             self._drop_workspace_views(workspace_key)
-            self._paged_workspaces[workspace_key] = (
-                out_partial.view(-1),
-                lse_partial.view(-1),
+            self._cache_workspace(
+                workspace_key,
+                (
+                    out_partial.view(-1),
+                    lse_partial.view(-1),
+                ),
             )
         view_key = (
             q.device,
@@ -1410,11 +1477,35 @@ class Sm120ForwardHost(Sm120ForwardPolicy):
         workspace = self._paged_workspaces[workspace_key]
         out_partial_view = workspace[0][: out_partial.numel()].view(out_partial.shape)
         lse_partial_view = workspace[1][: lse_partial.numel()].view(lse_partial.shape)
-        self._paged_workspace_views[view_key] = (
-            out_partial_view,
-            lse_partial_view,
-            lse_partial_view.transpose(-1, -2),
+        self._cache_workspace_view(
+            view_key,
+            (
+                out_partial_view,
+                lse_partial_view,
+                lse_partial_view.transpose(-1, -2),
+            ),
         )
+
+    def _cache_workspace_view(
+        self,
+        key: tuple,
+        value: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    ) -> None:
+        self._paged_workspace_views[key] = value
+        self._paged_workspace_views.move_to_end(key)
+        while len(self._paged_workspace_views) > _WORKSPACE_VIEW_CAPACITY:
+            self._paged_workspace_views.popitem(last=False)
+
+    def _cache_workspace(
+        self,
+        key: tuple[torch.device, int],
+        value: tuple[torch.Tensor, torch.Tensor],
+    ) -> None:
+        self._paged_workspaces[key] = value
+        self._paged_workspaces.move_to_end(key)
+        while len(self._paged_workspaces) > _WORKSPACE_CAPACITY:
+            stale_key, _ = self._paged_workspaces.popitem(last=False)
+            self._drop_workspace_views(stale_key)
 
     def _drop_workspace_views(self, workspace_key: tuple[torch.device, int]) -> None:
         stale_keys = [

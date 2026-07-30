@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import Callable, Optional, Tuple, Union
 
 import torch
@@ -15,11 +16,7 @@ try:
         from flash_attn.cute import flash_attn_varlen_func as _flash_attn_varlen_func
 
         _flash_attn_fwd = None
-        _supports_sm120_paged_decode = None
     else:
-        from sglang.kernels.ops.attention.fa4_sm120.runtime import (
-            supports_sm120_paged_decode as _supports_sm120_paged_decode,
-        )
         from sglang.kernels.ops.attention.flash_attn.cute import (
             flash_attn_varlen_func as _flash_attn_varlen_func,
         )
@@ -29,7 +26,6 @@ try:
 except Exception as _e:  # pragma: no cover
     _flash_attn_fwd = None
     _flash_attn_varlen_func = None
-    _supports_sm120_paged_decode = None
     _flash_attn_import_error = _e
 else:
     _flash_attn_import_error = None
@@ -45,23 +41,24 @@ class FlashAttentionV4RuntimePolicy:
 def get_flash_attention_v4_runtime_policy(
     *,
     device_capability: tuple[int, int],
-    head_dim: int,
     deterministic: bool,
 ) -> FlashAttentionV4RuntimePolicy:
     """Resolve the SGLang-facing FA4 policy without leaking arch details."""
     no_splitkv = device_capability < (9, 0) or device_capability >= (12, 0)
     num_splits = 1 if deterministic or no_splitkv else 0
-    use_specialized_decode = (
-        not deterministic
-        and _flash_attn_fwd is not None
-        and _supports_sm120_paged_decode is not None
-        and _supports_sm120_paged_decode(device_capability, head_dim)
-    )
+    use_arch_decode_policy = _flash_attn_fwd is not None and device_capability[0] == 12
     return FlashAttentionV4RuntimePolicy(
         num_splits=num_splits,
-        decode_num_splits=0 if use_specialized_decode else num_splits,
-        decode_uses_static_max_seqlen_k=use_specialized_decode,
+        decode_num_splits=(
+            0 if use_arch_decode_policy and not deterministic else num_splits
+        ),
+        decode_uses_static_max_seqlen_k=use_arch_decode_policy,
     )
+
+
+@lru_cache(maxsize=None)
+def _uses_direct_sm120_forward(device: torch.device) -> bool:
+    return torch.cuda.get_device_capability(device)[0] == 12
 
 
 def _maybe_contiguous(x: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
@@ -274,7 +271,11 @@ def flash_attn_with_kvcache(
     needs_autograd = torch.is_grad_enabled() and any(
         tensor is not None and tensor.requires_grad for tensor in differentiable_tensors
     )
-    if _flash_attn_fwd is not None and not needs_autograd:
+    if (
+        _flash_attn_fwd is not None
+        and not needs_autograd
+        and _uses_direct_sm120_forward(q.device)
+    ):
         result = _flash_attn_fwd(
             q,
             k_cache,

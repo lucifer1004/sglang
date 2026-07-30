@@ -6,12 +6,18 @@ import cutlass.cute as cute
 import pytest
 import torch
 
+from sglang.kernels.ops.attention.fa4_sm120.policy import (
+    low_hd_paged_decode_tile_m,
+    visible_decode_seqlen_k,
+)
 from sglang.kernels.ops.attention.fa4_sm120.runtime import (
     Sm120ForwardHost,
+    sm120_forward_host,
 )
 from sglang.kernels.ops.attention.flash_attention_v4 import (
     flash_attn_varlen_func,
     flash_attn_with_kvcache,
+    get_flash_attention_v4_runtime_policy,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 
@@ -25,6 +31,92 @@ if not (torch.cuda.is_available() and torch.cuda.get_device_capability() == (12,
     pytest.skip(
         "SM120 FlashAttention-4 test requires CUDA SM 12.0.",
         allow_module_level=True,
+    )
+
+
+def test_sm120_runtime_policy_delegates_decode_shapes():
+    policy = get_flash_attention_v4_runtime_policy(
+        device_capability=(12, 0),
+        deterministic=False,
+    )
+    assert policy.num_splits == 1
+    assert policy.decode_num_splits == 0
+    assert policy.decode_uses_static_max_seqlen_k
+
+    deterministic_policy = get_flash_attention_v4_runtime_policy(
+        device_capability=(12, 0),
+        deterministic=True,
+    )
+    assert deterministic_policy.num_splits == 1
+    assert deterministic_policy.decode_num_splits == 1
+    assert deterministic_policy.decode_uses_static_max_seqlen_k
+
+
+@pytest.mark.parametrize(
+    (
+        "head_dim",
+        "head_dim_v",
+        "visible_seqlen_k",
+        "qhead_per_kvhead",
+        "expected_tile_m",
+    ),
+    [
+        pytest.param(64, 64, 256, 1, None, id="minimum-exclusive"),
+        pytest.param(64, 64, 512, 8, None, id="hd64-short-mqa-fallback"),
+        pytest.param(64, 64, 513, 8, 16, id="hd64-long-mqa"),
+        pytest.param(128, 128, 512, 8, 32, id="hd128-short-mqa"),
+        pytest.param(128, 128, 2048, 1, 16, id="hd128-mha"),
+        pytest.param(64, 128, 2048, 1, None, id="asymmetric-fallback"),
+        pytest.param(96, 96, 2048, 1, None, id="unqualified-fallback"),
+    ],
+)
+def test_sm120_low_hd_decode_tile_qualification(
+    head_dim,
+    head_dim_v,
+    visible_seqlen_k,
+    qhead_per_kvhead,
+    expected_tile_m,
+):
+    assert (
+        low_hd_paged_decode_tile_m(
+            head_dim=head_dim,
+            head_dim_v=head_dim_v,
+            paged_kv=True,
+            seqlen_q=1,
+            visible_seqlen_k=visible_seqlen_k,
+            qhead_per_kvhead=qhead_per_kvhead,
+        )
+        == expected_tile_m
+    )
+
+
+def test_sm120_decode_visible_k_uses_exact_local_window():
+    assert (
+        visible_decode_seqlen_k(
+            8192,
+            is_local=False,
+            window_size_left=256,
+            window_size_right=0,
+        )
+        == 8192
+    )
+    assert (
+        visible_decode_seqlen_k(
+            8192,
+            is_local=True,
+            window_size_left=256,
+            window_size_right=0,
+        )
+        == 257
+    )
+    assert (
+        visible_decode_seqlen_k(
+            128,
+            is_local=True,
+            window_size_left=256,
+            window_size_right=0,
+        )
+        == 128
     )
 
 
@@ -732,6 +824,49 @@ def test_sm120_packed_gqa_score_mod_matches_reference(
     lse_reference = torch.cat([reference[1] for reference in references], dim=1)
     _assert_attention_close(output, output_reference, lse, lse_reference)
 
+    if has_aux:
+        updated_aux_value = -0.25
+        aux_tensors[0].fill_(updated_aux_value)
+        updated_output, updated_lse = flash_attn_varlen_func(
+            torch.cat(q_parts),
+            torch.cat(k_parts),
+            torch.cat(v_parts),
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            max_seqlen_q=max(q_lengths),
+            max_seqlen_k=max(k_lengths),
+            causal=True,
+            pack_gqa=True,
+            score_mod=score_mod,
+            aux_tensors=aux_tensors,
+            return_softmax_lse=True,
+        )
+        updated_references = [
+            _attention_reference(
+                q,
+                k,
+                v,
+                batch_idx=batch_idx,
+                causal=True,
+                score_mod=reference_kind,
+                aux_score=updated_aux_value,
+            )
+            for batch_idx, (q, k, v) in enumerate(zip(q_parts, k_parts, v_parts))
+        ]
+        updated_output_reference = torch.cat(
+            [reference[0] for reference in updated_references]
+        )
+        updated_lse_reference = torch.cat(
+            [reference[1] for reference in updated_references],
+            dim=1,
+        )
+        _assert_attention_close(
+            updated_output,
+            updated_output_reference,
+            updated_lse,
+            updated_lse_reference,
+        )
+
 
 @pytest.mark.parametrize(
     (
@@ -1013,6 +1148,34 @@ def test_sm120_relative_bias_cuda_graph_replays_and_eager_remains_reusable():
             False,
             1,
             id="bf16-gqa-hd96-hdv128-page32-causal-unpacked",
+        ),
+        pytest.param(
+            torch.bfloat16,
+            8,
+            2,
+            64,
+            64,
+            1,
+            64,
+            True,
+            (None, None),
+            True,
+            0,
+            id="bf16-gqa-hd64-page64-decode-auto-split",
+        ),
+        pytest.param(
+            torch.bfloat16,
+            8,
+            1,
+            128,
+            128,
+            1,
+            64,
+            True,
+            (None, None),
+            True,
+            0,
+            id="bf16-mqa-hd128-page64-decode-auto-split",
         ),
     ],
 )
@@ -1364,6 +1527,116 @@ def test_sm120_varlen_mqa_hd256_learnable_sink(window_left):
     torch.testing.assert_close(outputs[1], outputs[2], atol=0.0, rtol=0.0)
 
 
+def test_sm120_forward_only_varlen_cache_is_pack_order_independent(monkeypatch):
+    """MHA/GQA plans must be distinct and accept dynamic sequence offsets."""
+    sm120_forward_host.clear_launch_plans()
+    cache_hits = []
+    original_try_varlen = sm120_forward_host.try_varlen
+
+    def record_cache_hit(**kwargs):
+        result = original_try_varlen(**kwargs)
+        cache_hits.append(result is not None)
+        return result
+
+    monkeypatch.setattr(sm120_forward_host, "try_varlen", record_cache_hit)
+    torch.manual_seed(1234)
+    lengths = (128, 111, 97)
+    total, num_q_heads, head_dim = sum(lengths), 8, 64
+    q = torch.randn(
+        total,
+        num_q_heads,
+        head_dim,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    offsets = [0]
+    for length in lengths:
+        offsets.append(offsets[-1] + length)
+    cu_seqlens = torch.tensor(offsets, dtype=torch.int32, device="cuda")
+    inputs = {}
+    for name, num_kv_heads in (("mha", 8), ("gqa", 2)):
+        k = torch.randn(
+            total,
+            num_kv_heads,
+            head_dim,
+            device="cuda",
+            dtype=torch.bfloat16,
+        )
+        v = torch.randn_like(k)
+        reference = torch.cat(
+            [
+                _attention_reference(
+                    q[start:end],
+                    k[start:end],
+                    v[start:end],
+                    causal=True,
+                )[0]
+                for start, end in zip(offsets[:-1], offsets[1:])
+            ]
+        )
+        inputs[name] = (k, v, reference)
+
+    for name in ("mha", "gqa", "mha"):
+        k, v, reference = inputs[name]
+        output = torch.empty_like(q)
+        for _ in range(2):
+            result = flash_attn_varlen_func(
+                q,
+                k,
+                v,
+                cu_seqlens_q=cu_seqlens,
+                cu_seqlens_k=cu_seqlens,
+                max_seqlen_q=max(lengths),
+                max_seqlen_k=max(lengths),
+                softmax_scale=head_dim**-0.5,
+                causal=True,
+                pack_gqa=name == "gqa",
+                out=output,
+            )
+            assert result.data_ptr() == output.data_ptr()
+            _assert_attention_close(result, reference)
+
+    assert cache_hits == [False, True, False, True, True, True]
+
+    # The compiled plan keys tensor metadata, not the contents of cu_seqlens.
+    # Repartition the same storage while retaining shape, total, and maximum.
+    alternate_lengths = (97, 111, 128)
+    alternate_offsets = [0]
+    for length in alternate_lengths:
+        alternate_offsets.append(alternate_offsets[-1] + length)
+    alternate_cu_seqlens = torch.tensor(
+        alternate_offsets,
+        dtype=torch.int32,
+        device="cuda",
+    )
+    k, v, _ = inputs["mha"]
+    alternate_reference = torch.cat(
+        [
+            _attention_reference(
+                q[start:end],
+                k[start:end],
+                v[start:end],
+                causal=True,
+            )[0]
+            for start, end in zip(alternate_offsets[:-1], alternate_offsets[1:])
+        ]
+    )
+    alternate_output = flash_attn_varlen_func(
+        q,
+        k,
+        v,
+        cu_seqlens_q=alternate_cu_seqlens,
+        cu_seqlens_k=alternate_cu_seqlens,
+        max_seqlen_q=max(alternate_lengths),
+        max_seqlen_k=max(alternate_lengths),
+        softmax_scale=head_dim**-0.5,
+        causal=True,
+        pack_gqa=False,
+    )
+    assert cache_hits[-1]
+    _assert_attention_close(alternate_output, alternate_reference)
+
+
 def test_sm120_varlen_padding_ctas_are_inert_across_tile_specializations():
     """Padding CTAs must not consume stale SMEM or write another batch's output."""
     num_sms = torch.cuda.get_device_properties(0).multi_processor_count
@@ -1444,8 +1717,25 @@ def test_sm120_varlen_padding_ctas_are_inert_across_tile_specializations():
 
 
 @pytest.mark.parametrize("window_left", [None, 192])
-def test_sm120_paged_decode_ragged_splits_are_cache_order_independent(window_left):
+def test_sm120_paged_decode_ragged_splits_are_cache_order_independent(
+    monkeypatch,
+    window_left,
+):
     """Ragged SplitKV must remain correct across uniform/ragged cache reuse."""
+    sm120_forward_host.clear_launch_plans()
+    cache_hits = []
+    original_try_paged_decode = sm120_forward_host.try_paged_decode
+
+    def record_cache_hit(**kwargs):
+        result = original_try_paged_decode(**kwargs)
+        cache_hits.append(result is not None)
+        return result
+
+    monkeypatch.setattr(
+        sm120_forward_host,
+        "try_paged_decode",
+        record_cache_hit,
+    )
     torch.manual_seed(1234)
     batch_size, num_q_heads, head_dim = 4, 6, 256
     max_seqlen, page_size = 1024, 64
@@ -1509,6 +1799,7 @@ def test_sm120_paged_decode_ragged_splits_are_cache_order_independent(window_lef
     ragged_second = run(ragged_lengths)
     uniform_second = run(uniform_lengths)
 
+    assert cache_hits == [False, True, True, True]
     torch.testing.assert_close(ragged_first, ragged_second, atol=0.0, rtol=0.0)
     torch.testing.assert_close(uniform_first, uniform_second, atol=0.0, rtol=0.0)
 
@@ -1635,6 +1926,20 @@ def test_sm120_paged_decode_graph_pdl_is_correct_and_eager_reusable(
     expected_split_qk,
 ):
     """Every SplitKV dataflow must safely launch its captured combine early."""
+    sm120_forward_host.clear_launch_plans()
+    cache_hits = []
+    original_try_paged_decode = sm120_forward_host.try_paged_decode
+
+    def record_cache_hit(**kwargs):
+        result = original_try_paged_decode(**kwargs)
+        cache_hits.append(result is not None)
+        return result
+
+    monkeypatch.setattr(
+        sm120_forward_host,
+        "try_paged_decode",
+        record_cache_hit,
+    )
     torch.manual_seed(20260730)
     batch_size, head_dim = 1, 256
     max_seqlen, page_size = 2048, 64
@@ -1711,6 +2016,7 @@ def test_sm120_paged_decode_graph_pdl_is_correct_and_eager_reusable(
     eager_after = run()
     torch.cuda.synchronize()
 
+    assert cache_hits == [False, False, True]
     torch.testing.assert_close(eager_before, eager_after, atol=0.0, rtol=0.0)
     torch.testing.assert_close(
         graph_output,

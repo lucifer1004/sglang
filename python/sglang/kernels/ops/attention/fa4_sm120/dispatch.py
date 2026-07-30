@@ -30,11 +30,3 @@ def try_cached_varlen(*, arch: int, **kwargs):
     """Try an architecture-owned varlen launch plan."""
     host = get_forward_host(arch)
     return None if host is None else host.try_varlen(arch=arch, **kwargs)
-
-
-def clear_forward_host_caches() -> None:
-    """Clear host state coupled to compiled forward functions."""
-    for arch in (120,):
-        host = get_forward_host(arch)
-        if host is not None:
-            host.clear_launch_plans()

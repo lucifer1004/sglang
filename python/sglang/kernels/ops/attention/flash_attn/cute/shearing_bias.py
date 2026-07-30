@@ -70,8 +70,8 @@ class ShearingBias:
         self.tile_m = tile_m
         # The output columns are aligned to the rightmost N tile visible to the
         # attention CTA. Keep this distinct from ``tile_m`` above: the shear
-        # scheduler may group rows in 128-row blocks while an SM120 attention
-        # specialization consumes 64 rows per CTA.
+        # scheduler may group rows in larger blocks than the attention kernel
+        # consumes per CTA.
         assert attention_tile_m % self.rows_per_cta == 0
         self.attention_tile_m = attention_tile_m
         # Shrink the subtile grid dim to the rows a block can actually hold

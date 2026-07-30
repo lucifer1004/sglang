@@ -40,8 +40,6 @@ class FlashAttentionForwardSm120DecodeTranspose(FlashAttentionForwardSm120):
     # specialization from being reused for the TMA tensor layout.
     paged_tma = True
     query_mma_n = 8
-    transpose_pv = True
-    use_stmatrix_p_store = False
     query_in_regs = True
 
     def _uses_n_distributed_qk(self) -> bool:
@@ -60,8 +58,7 @@ class FlashAttentionForwardSm120DecodeTranspose(FlashAttentionForwardSm120):
         # The tiled MMA is deliberately warp-local. The base kernel normally
         # derives its cooperative-group size from TiledMma.size, which would
         # expose only one consumer warp here. Four physical consumer warps
-        # instead operate on disjoint K rows. The hybrid subclass uses a
-        # four-warp ordinary PV TiledMma, but keeps the same cooperative group.
+        # instead operate on disjoint K rows.
         self.num_qk_threads = self.num_threads
         self.num_mma_threads = self.num_threads
         self.num_Q_load_threads = self.num_threads
@@ -74,23 +71,12 @@ class FlashAttentionForwardSm120DecodeTranspose(FlashAttentionForwardSm120):
             (1, 1, 1),
             permutation_mnk=(16, self.query_mma_n, 16),
         )
-        tiled_mma_pv = (
-            # Each warp covers 64 value rows; the four disjoint SMEM views
-            # cover HDV=256 without a CTA-level M permutation.
-            cute.make_tiled_mma(
-                mma_op,
-                (1, 1, 1),
-                permutation_mnk=(64, self.query_mma_n, 16),
-            )
-            if const_expr(self.transpose_pv)
-            # Hybrid path: P @ V uses one M warp and four N warps. The active
-            # R<=8 query rows occupy the atom's padded M=16 dimension, while
-            # the collective covers the ordinary Q-major output.
-            else cute.make_tiled_mma(
-                mma_op,
-                (1, 4, 1),
-                permutation_mnk=(16, 64, 16),
-            )
+        # Each warp covers 64 value rows; the four disjoint SMEM views cover
+        # HDV=256 without a CTA-level M permutation.
+        tiled_mma_pv = cute.make_tiled_mma(
+            mma_op,
+            (1, 1, 1),
+            permutation_mnk=(64, self.query_mma_n, 16),
         )
         return tiled_mma_qk, tiled_mma_pv
 
@@ -216,12 +202,9 @@ class FlashAttentionForwardSm120DecodeTranspose(FlashAttentionForwardSm120):
         lane_idx = tidx % cute.arch.WARP_SIZE
         key_row_base = warp_idx * const_expr(16)
 
-        cute.experimental.iket.range_push("transpose_k_wait")
         k_wait_token = pipeline_k.consumer_try_wait(consumer_state)
         pipeline_k.consumer_wait(consumer_state, k_wait_token)
-        cute.experimental.iket.range_pop()
 
-        cute.experimental.iket.range_push("transpose_qk_mma")
         thr_mma_qk = tiled_mma_qk.get_slice(lane_idx)
         acc_shape_S = thr_mma_qk.partition_shape_C((16, self.query_mma_n))
         acc_S = cute.make_rmem_tensor(acc_shape_S, Float32)
@@ -238,9 +221,7 @@ class FlashAttentionForwardSm120DecodeTranspose(FlashAttentionForwardSm120):
             B_in_regs=self.query_in_regs,
         )
         pipeline_k.consumer_release(consumer_state)
-        cute.experimental.iket.range_pop()
 
-        cute.experimental.iket.range_push("transpose_softmax_local")
         acc_S_qk = layout_utils.reshape_acc_to_mn(acc_S, transpose=True)
         cS = cute.make_identity_tensor((16, self.query_mma_n))
         tScS_qk = layout_utils.reshape_acc_to_mn(
@@ -306,13 +287,11 @@ class FlashAttentionForwardSm120DecodeTranspose(FlashAttentionForwardSm120):
                 sRowScale[warp_idx, query_row] = row_max_local[r]
                 sRowScale[local_sum_base + warp_idx, query_row] = row_sum_local[r]
         cute.arch.fence_view_async_shared()
-        cute.experimental.iket.range_pop()
 
         cute.arch.barrier(
             barrier_id=int(NamedBarrierFwd.PFull),
             number_of_threads=self.num_mma_threads,
         )
-        cute.experimental.iket.range_push("transpose_softmax_global")
         if tidx < self.query_mma_n:
             query_row = tidx
             row_max = sRowScale[0, query_row]
@@ -357,55 +336,21 @@ class FlashAttentionForwardSm120DecodeTranspose(FlashAttentionForwardSm120):
             if const_expr(not is_first_n_block):
                 sRowScale[old_o_scale_row, query_row] = old_o_scale
         cute.arch.fence_view_async_shared()
-        cute.experimental.iket.range_pop()
 
         cute.arch.barrier(
             barrier_id=int(NamedBarrierFwd.PEmpty),
             number_of_threads=self.num_mma_threads,
         )
-        cute.experimental.iket.range_push("transpose_p_store")
         for r in cutlass.range(num_query_rows, unroll_full=True):
             query_row = tScS_qk[r, 0][1]
             warp_scale = sRowScale[warp_scale_base + warp_idx, query_row]
             acc_S_qk[r, None].store(acc_S_qk[r, None].load() * warp_scale)
-        if const_expr(self.use_stmatrix_p_store):
-            # m16n8 accumulators already use the stmatrix row-fragment
-            # register layout: each lane owns two adjacent N/query values for
-            # each of its two M/key rows. Store each 8x8 key half in
-            # column-major form, which is physically the required row-major
-            # QxK P tile. Threads 0..7 provide the eight naturally aligned
-            # destination row addresses; higher-thread addresses are ignored
-            # by stmatrix.x1 but remain valid.
-            smem_store_atom_P = cute.make_copy_atom(
-                warp.StMatrix8x8x16bOp(
-                    transpose=True,
-                    num_matrices=1,
-                ),
-                self.dtype,
-            )
-            rP = cute.make_rmem_tensor(num_query_rows, self.dtype)
-            for key_half in cutlass.range_constexpr(2):
-                for r in cutlass.range(num_query_rows, unroll_full=True):
-                    rP[r] = self.dtype(acc_S_qk[r, key_half])
-                address_row = lane_idx % self.query_mma_n
-                sP_row = cute.local_tile(
-                    sP[address_row, None, p_stage],
-                    (8,),
-                    (warp_idx * 2 + key_half,),
-                )
-                # The atom consumes one b32 fragment (two BF16 values) per
-                # thread. Only the iterator is used as the row address, so
-                # present a matching two-element logical destination.
-                sP_address = cute.local_tile(sP_row, (2,), (0,))
-                cute.copy(smem_store_atom_P, rP, sP_address)
-        else:
-            for r in cutlass.range(num_query_rows, unroll_full=True):
-                query_row = tScS_qk[r, 0][1]
-                for c in cutlass.range(cute.size(acc_S_qk, mode=[1]), unroll_full=True):
-                    key_row = key_row_base + tScS_qk[r, c][0]
-                    sP[query_row, key_row, p_stage] = self.dtype(acc_S_qk[r, c])
+        for r in cutlass.range(num_query_rows, unroll_full=True):
+            query_row = tScS_qk[r, 0][1]
+            for c in cutlass.range(cute.size(acc_S_qk, mode=[1]), unroll_full=True):
+                key_row = key_row_base + tScS_qk[r, c][0]
+                sP[query_row, key_row, p_stage] = self.dtype(acc_S_qk[r, c])
         cute.arch.fence_view_async_shared()
-        cute.experimental.iket.range_pop()
 
         cute.arch.barrier(
             barrier_id=int(NamedBarrierFwd.PFull),
@@ -415,58 +360,28 @@ class FlashAttentionForwardSm120DecodeTranspose(FlashAttentionForwardSm120):
         # multiplying it by that tile's compile-time unit scale is pure
         # overhead. Later tiles still rescale accumulated output before PV.
         if const_expr(not is_first_n_block):
-            if const_expr(self.transpose_pv):
-                self._rescale_transposed_o(
-                    acc_O,
-                    tiled_mma_pv,
-                    tidx,
-                    sRowScale,
-                    old_o_scale_row,
-                )
-            else:
-                thr_mma_pv = tiled_mma_pv.get_slice(tidx)
-                cO = cute.make_identity_tensor((self.tile_m, self.tile_hdimv))
-                tOcO_mn = layout_utils.reshape_acc_to_mn(thr_mma_pv.partition_C(cO))
-                num_rows_pv = acc_O.shape[0][0] * acc_O.shape[1]
-                row_scale = cute.make_rmem_tensor(num_rows_pv, Float32)
-                for r in cutlass.range(cute.size(row_scale), unroll_full=True):
-                    row_scale[r] = sRowScale[old_o_scale_row, tOcO_mn[r, 0][0]]
-                self._rescale_O(acc_O, row_scale)
+            self._rescale_transposed_o(
+                acc_O,
+                tiled_mma_pv,
+                tidx,
+                sRowScale,
+                old_o_scale_row,
+            )
 
-        cute.experimental.iket.range_push("transpose_v_wait")
         v_wait_token = pipeline_v.consumer_try_wait(consumer_state)
         pipeline_v.consumer_wait(consumer_state, v_wait_token)
-        cute.experimental.iket.range_pop()
 
-        cute.experimental.iket.range_push("transpose_pv_mma")
-        if const_expr(self.transpose_pv):
-            self._gemm_n8(
-                tiled_mma_pv,
-                acc_O,
-                tOrV,
-                tOrP,
-                tVsV[None, None, None, p_stage],
-                tPsP[None, None, None, p_stage],
-                smem_thr_copy_V,
-                smem_thr_copy_P,
-            )
-        else:
-            tOrP_copy_view = smem_thr_copy_P.retile(tOrP)
-            cute.copy(
-                smem_thr_copy_P,
-                tPsP[None, None, None, p_stage],
-                tOrP_copy_view,
-            )
-            self._gemm_pv(
-                tiled_mma_pv,
-                acc_O,
-                tOrP,
-                tOrV,
-                tVsV[None, None, None, p_stage],
-                smem_thr_copy_V,
-            )
+        self._gemm_n8(
+            tiled_mma_pv,
+            acc_O,
+            tOrV,
+            tOrP,
+            tVsV[None, None, None, p_stage],
+            tPsP[None, None, None, p_stage],
+            smem_thr_copy_V,
+            smem_thr_copy_P,
+        )
         pipeline_v.consumer_release(consumer_state)
-        cute.experimental.iket.range_pop()
 
         cute.arch.barrier(
             barrier_id=int(NamedBarrierFwd.PEmpty),
@@ -571,7 +486,6 @@ class FlashAttentionForwardSm120DecodeTranspose(FlashAttentionForwardSm120):
         assert self.tile_m == 16 and self.tile_n == 64
         assert self.tile_hdim == 256
         assert self.tile_hdimv in (64, 256)
-        assert self.transpose_pv or self.tile_hdimv >= 64
         assert self.qhead_per_kvhead <= self.query_mma_n
         assert is_qk_owner
 
@@ -579,16 +493,8 @@ class FlashAttentionForwardSm120DecodeTranspose(FlashAttentionForwardSm120):
         warp_idx = tidx // cute.arch.WARP_SIZE
         lane_idx = tidx % cute.arch.WARP_SIZE
         thr_mma_qk = tiled_mma_qk.get_slice(lane_idx)
-        thr_mma_pv = tiled_mma_pv.get_slice(
-            lane_idx if const_expr(self.transpose_pv) else tidx
-        )
-        acc_shape_O = thr_mma_pv.partition_shape_C(
-            (
-                (64, self.query_mma_n)
-                if const_expr(self.transpose_pv)
-                else (self.tile_m, self.tile_hdimv)
-            )
-        )
+        thr_mma_pv = tiled_mma_pv.get_slice(lane_idx)
+        acc_shape_O = thr_mma_pv.partition_shape_C((64, self.query_mma_n))
         acc_O = cute.make_rmem_tensor(acc_shape_O, Float32)
         acc_O.fill(0.0)
 
@@ -606,24 +512,12 @@ class FlashAttentionForwardSm120DecodeTranspose(FlashAttentionForwardSm120):
         smem_thr_copy_Q = utils.make_tiled_copy_B(
             smem_copy_atom_k_major, tiled_mma_qk
         ).get_slice(lane_idx)
-        smem_thr_copy_V = (
-            utils.make_tiled_copy_A(smem_copy_atom_v_major, tiled_mma_pv).get_slice(
-                lane_idx
-            )
-            if const_expr(self.transpose_pv)
-            else utils.make_tiled_copy_B(
-                smem_copy_atom_v_major, tiled_mma_pv
-            ).get_slice(tidx)
-        )
-        smem_thr_copy_P = (
-            utils.make_tiled_copy_B(smem_copy_atom_k_major, tiled_mma_pv).get_slice(
-                lane_idx
-            )
-            if const_expr(self.transpose_pv)
-            else utils.make_tiled_copy_A(
-                smem_copy_atom_k_major, tiled_mma_pv
-            ).get_slice(tidx)
-        )
+        smem_thr_copy_V = utils.make_tiled_copy_A(
+            smem_copy_atom_v_major, tiled_mma_pv
+        ).get_slice(lane_idx)
+        smem_thr_copy_P = utils.make_tiled_copy_B(
+            smem_copy_atom_k_major, tiled_mma_pv
+        ).get_slice(lane_idx)
 
         sK_warp = cute.local_tile(
             sK,
@@ -640,30 +534,22 @@ class FlashAttentionForwardSm120DecodeTranspose(FlashAttentionForwardSm120):
             thr_mma_qk.partition_A(sK_warp[None, None, 0])
         )
         tSrQ = thr_mma_qk.make_fragment_B(thr_mma_qk.partition_B(sQ_query))
-        if const_expr(self.transpose_pv):
-            sV_warp = cute.local_tile(
-                sV,
-                (64, self.tile_n, self._num_v_stages()),
-                (warp_idx, 0, 0),
-            )
-            tOrV = thr_mma_pv.make_fragment_A(
-                thr_mma_pv.partition_A(sV_warp[None, None, 0])
-            )
-            tOrP = thr_mma_pv.make_fragment_B(
-                thr_mma_pv.partition_B(sP_query[None, None, 0])
-            )
-            tVsV = smem_thr_copy_V.partition_S(sV_warp)
-        else:
-            tOrP = thr_mma_pv.make_fragment_A(
-                thr_mma_pv.partition_A(sP_query[None, None, 0])
-            )
-            tOrV = thr_mma_pv.make_fragment_B(thr_mma_pv.partition_B(sV[None, None, 0]))
-            tVsV = smem_thr_copy_V.partition_S(sV)
+        sV_warp = cute.local_tile(
+            sV,
+            (64, self.tile_n, self._num_v_stages()),
+            (warp_idx, 0, 0),
+        )
+        tOrV = thr_mma_pv.make_fragment_A(
+            thr_mma_pv.partition_A(sV_warp[None, None, 0])
+        )
+        tOrP = thr_mma_pv.make_fragment_B(
+            thr_mma_pv.partition_B(sP_query[None, None, 0])
+        )
+        tVsV = smem_thr_copy_V.partition_S(sV_warp)
         tKsK = smem_thr_copy_K.partition_S(sK_warp)
         tQsQ = smem_thr_copy_Q.partition_S(sQ_query)
         tPsP = smem_thr_copy_P.partition_S(sP_query)
 
-        cute.experimental.iket.range_push("transpose_q_load")
         PackGQA(
             self.tile_m,
             self.tile_hdim,
@@ -683,7 +569,6 @@ class FlashAttentionForwardSm120DecodeTranspose(FlashAttentionForwardSm120):
             barrier_id=1,
             number_of_threads=self.num_Q_load_threads,
         )
-        cute.experimental.iket.range_pop()
 
         if const_expr(self.query_in_regs):
             # Q.T is invariant across all KV tiles and its N=8 fragment is
@@ -765,7 +650,6 @@ class FlashAttentionForwardSm120DecodeTranspose(FlashAttentionForwardSm120):
         global_sum_row = const_expr(9)
         final_scale_row = const_expr(0)
         row_limit = seqlen.seqlen_q * self.qhead_per_kvhead
-        cute.experimental.iket.range_push("transpose_finalize")
         if tidx < self.query_mma_n:
             query_row = tidx
             row_max = sRowScale[global_max_row, query_row]
@@ -805,68 +689,23 @@ class FlashAttentionForwardSm120DecodeTranspose(FlashAttentionForwardSm120):
             barrier_id=int(NamedBarrierFwd.PFull),
             number_of_threads=self.num_mma_threads,
         )
-        if const_expr(self.transpose_pv):
-            self._rescale_transposed_o(
-                acc_O,
-                tiled_mma_pv,
-                tidx,
-                sRowScale,
-                final_scale_row,
-            )
-            self._store_transposed_output(
-                acc_O,
-                mO,
-                mLSE,
-                sLSE,
-                tiled_mma_pv,
-                tidx,
-                seqlen,
-                m_block,
-                head_idx,
-                batch_idx,
-                split_idx,
-            )
-        else:
-            cO = cute.make_identity_tensor((self.tile_m, self.tile_hdimv))
-            tOcO_mn = layout_utils.reshape_acc_to_mn(thr_mma_pv.partition_C(cO))
-            num_rows_pv = acc_O.shape[0][0] * acc_O.shape[1]
-            row_scale = cute.make_rmem_tensor(num_rows_pv, Float32)
-            lse = cute.make_rmem_tensor(num_rows_pv, Float32)
-            for r in cutlass.range(cute.size(row_scale), unroll_full=True):
-                row = tOcO_mn[r, 0][0]
-                row_scale[r] = sRowScale[final_scale_row, row]
-                lse[r] = sLSE[row]
-            self._rescale_O(acc_O, row_scale)
-            self.epilogue(
-                acc_O,
-                lse,
-                mO,
-                mLSE,
-                sO,
-                seqlen,
-                gmem_tiled_copy_O,
-                None,
-                tiled_mma_pv,
-                tidx,
-                m_block,
-                head_idx,
-                batch_idx,
-                split_idx,
-            )
-        cute.experimental.iket.range_pop()
-
-
-class FlashAttentionForwardSm120DecodeSwapQkOnly(
-    FlashAttentionForwardSm120DecodeTranspose
-):
-    """Use K @ Q.T for score efficiency and ordinary P @ V output."""
-
-    transpose_pv = False
-
-
-class FlashAttentionForwardSm120DecodeSwapQkStmatrixP(
-    FlashAttentionForwardSm120DecodeSwapQkOnly
-):
-    """Hybrid dataflow with a native transposed stmatrix P handoff."""
-
-    use_stmatrix_p_store = True
+        self._rescale_transposed_o(
+            acc_O,
+            tiled_mma_pv,
+            tidx,
+            sRowScale,
+            final_scale_row,
+        )
+        self._store_transposed_output(
+            acc_O,
+            mO,
+            mLSE,
+            sLSE,
+            tiled_mma_pv,
+            tidx,
+            seqlen,
+            m_block,
+            head_idx,
+            batch_idx,
+            split_idx,
+        )

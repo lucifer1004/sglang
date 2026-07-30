@@ -58,7 +58,6 @@ from sglang.kernels.ops.attention.flash_attn.cute.flash_fwd_sm100 import (
     FlashAttentionForwardSm100,
 )
 from sglang.kernels.ops.attention.fa4_sm120.dispatch import (
-    clear_forward_host_caches,
     get_forward_host,
     try_cached_paged_decode,
     try_cached_varlen,
@@ -557,16 +556,13 @@ def _flash_attn_fwd(
         ), "inputs must be on CUDA device"
     arch = _get_device_arch() if _arch is None else _arch
     arch_forward_host = get_forward_host(arch)
-    assert arch // 10 in [
-        8,
-        9,
-        10,
-        11,
-        12,
-    ], "Unsupported compute capability. Supported: 8.x, 9.x, 10.x, 11.x, 12.x"
+    assert arch // 10 in [8, 9, 10, 11] or arch_forward_host is not None, (
+        "Unsupported compute capability. Supported: 8.x, 9.x, 10.x, 11.x, "
+        "and architectures registered through the forward-host bridge"
+    )
     assert num_head % num_head_kv == 0, "num_head must be divisible by num_head_kv"
     alignment = 16 // v.element_size()
-    if arch // 10 not in [8, 12]:
+    if arch // 10 != 8 and arch_forward_host is None:
         _validate_head_dims(head_dim, head_dim_v, arch // 10, alignment)
     if softmax_scale is None:
         softmax_scale = (
@@ -988,17 +984,15 @@ def _flash_attn_fwd(
     cu_total_m_blocks_bias = None
     blocks_to_batch_idx = None
     if rel_bias is not None:
-        assert arch // 10 in [
-            9,
-            10,
-            11,
-            12,
-        ], "rel_bias is only supported on SM9x/10x/11x/12x"
+        assert arch // 10 in [9, 10, 11] or arch_forward_host is not None, (
+            "rel_bias requires SM9x/10x/11x or an architecture-owned "
+            "forward implementation"
+        )
         qhead_per_kvhead_packgqa = qhead_per_kvhead if pack_gqa else 1
         rel_extent = rel_bias.shape[-1]
         rel_extent_padded = rel_extent + 256
         assert rel_extent % 128 == 0
-        if arch // 10 == 12:
+        if arch_forward_host is not None:
             assert tile_m == 64 and tile_n == 128
         else:
             assert tile_m == 128 and tile_n == 128
@@ -1562,7 +1556,7 @@ def _flash_attn_fwd(
                     AuxData(cute_aux_tensors, aux_scalars),
                 ]
             )
-            if arch // 10 in [9, 10, 11, 12]:
+            if arch // 10 in [9, 10, 11] or arch_forward_host is not None:
                 compile_args.append(bias_tensor)  # mBias
             if arch // 10 in [10, 11]:
                 if not use_dedicated_hd256_kernel:
@@ -1670,7 +1664,7 @@ def _flash_attn_fwd(
                     AuxData(aux_tensors, aux_scalars),
                 ]
             )
-            if arch // 10 in [9, 10, 11, 12]:
+            if arch // 10 in [9, 10, 11] or arch_forward_host is not None:
                 call_args.append(bias)  # mBias
             if arch // 10 in [10, 11]:
                 if not use_dedicated_hd256_kernel:
@@ -1689,8 +1683,6 @@ def _flash_attn_fwd(
             compiled_fwd = _flash_attn_fwd.compile_cache[compile_key]
             if (
                 arch_forward_host is not None
-                and batch_size == 1
-                and pack_gqa
                 and cu_seqlens_q is not None
                 and cu_seqlens_k is not None
                 and seqused_q is None
@@ -1744,8 +1736,6 @@ def _flash_attn_fwd(
         not fake_mode
         and not torch.cuda.is_current_stream_capturing()
         and arch_forward_host is not None
-        and batch_size == 1
-        and pack_gqa
         and q is not None
         and k is not None
         and qv is None
@@ -1756,7 +1746,7 @@ def _flash_attn_fwd(
         and page_table is not None
         and head_dim == 256
         and head_dim_v == 256
-        and max_seqlen_q * qhead_per_kvhead <= 16
+        and max_seqlen_q * (qhead_per_kvhead if pack_gqa else 1) <= 16
         and not requires_grad
         and (learnable_sink is None or not learnable_sink.requires_grad)
         and lse is None
@@ -1815,7 +1805,6 @@ def _flash_attn_fwd(
 
 
 _flash_attn_fwd.compile_cache = get_jit_cache("fwd")
-_flash_attn_fwd.compile_cache.register_clear_hook(clear_forward_host_caches)
 _flash_attn_fwd.compile_cache_shear_bias = get_jit_cache("fwd_shear_bias")
 _flash_attn_fwd.compile_cache_prepare_shear_bias = get_jit_cache(
     "fwd_prepare_shear_bias"
