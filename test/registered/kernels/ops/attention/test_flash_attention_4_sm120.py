@@ -1488,7 +1488,7 @@ def test_sm120_relative_bias_paged_splitkv_is_cache_order_independent():
 
 @pytest.mark.parametrize("window_left", [None, 250])
 def test_sm120_varlen_mqa_hd256_learnable_sink(window_left):
-    """Cover the WeLMv4 Q6/KV1/hd256 global and local prefill shapes."""
+    """Cover Q6/KV1 head-dim-256 global and local prefill shapes."""
     torch.manual_seed(1234)
     seq, num_q_heads, head_dim = 512, 6, 256
     q = torch.randn(seq, num_q_heads, head_dim, device="cuda", dtype=torch.bfloat16)
