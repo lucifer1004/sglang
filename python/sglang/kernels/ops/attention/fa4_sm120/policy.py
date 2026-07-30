@@ -7,6 +7,9 @@ LOW_HD_DECODE_SHAPES = frozenset({(64, 64), (128, 128)})
 LOW_HD_DECODE_TILE_N = 64
 LOW_HD_DECODE_MIN_VISIBLE_K = 256
 LOW_HD_DECODE_SHORT_VISIBLE_K = 512
+LOW_HD_DECODE_MAX_SPLITS = 8
+LOW_HD_DECODE_SHORT_MIN_TILES_PER_CTA = 2
+LOW_HD_DECODE_LONG_MIN_TILES_PER_CTA = 8
 
 
 def visible_decode_seqlen_k(
@@ -32,6 +35,8 @@ def low_hd_paged_decode_tile_m(
     seqlen_q: Optional[int],
     visible_seqlen_k: Optional[int],
     qhead_per_kvhead: Optional[int],
+    num_sms: Optional[int] = None,
+    total_mblocks: Optional[int] = None,
 ) -> Optional[int]:
     """Return the qualified low-HD decode M tile, or ``None`` for fallback."""
     if (
@@ -48,6 +53,18 @@ def low_hd_paged_decode_tile_m(
         and qhead_ratio >= 8
         and visible_seqlen_k <= LOW_HD_DECODE_SHORT_VISIBLE_K
     ):
+        if num_sms is not None and total_mblocks is not None:
+            num_n_blocks = (
+                visible_seqlen_k + LOW_HD_DECODE_TILE_N - 1
+            ) // LOW_HD_DECODE_TILE_N
+            max_short_splits = min(
+                LOW_HD_DECODE_MAX_SPLITS,
+                num_n_blocks // LOW_HD_DECODE_SHORT_MIN_TILES_PER_CTA,
+            )
+            # Use the one-warp M16 CTA only when bounded SplitKV can fill an
+            # SM wave without reducing each partition below two KV tiles.
+            if total_mblocks * max_short_splits >= num_sms:
+                return 16
         return None
     if qhead_ratio >= 8 and visible_seqlen_k <= LOW_HD_DECODE_SHORT_VISIBLE_K:
         return 32

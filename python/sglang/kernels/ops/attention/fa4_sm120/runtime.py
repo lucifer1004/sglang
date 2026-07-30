@@ -26,6 +26,8 @@ from sglang.kernels.ops.attention.fa4_sm120.flash_fwd import (
     FlashAttentionForwardSm120,
 )
 from sglang.kernels.ops.attention.fa4_sm120.policy import (
+    LOW_HD_DECODE_LONG_MIN_TILES_PER_CTA,
+    LOW_HD_DECODE_MAX_SPLITS,
     is_low_hd_paged_decode_tile,
     visible_decode_seqlen_k,
 )
@@ -272,25 +274,33 @@ def _select_low_hd_decode_num_splits(
     One hardware wave leaves each CTA with too long a serial K loop for this
     one-warp kernel. For short KV, use the fewest splits that approximately
     fill one device-specific SM wave; more waves only add combine work. For
-    longer KV, bound the launch to roughly three waves and size its KV grain
-    from the active packed rows and head width. Once the unsplit grid already
-    fills the machine, only the middle regime benefits from one extra split.
+    longer KV, bound the launch by hardware waves and a minimum per-CTA KV
+    grain. Once eight-way splitting leaves a long grain, prefer balanced
+    power-of-two partitions over device-specific odd split counts.
     """
     if num_n_blocks <= 4 or total_mblocks <= 0:
         return 1
     if total_mblocks >= num_sms and (num_n_blocks <= 8 or num_n_blocks >= 64):
         return 1
-    max_three_wave_splits = max(1, (3 * num_sms) // total_mblocks)
+    wave_split_budget = max(1, (3 * num_sms) // total_mblocks)
+    if num_n_blocks >= LOW_HD_DECODE_MAX_SPLITS * LOW_HD_DECODE_LONG_MIN_TILES_PER_CTA:
+        # Long KV can afford the next power-of-two split without making the
+        # per-CTA grain too small. Balanced partitions avoid partial waves and
+        # sustain memory bandwidth better than device-specific odd counts.
+        wave_split_budget = 1 << (wave_split_budget - 1).bit_length()
     if num_n_blocks <= 8:
         one_wave_splits = max(1, (num_sms + total_mblocks - 1) // total_mblocks)
-        kv_grain_splits = min(8, one_wave_splits)
+        kv_grain_splits = min(LOW_HD_DECODE_MAX_SPLITS, one_wave_splits)
     else:
         blocks_per_cta_floor = (
             8 if max_head_dim >= 128 and 2 <= packed_q_rows <= 4 else 4
         )
-        kv_grain_splits = min(8, num_n_blocks // blocks_per_cta_floor)
+        kv_grain_splits = min(
+            LOW_HD_DECODE_MAX_SPLITS,
+            num_n_blocks // blocks_per_cta_floor,
+        )
     return _normalize_num_splits(
-        min(max_three_wave_splits, kv_grain_splits),
+        min(wave_split_budget, kv_grain_splits),
         num_n_blocks,
     )
 
@@ -404,6 +414,7 @@ class Sm120ForwardPolicy:
         generic_heuristic: Callable[[int, int, int, int], int],
     ) -> Sm120ForwardPlan:
         """Resolve all SM120 dataflow decisions behind one host-side boundary."""
+        has_compact_q_groups = pack_gqa or packed_q_rows == max_seqlen_q
         split_num_n_blocks = cls.split_num_n_blocks(
             generic_num_n_blocks=generic_num_n_blocks,
             paged_kv=paged_kv,
@@ -420,7 +431,7 @@ class Sm120ForwardPolicy:
             head_dim_v=head_dim_v,
             paged_kv=paged_kv,
             max_seqlen_q=max_seqlen_q,
-            pack_gqa=pack_gqa,
+            has_compact_q_groups=has_compact_q_groups,
             element_size=element_size,
             packed_q_rows=packed_q_rows,
             tile_m=tile_m,
@@ -436,7 +447,6 @@ class Sm120ForwardPolicy:
         direct_uniform_batch = cls.use_direct_uniform_batch(
             batch_size=batch_size,
             paged_kv=paged_kv,
-            pack_gqa=pack_gqa,
             has_cu_seqlens_q=has_cu_seqlens_q,
             has_seqused_q=has_seqused_q,
             total_q=total_q,
@@ -448,7 +458,7 @@ class Sm120ForwardPolicy:
             head_dim_v=head_dim_v,
             paged_kv=paged_kv,
             max_seqlen_q=max_seqlen_q,
-            pack_gqa=pack_gqa,
+            has_compact_q_groups=has_compact_q_groups,
             packed_q_rows=packed_q_rows,
             tile_m=tile_m,
             tile_n=tile_n,
@@ -496,7 +506,7 @@ class Sm120ForwardPolicy:
             batch_size=batch_size,
             paged_kv=paged_kv,
             max_seqlen_q=max_seqlen_q,
-            pack_gqa=pack_gqa,
+            has_compact_q_groups=has_compact_q_groups,
             packed_q_rows=packed_q_rows,
             is_split_kv=is_split_kv,
             direct_uniform_batch=direct_uniform_batch,
@@ -601,7 +611,7 @@ class Sm120ForwardPolicy:
         head_dim_v: int,
         paged_kv: bool,
         max_seqlen_q: int,
-        pack_gqa: bool,
+        has_compact_q_groups: bool,
         element_size: int,
         packed_q_rows: int,
         tile_m: int,
@@ -620,7 +630,7 @@ class Sm120ForwardPolicy:
                 and head_dim_v == 256
                 and paged_kv
                 and max_seqlen_q == 1
-                and pack_gqa
+                and has_compact_q_groups
             )
             is_low_hd_paged_decode = is_low_hd_paged_decode_tile(
                 head_dim=head_dim,
@@ -708,16 +718,21 @@ class Sm120ForwardPolicy:
         *,
         batch_size: int,
         paged_kv: bool,
-        pack_gqa: bool,
         has_cu_seqlens_q: bool,
         has_seqused_q: bool,
         total_q: int,
         max_seqlen_q: int,
         num_m_blocks: int,
     ) -> bool:
+        """Use arithmetic scheduling for one uniform query row per request.
+
+        This invariant is independent of whether GQA heads are folded into the
+        query-row mode.  In particular, unpacked MHA should not pay the generic
+        varlen scheduler's prefix-sum walk merely to preserve its ordinary Q
+        loader.
+        """
         return (
             paged_kv
-            and pack_gqa
             and has_cu_seqlens_q
             and not has_seqused_q
             and max_seqlen_q == 1
@@ -732,7 +747,7 @@ class Sm120ForwardPolicy:
         head_dim_v: int,
         paged_kv: bool,
         max_seqlen_q: int,
-        pack_gqa: bool,
+        has_compact_q_groups: bool,
         packed_q_rows: int,
         tile_m: int,
         tile_n: int,
@@ -752,7 +767,7 @@ class Sm120ForwardPolicy:
             (head_dim, head_dim_v) == (256, 256)
             and paged_kv
             and max_seqlen_q == 1
-            and pack_gqa
+            and has_compact_q_groups
             and packed_q_rows <= 16
             and (tile_m, tile_n) == (16, 64)
             and num_n_blocks >= 1
@@ -768,7 +783,7 @@ class Sm120ForwardPolicy:
         batch_size: int,
         paged_kv: bool,
         max_seqlen_q: int,
-        pack_gqa: bool,
+        has_compact_q_groups: bool,
         packed_q_rows: int,
         is_split_kv: bool,
         direct_uniform_batch: bool,
@@ -783,7 +798,7 @@ class Sm120ForwardPolicy:
             and batch_size > 1
             and paged_kv
             and max_seqlen_q == 1
-            and pack_gqa
+            and has_compact_q_groups
             and packed_q_rows <= 16
             and is_split_kv
             and direct_uniform_batch

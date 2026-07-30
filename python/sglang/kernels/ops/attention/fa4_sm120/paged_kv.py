@@ -24,14 +24,14 @@ class Sm120PagedKVManager(ParamsBase):
     page_size_divmod: FastDivmodDivisor
     seqlen_k: Int32
     leftpad_k: Int32
-    n_block_size: Int32
+    n_block_size: cutlass.Constexpr[Int32]
     num_threads: cutlass.Constexpr[Int32]
     head_dim_padded: cutlass.Constexpr[Int32]
     head_dim_v_padded: cutlass.Constexpr[Int32]
 
     gmem_threads_per_row: cutlass.Constexpr[Int32]
-    page_entry_per_thread: Int32
-    async_copy_elems: Int32
+    page_entry_per_thread: cutlass.Constexpr[Int32]
+    async_copy_elems: cutlass.Constexpr[Int32]
 
     gmem_tiled_copy_KV: cute.TiledCopy
     gmem_thr_copy_KV: cute.TiledCopy
@@ -138,7 +138,7 @@ class Sm120PagedKVManager(ParamsBase):
     def compute_X_ptr(self, K_or_V: str):
         tPrXPtr = cute.make_rmem_tensor((self.page_entry_per_thread,), cutlass.Int64)
         mX = self.mK_paged if const_expr(K_or_V == "K") else self.mV_paged
-        for i in cutlass.range(self.page_entry_per_thread, unroll=1):
+        for i in cutlass.range_constexpr(self.page_entry_per_thread):
             page = self.tPrPage[i]
             page_offset = self.tPrPageOffset[i]
             # SGLang stores both paged K and paged V as

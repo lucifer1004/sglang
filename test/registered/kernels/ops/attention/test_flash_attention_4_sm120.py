@@ -1915,6 +1915,7 @@ def test_sm120_paged_decode_transpose_is_cache_order_independent():
     [
         pytest.param(6, True, True, False, id="transpose"),
         pytest.param(16, True, False, True, id="split-qk"),
+        pytest.param(1, None, False, True, id="auto-mha-split-qk"),
         pytest.param(6, False, False, False, id="single-qk"),
     ],
 )

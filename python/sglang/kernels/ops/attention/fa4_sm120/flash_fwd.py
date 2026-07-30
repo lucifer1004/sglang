@@ -333,18 +333,22 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
             return 64
 
         if shape == (32, 32):
-            # N256 trades one resident CTA for fewer mainloop iterations.
-            return 256 if has_steady_state_k_loop and fits_lpt_wave(256, 1) else 128
+            # N128 is robust across SM120 SKUs. N256's marginal single-CTA
+            # gain reverses under a nearly full hardware wave.
+            return 128
         if shape == (64, 64):
             if not has_steady_state_k_loop:
                 return 128
             return 192 if fits_lpt_wave(192, 1) else 64
         if shape == (96, 96):
-            # N64 has twice the residency of N128.
-            return 128 if fits_lpt_wave(128, 1) else 64
+            # N128's more efficient K loop wins even beyond one physical wave;
+            # the extra N64 residency does not recover its per-CTA deficit.
+            return 128
         if shape == (128, 128):
             return 128
-        return 96 if has_steady_state_k_loop else 64
+        # HD192 N96 is at best tied on the smaller SKU and regresses the larger
+        # one, so keep the zero-spill N64 configuration.
+        return 64
 
     @staticmethod
     def _smem_usage_in_bytes(
@@ -408,8 +412,9 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
         qualified_shape = (
             shape in FlashAttentionForwardSm120._qualified_wave_tile_shapes
         )
-        is_short_packed_q = (
-            pack_gqa
+        has_compact_q_groups = pack_gqa or (paged_kv and qhead_per_kvhead == 1)
+        is_short_compact_q = (
+            has_compact_q_groups
             and seqlen_q is not None
             and qhead_per_kvhead is not None
             and seqlen_q * qhead_per_kvhead <= 16
@@ -424,6 +429,17 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
                 window_size_right=window_size_right,
             )
         )
+        low_hd_m16_total_mblocks = None
+        if (
+            num_batch is not None
+            and num_head_kv is not None
+            and seqlen_q is not None
+            and qhead_per_kvhead is not None
+        ):
+            packed_q_rows = seqlen_q * qhead_per_kvhead
+            low_hd_m16_total_mblocks = (
+                num_batch * num_head_kv * ((packed_q_rows + 16 - 1) // 16)
+            )
         low_hd_tile_m = low_hd_paged_decode_tile_m(
             head_dim=head_dim,
             head_dim_v=head_dim_v,
@@ -431,11 +447,13 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
             seqlen_q=seqlen_q,
             visible_seqlen_k=visible_seqlen_k,
             qhead_per_kvhead=qhead_per_kvhead,
+            num_sms=num_sms,
+            total_mblocks=low_hd_m16_total_mblocks,
         )
         if low_hd_tile_m is not None:
             fallback_candidates = ((low_hd_tile_m, LOW_HD_DECODE_TILE_N, 1),)
         elif (head_dim, head_dim_v) == (256, 256):
-            if is_short_packed_q:
+            if is_short_compact_q:
                 fallback_candidates = (
                     (16, 64, 1),
                     (16, 80, 1),
@@ -488,7 +506,7 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
             and qhead_per_kvhead is not None
             and total_q_rows == seqlen_q * num_head_kv * qhead_per_kvhead
             and (is_causal or is_local)
-            and not is_short_packed_q
+            and not is_short_compact_q
         )
         candidates = fallback_candidates
         if can_select_qualified_tile:
@@ -534,7 +552,7 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
             and qhead_per_kvhead is not None
             and total_q_rows == seqlen_q * num_head_kv * qhead_per_kvhead
             and (is_causal or is_local)
-            and not is_short_packed_q
+            and not is_short_compact_q
         )
         if can_model_lpt:
             scores = {
