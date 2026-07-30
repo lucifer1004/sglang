@@ -21,11 +21,11 @@ from cutlass.cute.nvgpu import warp
 from cutlass.pipeline import PipelineAsync, PipelineState
 from quack import layout_utils
 
-from sglang.kernels.ops.attention.flash_attn.cute import utils
-from sglang.kernels.ops.attention.flash_attn.cute.block_info import BlockInfo
-from sglang.kernels.ops.attention.flash_attn.cute.flash_fwd_sm120 import (
+from sglang.kernels.ops.attention.fa4_sm120.flash_fwd import (
     FlashAttentionForwardSm120,
 )
+from sglang.kernels.ops.attention.flash_attn.cute import utils
+from sglang.kernels.ops.attention.flash_attn.cute.block_info import BlockInfo
 from sglang.kernels.ops.attention.flash_attn.cute.named_barrier import NamedBarrierFwd
 from sglang.kernels.ops.attention.flash_attn.cute.pack_gqa import PackGQA
 from sglang.kernels.ops.attention.flash_attn.cute.seqlen_info import SeqlenInfoQK
@@ -223,9 +223,7 @@ class FlashAttentionForwardSm120DecodeTranspose(FlashAttentionForwardSm120):
 
         cute.experimental.iket.range_push("transpose_qk_mma")
         thr_mma_qk = tiled_mma_qk.get_slice(lane_idx)
-        acc_shape_S = thr_mma_qk.partition_shape_C(
-            (16, self.query_mma_n)
-        )
+        acc_shape_S = thr_mma_qk.partition_shape_C((16, self.query_mma_n))
         acc_S = cute.make_rmem_tensor(acc_shape_S, Float32)
         acc_S.fill(0.0)
         self._gemm_n8(
@@ -265,30 +263,15 @@ class FlashAttentionForwardSm120DecodeTranspose(FlashAttentionForwardSm120):
                 if const_expr(self.is_local and window_size_left is not None)
                 else Int32(0)
             )
-            if (
-                tile_start + self.tile_n > seqlen.seqlen_k
-                or (
-                    const_expr(self.is_local and window_size_left is not None)
-                    and tile_start < local_window_start
-                )
+            if tile_start + self.tile_n > seqlen.seqlen_k or (
+                const_expr(self.is_local and window_size_left is not None)
+                and tile_start < local_window_start
             ):
-                for c in cutlass.range(
-                    cute.size(acc_S_qk, mode=[1]), unroll_full=True
-                ):
-                    key_row = (
-                        tile_start
-                        + key_row_base
-                        + tScS_qk[r, c][0]
-                    )
-                    if (
-                        key_row >= seqlen.seqlen_k
-                        or (
-                            const_expr(
-                                self.is_local
-                                and window_size_left is not None
-                            )
-                            and key_row < local_window_start
-                        )
+                for c in cutlass.range(cute.size(acc_S_qk, mode=[1]), unroll_full=True):
+                    key_row = tile_start + key_row_base + tScS_qk[r, c][0]
+                    if key_row >= seqlen.seqlen_k or (
+                        const_expr(self.is_local and window_size_left is not None)
+                        and key_row < local_window_start
                     ):
                         acc_S_qk[r, c] = -Float32.inf
 
@@ -302,9 +285,7 @@ class FlashAttentionForwardSm120DecodeTranspose(FlashAttentionForwardSm120):
             for offset in cutlass.range_constexpr(2, 5):
                 row_max = utils.fmax(
                     row_max,
-                    cute.arch.shuffle_sync_bfly(
-                        row_max, offset=1 << offset
-                    ),
+                    cute.arch.shuffle_sync_bfly(row_max, offset=1 << offset),
                 )
             row_max_safe = 0.0 if row_max == -Float32.inf else row_max
             acc_S_row_exp = cute.math.exp2(
@@ -313,9 +294,7 @@ class FlashAttentionForwardSm120DecodeTranspose(FlashAttentionForwardSm120):
             )
             row_sum = utils.fadd_reduce(acc_S_row_exp)
             for offset in cutlass.range_constexpr(2, 5):
-                row_sum += cute.arch.shuffle_sync_bfly(
-                    row_sum, offset=1 << offset
-                )
+                row_sum += cute.arch.shuffle_sync_bfly(row_sum, offset=1 << offset)
             row_max_local[r] = row_max
             row_sum_local[r] = row_sum
             acc_S_qk[r, None].store(acc_S_row_exp)
@@ -325,9 +304,7 @@ class FlashAttentionForwardSm120DecodeTranspose(FlashAttentionForwardSm120):
             for r in cutlass.range(num_query_rows, unroll_full=True):
                 query_row = tScS_qk[r, 0][1]
                 sRowScale[warp_idx, query_row] = row_max_local[r]
-                sRowScale[
-                    local_sum_base + warp_idx, query_row
-                ] = row_sum_local[r]
+                sRowScale[local_sum_base + warp_idx, query_row] = row_sum_local[r]
         cute.arch.fence_view_async_shared()
         cute.experimental.iket.range_pop()
 
@@ -340,9 +317,7 @@ class FlashAttentionForwardSm120DecodeTranspose(FlashAttentionForwardSm120):
             query_row = tidx
             row_max = sRowScale[0, query_row]
             for warp_idx_it in cutlass.range_constexpr(1, num_qk_warps):
-                row_max = utils.fmax(
-                    row_max, sRowScale[warp_idx_it, query_row]
-                )
+                row_max = utils.fmax(row_max, sRowScale[warp_idx_it, query_row])
             row_max_prev = (
                 row_max
                 if const_expr(is_first_n_block)
@@ -353,15 +328,12 @@ class FlashAttentionForwardSm120DecodeTranspose(FlashAttentionForwardSm120):
                 if const_expr(is_first_n_block)
                 else utils.fmax(row_max_prev, row_max)
             )
-            row_max_new_safe = (
-                0.0 if row_max_new == -Float32.inf else row_max_new
-            )
+            row_max_new_safe = 0.0 if row_max_new == -Float32.inf else row_max_new
             old_o_scale = (
                 1.0
                 if const_expr(is_first_n_block)
                 else cute.math.exp2(
-                    (row_max_prev - row_max_new_safe)
-                    * softmax_scale_log2,
+                    (row_max_prev - row_max_new_safe) * softmax_scale_log2,
                     fastmath=True,
                 )
             )
@@ -372,21 +344,13 @@ class FlashAttentionForwardSm120DecodeTranspose(FlashAttentionForwardSm120):
             )
             for warp_idx_it in cutlass.range_constexpr(num_qk_warps):
                 warp_scale = cute.math.exp2(
-                    (
-                        sRowScale[warp_idx_it, query_row]
-                        - row_max_new_safe
-                    )
+                    (sRowScale[warp_idx_it, query_row] - row_max_new_safe)
                     * softmax_scale_log2,
                     fastmath=True,
                 )
-                sRowScale[
-                    warp_scale_base + warp_idx_it, query_row
-                ] = warp_scale
+                sRowScale[warp_scale_base + warp_idx_it, query_row] = warp_scale
                 row_sum_new += (
-                    sRowScale[
-                        local_sum_base + warp_idx_it, query_row
-                    ]
-                    * warp_scale
+                    sRowScale[local_sum_base + warp_idx_it, query_row] * warp_scale
                 )
             sRowScale[global_max_row, query_row] = row_max_new
             sRowScale[global_sum_row, query_row] = row_sum_new
@@ -402,12 +366,8 @@ class FlashAttentionForwardSm120DecodeTranspose(FlashAttentionForwardSm120):
         cute.experimental.iket.range_push("transpose_p_store")
         for r in cutlass.range(num_query_rows, unroll_full=True):
             query_row = tScS_qk[r, 0][1]
-            warp_scale = sRowScale[
-                warp_scale_base + warp_idx, query_row
-            ]
-            acc_S_qk[r, None].store(
-                acc_S_qk[r, None].load() * warp_scale
-            )
+            warp_scale = sRowScale[warp_scale_base + warp_idx, query_row]
+            acc_S_qk[r, None].store(acc_S_qk[r, None].load() * warp_scale)
         if const_expr(self.use_stmatrix_p_store):
             # m16n8 accumulators already use the stmatrix row-fragment
             # register layout: each lane owns two adjacent N/query values for
@@ -425,9 +385,7 @@ class FlashAttentionForwardSm120DecodeTranspose(FlashAttentionForwardSm120):
             )
             rP = cute.make_rmem_tensor(num_query_rows, self.dtype)
             for key_half in cutlass.range_constexpr(2):
-                for r in cutlass.range(
-                    num_query_rows, unroll_full=True
-                ):
+                for r in cutlass.range(num_query_rows, unroll_full=True):
                     rP[r] = self.dtype(acc_S_qk[r, key_half])
                 address_row = lane_idx % self.query_mma_n
                 sP_row = cute.local_tile(
@@ -441,17 +399,11 @@ class FlashAttentionForwardSm120DecodeTranspose(FlashAttentionForwardSm120):
                 sP_address = cute.local_tile(sP_row, (2,), (0,))
                 cute.copy(smem_store_atom_P, rP, sP_address)
         else:
-            for r in cutlass.range(
-                num_query_rows, unroll_full=True
-            ):
+            for r in cutlass.range(num_query_rows, unroll_full=True):
                 query_row = tScS_qk[r, 0][1]
-                for c in cutlass.range(
-                    cute.size(acc_S_qk, mode=[1]), unroll_full=True
-                ):
+                for c in cutlass.range(cute.size(acc_S_qk, mode=[1]), unroll_full=True):
                     key_row = key_row_base + tScS_qk[r, c][0]
-                    sP[query_row, key_row, p_stage] = self.dtype(
-                        acc_S_qk[r, c]
-                    )
+                    sP[query_row, key_row, p_stage] = self.dtype(acc_S_qk[r, c])
         cute.arch.fence_view_async_shared()
         cute.experimental.iket.range_pop()
 
@@ -473,20 +425,12 @@ class FlashAttentionForwardSm120DecodeTranspose(FlashAttentionForwardSm120):
                 )
             else:
                 thr_mma_pv = tiled_mma_pv.get_slice(tidx)
-                cO = cute.make_identity_tensor(
-                    (self.tile_m, self.tile_hdimv)
-                )
-                tOcO_mn = layout_utils.reshape_acc_to_mn(
-                    thr_mma_pv.partition_C(cO)
-                )
+                cO = cute.make_identity_tensor((self.tile_m, self.tile_hdimv))
+                tOcO_mn = layout_utils.reshape_acc_to_mn(thr_mma_pv.partition_C(cO))
                 num_rows_pv = acc_O.shape[0][0] * acc_O.shape[1]
                 row_scale = cute.make_rmem_tensor(num_rows_pv, Float32)
-                for r in cutlass.range(
-                    cute.size(row_scale), unroll_full=True
-                ):
-                    row_scale[r] = sRowScale[
-                        old_o_scale_row, tOcO_mn[r, 0][0]
-                    ]
+                for r in cutlass.range(cute.size(row_scale), unroll_full=True):
+                    row_scale[r] = sRowScale[old_o_scale_row, tOcO_mn[r, 0][0]]
                 self._rescale_O(acc_O, row_scale)
 
         cute.experimental.iket.range_push("transpose_v_wait")
@@ -556,21 +500,15 @@ class FlashAttentionForwardSm120DecodeTranspose(FlashAttentionForwardSm120):
             thr_mma_pv.partition_C(cO), transpose=True
         )
         mO_cur = (
-            seqlen.offset_batch_Q(mO, batch_idx, dim=3)[
-                None, None, head_idx, split_idx
-            ]
+            seqlen.offset_batch_Q(mO, batch_idx, dim=3)[None, None, head_idx, split_idx]
             if const_expr(self.is_split_kv)
-            else seqlen.offset_batch_Q(mO, batch_idx, dim=3)[
-                None, None, head_idx
-            ]
+            else seqlen.offset_batch_Q(mO, batch_idx, dim=3)[None, None, head_idx]
         )
         for r in cutlass.range(cute.size(acc_O_qd, mode=[0]), unroll_full=True):
             query_row_local = tOcO_qd[r, 0][1]
             query_row = m_block * self.tile_m + query_row_local
             if query_row < row_limit:
-                for c in cutlass.range(
-                    cute.size(acc_O_qd, mode=[1]), unroll_full=True
-                ):
+                for c in cutlass.range(cute.size(acc_O_qd, mode=[1]), unroll_full=True):
                     value_col = warp_idx * const_expr(64) + tOcO_qd[r, c][0]
                     mO_cur[query_row, value_col] = self.dtype(acc_O_qd[r, c])
 
@@ -637,9 +575,7 @@ class FlashAttentionForwardSm120DecodeTranspose(FlashAttentionForwardSm120):
         assert self.qhead_per_kvhead <= self.query_mma_n
         assert is_qk_owner
 
-        mQ_cur = seqlen.offset_batch_Q(mQ, batch_idx, dim=3)[
-            None, None, head_idx
-        ]
+        mQ_cur = seqlen.offset_batch_Q(mQ, batch_idx, dim=3)[None, None, head_idx]
         warp_idx = tidx // cute.arch.WARP_SIZE
         lane_idx = tidx % cute.arch.WARP_SIZE
         thr_mma_qk = tiled_mma_qk.get_slice(lane_idx)
@@ -671,18 +607,18 @@ class FlashAttentionForwardSm120DecodeTranspose(FlashAttentionForwardSm120):
             smem_copy_atom_k_major, tiled_mma_qk
         ).get_slice(lane_idx)
         smem_thr_copy_V = (
-            utils.make_tiled_copy_A(
-                smem_copy_atom_v_major, tiled_mma_pv
-            ).get_slice(lane_idx)
+            utils.make_tiled_copy_A(smem_copy_atom_v_major, tiled_mma_pv).get_slice(
+                lane_idx
+            )
             if const_expr(self.transpose_pv)
             else utils.make_tiled_copy_B(
                 smem_copy_atom_v_major, tiled_mma_pv
             ).get_slice(tidx)
         )
         smem_thr_copy_P = (
-            utils.make_tiled_copy_B(
-                smem_copy_atom_k_major, tiled_mma_pv
-            ).get_slice(lane_idx)
+            utils.make_tiled_copy_B(smem_copy_atom_k_major, tiled_mma_pv).get_slice(
+                lane_idx
+            )
             if const_expr(self.transpose_pv)
             else utils.make_tiled_copy_A(
                 smem_copy_atom_k_major, tiled_mma_pv
@@ -694,9 +630,7 @@ class FlashAttentionForwardSm120DecodeTranspose(FlashAttentionForwardSm120):
             (16, self.tile_hdim, self._num_k_stages()),
             (warp_idx, 0, 0),
         )
-        sQ_query = cute.local_tile(
-            sQ, (self.query_mma_n, self.tile_hdim), (0, 0)
-        )
+        sQ_query = cute.local_tile(sQ, (self.query_mma_n, self.tile_hdim), (0, 0))
         sP_query = cute.local_tile(
             sP,
             (self.query_mma_n, self.tile_n, self._num_p_stages()),
@@ -705,9 +639,7 @@ class FlashAttentionForwardSm120DecodeTranspose(FlashAttentionForwardSm120):
         tSrK = thr_mma_qk.make_fragment_A(
             thr_mma_qk.partition_A(sK_warp[None, None, 0])
         )
-        tSrQ = thr_mma_qk.make_fragment_B(
-            thr_mma_qk.partition_B(sQ_query)
-        )
+        tSrQ = thr_mma_qk.make_fragment_B(thr_mma_qk.partition_B(sQ_query))
         if const_expr(self.transpose_pv):
             sV_warp = cute.local_tile(
                 sV,
@@ -725,9 +657,7 @@ class FlashAttentionForwardSm120DecodeTranspose(FlashAttentionForwardSm120):
             tOrP = thr_mma_pv.make_fragment_A(
                 thr_mma_pv.partition_A(sP_query[None, None, 0])
             )
-            tOrV = thr_mma_pv.make_fragment_B(
-                thr_mma_pv.partition_B(sV[None, None, 0])
-            )
+            tOrV = thr_mma_pv.make_fragment_B(thr_mma_pv.partition_B(sV[None, None, 0]))
             tVsV = smem_thr_copy_V.partition_S(sV)
         tKsK = smem_thr_copy_K.partition_S(sK_warp)
         tQsQ = smem_thr_copy_Q.partition_S(sQ_query)
@@ -843,30 +773,20 @@ class FlashAttentionForwardSm120DecodeTranspose(FlashAttentionForwardSm120):
             if query_row < row_limit:
                 if const_expr(learnable_sink is not None):
                     if const_expr(not self.is_split_kv) or split_idx == 0:
-                        q_head_idx = (
-                            query_row
-                            + head_idx * self.qhead_per_kvhead
-                        )
+                        q_head_idx = query_row + head_idx * self.qhead_per_kvhead
                         sink_val = Float32(learnable_sink[q_head_idx])
                         log2_e = math.log2(math.e)
                         if row_max == -Float32.inf:
-                            row_max = sink_val * (
-                                log2_e / softmax_scale_log2
-                            )
+                            row_max = sink_val * (log2_e / softmax_scale_log2)
                             row_sum = 1.0
                         else:
                             row_sum += cute.math.exp2(
-                                sink_val * log2_e
-                                - row_max * softmax_scale_log2,
+                                sink_val * log2_e - row_max * softmax_scale_log2,
                                 fastmath=True,
                             )
-                row_sum_is_zero_or_nan = (
-                    row_sum == 0.0 or row_sum != row_sum
-                )
-                sRowScale[final_scale_row, query_row] = (
-                    cute.arch.rcp_approx(
-                        row_sum if not row_sum_is_zero_or_nan else 1.0
-                    )
+                row_sum_is_zero_or_nan = row_sum == 0.0 or row_sum != row_sum
+                sRowScale[final_scale_row, query_row] = cute.arch.rcp_approx(
+                    row_sum if not row_sum_is_zero_or_nan else 1.0
                 )
                 sLSE[query_row] = (
                     (
@@ -907,18 +827,12 @@ class FlashAttentionForwardSm120DecodeTranspose(FlashAttentionForwardSm120):
                 split_idx,
             )
         else:
-            cO = cute.make_identity_tensor(
-                (self.tile_m, self.tile_hdimv)
-            )
-            tOcO_mn = layout_utils.reshape_acc_to_mn(
-                thr_mma_pv.partition_C(cO)
-            )
+            cO = cute.make_identity_tensor((self.tile_m, self.tile_hdimv))
+            tOcO_mn = layout_utils.reshape_acc_to_mn(thr_mma_pv.partition_C(cO))
             num_rows_pv = acc_O.shape[0][0] * acc_O.shape[1]
             row_scale = cute.make_rmem_tensor(num_rows_pv, Float32)
             lse = cute.make_rmem_tensor(num_rows_pv, Float32)
-            for r in cutlass.range(
-                cute.size(row_scale), unroll_full=True
-            ):
+            for r in cutlass.range(cute.size(row_scale), unroll_full=True):
                 row = tOcO_mn[r, 0][0]
                 row_scale[r] = sRowScale[final_scale_row, row]
                 lse[r] = sLSE[row]

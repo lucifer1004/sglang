@@ -1,5 +1,5 @@
 # Copyright (c) 2026, SGLang Team.
-"""SM120-only schedulers used by forward-kernel specializations."""
+"""Schedulers owned by the SGLang SM120 FA4 implementation."""
 
 from dataclasses import dataclass
 from typing import Tuple
@@ -38,8 +38,9 @@ class Sm120UniformBatchScheduler:
         def create(
             args: TileSchedulerArguments, *, loc=None, ip=None
         ) -> "Sm120UniformBatchScheduler.Params":
-            assert (
-                args.cluster_shape_mn == (1, 1)
+            assert args.cluster_shape_mn == (
+                1,
+                1,
             ), "SM120 uniform-batch scheduling requires a 1x1 cluster"
             return Sm120UniformBatchScheduler.Params(
                 num_head=args.num_head,
@@ -85,9 +86,7 @@ class Sm120UniformBatchScheduler:
         params: Params, clc=None, *, loc=None, ip=None
     ) -> "Sm120UniformBatchScheduler":
         tile_idx, split_idx, _ = cute.arch.block_idx()
-        return Sm120UniformBatchScheduler(
-            params, tile_idx, split_idx, loc=loc, ip=ip
-        )
+        return Sm120UniformBatchScheduler(params, tile_idx, split_idx, loc=loc, ip=ip)
 
     @staticmethod
     @cute.jit
@@ -112,7 +111,9 @@ class Sm120UniformBatchScheduler:
         mh_block = self._tile_idx - batch_idx * mh_blocks_per_batch
         block = mh_block // params.num_head
         head_idx = mh_block - block * params.num_head
-        split_idx = self._split_idx if cutlass.const_expr(params.is_split_kv) else Int32(0)
+        split_idx = (
+            self._split_idx if cutlass.const_expr(params.is_split_kv) else Int32(0)
+        )
         return WorkTileInfo(
             (Int32(block), Int32(head_idx), Int32(batch_idx), split_idx),
             self._is_first_block,

@@ -5,12 +5,12 @@ import math
 import pytest
 import torch
 
+from sglang.kernels.ops.attention.fa4_sm120.runtime import (
+    Sm120ForwardHost,
+)
 from sglang.kernels.ops.attention.flash_attention_v4 import (
     flash_attn_varlen_func,
     flash_attn_with_kvcache,
-)
-from sglang.kernels.ops.attention.flash_attn.cute.flash_fwd_sm120_host import (
-    Sm120ForwardHost,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 

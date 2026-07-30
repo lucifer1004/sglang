@@ -57,7 +57,7 @@ from sglang.kernels.ops.attention.flash_attn.cute.flash_fwd_sm100 import (
     DescaleTensors,
     FlashAttentionForwardSm100,
 )
-from sglang.kernels.ops.attention.flash_attn.cute.flash_fwd_host import (
+from sglang.kernels.ops.attention.fa4_sm120.dispatch import (
     clear_forward_host_caches,
     get_forward_host,
     try_cached_paged_decode,

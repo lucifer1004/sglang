@@ -21,10 +21,10 @@ from typing import Callable, Optional
 import torch
 from cutlass import Int32
 
-from sglang.kernels.ops.attention.flash_attn.cute import fa_logging
-from sglang.kernels.ops.attention.flash_attn.cute.flash_fwd_sm120 import (
+from sglang.kernels.ops.attention.fa4_sm120.flash_fwd import (
     FlashAttentionForwardSm120,
 )
+from sglang.kernels.ops.attention.flash_attn.cute import fa_logging
 from sglang.kernels.ops.attention.flash_attn.cute.utils import AuxData
 
 _LAUNCH_PLAN_CAPACITY = 4096
@@ -125,9 +125,7 @@ def _get_decode_hardware(device: torch.device) -> _DecodeHardware:
     memory_bus_width = properties.memory_bus_width
     # CUDA reports the physical memory clock in kHz. Account for DDR and
     # convert bus bits to bytes: kHz * 1000 * 2 * (bits / 8) / 1e9.
-    peak_memory_gbps = (
-        properties.memory_clock_rate * memory_bus_width / 4_000_000
-    )
+    peak_memory_gbps = properties.memory_clock_rate * memory_bus_width / 4_000_000
     return _DecodeHardware(
         num_sms=properties.multi_processor_count,
         memory_channels=max(1, memory_bus_width // 32),
@@ -140,9 +138,7 @@ def _normalize_num_splits(num_splits: int, num_n_blocks: int) -> int:
     if num_splits <= 1 or num_n_blocks <= 1:
         return 1
     requested_splits = min(num_splits, num_n_blocks)
-    blocks_per_split = (
-        num_n_blocks + requested_splits - 1
-    ) // requested_splits
+    blocks_per_split = (num_n_blocks + requested_splits - 1) // requested_splits
     return (num_n_blocks + blocks_per_split - 1) // blocks_per_split
 
 
@@ -162,9 +158,7 @@ def _predict_decode_split_us(
     num_m_blocks = (packed_q_rows + tile_m - 1) // tile_m
     batch_head_groups = total_mblocks // num_m_blocks
     main_ctas = total_mblocks * num_splits
-    kv_tiles_per_cta = (
-        num_n_blocks + num_splits - 1
-    ) // num_splits
+    kv_tiles_per_cta = (num_n_blocks + num_splits - 1) // num_splits
     clock_scale = _DECODE_REFERENCE_CORE_GHZ / hardware.core_clock_ghz
     latency_main_us = (
         _DECODE_LATENCY_FIXED_REF_US
@@ -173,10 +167,7 @@ def _predict_decode_split_us(
     ctas_per_channel = main_ctas / hardware.memory_channels
     memory_fill = max(
         1e-6,
-        1.0
-        - math.exp(
-            -ctas_per_channel / _DECODE_UNDERFILL_TAU_CTAS_PER_CHANNEL
-        ),
+        1.0 - math.exp(-ctas_per_channel / _DECODE_UNDERFILL_TAU_CTAS_PER_CHANNEL),
     )
     logical_kv_bytes = (
         batch_head_groups
@@ -185,9 +176,7 @@ def _predict_decode_split_us(
         * (head_dim + head_dim_v)
         * element_size
     )
-    theoretical_transfer_us = (
-        logical_kv_bytes / hardware.peak_memory_gbps / 1000.0
-    )
+    theoretical_transfer_us = logical_kv_bytes / hardware.peak_memory_gbps / 1000.0
     memory_main_us = (
         _DECODE_MEMORY_FIXED_REF_US * clock_scale
         + theoretical_transfer_us / _DECODE_MEMORY_SOL / memory_fill
@@ -196,9 +185,7 @@ def _predict_decode_split_us(
     if num_splits == 1:
         return main_us
     output_rows = batch_head_groups * packed_q_rows
-    combine_ctas = ((output_rows + 7) // 8) * (
-        (head_dim_v + 127) // 128
-    )
+    combine_ctas = ((output_rows + 7) // 8) * ((head_dim_v + 127) // 128)
     combine_us = (
         _DECODE_COMBINE_FIXED_US
         + _DECODE_COMBINE_SPLIT_TO_8_US * min(num_splits, 8)
@@ -313,7 +300,7 @@ class Sm120ForwardPolicy:
     @staticmethod
     @lru_cache(maxsize=1)
     def implementation_token() -> tuple:
-        from sglang.kernels.ops.attention.flash_attn.cute.flash_fwd_sm120_decode_transpose import (
+        from sglang.kernels.ops.attention.fa4_sm120.flash_fwd_decode import (
             FlashAttentionForwardSm120DecodeTranspose,
         )
 
@@ -582,9 +569,7 @@ class Sm120ForwardPolicy:
             )
             if is_hd256_paged_decode:
                 if fake_mode:
-                    max_splits = min(
-                        128, 1 << (num_sms.bit_length() - 1)
-                    )
+                    max_splits = min(128, 1 << (num_sms.bit_length() - 1))
                     num_splits = generic_heuristic(
                         total_mblocks,
                         num_sms,
@@ -836,7 +821,7 @@ class Sm120ForwardPolicy:
             )
         Kernel = FlashAttentionForwardSm120
         if plan.transpose_qk_pv:
-            from sglang.kernels.ops.attention.flash_attn.cute.flash_fwd_sm120_decode_transpose import (
+            from sglang.kernels.ops.attention.fa4_sm120.flash_fwd_decode import (
                 FlashAttentionForwardSm120DecodeTranspose,
             )
 

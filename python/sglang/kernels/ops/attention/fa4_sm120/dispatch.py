@@ -1,9 +1,8 @@
 # Copyright (c) 2026, SGLang Team.
-"""Architecture-host registry for FA4 forward kernels.
+"""Lightweight dispatch bridge for SGLang-owned SM120 FA4 kernels.
 
-The public interface dispatches through this module so architecture-specific
-policy, launch caches, and implementation imports remain outside
-``interface.py``.
+The vendored FA4 interface dispatches through this module so the SM120
+implementation and its launch state remain outside ``flash_attn/cute``.
 """
 
 from functools import lru_cache
@@ -13,7 +12,7 @@ from functools import lru_cache
 def get_forward_host(arch: int):
     """Return the optional architecture-owned forward host."""
     if arch // 10 == 12:
-        from sglang.kernels.ops.attention.flash_attn.cute.flash_fwd_sm120_host import (
+        from sglang.kernels.ops.attention.fa4_sm120.runtime import (
             sm120_forward_host,
         )
 

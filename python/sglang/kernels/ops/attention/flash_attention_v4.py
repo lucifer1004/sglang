@@ -17,11 +17,11 @@ try:
         _flash_attn_fwd = None
         _supports_sm120_paged_decode = None
     else:
+        from sglang.kernels.ops.attention.fa4_sm120.runtime import (
+            supports_sm120_paged_decode as _supports_sm120_paged_decode,
+        )
         from sglang.kernels.ops.attention.flash_attn.cute import (
             flash_attn_varlen_func as _flash_attn_varlen_func,
-        )
-        from sglang.kernels.ops.attention.flash_attn.cute.flash_fwd_sm120_host import (
-            supports_sm120_paged_decode as _supports_sm120_paged_decode,
         )
         from sglang.kernels.ops.attention.flash_attn.cute.interface import (
             _flash_attn_fwd,
