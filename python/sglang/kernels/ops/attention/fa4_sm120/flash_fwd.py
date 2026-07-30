@@ -76,6 +76,9 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
         paged_kv: bool = False,
         split_qk_n: bool = False,
         split_kv_blocks_per_cta: int = 0,
+        has_bias: bool = False,
+        bias_block_size: int = 64,
+        rel_extent_padded: int = 128,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -83,6 +86,17 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
         self.paged_kv = paged_kv
         self.split_qk_n = split_qk_n
         self.split_kv_blocks_per_cta = split_kv_blocks_per_cta
+        self.has_bias = has_bias
+        self.bias_block_size = bias_block_size
+        self.rel_extent_padded = rel_extent_padded
+        if has_bias:
+            assert not self._uses_split_pv_warps()
+            assert self.tile_n == 128
+            assert 0 < bias_block_size <= self.tile_m
+            assert bias_block_size % 8 == 0
+            assert rel_extent_padded >= 128
+            assert rel_extent_padded % 128 == 0
+        self.bias_n_max = rel_extent_padded // self.tile_n if has_bias else 0
 
     @cute.jit
     def _get_n_block_min_max(
@@ -781,6 +795,17 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
                 (self.tile_m, self.tile_n, self._num_p_stages()),
                 (0, 1, 2),
             )
+        if const_expr(self.has_bias):
+            sBias_layout_atom = self._make_smem_layout_atom(
+                self.dtype, self.tile_n, is_k_major=True
+            )
+            self.sBias_layout = cute.tile_to_shape(
+                sBias_layout_atom,
+                (self.bias_block_size, self.tile_n, self.num_stages),
+                (0, 1, 2),
+            )
+        else:
+            self.sBias_layout = None
 
     @staticmethod
     def _make_smem_layout_atom(
@@ -893,6 +918,14 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
             ],
             1024,
         ]
+        mbar_Bias_struct = cute.struct.MemRange[cutlass.Int64, self.num_stages * 2]
+        sBias_struct = cute.struct.Align[
+            cute.struct.MemRange[
+                self.dtype,
+                cute.cosize(self.sBias_layout) if const_expr(self.has_bias) else 0,
+            ],
+            1024,
+        ]
 
         @cute.struct
         class SharedStorage:
@@ -907,7 +940,22 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
             sQ: sQ_struct
             sK: sK_struct
 
-        return SharedStorage
+        @cute.struct
+        class SharedStorageBias:
+            mbar_Q: mbar_Q_struct
+            mbar_K: mbar_K_struct
+            mbar_V: mbar_V_struct
+            mbar_P: mbar_P_struct
+            mbar_final: mbar_final_struct
+            mbar_Bias: mbar_Bias_struct
+            softmax_stats: softmax_stats_struct
+            sP: sP_struct
+            sV: sV_struct
+            sQ: sQ_struct
+            sK: sK_struct
+            sBias: sBias_struct
+
+        return SharedStorageBias if const_expr(self.has_bias) else SharedStorage
 
     @cute.jit
     def __call__(
@@ -928,10 +976,12 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
         learnable_sink: Optional[cute.Tensor] = None,
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
         aux_data: AuxData = AuxData(),
+        mBias: Optional[cute.Tensor] = None,
         launch_split_combine_early: Int32 = Int32(0),
         stream: cuda.CUstream = None,
     ):
         assert blocksparse_tensors is None, "Block sparsity is not supported on SM120"
+        assert (mBias is not None) == self.has_bias
         assert (
             mPageTable is None or self.paged_kv
         ), "SM120 paged KV requires the dedicated DMA-warp specialization"
@@ -966,6 +1016,9 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
         SharedStorage = self._get_shared_storage_cls()
 
         mQ, mK, mV, mO = [assume_tensor_aligned(t) for t in (mQ, mK, mV, mO)]
+        if const_expr(mBias is not None):
+            assert mBias.element_type == self.dtype
+            mBias = assume_tensor_aligned(mBias)
         Q_layout_transpose = (
             [1, 3, 2, 0] if const_expr(mCuSeqlensQ is None) else [0, 2, 1]
         )
@@ -975,6 +1028,11 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
         mQ = cute.make_tensor(
             mQ.iterator, cute.select(mQ.layout, mode=Q_layout_transpose)
         )
+        if const_expr(mBias is not None):
+            mBias = cute.make_tensor(
+                mBias.iterator,
+                cute.select(mBias.layout, mode=Q_layout_transpose),
+            )
         mK, mV = [
             cute.make_tensor(
                 t.iterator, cute.select(t.layout, mode=KV_layout_transpose)
@@ -1019,6 +1077,10 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
                 mLSE = pack_gqa_layout(
                     mLSE, self.qhead_per_kvhead, nheads_kv, head_idx=1
                 )
+            if const_expr(mBias is not None):
+                mBias = pack_gqa_layout(
+                    mBias, self.qhead_per_kvhead, nheads_kv, head_idx=2
+                )
 
         if const_expr(mPageTable is None or self.paged_tma):
             tma_copy_op = cpasync.CopyBulkTensorTileG2SOp()
@@ -1056,6 +1118,21 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
             tma_atom_V = None
             tma_tensor_K = mK
             tma_tensor_V = mV
+        if const_expr(self.has_bias):
+            tma_atom_Bias, tma_tensor_Bias = cpasync.make_tiled_tma_atom(
+                cpasync.CopyBulkTensorTileG2SOp(),
+                mBias,
+                cute.select(self.sBias_layout, mode=[0, 1]),
+                (self.bias_block_size, self.tile_n),
+                1,
+            )
+            self.tma_copy_bytes_Bias = cute.size_in_bytes(
+                mBias.element_type,
+                cute.select(self.sBias_layout, mode=[0, 1]),
+            )
+        else:
+            tma_atom_Bias = None
+            tma_tensor_Bias = mBias
 
         is_varlen = const_expr(mCuSeqlensQ is not None or mSeqUsedQ is not None)
         num_batch = (
@@ -1096,9 +1173,14 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
             scheduling_mode=SchedulingMode.STATIC,
         )
         grid_dim = TileScheduler.get_grid_shape(tile_sched_params)
-        softmax_scale_log2, softmax_scale = utils.compute_softmax_scale_log2(
-            softmax_scale, self.score_mod
-        )
+        if const_expr(self.has_bias):
+            base_softmax_scale = softmax_scale
+            softmax_scale_log2, softmax_scale = utils.LOG2_E, None
+        else:
+            base_softmax_scale = None
+            softmax_scale_log2, softmax_scale = utils.compute_softmax_scale_log2(
+                softmax_scale, self.score_mod
+            )
         window_size_left = (
             Int32(window_size_left) if window_size_left is not None else None
         )
@@ -1125,10 +1207,13 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
             mSeqUsedQ,
             mSeqUsedK,
             mPageTable,
+            tma_tensor_Bias,
             tma_atom_K,
             tma_atom_V,
+            tma_atom_Bias,
             softmax_scale_log2,
             softmax_scale,
+            base_softmax_scale,
             window_size_left,
             window_size_right,
             learnable_sink,
@@ -1137,6 +1222,7 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
             self.sV_layout,
             self.sO_layout,
             self.sP_layout,
+            self.sBias_layout,
             self.gmem_tiled_copy_Q,
             self.gmem_tiled_copy_O,
             tiled_mma_qk,
@@ -1153,6 +1239,11 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
             smem=SharedStorage.size_in_bytes(),
             stream=stream,
             min_blocks_per_mp=1,
+            # The immediately preceding ShearingBias grid releases this
+            # dependent launch before all of its CTAs have retired. Bias
+            # readers synchronize before their first TMA issue below; the
+            # remaining kernel prologue can overlap the tail of the shear.
+            use_pdl=self.has_bias,
         )
 
     @cute.kernel
@@ -1168,10 +1259,13 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
         mSeqUsedQ: Optional[cute.Tensor],
         mSeqUsedK: Optional[cute.Tensor],
         mPageTable: Optional[cute.Tensor],
+        mBias: Optional[cute.Tensor],
         tma_atom_K: Optional[cute.CopyAtom],
         tma_atom_V: Optional[cute.CopyAtom],
+        tma_atom_Bias: Optional[cute.CopyAtom],
         softmax_scale_log2: Float32,
         softmax_scale: Optional[Float32],
+        base_softmax_scale: Optional[Float32],
         window_size_left: Optional[Int32],
         window_size_right: Optional[Int32],
         learnable_sink: Optional[cute.Tensor],
@@ -1180,6 +1274,7 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
         sV_layout: cute.ComposedLayout,
         sO_layout: cute.ComposedLayout,
         sP_layout: cute.ComposedLayout | None,
+        sBias_layout: cute.ComposedLayout | None,
         gmem_tiled_copy_Q: cute.TiledCopy,
         gmem_tiled_copy_O: cute.TiledCopy,
         tiled_mma_qk: cute.TiledMma,
@@ -1202,6 +1297,9 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
             if warp_idx == 0:
                 cpasync.prefetch_descriptor(tma_atom_K)
                 cpasync.prefetch_descriptor(tma_atom_V)
+        if const_expr(self.has_bias):
+            if warp_idx == 0:
+                cpasync.prefetch_descriptor(tma_atom_Bias)
 
         smem = cutlass.utils.SmemAllocator()
         storage = smem.allocate(SharedStorage)
@@ -1209,6 +1307,11 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
         sK = storage.sK.get_tensor(sK_layout.outer, swizzle=sK_layout.inner)
         sV = storage.sV.get_tensor(sV_layout.outer, swizzle=sV_layout.inner)
         sO = storage.sQ.get_tensor(sO_layout.outer, swizzle=sO_layout.inner)
+        sBias = (
+            storage.sBias.get_tensor(sBias_layout.outer, swizzle=sBias_layout.inner)
+            if const_expr(self.has_bias)
+            else None
+        )
         sP = None
         sRowScale = None
         sFinalScale = None
@@ -1289,6 +1392,18 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
                 barrier_storage=storage.mbar_V.data_ptr(),
                 defer_sync=True,
             )
+        pipeline_bias = (
+            PipelineTmaAsync.create(
+                num_stages=self.num_stages,
+                producer_group=tma_group,
+                consumer_group=qk_group,
+                tx_count=self.tma_copy_bytes_Bias,
+                barrier_storage=storage.mbar_Bias.data_ptr(),
+                defer_sync=True,
+            )
+            if const_expr(self.has_bias)
+            else None
+        )
         pipeline_p = None
         pipeline_final = None
         if const_expr(sP_layout is not None):
@@ -1434,6 +1549,7 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
                                 tidx - self.num_dma_threads,
                                 softmax_scale_log2,
                                 softmax_scale,
+                                base_softmax_scale,
                                 tile_scheduler,
                                 mCuSeqlensQ,
                                 mCuSeqlensK,
@@ -1471,6 +1587,7 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
                             tidx - self.num_dma_threads,
                             softmax_scale_log2,
                             softmax_scale,
+                            base_softmax_scale,
                             tile_scheduler,
                             mCuSeqlensQ,
                             mCuSeqlensK,
@@ -1508,6 +1625,7 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
                             tidx - self.num_dma_threads,
                             softmax_scale_log2,
                             softmax_scale,
+                            base_softmax_scale,
                             tile_scheduler,
                             mCuSeqlensQ,
                             mCuSeqlensK,
@@ -1604,6 +1722,10 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
                             mSeqUsedK,
                             window_size_left,
                             window_size_right,
+                            mBias=mBias,
+                            sBias=sBias,
+                            tma_atom_Bias=tma_atom_Bias,
+                            pipeline_bias=pipeline_bias,
                         )
                     else:
                         self.load_paged_persistent(
@@ -1624,6 +1746,10 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
                             window_size_left,
                             window_size_right,
                             tidx,
+                            mBias=mBias,
+                            sBias=sBias,
+                            tma_atom_Bias=tma_atom_Bias,
+                            pipeline_bias=pipeline_bias,
                         )
                     cute.experimental.iket.range_pop()
                 elif warp_idx <= self.num_threads // cute.arch.WARP_SIZE:
@@ -1650,6 +1776,7 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
                         tidx - self.num_dma_threads,
                         softmax_scale_log2,
                         softmax_scale,
+                        base_softmax_scale,
                         tile_scheduler,
                         mCuSeqlensQ,
                         mCuSeqlensK,
@@ -1661,6 +1788,8 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
                         True,
                         aux_data,
                         fastdiv_mods,
+                        sBias=sBias,
+                        pipeline_bias=pipeline_bias,
                     )
                     cute.experimental.iket.range_pop()
 
@@ -1726,6 +1855,27 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
                             )
 
     @cute.jit
+    def _get_bias_load_info(
+        self,
+        block_info: BlockInfo,
+        seqlen: SeqlenInfoQK,
+        m_block: Int32,
+        n_block_min: Int32,
+        n_block_max: Int32,
+    ):
+        """Map the split-local right edge to the pre-sheared bias blocks."""
+        _, n_block_max_abs = block_info.get_n_block_min_max(
+            seqlen, m_block, absolute=True
+        )
+        bias_idx_offset = n_block_max_abs - n_block_max
+        bias_max_idx = self.bias_n_max - 1 - bias_idx_offset
+        num_bias_loads = min(
+            self.bias_n_max - bias_idx_offset,
+            n_block_max - n_block_min,
+        )
+        return bias_max_idx, num_bias_loads
+
+    @cute.jit
     def load_tma_persistent(
         self,
         mK: cute.Tensor,
@@ -1744,6 +1894,10 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
         mSeqUsedK: Optional[cute.Tensor],
         window_size_left: Optional[Int32],
         window_size_right: Optional[Int32],
+        mBias: Optional[cute.Tensor] = None,
+        sBias: Optional[cute.Tensor] = None,
+        tma_atom_Bias: Optional[cute.CopyAtom] = None,
+        pipeline_bias: Optional[PipelineAsync] = None,
     ):
         producer_state_k = PipelineState(
             self._num_k_stages(), Int32(0), Int32(0), Int32(1)
@@ -1788,6 +1942,15 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
         head_idx_kv = (
             head_idx if const_expr(self.pack_gqa) else head_idx // self.qhead_per_kvhead
         )
+        bias_max_idx, num_bias_loads = Int32(0), Int32(0)
+        if const_expr(self.has_bias):
+            bias_max_idx, num_bias_loads = self._get_bias_load_info(
+                block_info,
+                seqlen,
+                m_block,
+                n_block_min,
+                n_block_max,
+            )
         producer_state_k, producer_state_v = self.load_tma(
             mK,
             mV,
@@ -1804,6 +1967,14 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
             n_block_max,
             head_idx_kv,
             batch_idx,
+            mBias,
+            sBias,
+            tma_atom_Bias,
+            pipeline_bias,
+            m_block,
+            head_idx,
+            bias_max_idx,
+            num_bias_loads,
         )
 
         pipeline_k.producer_tail(producer_state_k)
@@ -1829,6 +2000,10 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
         window_size_left: Optional[Int32],
         window_size_right: Optional[Int32],
         tidx: Int32,
+        mBias: Optional[cute.Tensor] = None,
+        sBias: Optional[cute.Tensor] = None,
+        tma_atom_Bias: Optional[cute.CopyAtom] = None,
+        pipeline_bias: Optional[PipelineAsync] = None,
     ):
         producer_state_k = PipelineState(
             self._num_k_stages(), Int32(0), Int32(0), Int32(1)
@@ -1873,6 +2048,34 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
         head_idx_kv = (
             head_idx if const_expr(self.pack_gqa) else head_idx // self.qhead_per_kvhead
         )
+        bias_max_idx, num_bias_loads = Int32(0), Int32(0)
+        if const_expr(self.has_bias):
+            bias_max_idx, num_bias_loads = self._get_bias_load_info(
+                block_info,
+                seqlen,
+                m_block,
+                n_block_min,
+                n_block_max,
+            )
+            mBias_cur = seqlen.offset_batch_Q(mBias, batch_idx, dim=3)[
+                None, None, head_idx
+            ]
+            gBias = cute.local_tile(
+                mBias_cur,
+                (self.bias_block_size, self.tile_n),
+                (None, None),
+            )
+            tBsBias, tBgBias = cpasync.tma_partition(
+                tma_atom_Bias,
+                0,
+                cute.make_layout(1),
+                cute.group_modes(sBias, 0, 2),
+                cute.group_modes(gBias, 0, 2),
+            )
+            # Worktiles outside the materialized relative-bias band issue no
+            # bias TMA and therefore need not wait on the shear producer.
+            if num_bias_loads > 0:
+                cute.arch.griddepcontrol_wait()
         if const_expr(self.paged_tma):
             mK_cur = mK[None, None, head_idx_kv, None]
             mV_cur = mV[None, None, head_idx_kv, None]
@@ -1905,6 +2108,18 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
                 n_block = cutlass.max(n_block_max - 1 - n_tile, n_block_min)
                 page_idx = mPageTable[batch_idx, n_block]
 
+                if const_expr(self.has_bias):
+                    if n_tile < num_bias_loads:
+                        pipeline_bias.producer_acquire(producer_state_k)
+                        cute.copy(
+                            tma_atom_Bias,
+                            tBgBias[None, m_block, bias_max_idx - n_tile],
+                            tBsBias[None, producer_state_k.index],
+                            tma_bar_ptr=pipeline_bias.producer_get_barrier(
+                                producer_state_k
+                            ),
+                        )
+                        pipeline_bias.producer_commit(producer_state_k)
                 pipeline_k.producer_acquire(producer_state_k)
                 copy_K(
                     src_idx=page_idx,
@@ -1951,6 +2166,18 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
             n_block = cutlass.max(n_block_max - 1 - n_tile, n_block_min)
             paged_kv_manager.load_page_table(n_block)
 
+            if const_expr(self.has_bias):
+                if n_tile < num_bias_loads:
+                    pipeline_bias.producer_acquire(producer_state_k)
+                    cute.copy(
+                        tma_atom_Bias,
+                        tBgBias[None, m_block, bias_max_idx - n_tile],
+                        tBsBias[None, producer_state_k.index],
+                        tma_bar_ptr=pipeline_bias.producer_get_barrier(
+                            producer_state_k
+                        ),
+                    )
+                    pipeline_bias.producer_commit(producer_state_k)
             pipeline_k.producer_acquire(producer_state_k)
             paged_kv_manager.load_KV(
                 n_block,
@@ -2771,6 +2998,7 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
         tidx: Int32,
         softmax_scale_log2: Float32,
         softmax_scale: Optional[Float32],
+        base_softmax_scale: Optional[Float32],
         tile_scheduler: TileSchedulerProtocol,
         mCuSeqlensQ: Optional[cute.Tensor],
         mCuSeqlensK: Optional[cute.Tensor],
@@ -2782,6 +3010,8 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
         is_qk_owner: cutlass.Constexpr[bool],
         aux_data: AuxData = AuxData(),
         fastdiv_mods=None,
+        sBias: Optional[cute.Tensor] = None,
+        pipeline_bias: Optional[PipelineAsync] = None,
     ):
         consumer_state = PipelineState(self.num_stages, Int32(0), Int32(0), Int32(0))
         block_info = BlockInfo(
@@ -2822,7 +3052,8 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
             split_idx,
             tile_scheduler.params.num_splits,
         )
-        self.mma(
+        mma_fn = partial(
+            self.mma,
             mQ,
             mO,
             mLSE,
@@ -2856,6 +3087,14 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
             aux_data,
             fastdiv_mods,
         )
+        if const_expr(self.has_bias):
+            mma_fn(
+                base_softmax_scale=base_softmax_scale,
+                sBias=sBias,
+                pipeline_bias=pipeline_bias,
+            )
+        else:
+            mma_fn()
 
     @cute.jit
     def load_tma(
@@ -2875,6 +3114,14 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
         n_block_max: Int32,
         head_idx: Int32,
         batch_idx: Int32,
+        mBias: Optional[cute.Tensor] = None,
+        sBias: Optional[cute.Tensor] = None,
+        tma_atom_Bias: Optional[cute.CopyAtom] = None,
+        pipeline_bias: Optional[PipelineAsync] = None,
+        m_block: Int32 = Int32(0),
+        bias_head_idx: Int32 = Int32(0),
+        bias_max_idx: Int32 = Int32(0),
+        num_bias_loads: Int32 = Int32(0),
     ):
         if const_expr(not seqlen.has_cu_seqlens_k):
             mK_cur = mK[None, None, head_idx, batch_idx]
@@ -2890,9 +3137,39 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
         copy_V, _, _ = copy_utils.tma_get_copy_fn(
             tma_atom_V, 0, cute.make_layout(1), gV, sV
         )
+        if const_expr(self.has_bias):
+            mBias_cur = seqlen.offset_batch_Q(mBias, batch_idx, dim=3)[
+                None, None, bias_head_idx
+            ]
+            gBias = cute.local_tile(
+                mBias_cur,
+                (self.bias_block_size, self.tile_n),
+                (None, None),
+            )
+            tBsBias, tBgBias = cpasync.tma_partition(
+                tma_atom_Bias,
+                0,
+                cute.make_layout(1),
+                cute.group_modes(sBias, 0, 2),
+                cute.group_modes(gBias, 0, 2),
+            )
+            if num_bias_loads > 0:
+                cute.arch.griddepcontrol_wait()
         num_n_blocks = cutlass.max(n_block_max - n_block_min, 1)
         for n_tile in cutlass.range(num_n_blocks, unroll=1):
             n_block = cutlass.max(n_block_max - 1 - n_tile, n_block_min)
+            if const_expr(self.has_bias):
+                if n_tile < num_bias_loads:
+                    pipeline_bias.producer_acquire(producer_state_k)
+                    cute.copy(
+                        tma_atom_Bias,
+                        tBgBias[None, m_block, bias_max_idx - n_tile],
+                        tBsBias[None, producer_state_k.index],
+                        tma_bar_ptr=pipeline_bias.producer_get_barrier(
+                            producer_state_k
+                        ),
+                    )
+                    pipeline_bias.producer_commit(producer_state_k)
             cute.experimental.iket.range_push("k_acquire_issue")
             pipeline_k.producer_acquire(producer_state_k)
             copy_K(
@@ -2951,10 +3228,22 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
         is_qk_owner: cutlass.Constexpr[bool],
         aux_data: AuxData = AuxData(),
         fastdiv_mods=None,
+        sBias: Optional[cute.Tensor] = None,
+        pipeline_bias: Optional[PipelineAsync] = None,
+        base_softmax_scale: Optional[Float32] = None,
     ):
         mQ_cur = seqlen.offset_batch_Q(mQ, batch_idx, dim=3)[None, None, head_idx]
         if const_expr(not self.pack_gqa):
             gQ = cute.local_tile(mQ_cur, (self.tile_m, self.tile_hdim), (m_block, 0))
+        num_bias_loads = Int32(0)
+        if const_expr(self.has_bias):
+            _, num_bias_loads = self._get_bias_load_info(
+                block_info,
+                seqlen,
+                m_block,
+                n_block_min,
+                n_block_max,
+            )
 
         split_pv_warps = self._uses_split_pv_warps()
         thr_mma_pv = tiled_mma_pv.get_slice(tidx)
@@ -3250,6 +3539,10 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
                 pipeline_k,
                 pipeline_v,
                 score_mod=self.score_mod,
+                sBias=sBias,
+                pipeline_bias=pipeline_bias,
+                base_softmax_scale=base_softmax_scale,
+                apply_bias=n_block >= n_block_max - num_bias_loads,
                 batch_idx=batch_idx,
                 head_idx=head_idx,
                 m_block=m_block,
@@ -3279,6 +3572,10 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
                         pipeline_k,
                         pipeline_v,
                         score_mod=self.score_mod,
+                        sBias=sBias,
+                        pipeline_bias=pipeline_bias,
+                        base_softmax_scale=base_softmax_scale,
+                        apply_bias=n_block >= n_block_max - num_bias_loads,
                         batch_idx=batch_idx,
                         head_idx=head_idx,
                         m_block=m_block,
@@ -3307,6 +3604,12 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
                     pipeline_k,
                     pipeline_v,
                     score_mod=self.score_mod,
+                    sBias=sBias,
+                    pipeline_bias=pipeline_bias,
+                    base_softmax_scale=base_softmax_scale,
+                    apply_bias=(
+                        n_block_upper - n_tile - 1 >= n_block_max - num_bias_loads
+                    ),
                     batch_idx=batch_idx,
                     head_idx=head_idx,
                     m_block=m_block,
@@ -3329,6 +3632,12 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
                         pipeline_k,
                         pipeline_v,
                         score_mod=self.score_mod,
+                        sBias=sBias,
+                        pipeline_bias=pipeline_bias,
+                        base_softmax_scale=base_softmax_scale,
+                        apply_bias=(
+                            n_block_upper - n_tile - 1 >= n_block_max - num_bias_loads
+                        ),
                         batch_idx=batch_idx,
                         head_idx=head_idx,
                         m_block=m_block,
@@ -3705,6 +4014,10 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
         pipeline_k: PipelineAsync,
         pipeline_v: PipelineAsync,
         score_mod: Callable | None,
+        sBias: Optional[cute.Tensor],
+        pipeline_bias: Optional[PipelineAsync],
+        base_softmax_scale: Optional[Float32],
+        apply_bias: bool,
         batch_idx: Int32,
         head_idx: Int32,
         m_block: Int32,
@@ -3797,6 +4110,10 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
         pipeline_k: PipelineAsync,
         pipeline_v: PipelineAsync,
         score_mod: Callable | None,
+        sBias: Optional[cute.Tensor],
+        pipeline_bias: Optional[PipelineAsync],
+        base_softmax_scale: Optional[Float32],
+        apply_bias: bool,
         batch_idx: Int32,
         head_idx: Int32,
         m_block: Int32,
@@ -3900,6 +4217,39 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
             acc_O_mn[r, None].store(acc_O_mn[r, None].load() * row_scale[r])
 
     @cute.jit
+    def apply_sheared_bias(
+        self,
+        acc_S: cute.Tensor,
+        thr_mma_qk: cute.TiledMma,
+        sBias: cute.Tensor,
+        pipeline_bias: PipelineAsync,
+        consumer_state: PipelineState,
+        base_softmax_scale: Float32,
+        apply_bias: bool,
+    ):
+        """Scale QK and merge one asynchronously staged sheared-bias tile."""
+        if apply_bias:
+            bias_wait_token = pipeline_bias.consumer_try_wait(consumer_state)
+            pipeline_bias.consumer_wait(consumer_state, bias_wait_token)
+            cS = cute.make_identity_tensor((self.tile_m, self.tile_n))
+            tScS = thr_mma_qk.partition_C(cS)
+            for i in cutlass.range(cute.size(acc_S.shape), unroll_full=True):
+                row = tScS[i][0]
+                col = tScS[i][1]
+                acc_S[i] = acc_S[i] * base_softmax_scale
+                if (
+                    const_expr(self.bias_block_size == self.tile_m)
+                    or row < self.bias_block_size
+                ):
+                    acc_S[i] = acc_S[i] + sBias[row, col, consumer_state.index].to(
+                        self.qk_acc_dtype
+                    )
+            pipeline_bias.consumer_release(consumer_state)
+        else:
+            for i in cutlass.range(cute.size(acc_S.shape), unroll_full=True):
+                acc_S[i] = acc_S[i] * base_softmax_scale
+
+    @cute.jit
     def compute_one_n_block(
         self,
         n_block: Int32,
@@ -3910,6 +4260,10 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
         pipeline_k: PipelineAsync,
         pipeline_v: PipelineAsync,
         score_mod: Callable | None,
+        sBias: Optional[cute.Tensor],
+        pipeline_bias: Optional[PipelineAsync],
+        base_softmax_scale: Optional[Float32],
+        apply_bias: bool,
         batch_idx: Int32,
         head_idx: Int32,
         m_block: Int32,
@@ -3942,6 +4296,16 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
         cute.experimental.iket.range_pop()
 
         cute.experimental.iket.range_push("softmax")
+        if const_expr(self.has_bias):
+            self.apply_sheared_bias(
+                acc_S,
+                mma_params.thr_mma_qk,
+                sBias,
+                pipeline_bias,
+                consumer_state,
+                base_softmax_scale,
+                apply_bias,
+            )
         if const_expr(score_mod is not None):
             self.apply_score_mod(
                 mma_params.thr_mma_qk,
@@ -3950,7 +4314,9 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
                 m_block,
                 acc_S,
                 n_block,
-                softmax_scale=softmax.softmax_scale,
+                softmax_scale=(
+                    1.0 if const_expr(self.has_bias) else softmax.softmax_scale
+                ),
                 seqlen=seqlen,
                 aux_data=aux_data,
                 fastdiv_mods=fastdiv_mods,

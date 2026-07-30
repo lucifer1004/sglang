@@ -689,6 +689,7 @@ def _flash_attn_fwd(
             head_dim=head_dim,
             head_dim_v=head_dim_v,
             tile_mn=tile_mn,
+            has_bias=rel_bias is not None,
             total_q_rows=total_q * num_head,
             num_sms=None if fake_mode else num_SMs,
             num_batch=batch_size,
@@ -793,7 +794,10 @@ def _flash_attn_fwd(
             window_size_left=window_size_left,
             window_size_right=window_size_right,
             has_score_or_mask_mod=(
-                softcap is not None or score_mod is not None or mask_mod is not None
+                softcap is not None
+                or score_mod is not None
+                or mask_mod is not None
+                or rel_bias is not None
             ),
             is_stream_capturing=(
                 not fake_mode and torch.cuda.is_current_stream_capturing()
@@ -975,8 +979,8 @@ def _flash_attn_fwd(
         disable_sparse_kv_bitmask = None
         p = row_max = None
 
-    # rel_bias -> sheared bias (Inkling relative attention). Produces `bias`, the column-aligned
-    # bias the SM100 kernel adds to pre-softmax scores via its dedicated TMA pipeline.
+    # Inkling relative attention. Shear the relative rows into the column-aligned
+    # tiles consumed by the architecture-specific attention mainloop.
     rel_extent = 0
     rel_extent_padded = 0
     bias = None
@@ -988,12 +992,16 @@ def _flash_attn_fwd(
             9,
             10,
             11,
-        ], "rel_bias (sheared bias) is only supported on SM9x/10x"
+            12,
+        ], "rel_bias is only supported on SM9x/10x/11x/12x"
         qhead_per_kvhead_packgqa = qhead_per_kvhead if pack_gqa else 1
         rel_extent = rel_bias.shape[-1]
         rel_extent_padded = rel_extent + 256
         assert rel_extent % 128 == 0
-        assert tile_m == 128 and tile_n == 128
+        if arch // 10 == 12:
+            assert tile_m == 64 and tile_n == 128
+        else:
+            assert tile_m == 128 and tile_n == 128
         assert (
             causal
             or window_size_left is None
@@ -1119,6 +1127,7 @@ def _flash_attn_fwd(
             qhead_per_kvhead,
             rows_per_cta,
             group_tile_bias,
+            tile_m,
             max_m_blocks_leq_one,
             cu_total_m_blocks_bias is not None,
             blocks_to_batch_idx is not None,
@@ -1155,6 +1164,7 @@ def _flash_attn_fwd(
                     qhead_per_kvhead=qhead_per_kvhead,
                     rows_per_cta=rows_per_cta,
                     tile_m=group_tile_bias,
+                    attention_tile_m=tile_m,
                     max_m_blocks_leq_one=max_m_blocks_leq_one,
                     use_pdl=use_pdl,
                 ),
@@ -1188,10 +1198,6 @@ def _flash_attn_fwd(
                 window_size_left,
                 window_size_right,
             )
-        if os.environ.get("BIAS_PREP_ONLY", "0") == "1":
-            # Benchmark hook: time just the shear-prep kernels, skip the attention kernel.
-            return out, lse
-
     compile_key = (
         dtype,
         head_dim,
@@ -1497,6 +1503,9 @@ def _flash_attn_fwd(
                 mask_mod=mask_mod,
                 has_aux_tensors=aux_tensors is not None,
                 is_split_kv=is_split_kv,
+                has_bias=bias is not None,
+                bias_block_size=tile_bias,
+                rel_extent_padded=rel_extent_padded,
                 plan=arch_forward_plan,
             )
         else:
@@ -1553,7 +1562,7 @@ def _flash_attn_fwd(
                     AuxData(cute_aux_tensors, aux_scalars),
                 ]
             )
-            if arch // 10 in [9, 10, 11]:
+            if arch // 10 in [9, 10, 11, 12]:
                 compile_args.append(bias_tensor)  # mBias
             if arch // 10 in [10, 11]:
                 if not use_dedicated_hd256_kernel:
@@ -1661,7 +1670,7 @@ def _flash_attn_fwd(
                     AuxData(aux_tensors, aux_scalars),
                 ]
             )
-            if arch // 10 in [9, 10, 11]:
+            if arch // 10 in [9, 10, 11, 12]:
                 call_args.append(bias)  # mBias
             if arch // 10 in [10, 11]:
                 if not use_dedicated_hd256_kernel:

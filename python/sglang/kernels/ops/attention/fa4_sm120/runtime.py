@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from functools import lru_cache
 from typing import Callable, Optional
 
+import cutlass.utils as utils_basic
 import torch
 from cutlass import Int32
 
@@ -490,6 +491,7 @@ class Sm120ForwardPolicy:
         head_dim: int,
         head_dim_v: int,
         tile_mn: Optional[tuple[int, int]],
+        has_bias: bool,
         total_q_rows: int,
         num_sms: Optional[int],
         num_batch: int,
@@ -504,7 +506,16 @@ class Sm120ForwardPolicy:
         pack_gqa: bool,
         paged_kv: bool,
     ) -> Sm120ForwardConfig:
-        if tile_mn is None:
+        if has_bias:
+            if max(head_dim, head_dim_v) > 128:
+                raise ValueError(
+                    "SM120 relative bias currently supports head_dim and "
+                    "head_dim_v up to 128"
+                )
+            if tile_mn is not None and tile_mn != (64, 128):
+                raise ValueError("SM120 relative bias requires tile_mn=(64, 128)")
+            tile_m, tile_n = 64, 128
+        elif tile_mn is None:
             tile_m, tile_n = FlashAttentionForwardSm120.get_fwd_tile_size(
                 head_dim,
                 head_dim_v,
@@ -801,6 +812,9 @@ class Sm120ForwardPolicy:
         mask_mod: Optional[Callable],
         has_aux_tensors: bool,
         is_split_kv: bool,
+        has_bias: bool,
+        bias_block_size: int,
+        rel_extent_padded: int,
         plan: Sm120ForwardPlan,
     ) -> FlashAttentionForwardSm120:
         if not FlashAttentionForwardSm120.can_implement(
@@ -819,6 +833,26 @@ class Sm120ForwardPolicy:
                 "The requested FlashAttention forward configuration exceeds "
                 "SM120 kernel constraints or shared-memory capacity"
             )
+        if has_bias:
+            bias_smem_bytes = (
+                bias_block_size * config.tile_n * (dtype.width // 8) * config.num_stages
+            )
+            total_smem_bytes = (
+                FlashAttentionForwardSm120._smem_usage_in_bytes(
+                    head_dim,
+                    head_dim_v,
+                    config.tile_m,
+                    config.tile_n,
+                    config.num_stages,
+                    False,
+                )
+                + bias_smem_bytes
+            )
+            if total_smem_bytes > utils_basic.get_smem_capacity_in_bytes("sm_120"):
+                raise ValueError(
+                    "The requested SM120 sheared-bias specialization exceeds "
+                    "shared-memory capacity"
+                )
         Kernel = FlashAttentionForwardSm120
         if plan.transpose_qk_pv:
             from sglang.kernels.ops.attention.fa4_sm120.flash_fwd_decode import (
@@ -843,6 +877,9 @@ class Sm120ForwardPolicy:
             mask_mod=mask_mod,
             has_aux_tensors=has_aux_tensors,
             is_split_kv=is_split_kv,
+            has_bias=has_bias,
+            bias_block_size=bias_block_size,
+            rel_extent_padded=rel_extent_padded,
             direct_uniform_batch=plan.direct_uniform_batch,
             paged_kv=paged_kv,
             split_qk_n=plan.split_qk_n,
@@ -984,6 +1021,7 @@ class Sm120ForwardHost(Sm120ForwardPolicy):
             learnable_sink,
             None,
             _EMPTY_AUX_DATA,
+            None,
             0,
         )
         return out, None
@@ -1265,6 +1303,7 @@ class Sm120ForwardHost(Sm120ForwardPolicy):
             learnable_sink,
             None,
             _EMPTY_AUX_DATA,
+            None,
             0,
         )
         if plan.actual_num_splits > 1:
