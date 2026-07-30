@@ -766,8 +766,6 @@ class FlashAttentionForwardBase:
 
 
 class FlashAttentionForwardSm80(FlashAttentionForwardBase):
-    supports_learnable_sink = False
-
     def _get_smem_layout_atom(self):
         sQ_layout_atom = sm80_utils.get_smem_layout_atom(self.dtype, self.tile_hdim)
         sK_layout_atom = sQ_layout_atom
@@ -851,10 +849,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         mQ/mK/mV/mO has same data types(supports fp16 and bf16) and same layout:
         (batch_size, seqlen_q, num_head, head_dim):(_, _, _, 1)
         """
-        if const_expr(not self.supports_learnable_sink):
-            assert (
-                learnable_sink is None
-            ), "Learnable sink is not supported on SM80"
+        assert learnable_sink is None, "Learnable sink is not supported in this kernel"
         self._check_type(
             *(
                 t.element_type if t is not None else None

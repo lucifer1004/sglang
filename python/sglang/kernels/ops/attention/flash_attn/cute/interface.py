@@ -57,8 +57,11 @@ from sglang.kernels.ops.attention.flash_attn.cute.flash_fwd_sm100 import (
     DescaleTensors,
     FlashAttentionForwardSm100,
 )
-from sglang.kernels.ops.attention.flash_attn.cute.flash_fwd_sm120_host import (
-    sm120_forward_host,
+from sglang.kernels.ops.attention.flash_attn.cute.flash_fwd_host import (
+    clear_forward_host_caches,
+    get_forward_host,
+    try_cached_paged_decode,
+    try_cached_varlen,
 )
 from sglang.kernels.ops.attention.flash_attn.cute.shearing_bias import ShearingBias
 
@@ -372,7 +375,7 @@ def _flash_attn_fwd(
             )
         )
     ):
-        fast_result = sm120_forward_host.try_paged_decode(
+        fast_result = try_cached_paged_decode(
             arch=_get_device_arch(),
             q=q,
             k=k,
@@ -553,9 +556,7 @@ def _flash_attn_fwd(
             )
         ), "inputs must be on CUDA device"
     arch = _get_device_arch() if _arch is None else _arch
-    arch_forward_host = (
-        sm120_forward_host if sm120_forward_host.supports_arch(arch) else None
-    )
+    arch_forward_host = get_forward_host(arch)
     assert arch // 10 in [
         8,
         9,
@@ -760,21 +761,48 @@ def _flash_attn_fwd(
     ) // m_block_size_effective
     total_mblocks = batch_size * num_head_kv * num_m_blocks
     num_n_blocks = (seqlen_k_loaded + tile_n - 1) // tile_n
+    arch_forward_plan = None
     if arch_forward_host is not None:
-        num_splits = arch_forward_host.select_num_splits(
+        arch_forward_plan = arch_forward_host.resolve_plan(
             requested_num_splits=num_splits,
+            generic_num_n_blocks=num_n_blocks,
             head_dim=head_dim,
             head_dim_v=head_dim_v,
+            batch_size=batch_size,
+            num_head_kv=num_head_kv,
             paged_kv=page_table is not None,
+            page_size=page_size,
+            k=k,
+            v=v,
             max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
             pack_gqa=pack_gqa,
+            element_size=q.element_size(),
+            packed_q_rows=seqlen_q_packgqa,
+            tile_m=tile_m,
+            tile_n=tile_n,
+            num_m_blocks=num_m_blocks,
             total_mblocks=total_mblocks,
             num_sms=num_SMs,
-            num_n_blocks=num_n_blocks,
+            total_q=total_q,
+            has_cu_seqlens_q=cu_seqlens_q is not None,
+            has_seqused_q=seqused_q is not None,
+            has_seqused_k=seqused_k is not None,
+            is_causal=causal,
+            is_local=local,
+            window_size_left=window_size_left,
+            window_size_right=window_size_right,
+            has_score_or_mask_mod=(
+                softcap is not None or score_mod is not None or mask_mod is not None
+            ),
+            is_stream_capturing=(
+                not fake_mode and torch.cuda.is_current_stream_capturing()
+            ),
             device=device,
             fake_mode=fake_mode,
             generic_heuristic=num_splits_heuristic,
         )
+        num_splits = arch_forward_plan.num_splits
     elif num_splits < 1:
         num_splits = num_splits_heuristic(
             total_mblocks,
@@ -799,18 +827,6 @@ def _flash_attn_fwd(
             num_splits = 1
 
     is_split_kv = num_splits > 1
-    direct_single_wave = arch_forward_host is not None and (
-        arch_forward_host.use_direct_single_wave(
-            batch_size=batch_size,
-            pack_gqa=pack_gqa,
-            has_cu_seqlens_q=cu_seqlens_q is not None,
-            has_seqused_q=seqused_q is not None,
-            total_q=total_q,
-            max_seqlen_q=max_seqlen_q,
-            total_mblocks=total_mblocks,
-            num_sms=num_SMs,
-        )
-    )
     if is_split_kv:
         out_partial = torch.empty(
             num_splits,
@@ -1210,7 +1226,7 @@ def _flash_attn_fwd(
         is_split_kv,
         pack_gqa,
         arch,
-        direct_single_wave,
+        arch_forward_plan.compile_key if arch_forward_plan is not None else None,
         page_size not in [None, tile_n],  # paged KV non-TMA
         use_2cta_instrs,
         q_subtile_factor,
@@ -1465,6 +1481,7 @@ def _flash_attn_fwd(
         elif arch_forward_host is not None:
             assert not use_block_sparsity, "Block sparsity not supported on SM 12.0"
             assert arch_forward_config is not None
+            assert arch_forward_plan is not None
             fa_fwd = arch_forward_host.make_kernel(
                 dtype=dtype,
                 head_dim=head_dim,
@@ -1479,7 +1496,7 @@ def _flash_attn_fwd(
                 mask_mod=mask_mod,
                 has_aux_tensors=aux_tensors is not None,
                 is_split_kv=is_split_kv,
-                direct_single_wave=direct_single_wave,
+                plan=arch_forward_plan,
             )
         else:
             raise ValueError(
@@ -1548,6 +1565,11 @@ def _flash_attn_fwd(
                             v_sf_vec_size,
                         ]
                     )
+            if arch_forward_host is not None:
+                assert arch_forward_plan is not None
+                compile_args.extend(
+                    arch_forward_host.compile_arguments(arch_forward_plan)
+                )
             compile_args.append(current_stream)
             _flash_attn_fwd.compile_cache[compile_key] = cute.compile(
                 *compile_args, options="--enable-tvm-ffi"
@@ -1651,6 +1673,9 @@ def _flash_attn_fwd(
                             sfv_call,  # mSFV (None unless v_blockscaled)
                         ]
                     )
+            if arch_forward_host is not None:
+                assert arch_forward_plan is not None
+                call_args.extend(arch_forward_host.runtime_arguments(arch_forward_plan))
             compiled_fwd = _flash_attn_fwd.compile_cache[compile_key]
             if (
                 arch_forward_host is not None
@@ -1780,7 +1805,7 @@ def _flash_attn_fwd(
 
 
 _flash_attn_fwd.compile_cache = get_jit_cache("fwd")
-_flash_attn_fwd.compile_cache.register_clear_hook(sm120_forward_host.clear_launch_plans)
+_flash_attn_fwd.compile_cache.register_clear_hook(clear_forward_host_caches)
 _flash_attn_fwd.compile_cache_shear_bias = get_jit_cache("fwd_shear_bias")
 _flash_attn_fwd.compile_cache_prepare_shear_bias = get_jit_cache(
     "fwd_prepare_shear_bias"
@@ -2157,7 +2182,7 @@ def flash_attn_varlen_func(
             )
         )
     ):
-        fast_result = sm120_forward_host.try_varlen(
+        fast_result = try_cached_varlen(
             arch=_get_device_arch(),
             q=q,
             k=k,
@@ -2257,7 +2282,7 @@ def _compile_fwd_combine(
         tile_m,
         k_block_size,
         log_max_splits,
-        num_threads=256,
+        num_threads=fa_combine.num_threads,
     ):
         raise RuntimeError(
             "FlashAttention combine kernel cannot be implemented with given parameters"

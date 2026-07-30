@@ -29,8 +29,9 @@ class PagedKVManager(ParamsBase):
     head_dim_padded: cutlass.Constexpr[Int32]
     head_dim_v_padded: cutlass.Constexpr[Int32]
 
-    arch: cutlass.Constexpr[Int32]
     v_gmem_transposed: cutlass.Constexpr[bool]
+    unroll_page_table: cutlass.Constexpr[bool]
+    stage_sliced_smem: cutlass.Constexpr[bool]
 
     gmem_threads_per_row: cutlass.Constexpr[Int32]
     page_entry_per_thread: Int32
@@ -64,10 +65,14 @@ class PagedKVManager(ParamsBase):
         mSFK_paged: Optional[cute.Tensor] = None,
         mSFV_paged: Optional[cute.Tensor] = None,
         arch: cutlass.Constexpr[int] = 100,
+        v_gmem_transposed: Optional[bool] = None,
+        unroll_page_table: bool = False,
+        stage_sliced_smem: Optional[bool] = None,
     ):
-        # SM100 transposes V in gmem to (dv, page_size, num_pages).
-        # SM90 and SM120 keep V as (page_size, dv, num_pages), same as K.
-        v_gmem_transposed = arch not in (90, 120)
+        if v_gmem_transposed is None:
+            v_gmem_transposed = arch != 90
+        if stage_sliced_smem is None:
+            stage_sliced_smem = arch == 90
         universal_copy_bits = 128
         async_copy_elems = universal_copy_bits // dtype.width
         dtype_bytes = dtype.width // 8
@@ -157,8 +162,9 @@ class PagedKVManager(ParamsBase):
             num_threads,
             head_dim_padded,
             head_dim_v_padded,
-            arch,
             v_gmem_transposed,
+            unroll_page_table,
+            stage_sliced_smem,
             gmem_threads_per_row,
             page_entry_per_thread,
             async_copy_elems,
@@ -194,7 +200,7 @@ class PagedKVManager(ParamsBase):
 
     @cute.jit
     def load_page_table(self, n_block: Int32):
-        if const_expr(self.arch == 120):
+        if const_expr(self.unroll_page_table):
             for i in cutlass.range_constexpr(self.page_entry_per_thread):
                 self._load_page_table_entry(i, n_block)
         else:
@@ -283,8 +289,8 @@ class PagedKVManager(ParamsBase):
 
         tPrXPtr = self.compute_X_ptr(K_or_V)
 
-        if const_expr(self.arch in (90, 120)):
-            # SM90/SM120: sX is already stage-sliced by the caller.
+        if const_expr(self.stage_sliced_smem):
+            # The caller already selected the shared-memory pipeline stage.
             # Flatten hierarchical modes to get (n_block_size, head_dim).
             sX_pi = cute.group_modes(sX, 0, 1)
             # V is transposed by the caller's view before MMA.
