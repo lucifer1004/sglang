@@ -20,6 +20,32 @@ def get_forward_host(arch: int):
     return None
 
 
+def resolve_runtime_policy(
+    *,
+    device_capability: tuple[int, int],
+    deterministic: bool,
+) -> tuple[int, int, bool]:
+    """Resolve generic and architecture-owned SplitKV launch policy."""
+    arch = device_capability[0] * 10 + device_capability[1]
+    uses_arch_decode_policy = get_forward_host(arch) is not None
+    no_splitkv = device_capability < (9, 0) or uses_arch_decode_policy
+    num_splits = 1 if deterministic or no_splitkv else 0
+    decode_num_splits = (
+        0 if uses_arch_decode_policy and not deterministic else num_splits
+    )
+    return num_splits, decode_num_splits, uses_arch_decode_policy
+
+
+@lru_cache(maxsize=None)
+def get_forward_arch(device) -> int | None:
+    """Return the device arch when it has an architecture-owned forward host."""
+    import torch
+
+    major, minor = torch.cuda.get_device_capability(device)
+    arch = major * 10 + minor
+    return arch if get_forward_host(arch) is not None else None
+
+
 def try_cached_paged_decode(*, arch: int, **kwargs):
     """Try an architecture-owned paged-decode launch plan."""
     host = get_forward_host(arch)

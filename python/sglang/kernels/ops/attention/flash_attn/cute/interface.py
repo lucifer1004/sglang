@@ -86,9 +86,8 @@ def _parse_arch_str(arch_str):
 def _get_device_arch():
     """Cached device arch check.
 
-    Override with FLASH_ATTENTION_ARCH (e.g. 'sm_80' or '80') to select which
-    kernel path to use (SM80/SM90/SM100/SM120) independently of the compilation
-    target (CUTE_DSL_ARCH).
+    Override with FLASH_ATTENTION_ARCH (e.g. 'sm_80' or '80') to select the
+    kernel path independently of the compilation target (CUTE_DSL_ARCH).
 
     For CPU-only compilation (no GPU), set both:
       FLASH_ATTENTION_ARCH=sm_80  (kernel selection)
@@ -349,9 +348,14 @@ def _flash_attn_fwd(
         aux_tensors: Some score_mods will want to read from global aux_tensors. This is how we thread them through to the inner kernel.
         aux_scalars: Runtime scalar captures used by score_mod or mask_mod.
     """
+    fake_mode = is_fake_mode()
+    arch = _get_device_arch() if _arch is None else _arch
+    arch_forward_host = get_forward_host(arch)
     requested_num_splits = num_splits
     if (
-        not return_lse
+        not fake_mode
+        and arch_forward_host is not None
+        and not return_lse
         and lse is None
         and softcap in (None, 0.0)
         and all(
@@ -375,7 +379,7 @@ def _flash_attn_fwd(
         )
     ):
         fast_result = try_cached_paged_decode(
-            arch=_get_device_arch(),
+            arch=arch,
             q=q,
             k=k,
             v=v,
@@ -399,7 +403,6 @@ def _flash_attn_fwd(
             return fast_result
 
     aux_scalars = tuple(aux_scalars) if aux_scalars else None
-    fake_mode = is_fake_mode()
     q, k, v, qv = [maybe_contiguous(t) for t in (q, k, v, qv)]
     assert q is not None or qv is not None
     assert v is not None
@@ -554,8 +557,6 @@ def _flash_attn_fwd(
                 learnable_sink,
             )
         ), "inputs must be on CUDA device"
-    arch = _get_device_arch() if _arch is None else _arch
-    arch_forward_host = get_forward_host(arch)
     assert arch // 10 in [8, 9, 10, 11] or arch_forward_host is not None, (
         "Unsupported compute capability. Supported: 8.x, 9.x, 10.x, 11.x, "
         "and architectures registered through the forward-host bridge"
@@ -620,6 +621,10 @@ def _flash_attn_fwd(
             device=device,
         )
     else:
+        if out.requires_grad:
+            raise ValueError("out must not require gradients")
+        if out.stride(-1) != 1:
+            raise ValueError("out must have stride 1 in the last dimension")
         _validate_tensor(
             out,
             "out",
@@ -992,10 +997,9 @@ def _flash_attn_fwd(
         rel_extent = rel_bias.shape[-1]
         rel_extent_padded = rel_extent + 256
         assert rel_extent % 128 == 0
-        if arch_forward_host is not None:
-            assert tile_m == 64 and tile_n == 128
-        else:
-            assert tile_m == 128 and tile_n == 128
+        assert tile_n == 128
+        if arch_forward_host is None:
+            assert tile_m == 128
         assert (
             causal
             or window_size_left is None
@@ -1480,7 +1484,10 @@ def _flash_attn_fwd(
                     ),
                 )
         elif arch_forward_host is not None:
-            assert not use_block_sparsity, "Block sparsity not supported on SM 12.0"
+            assert not use_block_sparsity, (
+                "Block sparsity is not supported by the architecture-owned "
+                "forward implementation"
+            )
             assert arch_forward_config is not None
             assert arch_forward_plan is not None
             fa_fwd = arch_forward_host.make_kernel(
@@ -1504,7 +1511,9 @@ def _flash_attn_fwd(
             )
         else:
             raise ValueError(
-                f"Unsupported compute capability: {arch}. Supported: 8.x, 9.x, 10.x, 11.x, 12.x"
+                f"Unsupported compute capability: {arch}. Supported: 8.x, 9.x, "
+                "10.x, 11.x, and architectures registered through the "
+                "forward-host bridge"
             )
         # TODO: check @can_implement
         if qv is not None:
@@ -2132,26 +2141,13 @@ def flash_attn_varlen_func(
         v_sf_vec_size = 32
     if out is not None and out.requires_grad:
         raise ValueError("out must not require gradients")
-    differentiable_tensors = (
-        q,
-        k,
-        v,
-        qv,
-        learnable_sink,
-        q_descale,
-        k_descale,
-        v_descale,
-        rel_bias,
-        sfq,
-        sfk,
-        sfv,
-        *(aux_tensors or ()),
-    )
-    needs_autograd = torch.is_grad_enabled() and any(
-        tensor is not None and tensor.requires_grad for tensor in differentiable_tensors
-    )
+    if out is not None and out.stride(-1) != 1:
+        raise ValueError("out must have stride 1 in the last dimension")
+    runtime_arch = _get_device_arch()
+    forward_host = None if is_fake_mode() else get_forward_host(runtime_arch)
     if (
-        q is not None
+        forward_host is not None
+        and q is not None
         and k is not None
         and cu_seqlens_q is not None
         and cu_seqlens_k is not None
@@ -2182,7 +2178,7 @@ def flash_attn_varlen_func(
         )
     ):
         fast_result = try_cached_varlen(
-            arch=_get_device_arch(),
+            arch=runtime_arch,
             q=q,
             k=k,
             v=v,
@@ -2240,9 +2236,30 @@ def flash_attn_varlen_func(
         return_lse,
         out,
     )
+    needs_autograd = False
+    if forward_host is not None or out is not None:
+        differentiable_tensors = (
+            q,
+            k,
+            v,
+            qv,
+            learnable_sink,
+            q_descale,
+            k_descale,
+            v_descale,
+            rel_bias,
+            sfq,
+            sfk,
+            sfv,
+            *(aux_tensors or ()),
+        )
+        needs_autograd = torch.is_grad_enabled() and any(
+            tensor is not None and tensor.requires_grad
+            for tensor in differentiable_tensors
+        )
     if needs_autograd and out is not None:
         raise ValueError("out is only supported for forward-only inference")
-    if not needs_autograd:
+    if not needs_autograd and forward_host is not None:
         return FlashAttnVarlenFunc.forward(None, *autograd_args)
     return FlashAttnVarlenFunc.apply(*autograd_args)
 
@@ -2281,7 +2298,7 @@ def _compile_fwd_combine(
         tile_m,
         k_block_size,
         log_max_splits,
-        num_threads=fa_combine.num_threads,
+        num_threads=256,
     ):
         raise RuntimeError(
             "FlashAttention combine kernel cannot be implemented with given parameters"

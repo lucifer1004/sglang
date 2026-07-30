@@ -51,6 +51,36 @@ def test_sm120_runtime_policy_delegates_decode_shapes():
     assert deterministic_policy.decode_num_splits == 1
     assert deterministic_policy.decode_uses_static_max_seqlen_k
 
+    future_policy = get_flash_attention_v4_runtime_policy(
+        device_capability=(13, 0),
+        deterministic=False,
+    )
+    assert future_policy.num_splits == 0
+    assert future_policy.decode_num_splits == 0
+    assert not future_policy.decode_uses_static_max_seqlen_k
+
+
+def test_sm120_preallocated_output_contract_is_validated_before_launch():
+    q = torch.empty((1, 1, 1, 32), device="cuda", dtype=torch.bfloat16)
+    k = torch.empty((1, 1, 1, 32), device="cuda", dtype=torch.bfloat16)
+    v = torch.empty_like(k)
+
+    with pytest.raises(ValueError, match="must not require gradients"):
+        flash_attn_with_kvcache(
+            q,
+            k,
+            v,
+            out=torch.empty_like(q, requires_grad=True),
+        )
+
+    strided_out = torch.empty(
+        (1, 1, 1, 64),
+        device="cuda",
+        dtype=torch.bfloat16,
+    )[..., ::2]
+    with pytest.raises(ValueError, match="must have stride 1"):
+        flash_attn_with_kvcache(q, k, v, out=strided_out)
+
 
 @pytest.mark.parametrize(
     (
@@ -1799,7 +1829,10 @@ def test_sm120_paged_decode_ragged_splits_are_cache_order_independent(
     ragged_second = run(ragged_lengths)
     uniform_second = run(uniform_lengths)
 
-    assert cache_hits == [False, True, True, True]
+    # The public host fast path and the generic compile path may both probe an
+    # empty cache on the first call. Once registered, every reuse must hit.
+    assert not any(cache_hits[:-3])
+    assert cache_hits[-3:] == [True, True, True]
     torch.testing.assert_close(ragged_first, ragged_second, atol=0.0, rtol=0.0)
     torch.testing.assert_close(uniform_first, uniform_second, atol=0.0, rtol=0.0)
 
@@ -2017,7 +2050,11 @@ def test_sm120_paged_decode_graph_pdl_is_correct_and_eager_reusable(
     eager_after = run()
     torch.cuda.synchronize()
 
-    assert cache_hits == [False, False, True]
+    # Eager warmup and graph capture may each probe through both the public
+    # bridge and the generic compile path. Captured execution must not reuse an
+    # eager launch plan, while the final eager call must.
+    assert not any(cache_hits[:-1])
+    assert cache_hits[-1]
     torch.testing.assert_close(eager_before, eager_after, atol=0.0, rtol=0.0)
     torch.testing.assert_close(
         graph_output,
