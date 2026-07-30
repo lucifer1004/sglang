@@ -118,14 +118,16 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
     # Relative CTA critical-path costs keyed by the complete kernel config:
     # (fixed work, work per N block, extra local-mask work). Sequence length,
     # window, packed heads, and SM count remain analytic inputs to the generic
-    # LPT model below. New head dimensions can be added after calibrating only
-    # these three config-local weights.
+    # LPT model below.
     _lpt_cost_by_config = {
         (256, 256, 32, 64): (213, 95, 95),
         (256, 256, 48, 64): (221, 99, 74),
         (256, 256, 64, 64): (212, 101, 67),
     }
     _lpt_tie_margin = 1
+    _qualified_wave_tile_shapes = frozenset(
+        ((32, 32), (64, 64), (96, 96), (128, 128), (192, 128))
+    )
 
     @staticmethod
     def _estimate_lpt_makespan(
@@ -156,8 +158,8 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
         packed_q = seqlen_q * qhead_per_kvhead
         num_m_blocks = (packed_q + tile_m - 1) // tile_m
         num_ctas = num_m_blocks * num_head_kv
-        # Beyond two waves the largest tile is preferable for this bounded-SMEM
-        # pipeline.  Returning None also keeps this O(1).
+        # The exact boundary expression below is intentionally limited to two
+        # physical waves. Returning None also keeps this estimator O(1).
         if num_ctas > 2 * num_sms:
             return None
 
@@ -197,10 +199,136 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
         if num_ctas <= num_sms:
             return heaviest_cta
         # With at most two waves, the first tail CTA is paired with the lightest
-        # CTA in the first hardware wave.  This captures the discrete tail that
+        # CTA in the first hardware wave. This captures the discrete tail that
         # an average-work occupancy model misses.
         wave_boundary = cta_cost(num_sms - 1) + cta_cost(num_sms)
         return max(heaviest_cta, wave_boundary)
+
+    @staticmethod
+    def _fits_lpt_equivalent_wave(
+        tile_n: int,
+        resident_ctas_per_sm: int,
+        *,
+        seqlen_q: int,
+        seqlen_k: int,
+        num_sms: int,
+        num_head_kv: int,
+        qhead_per_kvhead: int,
+        is_causal: bool,
+        is_local: bool,
+        window_size_left: int | None,
+        window_size_right: int | None,
+    ) -> bool:
+        """Return whether structural CTA work fits one LPT-equivalent wave."""
+        if resident_ctas_per_sm <= 0:
+            return False
+        packed_q = seqlen_q * qhead_per_kvhead
+        num_ctas = ((packed_q + 63) // 64) * num_head_kv
+        structural_cost = (0, 1, 0)
+        workload = FlashAttentionForwardSm120._estimate_lpt_makespan(
+            64,
+            tile_n,
+            structural_cost,
+            seqlen_q=seqlen_q,
+            seqlen_k=seqlen_k,
+            num_sms=num_sms * resident_ctas_per_sm,
+            num_head_kv=num_head_kv,
+            qhead_per_kvhead=qhead_per_kvhead,
+            is_causal=is_causal,
+            is_local=is_local,
+            window_size_left=window_size_left,
+            window_size_right=window_size_right,
+        )
+        heaviest_cta = FlashAttentionForwardSm120._estimate_lpt_makespan(
+            64,
+            tile_n,
+            structural_cost,
+            seqlen_q=seqlen_q,
+            seqlen_k=seqlen_k,
+            num_sms=max(num_ctas, 1),
+            num_head_kv=num_head_kv,
+            qhead_per_kvhead=qhead_per_kvhead,
+            is_causal=is_causal,
+            is_local=is_local,
+            window_size_left=window_size_left,
+            window_size_right=window_size_right,
+        )
+        return (
+            workload is not None
+            and heaviest_cta is not None
+            and workload <= heaviest_cta
+        )
+
+    @staticmethod
+    def _select_qualified_tile_n(
+        head_dim: int,
+        head_dim_v: int,
+        *,
+        seqlen_q: int,
+        seqlen_k: int,
+        num_sms: int,
+        num_head_kv: int,
+        qhead_per_kvhead: int,
+        is_causal: bool,
+        is_local: bool,
+        window_size_left: int | None,
+        window_size_right: int | None,
+    ) -> int | None:
+        """Select N from LPT workload and SM120 residency without timing fits."""
+        shape = (head_dim, head_dim_v)
+        if shape not in FlashAttentionForwardSm120._qualified_wave_tile_shapes:
+            return None
+        if (
+            seqlen_q <= 0
+            or seqlen_k <= 0
+            or num_sms <= 0
+            or num_head_kv <= 0
+            or qhead_per_kvhead <= 0
+        ):
+            return None
+
+        has_steady_state_k_loop = seqlen_k >= 1024
+
+        def fits_lpt_wave(tile_n: int, resident_ctas_per_sm: int) -> bool:
+            return FlashAttentionForwardSm120._fits_lpt_equivalent_wave(
+                tile_n,
+                resident_ctas_per_sm,
+                seqlen_q=seqlen_q,
+                seqlen_k=seqlen_k,
+                num_sms=num_sms,
+                num_head_kv=num_head_kv,
+                qhead_per_kvhead=qhead_per_kvhead,
+                is_causal=is_causal,
+                is_local=is_local,
+                window_size_left=window_size_left,
+                window_size_right=window_size_right,
+            )
+
+        if is_local:
+            if shape == (32, 32):
+                # N128 retains two resident CTAs/SM.
+                return 128 if fits_lpt_wave(128, 2) else 64
+            if shape == (64, 64):
+                return 128 if fits_lpt_wave(128, 1) else 64
+            return 64
+
+        if shape == (32, 32):
+            # N256 trades one resident CTA for fewer mainloop iterations.
+            return (
+                256
+                if has_steady_state_k_loop and fits_lpt_wave(256, 1)
+                else 128
+            )
+        if shape == (64, 64):
+            if not has_steady_state_k_loop:
+                return 128
+            return 192 if fits_lpt_wave(192, 1) else 64
+        if shape == (96, 96):
+            # N64 has twice the residency of N128.
+            return 128 if fits_lpt_wave(128, 1) else 64
+        if shape == (128, 128):
+            return 128
+        return 96 if has_steady_state_k_loop else 64
 
     @staticmethod
     def _smem_usage_in_bytes(
@@ -259,6 +387,10 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
     ) -> tuple[int, int]:
         """Select an SM120 tile that fits the architecture's 99 KB SMEM."""
         smem_capacity = utils_basic.get_smem_capacity_in_bytes("sm_120")
+        shape = (head_dim, head_dim_v)
+        qualified_shape = (
+            shape in FlashAttentionForwardSm120._qualified_wave_tile_shapes
+        )
         is_short_packed_q = (
             pack_gqa
             and seqlen_q is not None
@@ -294,27 +426,64 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
                     (48, 64, 1),
                     (32, 64, 1),
                 )
-        elif (head_dim, head_dim_v) in ((64, 64), (128, 128)):
-            # The larger SM120 warp-MMA shapes are register-bound at these
-            # head dimensions. M128N128 at HD64 and M128N64 at HD128 spill,
-            # while M64N64 remains spill-free and dominates across wave counts.
-            fallback_candidates = (
-                (64, 64, 1),
-                (128, 64, 1),
-            ) + (((128, 128, 1),) if head_dim == 64 else ())
+        elif qualified_shape:
+            # M64 is the zero-spill fallback across the qualified exact shapes.
+            # HD32 global benefits from N128 without giving up its second
+            # resident CTA; local masks retain the more parallel N64 tile.
+            safe_tile_n = (
+                128 if shape == (32, 32) and not is_local else 64
+            )
+            fallback_candidates = ((64, safe_tile_n, 1),) + (
+                ((64, 64, 1),) if safe_tile_n != 64 else ()
+            )
         else:
             fallback_candidates = (
                 ((128, 128, 1),) if max(head_dim, head_dim_v) <= 64 else ()
             ) + ((128, 64, 1), (64, 64, 1))
 
-        # The scheduling equation is independent of HD. Pipeline-specific work
-        # stays in a compact cost table keyed by the complete kernel config, so
-        # another HD can be enabled without duplicating the sequence/window
-        # policy. Shapes without calibrated configs retain the fallback above.
+        can_select_qualified_tile = (
+            qualified_shape
+            and num_batch == 1
+            and pack_gqa
+            and total_q_rows is not None
+            and num_sms is not None
+            and seqlen_q is not None
+            and seqlen_k is not None
+            and num_head_kv is not None
+            and qhead_per_kvhead is not None
+            and total_q_rows == seqlen_q * num_head_kv * qhead_per_kvhead
+            and (is_causal or is_local)
+            and not is_short_packed_q
+        )
+        candidates = fallback_candidates
+        if can_select_qualified_tile:
+            preferred_tile_n = FlashAttentionForwardSm120._select_qualified_tile_n(
+                head_dim,
+                head_dim_v,
+                seqlen_q=seqlen_q,
+                seqlen_k=seqlen_k,
+                num_sms=num_sms,
+                num_head_kv=num_head_kv,
+                qhead_per_kvhead=qhead_per_kvhead,
+                is_causal=is_causal,
+                is_local=is_local,
+                window_size_left=window_size_left,
+                window_size_right=window_size_right,
+            )
+            if preferred_tile_n is not None:
+                preferred = (64, preferred_tile_n, 1)
+                candidates = (preferred,) + tuple(
+                    candidate
+                    for candidate in fallback_candidates
+                    if candidate != preferred
+                )
+
+        # HD256 retains the calibrated LPT selection used by its dedicated
+        # bounded-SMEM pipeline.
         model_candidates = tuple(
             (config[2], config[3], 1)
             for config in FlashAttentionForwardSm120._lpt_cost_by_config
-            if config[:2] == (head_dim, head_dim_v)
+            if config[:2] == shape
             and FlashAttentionForwardSm120._smem_usage_in_bytes(*config, 1)
             <= smem_capacity
         )
@@ -332,7 +501,6 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
             and (is_causal or is_local)
             and not is_short_packed_q
         )
-        candidates = fallback_candidates
         if can_model_lpt:
             scores = {
                 candidate: FlashAttentionForwardSm120._estimate_lpt_makespan(

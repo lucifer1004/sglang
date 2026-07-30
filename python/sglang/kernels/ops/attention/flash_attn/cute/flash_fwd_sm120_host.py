@@ -62,6 +62,16 @@ class Sm120ForwardConfig:
     num_stages: int
     num_threads: int
 
+    @property
+    def compile_key(self) -> tuple:
+        """Return SM120 configuration state baked into generated code."""
+        return (
+            self.tile_m,
+            self.tile_n,
+            self.num_stages,
+            self.num_threads,
+        )
+
 
 @dataclass(frozen=True)
 class Sm120ForwardPlan:

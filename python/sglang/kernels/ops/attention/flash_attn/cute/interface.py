@@ -1226,6 +1226,7 @@ def _flash_attn_fwd(
         is_split_kv,
         pack_gqa,
         arch,
+        arch_forward_config.compile_key if arch_forward_config is not None else None,
         arch_forward_plan.compile_key if arch_forward_plan is not None else None,
         page_size not in [None, tile_n],  # paged KV non-TMA
         use_2cta_instrs,
