@@ -85,6 +85,8 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
         has_bias: bool = False,
         bias_block_size: int = 64,
         rel_extent_padded: int = 128,
+        fp8_kv: bool = False,
+        fp8_dma_threads: int = 64,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -95,6 +97,17 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
         self.has_bias = has_bias
         self.bias_block_size = bias_block_size
         self.rel_extent_padded = rel_extent_padded
+        self.fp8_kv = fp8_kv
+        self.kv_dtype = cutlass.Float8E4M3FN if fp8_kv else self.dtype
+        if fp8_kv:
+            assert fp8_dma_threads % cute.arch.WARP_SIZE == 0
+            self.num_dma_threads = fp8_dma_threads
+            assert paged_kv, "SM120 FP8 KV dequantization requires paged KV"
+            assert self.dtype == cutlass.BFloat16, "SM120 FP8 KV compute must be BF16"
+            assert not has_bias, "SM120 FP8 KV does not yet support relative bias"
+            assert not self._uses_split_pv_warps(), (
+                "SM120 FP8 KV does not support split QK/PV warp sets"
+            )
         if has_bias:
             assert not self._uses_split_pv_warps()
             assert self.tile_n == 128
@@ -103,6 +116,51 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
             assert rel_extent_padded >= 128
             assert rel_extent_padded % 128 == 0
         self.bias_n_max = rel_extent_padded // self.tile_n if has_bias else 0
+
+    def _check_type(
+        self,
+        mQ_type,
+        mK_type,
+        mV_type,
+        mO_type,
+        mLSE_type,
+        mCuSeqlensQ_type,
+        mCuSeqlensK_type,
+        mSeqUsedQ_type,
+        mSeqUsedK_type,
+    ):
+        if not self.fp8_kv:
+            return super()._check_type(
+                mQ_type,
+                mK_type,
+                mV_type,
+                mO_type,
+                mLSE_type,
+                mCuSeqlensQ_type,
+                mCuSeqlensK_type,
+                mSeqUsedQ_type,
+                mSeqUsedK_type,
+            )
+        if const_expr(mQ_type != cutlass.BFloat16):
+            raise TypeError("SM120 FP8 KV requires BF16 Q")
+        if const_expr(
+            mK_type != cutlass.Float8E4M3FN
+            or mV_type != cutlass.Float8E4M3FN
+        ):
+            raise TypeError("SM120 FP8 KV requires FP8 E4M3 K and V")
+        expected_o_type = Float32 if self.is_split_kv else cutlass.BFloat16
+        if const_expr(mO_type != expected_o_type):
+            raise TypeError("SM120 FP8 KV output type does not match the launch mode")
+        if const_expr(mLSE_type not in [None, Float32]):
+            raise TypeError("LSE tensor must be Float32")
+        if const_expr(mCuSeqlensQ_type not in [None, Int32]):
+            raise TypeError("cu_seqlens_q tensor must be Int32")
+        if const_expr(mCuSeqlensK_type not in [None, Int32]):
+            raise TypeError("cu_seqlens_k tensor must be Int32")
+        if const_expr(mSeqUsedQ_type not in [None, Int32]):
+            raise TypeError("seqused_q tensor must be Int32")
+        if const_expr(mSeqUsedK_type not in [None, Int32]):
+            raise TypeError("seqused_k tensor must be Int32")
 
     @cute.jit
     def _get_n_block_min_max(
@@ -113,7 +171,7 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
         split_idx: Int32,
         num_splits: Int32,
     ):
-        """Balance ragged decode requests without changing the workspace bound."""
+        """Apply an optional explicit KV-tile grain to SplitKV partitions."""
         if const_expr(self.split_kv_blocks_per_cta <= 0):
             return block_info.get_n_block_min_max(
                 seqlen, m_block, split_idx, num_splits
@@ -123,16 +181,14 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
             m_block,
             absolute=True,
         )
-        dynamic_splits = cute.ceil_div(
-            cutlass.max(n_block_max - n_block_min, 1),
-            self.split_kv_blocks_per_cta,
+        split_n_block_min = (
+            n_block_min + split_idx * self.split_kv_blocks_per_cta
         )
-        return block_info.get_n_block_min_max(
-            seqlen,
-            m_block,
-            split_idx,
-            dynamic_splits,
+        split_n_block_max = cutlass.min(
+            split_n_block_min + self.split_kv_blocks_per_cta,
+            n_block_max,
         )
+        return split_n_block_min, split_n_block_max
 
     num_dma_threads = 32
     # Relative CTA critical-path costs keyed by the complete kernel config:
@@ -1488,20 +1544,36 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
                     else self.num_threads
                 ),
             )
-            pipeline_k = pipeline_custom.PipelineCpAsync.create(
-                num_stages=self._num_k_stages(),
-                producer_group=dma_group,
-                consumer_group=k_consumer_group,
-                barrier_storage=storage.mbar_K.data_ptr(),
-                defer_sync=True,
-            )
-            pipeline_v = pipeline_custom.PipelineCpAsync.create(
-                num_stages=self._num_v_stages(),
-                producer_group=dma_group,
-                consumer_group=v_consumer_group,
-                barrier_storage=storage.mbar_V.data_ptr(),
-                defer_sync=True,
-            )
+            if const_expr(self.fp8_kv):
+                pipeline_k = PipelineAsync.create(
+                    num_stages=self._num_k_stages(),
+                    producer_group=dma_group,
+                    consumer_group=k_consumer_group,
+                    barrier_storage=storage.mbar_K.data_ptr(),
+                    defer_sync=True,
+                )
+                pipeline_v = PipelineAsync.create(
+                    num_stages=self._num_v_stages(),
+                    producer_group=dma_group,
+                    consumer_group=v_consumer_group,
+                    barrier_storage=storage.mbar_V.data_ptr(),
+                    defer_sync=True,
+                )
+            else:
+                pipeline_k = pipeline_custom.PipelineCpAsync.create(
+                    num_stages=self._num_k_stages(),
+                    producer_group=dma_group,
+                    consumer_group=k_consumer_group,
+                    barrier_storage=storage.mbar_K.data_ptr(),
+                    defer_sync=True,
+                )
+                pipeline_v = pipeline_custom.PipelineCpAsync.create(
+                    num_stages=self._num_v_stages(),
+                    producer_group=dma_group,
+                    consumer_group=v_consumer_group,
+                    barrier_storage=storage.mbar_V.data_ptr(),
+                    defer_sync=True,
+                )
         pipeline_bias = (
             PipelineTmaAsync.create(
                 num_stages=self.num_stages,
@@ -1802,7 +1874,7 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
                             window_size_left,
                             window_size_right,
                         )
-                elif warp_idx == 0:
+                elif warp_idx < self._num_dma_threads() // cute.arch.WARP_SIZE:
                     if const_expr(mPageTable is None):
                         self.load_tma_persistent(
                             mK,
@@ -1850,7 +1922,9 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
                             tma_atom_Bias=tma_atom_Bias,
                             pipeline_bias=pipeline_bias,
                         )
-                elif warp_idx <= self.num_threads // cute.arch.WARP_SIZE:
+                elif warp_idx < (
+                    self._num_dma_threads() + self.num_threads
+                ) // cute.arch.WARP_SIZE:
                     self.mma_persistent(
                         mQ,
                         mK,
@@ -2272,12 +2346,19 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
                     )
                     pipeline_bias.producer_commit(producer_state_k)
             pipeline_k.producer_acquire(producer_state_k)
-            paged_kv_manager.load_KV(
-                n_block,
-                sK[None, None, producer_state_k.index],
-                "K",
-            )
-            cute.arch.cp_async_commit_group()
+            if const_expr(self.fp8_kv):
+                paged_kv_manager.load_KV_dequant(
+                    n_block,
+                    sK[None, None, producer_state_k.index],
+                    "K",
+                )
+            else:
+                paged_kv_manager.load_KV(
+                    n_block,
+                    sK[None, None, producer_state_k.index],
+                    "K",
+                )
+                cute.arch.cp_async_commit_group()
             pipeline_k.producer_commit(producer_state_k)
             producer_state_k.advance()
 
@@ -2285,8 +2366,11 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
             sV_stage = layout_utils.transpose_view(
                 sV[None, None, producer_state_v.index]
             )
-            paged_kv_manager.load_KV(n_block, sV_stage, "V")
-            cute.arch.cp_async_commit_group()
+            if const_expr(self.fp8_kv):
+                paged_kv_manager.load_KV_dequant(n_block, sV_stage, "V")
+            else:
+                paged_kv_manager.load_KV(n_block, sV_stage, "V")
+                cute.arch.cp_async_commit_group()
             pipeline_v.producer_commit(producer_state_v)
             producer_state_v.advance()
 
@@ -3300,6 +3384,18 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
         base_softmax_scale: Optional[Float32] = None,
     ):
         mQ_cur = seqlen.offset_batch_Q(mQ, batch_idx, dim=3)[None, None, head_idx]
+        v_descale = None
+        if const_expr(self.fp8_kv):
+            kv_head_idx = (
+                head_idx
+                if const_expr(self.pack_gqa)
+                else head_idx // self.qhead_per_kvhead
+            )
+            k_descale = Float32(aux_data.tensors[0][batch_idx, kv_head_idx])
+            v_descale = Float32(aux_data.tensors[1][batch_idx, kv_head_idx])
+            softmax_scale_log2 *= k_descale
+            if const_expr(softmax_scale is not None):
+                softmax_scale *= k_descale
         if const_expr(not self.pack_gqa):
             gQ = cute.local_tile(mQ_cur, (self.tile_m, self.tile_hdim), (m_block, 0))
         num_bias_loads = Int32(0)
@@ -3802,6 +3898,8 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
             softmax.rescale_O(acc_O, row_scale)
             lse = softmax.row_sum
 
+        if const_expr(self.fp8_kv):
+            acc_O.store(acc_O.load() * v_descale)
         self.epilogue(
             acc_O,
             lse,

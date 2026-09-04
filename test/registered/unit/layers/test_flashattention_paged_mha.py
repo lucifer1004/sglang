@@ -20,7 +20,9 @@ with patch.dict(
 ):
     from sglang.srt.layers.attention.flashattention_backend import (
         FlashAttentionBackend,
+        _forward_num_splits,
     )
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
@@ -33,10 +35,15 @@ def _backend():
     backend.kv_cache_is_mxfp8 = False
     backend.fa_impl_ver = 3
     backend.num_splits = 4
+    backend.decode_num_splits = 0
     return backend
 
 
 class TestFlashAttentionPagedMHA(unittest.TestCase):
+    def test_target_verify_uses_decode_splitkv_policy(self):
+        self.assertEqual(_forward_num_splits(ForwardMode.EXTEND, 1, 0), 1)
+        self.assertEqual(_forward_num_splits(ForwardMode.TARGET_VERIFY, 1, 0), 0)
+
     def test_get_paged_mha_kv_cache_supports_head_groups(self):
         backend = _backend()
         backend.token_to_kv_pool = SimpleNamespace(
@@ -83,6 +90,33 @@ class TestFlashAttentionPagedMHA(unittest.TestCase):
         )
 
         self.assertEqual(q.dtype, torch.float16)
+        self.assertEqual(k_descale.shape, (2, 1))
+        self.assertEqual(v_descale.shape, (2, 1))
+
+    def test_prepare_sm120_fa4_fp8_kv_keeps_bf16_query(self):
+        backend = _backend()
+        backend.fa_impl_ver = 4
+        backend.device_capability = (12, 0)
+        backend.kv_cache_dtype = torch.float8_e4m3fn
+        layer = SimpleNamespace(
+            head_dim=128,
+            k_scale=torch.tensor(0.5),
+            v_scale=torch.tensor(0.25),
+        )
+        q = torch.ones(6, 128, dtype=torch.bfloat16)
+
+        q, _, _, k_descale, v_descale = backend.prepare_paged_mha_query(
+            q,
+            None,
+            None,
+            layer,
+            logical_batch_size=2,
+            kv_head_num=1,
+            is_prefill=True,
+            allow_sm120_fp8_kv=True,
+        )
+
+        self.assertEqual(q.dtype, torch.bfloat16)
         self.assertEqual(k_descale.shape, (2, 1))
         self.assertEqual(v_descale.shape, (2, 1))
 

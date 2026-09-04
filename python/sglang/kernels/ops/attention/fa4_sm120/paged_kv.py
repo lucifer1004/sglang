@@ -55,7 +55,9 @@ class Sm120PagedKVManager(ParamsBase):
         num_threads: cutlass.Constexpr[Int32],
         dtype: Type[cutlass.Numeric],
     ):
-        universal_copy_bits = 128
+        # Eight FP8 values expand to one conflict-free 16-byte BF16 store.
+        # The ordinary BF16 path retains its 128-bit cp.async transaction.
+        universal_copy_bits = 64 if dtype.width == 8 else 128
         async_copy_elems = universal_copy_bits // dtype.width
         dtype_bytes = dtype.width // 8
         gmem_k_block_size = math.gcd(
@@ -170,6 +172,32 @@ class Sm120PagedKVManager(ParamsBase):
             )
 
     @cute.jit
+    def _copy_row_dequant(
+        self,
+        tXsX: cute.Tensor,
+        tXcX: cute.Tensor,
+        mX_paged_cur_copy: cute.Tensor,
+        m: Int32,
+        should_load: cute.Tensor,
+    ):
+        """Synchronously convert one FP8 row slice into the BF16 SMEM tile."""
+        for k in cutlass.range_constexpr(cute.size(tXsX, mode=[2])):
+            ki = tXcX[0, 0, k][1] // self.async_copy_elems
+            src = mX_paged_cur_copy[None, ki]
+            dst = tXsX[None, m, k]
+            src = cute.make_tensor(src.iterator, dst.layout)
+            fragment = cute.make_fragment_like(dst, self.mK_paged.element_type)
+            fragment.fill(0.0)
+            load_atom = cute.make_copy_atom(
+                cute.nvgpu.CopyUniversalOp(),
+                self.mK_paged.element_type,
+                num_bits_per_copy=self.async_copy_elems
+                * self.mK_paged.element_type.width,
+            )
+            cute.copy(load_atom, src, fragment, pred=should_load)
+            dst.store(fragment.load().to(dst.element_type))
+
+    @cute.jit
     def load_KV(self, n_block: Int32, sX: cute.Tensor, K_or_V: str):
         assert K_or_V in ("K", "V")
 
@@ -214,3 +242,53 @@ class Sm120PagedKVManager(ParamsBase):
                 mX_paged_cur, (self.async_copy_elems,)
             )
             self._copy_row_async(tXsX, tXcX, mX_paged_cur_copy, m, should_load)
+
+    @cute.jit
+    def load_KV_dequant(self, n_block: Int32, sX: cute.Tensor, K_or_V: str):
+        """Load paged FP8 K/V and materialize the current BF16 shared tile."""
+        assert K_or_V in ("K", "V")
+
+        tPrXPtr = self.compute_X_ptr(K_or_V)
+        sX_pi = cute.group_modes(sX, 0, 1)
+        head_dim = (
+            self.head_dim_v_padded
+            if const_expr(K_or_V == "V")
+            else self.head_dim_padded
+        )
+        cX = cute.make_identity_tensor((self.n_block_size, head_dim))
+        tXsX = self.gmem_thr_copy_KV.partition_D(sX_pi)
+        tXcX = self.gmem_thr_copy_KV.partition_S(cX)
+        tXc0X = self.gmem_thr_copy_KV.get_slice(0).partition_S(cX)
+
+        seqlenk_row_limit = (
+            self.seqlen_k - n_block * self.n_block_size - tXcX[0][0]
+            if n_block >= 0
+            else 0
+        )
+        for m in cutlass.range_constexpr(cute.size(tXsX, mode=[1])):
+            row_valid = tXc0X[0, m, 0][0] < seqlenk_row_limit
+            should_load = cute.make_fragment_like(tXsX[(0, None), m, 0], cute.Boolean)
+            should_load.fill(row_valid)
+
+            x_ptr_i64 = utils.shuffle_sync(
+                tPrXPtr[m // self.gmem_threads_per_row],
+                m % self.gmem_threads_per_row,
+                width=self.gmem_threads_per_row,
+            )
+            x_gmem_ptr = cute.make_ptr(
+                self.mK_paged.element_type,
+                x_ptr_i64,
+                cute.AddressSpace.gmem,
+                assumed_align=16,
+            )
+            mX_paged_cur = cute.make_tensor(x_gmem_ptr, cute.make_layout((head_dim,)))
+            mX_paged_cur_copy = cute.tiled_divide(
+                mX_paged_cur, (self.async_copy_elems,)
+            )
+            self._copy_row_dequant(
+                tXsX,
+                tXcX,
+                mX_paged_cur_copy,
+                m,
+                should_load,
+            )

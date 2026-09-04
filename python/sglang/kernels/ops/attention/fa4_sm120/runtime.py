@@ -12,6 +12,8 @@ must remain consistent across those phases:
 * cached TVM-FFI launch plans and their temporary workspaces.
 """
 
+import contextlib
+import contextvars
 import math
 from collections import OrderedDict
 from dataclasses import dataclass
@@ -32,12 +34,23 @@ from sglang.kernels.ops.attention.fa4_sm120.policy import (
     is_low_hd_paged_decode_tile,
     visible_decode_seqlen_k,
 )
+from sglang.kernels.ops.attention.fa4_sm120.splitkv_model import (
+    SplitKvWorkload,
+    normalize_num_splits as _normalize_num_splits,
+)
+from sglang.kernels.ops.attention.fa4_sm120.splitkv_router import (
+    SplitKvProbeSpec,
+    SplitKvRouteSpec,
+    kv_storage_identity,
+    splitkv_calibration_registry,
+)
 from sglang.kernels.ops.attention.flash_attn.cute import fa_logging
 from sglang.kernels.ops.attention.flash_attn.cute.utils import AuxData
 
 _LAUNCH_PLAN_CAPACITY = 4096
 _WORKSPACE_CAPACITY = 64
 _WORKSPACE_VIEW_CAPACITY = 512
+_MAX_CALIBRATED_SPLITKV_WORKSPACE_BYTES = 512 << 20
 _EMPTY_AUX_DATA = AuxData(None, None)
 _DECODE_REFERENCE_CORE_GHZ = 2.4
 _DECODE_POWER_OF_TWO_SPLITS = (1, 2, 4, 8, 16, 32, 64, 128)
@@ -55,6 +68,28 @@ _DECODE_COMBINE_FIXED_US = 3.654860520719416
 _DECODE_COMBINE_SPLIT_TO_8_US = 0.015181182195831644
 _DECODE_COMBINE_SPLIT_ABOVE_8_US = 0.12157753908563328
 _DECODE_COMBINE_OUTPUT_CTA_US = 0.019185022429169515
+_CALIBRATION_KV_TILES_PER_CTA = contextvars.ContextVar(
+    "sm120_fa4_splitkv_calibration_kv_tiles_per_cta",
+    default=0,
+)
+
+
+@contextlib.contextmanager
+def splitkv_calibration_partition(kv_tiles_per_cta: int):
+    """Temporarily force an internal SplitKV grain for calibration only.
+
+    The override is intentionally absent from the public FA4 API.  It only
+    changes pure route resolution, so graph construction may enter it; the
+    measurement and fitting entry points enforce the no-calibration-during-
+    capture rule.
+    """
+    if kv_tiles_per_cta <= 0:
+        raise ValueError("kv_tiles_per_cta must be positive")
+    token = _CALIBRATION_KV_TILES_PER_CTA.set(kv_tiles_per_cta)
+    try:
+        yield
+    finally:
+        _CALIBRATION_KV_TILES_PER_CTA.reset(token)
 
 
 @dataclass(frozen=True)
@@ -144,14 +179,6 @@ def _get_decode_hardware(device: torch.device) -> _DecodeHardware:
         core_clock_ghz=properties.clock_rate / 1_000_000,
         is_integrated=is_integrated,
     )
-
-
-def _normalize_num_splits(num_splits: int, num_n_blocks: int) -> int:
-    if num_splits <= 1 or num_n_blocks <= 1:
-        return 1
-    requested_splits = min(num_splits, num_n_blocks)
-    blocks_per_split = (num_n_blocks + requested_splits - 1) // requested_splits
-    return (num_n_blocks + blocks_per_split - 1) // blocks_per_split
 
 
 def _predict_decode_split_us(
@@ -455,6 +482,7 @@ class Sm120ForwardPolicy:
         max_seqlen_q: int,
         max_seqlen_k: int,
         pack_gqa: bool,
+        compute_dtype: torch.dtype,
         element_size: int,
         packed_q_rows: int,
         tile_m: int,
@@ -488,25 +516,6 @@ class Sm120ForwardPolicy:
             window_size_right=window_size_right,
             tile_n=tile_n,
         )
-        num_splits = cls.select_num_splits(
-            requested_num_splits=requested_num_splits,
-            head_dim=head_dim,
-            head_dim_v=head_dim_v,
-            paged_kv=paged_kv,
-            max_seqlen_q=max_seqlen_q,
-            has_compact_q_groups=has_compact_q_groups,
-            element_size=element_size,
-            packed_q_rows=packed_q_rows,
-            tile_m=tile_m,
-            tile_n=tile_n,
-            total_mblocks=total_mblocks,
-            num_sms=num_sms,
-            num_n_blocks=split_num_n_blocks,
-            device=device,
-            fake_mode=fake_mode,
-            generic_heuristic=generic_heuristic,
-        )
-        is_split_kv = num_splits > 1
         direct_uniform_batch = cls.use_direct_uniform_batch(
             batch_size=batch_size,
             paged_kv=paged_kv,
@@ -530,6 +539,62 @@ class Sm120ForwardPolicy:
             is_local=is_local,
             has_score_or_mask_mod=has_score_or_mask_mod,
         )
+        calibration_grain = _CALIBRATION_KV_TILES_PER_CTA.get()
+        routed_grain = 0
+        if calibration_grain > 0 and split_num_n_blocks > 0:
+            num_splits = math.ceil(split_num_n_blocks / calibration_grain)
+        else:
+            calibrated = cls.select_calibrated_partition(
+                requested_num_splits=requested_num_splits,
+                head_dim=head_dim,
+                head_dim_v=head_dim_v,
+                paged_kv=paged_kv,
+                max_seqlen_q=max_seqlen_q,
+                max_seqlen_k=max_seqlen_k,
+                has_compact_q_groups=has_compact_q_groups,
+                has_score_or_mask_mod=has_score_or_mask_mod,
+                is_causal=is_causal,
+                is_local=is_local,
+                page_size=page_size,
+                num_head_kv=num_head_kv,
+                compute_dtype=compute_dtype,
+                kv_dtype=v.dtype,
+                kv_element_size=v.element_size(),
+                packed_q_rows=packed_q_rows,
+                tile_m=tile_m,
+                tile_n=tile_n,
+                total_mblocks=total_mblocks,
+                num_m_blocks=num_m_blocks,
+                num_n_blocks=split_num_n_blocks,
+                direct_uniform_batch=direct_uniform_batch,
+                split_qk_n=split_qk_n,
+                device=device,
+                fake_mode=fake_mode,
+                is_stream_capturing=is_stream_capturing,
+            )
+            if calibrated is not None:
+                routed_grain = calibrated.prediction.kv_tiles_per_cta
+                num_splits = calibrated.prediction.num_splits
+            else:
+                num_splits = cls.select_num_splits(
+                    requested_num_splits=requested_num_splits,
+                    head_dim=head_dim,
+                    head_dim_v=head_dim_v,
+                    paged_kv=paged_kv,
+                    max_seqlen_q=max_seqlen_q,
+                    has_compact_q_groups=has_compact_q_groups,
+                    element_size=element_size,
+                    packed_q_rows=packed_q_rows,
+                    tile_m=tile_m,
+                    tile_n=tile_n,
+                    total_mblocks=total_mblocks,
+                    num_sms=num_sms,
+                    num_n_blocks=split_num_n_blocks,
+                    device=device,
+                    fake_mode=fake_mode,
+                    generic_heuristic=generic_heuristic,
+                )
+        is_split_kv = num_splits > 1
         dense_paged_kv = (
             page_size is not None
             and k is not None
@@ -563,20 +628,26 @@ class Sm120ForwardPolicy:
         )
         if transpose_qk_pv:
             split_qk_n = False
-        split_kv_blocks_per_cta = cls.select_paged_decode_split_kv_blocks_per_cta(
-            head_dim=head_dim,
-            head_dim_v=head_dim_v,
-            batch_size=batch_size,
-            paged_kv=paged_kv,
-            max_seqlen_q=max_seqlen_q,
-            has_compact_q_groups=has_compact_q_groups,
-            packed_q_rows=packed_q_rows,
-            is_split_kv=is_split_kv,
-            direct_uniform_batch=direct_uniform_batch,
-            has_seqused_k=has_seqused_k,
-            split_qk_n=split_qk_n,
-            num_splits=num_splits,
-            num_n_blocks=split_num_n_blocks,
+        split_kv_blocks_per_cta = (
+            calibration_grain
+            if calibration_grain > 0 and is_split_kv
+            else routed_grain
+            if routed_grain > 0 and is_split_kv
+            else cls.select_paged_decode_split_kv_blocks_per_cta(
+                head_dim=head_dim,
+                head_dim_v=head_dim_v,
+                batch_size=batch_size,
+                paged_kv=paged_kv,
+                max_seqlen_q=max_seqlen_q,
+                has_compact_q_groups=has_compact_q_groups,
+                packed_q_rows=packed_q_rows,
+                is_split_kv=is_split_kv,
+                direct_uniform_batch=direct_uniform_batch,
+                has_seqused_k=has_seqused_k,
+                split_qk_n=split_qk_n,
+                num_splits=num_splits,
+                num_n_blocks=split_num_n_blocks,
+            )
         )
         return Sm120ForwardPlan(
             num_splits=num_splits,
@@ -588,6 +659,99 @@ class Sm120ForwardPolicy:
             launch_split_combine_early=cls.use_graph_capture_split_combine_pdl(
                 is_stream_capturing=is_stream_capturing,
                 is_split_kv=is_split_kv,
+            ),
+        )
+
+    @staticmethod
+    def select_calibrated_partition(
+        *,
+        requested_num_splits: int,
+        head_dim: int,
+        head_dim_v: int,
+        paged_kv: bool,
+        max_seqlen_q: int,
+        max_seqlen_k: int,
+        has_compact_q_groups: bool,
+        has_score_or_mask_mod: bool,
+        is_causal: bool,
+        is_local: bool,
+        page_size: Optional[int],
+        num_head_kv: int,
+        compute_dtype: torch.dtype,
+        kv_dtype: torch.dtype,
+        kv_element_size: int,
+        packed_q_rows: int,
+        tile_m: int,
+        tile_n: int,
+        total_mblocks: int,
+        num_m_blocks: int,
+        num_n_blocks: int,
+        direct_uniform_batch: bool,
+        split_qk_n: bool,
+        device: torch.device,
+        fake_mode: bool,
+        is_stream_capturing: bool,
+    ):
+        """Return a cached calibrated route, or ``None`` for safe fallback."""
+        storage = kv_storage_identity(kv_dtype)
+        compute = kv_storage_identity(compute_dtype)
+        if not (
+            requested_num_splits < 1
+            and paged_kv
+            and page_size is not None
+            and 0 < max_seqlen_q <= 8
+            and has_compact_q_groups
+            and not has_score_or_mask_mod
+            and is_causal
+            and not is_local
+            and not fake_mode
+            and storage is not None
+            and compute is not None
+            and num_n_blocks > 0
+            and num_m_blocks > 0
+            # HD256 can switch to the M64N8 transpose dataflow as a function
+            # of the selected grain.  It needs a joint multi-family model and
+            # therefore retains its qualified architecture heuristic for now.
+            and (head_dim, head_dim_v) != (256, 256)
+        ):
+            return None
+        batch_head_groups = total_mblocks // num_m_blocks
+        workload = SplitKvWorkload(
+            total_mblocks=total_mblocks,
+            num_n_blocks=num_n_blocks,
+            main_bytes_per_kv_tile=(
+                tile_n * (head_dim + head_dim_v) * kv_element_size
+            ),
+            output_rows=batch_head_groups * packed_q_rows,
+            head_dim_v=head_dim_v,
+            max_workspace_bytes=_MAX_CALIBRATED_SPLITKV_WORKSPACE_BYTES,
+        )
+        route = SplitKvRouteSpec(
+            kv_storage=storage,
+            compute=compute,
+            head_dim=head_dim,
+            head_dim_v=head_dim_v,
+            tile_m=tile_m,
+            tile_n=tile_n,
+            page_size=page_size,
+            direct_uniform_batch=direct_uniform_batch,
+            split_qk_n=split_qk_n,
+        )
+        return splitkv_calibration_registry.resolve(
+            route=route,
+            workload=workload,
+            device=device,
+            is_stream_capturing=is_stream_capturing,
+            probe=SplitKvProbeSpec(
+                batch_size=batch_head_groups // num_head_kv,
+                num_head_kv=num_head_kv,
+                qhead_per_kvhead=(
+                    packed_q_rows // max_seqlen_q if max_seqlen_q > 0 else 1
+                ),
+                max_seqlen_q=max_seqlen_q,
+                max_seqlen_k=max_seqlen_k,
+                page_size=page_size,
+                causal=is_causal,
             ),
         )
 
@@ -688,6 +852,11 @@ class Sm120ForwardPolicy:
     ) -> int:
         num_splits = requested_num_splits
         if num_splits < 1:
+            # SM120 delegates short decode/target-verify routing to this host,
+            # but ordinary prefill remains unsplit until it has an independently
+            # qualified route model.
+            if max_seqlen_q > 8:
+                return 1
             is_hd256_paged_decode = (
                 head_dim == 256
                 and head_dim_v == 256
@@ -945,6 +1114,8 @@ class Sm120ForwardPolicy:
         bias_block_size: int,
         rel_extent_padded: int,
         plan: Sm120ForwardPlan,
+        fp8_kv: bool = False,
+        fp8_dma_threads: int = 64,
     ) -> FlashAttentionForwardSm120:
         if not FlashAttentionForwardSm120.can_implement(
             dtype,
@@ -1013,6 +1184,8 @@ class Sm120ForwardPolicy:
             paged_kv=paged_kv,
             split_qk_n=plan.split_qk_n,
             split_kv_blocks_per_cta=plan.split_kv_blocks_per_cta,
+            fp8_kv=fp8_kv,
+            fp8_dma_threads=fp8_dma_threads,
         )
 
 
@@ -1229,6 +1402,8 @@ class Sm120ForwardHost(Sm120ForwardPolicy):
             window_size_right,
             pack_gqa,
             requested_num_splits,
+            _CALIBRATION_KV_TILES_PER_CTA.get(),
+            splitkv_calibration_registry.version,
             self.implementation_token(),
             fa_logging.get_fa_log_level(),
         )

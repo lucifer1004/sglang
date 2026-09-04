@@ -1074,9 +1074,27 @@ class ModelRunner:
         return self.sampling_prewarm_result
 
     def init_cuda_graphs(self, capture_decode_cuda_graph: bool = True):
-        capture = capture_cuda_graphs(
-            model_runner=self, capture_decode_cuda_graph=capture_decode_cuda_graph
-        )
+        calibration_context = contextlib.nullcontext()
+        if self.device == "cuda" and torch.cuda.get_device_capability(self.device)[
+            0
+        ] == 12:
+            # FA4 owns its calibration implementation; model startup supplies
+            # the lifecycle boundary and TP group whose ranks must publish one
+            # route table before graph recording.
+            from sglang.kernels.ops.attention.fa4_sm120.splitkv_router import (
+                splitkv_calibration_session,
+            )
+
+            calibration_group = (
+                self.tp_group.cpu_group if self.tp_group.world_size > 1 else None
+            )
+            calibration_context = splitkv_calibration_session(
+                process_group=calibration_group, allow_tuning=True
+            )
+        with calibration_context:
+            capture = capture_cuda_graphs(
+                model_runner=self, capture_decode_cuda_graph=capture_decode_cuda_graph
+            )
         self.eager_runner = capture.eager_runner
         self.prefill_cuda_graph_runner = capture.prefill.runner
         self.decode_cuda_graph_runner = capture.decode.runner

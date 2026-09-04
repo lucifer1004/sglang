@@ -20,6 +20,7 @@ from sglang.kernels.ops.attention.flash_attention_v4 import (
 
 if os.environ.get("SGLANG_INKLING_FA4_USE_PIP") == "1":
     # The pip escape hatch deliberately bypasses SGLang-owned SM12x kernels.
+    _flash_attn_fp8_kv_sm120 = None
     get_forward_arch = None
     resolve_runtime_policy = None
     try_cached_paged_decode = None
@@ -28,6 +29,9 @@ else:
         get_forward_arch,
         resolve_runtime_policy,
         try_cached_paged_decode,
+    )
+    from sglang.kernels.ops.attention.fa4_sm120.fp8_kv import (
+        flash_attn_fp8_kv_sm120 as _flash_attn_fp8_kv_sm120,
     )
 
 
@@ -71,6 +75,80 @@ def _validate_out_contract(out: Optional[torch.Tensor]) -> None:
         raise ValueError("out must not require gradients")
     if out.stride(-1) != 1:
         raise ValueError("out must have stride 1 in the last dimension")
+
+
+def _can_use_fused_fp8_kv(
+    *,
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    page_table: Optional[torch.Tensor],
+    cache_seqlens: Optional[torch.Tensor],
+    cu_seqlens_q: Optional[torch.Tensor],
+    max_seqlen_q: Optional[int],
+    max_seqlen_k: Optional[int],
+    q_descale: Optional[torch.Tensor],
+    k_descale: Optional[torch.Tensor],
+    v_descale: Optional[torch.Tensor],
+    causal: bool,
+    window_size: Tuple[int, int],
+    attention_chunk: Optional[int],
+    softcap: float,
+    num_splits: int,
+    pack_gqa: Optional[bool],
+    sinks: Optional[torch.Tensor],
+    score_mod: Optional[Callable],
+    aux_tensors: Optional[list],
+    sfq: Optional[torch.Tensor],
+    sfk: Optional[torch.Tensor],
+    sfv: Optional[torch.Tensor],
+    rel_bias: Optional[torch.Tensor],
+    rel_bias_prep_cache: Optional[dict],
+    return_softmax_lse: bool,
+    out: Optional[torch.Tensor],
+) -> bool:
+    """Recognize the deliberately narrow SM120 BF16-compute FP8-KV path."""
+    return (
+        _flash_attn_fp8_kv_sm120 is not None
+        and q.is_cuda
+        and torch.cuda.get_device_capability(q.device)[0] == 12
+        and q.dtype == torch.bfloat16
+        and k_cache.dtype == torch.float8_e4m3fn
+        and v_cache.dtype == torch.float8_e4m3fn
+        and q.device == k_cache.device == v_cache.device
+        and q.ndim == 3
+        and k_cache.ndim == 4
+        and k_cache.shape == v_cache.shape
+        and q.shape[-1] == k_cache.shape[-1] == v_cache.shape[-1] == 128
+        and page_table is not None
+        and cache_seqlens is not None
+        and cu_seqlens_q is not None
+        and max_seqlen_q is not None
+        and 0 < max_seqlen_q <= 8
+        and max_seqlen_k is not None
+        and q_descale is None
+        and k_descale is not None
+        and v_descale is not None
+        and causal
+        and window_size == (-1, -1)
+        and attention_chunk is None
+        and softcap in (None, 0.0)
+        and num_splits >= 0
+        and (
+            pack_gqa is True
+            or (pack_gqa is None and q.shape[1] > k_cache.shape[2])
+        )
+        and sinks is None
+        and score_mod is None
+        and aux_tensors is None
+        and sfq is None
+        and sfk is None
+        and sfv is None
+        and rel_bias is None
+        and rel_bias_prep_cache is None
+        and not return_softmax_lse
+        and (out is None or out.is_contiguous())
+    )
 
 
 @debug_kernel_api
@@ -249,6 +327,57 @@ def flash_attn_with_kvcache(
     if isinstance(cache_seqlens, int):
         cache_seqlens = torch.full(
             (k_cache.shape[0],), cache_seqlens, dtype=torch.int32, device=k_cache.device
+        )
+
+    if _can_use_fused_fp8_kv(
+        q=q,
+        k_cache=k_cache,
+        v_cache=v_cache,
+        page_table=page_table,
+        cache_seqlens=cache_seqlens,
+        cu_seqlens_q=cu_seqlens_q,
+        max_seqlen_q=max_seqlen_q,
+        max_seqlen_k=max_seqlen_k,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
+        causal=causal,
+        window_size=window_size,
+        attention_chunk=attention_chunk,
+        softcap=softcap,
+        num_splits=num_splits,
+        pack_gqa=pack_gqa,
+        sinks=sinks,
+        score_mod=score_mod,
+        aux_tensors=aux_tensors,
+        sfq=sfq,
+        sfk=sfk,
+        sfv=sfv,
+        rel_bias=rel_bias,
+        rel_bias_prep_cache=rel_bias_prep_cache,
+        return_softmax_lse=return_softmax_lse,
+        out=out,
+    ):
+        q, k_cache, v_cache = [_maybe_contiguous(t) for t in (q, k_cache, v_cache)]
+        cu_seqlens_q, cache_seqlens, page_table = [
+            _maybe_contiguous(t) for t in (cu_seqlens_q, cache_seqlens, page_table)
+        ]
+        return _flash_attn_fp8_kv_sm120(
+            q,
+            k_cache,
+            v_cache,
+            page_table=page_table,
+            cache_seqlens=cache_seqlens,
+            cu_seqlens_q=cu_seqlens_q,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            k_descale=k_descale,
+            v_descale=v_descale,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            num_splits=num_splits,
+            pack_gqa=(q.shape[1] > k_cache.shape[2] if pack_gqa is None else pack_gqa),
+            out=out,
         )
 
     forward_arch = get_forward_arch(q.device) if get_forward_arch is not None else None

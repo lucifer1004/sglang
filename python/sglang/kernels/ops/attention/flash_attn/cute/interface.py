@@ -809,6 +809,7 @@ def _flash_attn_fwd(
             max_seqlen_q=max_seqlen_q,
             max_seqlen_k=max_seqlen_k,
             pack_gqa=pack_gqa,
+            compute_dtype=q.dtype,
             element_size=q.element_size(),
             packed_q_rows=seqlen_q_packgqa,
             tile_m=tile_m,

@@ -59,6 +59,13 @@ def _should_disable_scheduler_metadata_precompute() -> bool:
     return bool(get_parallel().enable_prefill_cp or get_parallel().enable_dp_attention)
 
 
+def _forward_num_splits(
+    forward_mode: ForwardMode, num_splits: int, decode_num_splits: int
+) -> int:
+    """Route target verification through the short-query decode policy."""
+    return decode_num_splits if forward_mode.is_target_verify() else num_splits
+
+
 @dataclass
 class FlashAttentionMetadata:
     """Metadata to be init once in the model forward pass,
@@ -271,6 +278,7 @@ class FlashAttentionBackend(AttentionBackend):
         # Select version
         self.fa_impl_ver = fa_impl_ver
         device_capability = get_device_capability()
+        self.device_capability = device_capability
         if self.fa_impl_ver == 3:
             from sgl_kernel.flash_attn import (
                 flash_attn_varlen_func,
@@ -1217,6 +1225,7 @@ class FlashAttentionBackend(AttentionBackend):
         logical_batch_size: int,
         kv_head_num: int,
         is_prefill: bool,
+        allow_sm120_fp8_kv: bool = False,
     ) -> tuple[
         torch.Tensor,
         Optional[torch.Tensor],
@@ -1225,19 +1234,33 @@ class FlashAttentionBackend(AttentionBackend):
         Optional[torch.Tensor],
     ]:
         k_descale = v_descale = None
+        sm120_bf16_q_fp8_kv = (
+            allow_sm120_fp8_kv
+            and is_prefill
+            and self.fa_impl_ver == 4
+            and self.device_capability[0] == 12
+            and self.kv_cache_dtype == torch.float8_e4m3fn
+            and layer.head_dim == 128
+            and getattr(layer, "v_head_dim", layer.head_dim) == 128
+        )
         if (
             self.kv_cache_dtype_str != "auto"
             and layer.head_dim <= 256
             and not self.kv_cache_is_mxfp8
-            and (not is_prefill or self.fa_impl_ver != 4)
+            and (
+                not is_prefill
+                or self.fa_impl_ver != 4
+                or sm120_bf16_q_fp8_kv
+            )
         ):
             if layer.k_scale is not None:
                 descale_shape = (logical_batch_size, kv_head_num)
                 k_descale = layer.k_scale.expand(descale_shape)
                 v_descale = layer.v_scale.expand(descale_shape)
-            q = q.to(self.kv_cache_dtype)
-            q_rope = q_rope.to(self.kv_cache_dtype) if q_rope is not None else None
-            k_rope = k_rope.to(self.kv_cache_dtype) if k_rope is not None else None
+            if not sm120_bf16_q_fp8_kv:
+                q = q.to(self.kv_cache_dtype)
+                q_rope = q_rope.to(self.kv_cache_dtype) if q_rope is not None else None
+                k_rope = k_rope.to(self.kv_cache_dtype) if k_rope is not None else None
         return q, q_rope, k_rope, k_descale, v_descale
 
     def forward_extend(
@@ -1352,15 +1375,6 @@ class FlashAttentionBackend(AttentionBackend):
             if is_swa_layer
             else (-1, -1)
         )
-        q, q_rope, k_rope, fa_k_descale, fa_v_descale = self.prepare_paged_mha_query(
-            q,
-            q_rope,
-            k_rope,
-            layer,
-            logical_batch_size=forward_batch.batch_size,
-            kv_head_num=layer.tp_k_head_num,
-            is_prefill=True,
-        )
         # Check if we should use local attention
         use_local_attn = (
             self.has_local_attention
@@ -1377,6 +1391,45 @@ class FlashAttentionBackend(AttentionBackend):
             forward_batch.forward_mode.is_target_verify()
             and self.topk > 1
             and not is_swa_layer
+        )
+        allow_sm120_fp8_kv = (
+            forward_batch.forward_mode.is_target_verify()
+            and not forward_batch.forward_mode.is_context_parallel_extend()
+            and not use_cascade_attn
+            and not use_local_attn
+            and not is_swa_layer
+            and not self.fa_skip_kv_cache
+            and not layer.is_cross_attention
+            and score_mod is None
+            and sinks is None
+            and rel_bias is None
+            and layer.logit_cap in (None, 0.0)
+        )
+        sm120_fp8_kv_target_verify = (
+            forward_batch.forward_mode.is_target_verify()
+            and self.fa_impl_ver == 4
+            and self.device_capability[0] == 12
+            and self.kv_cache_dtype == torch.float8_e4m3fn
+            and layer.head_dim == 128
+            and getattr(layer, "v_head_dim", layer.head_dim) == 128
+        )
+        if sm120_fp8_kv_target_verify and not allow_sm120_fp8_kv:
+            raise NotImplementedError(
+                "SM120 FA4 BF16-Q/FP8-KV target verification requires "
+                "causal global attention without cascade, CP, sinks, score "
+                "modification, relative bias, or KV-cache bypass"
+            )
+        q, q_rope, k_rope, fa_k_descale, fa_v_descale = (
+            self.prepare_paged_mha_query(
+                q,
+                q_rope,
+                k_rope,
+                layer,
+                logical_batch_size=forward_batch.batch_size,
+                kv_head_num=layer.tp_k_head_num,
+                is_prefill=True,
+                allow_sm120_fp8_kv=allow_sm120_fp8_kv,
+            )
         )
 
         kwargs = {}
@@ -1445,6 +1498,14 @@ class FlashAttentionBackend(AttentionBackend):
 
         # Use Flash Attention for prefill
         if not self.use_mla:
+            # TARGET_VERIFY is represented by forward_extend but has the same
+            # short-query SplitKV routing contract as decode.  Ordinary prefill
+            # retains the architecture policy's unsplit setting.
+            forward_num_splits = _forward_num_splits(
+                forward_batch.forward_mode,
+                self.num_splits,
+                self.decode_num_splits,
+            )
             # Do multi-head attention
             key_cache, value_cache = self.get_paged_mha_kv_cache(
                 layer,
@@ -1478,7 +1539,7 @@ class FlashAttentionBackend(AttentionBackend):
                         window_size=window_size,
                         softcap=layer.logit_cap,
                         return_softmax_lse=use_cascade_attn,
-                        num_splits=self.num_splits,
+                        num_splits=forward_num_splits,
                         ver=self.fa_impl_ver,
                         **kwargs,
                     )
@@ -1552,7 +1613,7 @@ class FlashAttentionBackend(AttentionBackend):
                     causal=causal,
                     window_size=window_size,
                     softcap=layer.logit_cap,
-                    num_splits=self.num_splits,
+                    num_splits=forward_num_splits,
                     out=_fa_out,
                     **kwargs,
                 )
@@ -1566,12 +1627,13 @@ class FlashAttentionBackend(AttentionBackend):
                     cu_seqlens_q=cu_seqlens_q,
                     cu_seqlens_k_new=cu_seqlens_k if not use_local_attn else None,
                     max_seqlen_q=max_seqlen_q,
+                    max_seqlen_k=metadata.max_seq_len_k,
                     softmax_scale=layer.scaling,
                     causal=False if use_cascade_attn else causal,
                     window_size=window_size,
                     softcap=layer.logit_cap,
                     return_softmax_lse=use_cascade_attn,
-                    num_splits=self.num_splits,
+                    num_splits=forward_num_splits,
                     out=_fa_out,
                     ver=self.fa_impl_ver,
                     **kwargs,
@@ -1598,7 +1660,7 @@ class FlashAttentionBackend(AttentionBackend):
                     window_size=window_size,
                     softcap=layer.logit_cap,
                     return_softmax_lse=True,
-                    num_splits=self.num_splits,
+                    num_splits=forward_num_splits,
                     ver=self.fa_impl_ver,
                     **kwargs,
                 )

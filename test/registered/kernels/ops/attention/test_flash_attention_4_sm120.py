@@ -13,6 +13,23 @@ from sglang.kernels.ops.attention.fa4_sm120.policy import (
 from sglang.kernels.ops.attention.fa4_sm120.runtime import (
     Sm120ForwardHost,
     sm120_forward_host,
+    splitkv_calibration_partition,
+)
+from sglang.kernels.ops.attention.fa4_sm120.splitkv_calibration import (
+    SplitKvCalibrationEntry,
+    SplitKvCalibrationKey,
+    splitkv_device_identity,
+    splitkv_implementation_identity,
+)
+from sglang.kernels.ops.attention.fa4_sm120.splitkv_model import (
+    SplitKvCalibration,
+    SplitKvWorkload,
+)
+from sglang.kernels.ops.attention.fa4_sm120.splitkv_router import (
+    SplitKvRouteSpec,
+    splitkv_calibration_registry,
+    splitkv_calibration_session,
+    splitkv_workload_key,
 )
 from sglang.kernels.ops.attention.flash_attention_v4_sm120 import (
     flash_attn_varlen_func,
@@ -59,6 +76,202 @@ def test_sm120_runtime_policy_delegates_decode_shapes():
     assert future_policy.decode_num_splits == 0
     assert not future_policy.decode_uses_static_max_seqlen_k
 
+    assert (
+        sm120_forward_host.select_num_splits(
+            requested_num_splits=0,
+            head_dim=128,
+            head_dim_v=128,
+            paged_kv=True,
+            max_seqlen_q=16,
+            has_compact_q_groups=True,
+            element_size=2,
+            packed_q_rows=96,
+            tile_m=64,
+            tile_n=64,
+            total_mblocks=2,
+            num_sms=torch.cuda.get_device_properties(0).multi_processor_count,
+            num_n_blocks=128,
+            device=torch.device("cuda"),
+            fake_mode=False,
+            generic_heuristic=lambda *_: 8,
+        )
+        == 1
+    )
+
+
+def test_sm120_internal_calibration_partition_is_exact_and_graph_stable(monkeypatch):
+    sm120_forward_host.clear_launch_plans()
+    captured_plans = []
+    original_resolve_plan = Sm120ForwardHost.resolve_plan
+
+    def recording_resolve_plan(**kwargs):
+        plan = original_resolve_plan(**kwargs)
+        captured_plans.append(plan)
+        return plan
+
+    monkeypatch.setattr(
+        Sm120ForwardHost,
+        "resolve_plan",
+        staticmethod(recording_resolve_plan),
+    )
+    torch.manual_seed(20260903)
+    q_len, q_heads, kv_heads, head_dim = 2, 6, 1, 128
+    page_size, kv_len = 64, 1024
+    q = torch.randn(q_len, q_heads, head_dim, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(
+        kv_len // page_size,
+        page_size,
+        kv_heads,
+        head_dim,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    v = torch.randn_like(k)
+    page_table = torch.arange(
+        kv_len // page_size, device="cuda", dtype=torch.int32
+    )[None]
+    cache_seqlens = torch.tensor([kv_len], device="cuda", dtype=torch.int32)
+    cu_seqlens_q = torch.tensor([0, q_len], device="cuda", dtype=torch.int32)
+    eager_out = torch.empty_like(q)
+    graph_out = torch.empty_like(q)
+    reference_out = torch.empty_like(q)
+
+    def run(out):
+        return flash_attn_with_kvcache(
+            q,
+            k,
+            v,
+            page_table=page_table,
+            cache_seqlens=cache_seqlens,
+            cu_seqlens_q=cu_seqlens_q,
+            max_seqlen_q=q_len,
+            max_seqlen_k=kv_len,
+            causal=True,
+            num_splits=3,
+            pack_gqa=True,
+            out=out,
+        )
+
+    with splitkv_calibration_partition(7):
+        run(eager_out)
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            run(graph_out)
+    graph.replay()
+    run(reference_out)
+    torch.cuda.synchronize()
+
+    calibration_plans = [
+        plan for plan in captured_plans if plan.split_kv_blocks_per_cta == 7
+    ]
+    assert calibration_plans
+    assert all(plan.num_splits == 3 for plan in calibration_plans)
+    assert captured_plans[-1].split_kv_blocks_per_cta == 0
+    torch.testing.assert_close(eager_out, reference_out, atol=2e-3, rtol=0.0)
+    torch.testing.assert_close(graph_out, reference_out, atol=2e-3, rtol=0.0)
+
+
+def test_sm120_cached_calibrated_route_is_stable_during_graph_capture(monkeypatch):
+    sm120_forward_host.clear_launch_plans()
+    splitkv_calibration_registry.reset()
+    captured_plans = []
+    original_resolve_plan = Sm120ForwardHost.resolve_plan
+
+    def recording_resolve_plan(**kwargs):
+        plan = original_resolve_plan(**kwargs)
+        captured_plans.append(plan)
+        return plan
+
+    monkeypatch.setattr(
+        Sm120ForwardHost,
+        "resolve_plan",
+        staticmethod(recording_resolve_plan),
+    )
+    q_len, q_heads, kv_heads, head_dim = 2, 6, 1, 128
+    page_size, kv_len = 64, 1024
+    q = torch.zeros(q_len, q_heads, head_dim, device="cuda", dtype=torch.bfloat16)
+    k = torch.zeros(
+        kv_len // page_size,
+        page_size,
+        kv_heads,
+        head_dim,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    v = torch.zeros_like(k)
+    page_table = torch.arange(k.shape[0], device="cuda", dtype=torch.int32)[None]
+    cache_seqlens = torch.tensor([kv_len], device="cuda", dtype=torch.int32)
+    cu_seqlens_q = torch.tensor([0, q_len], device="cuda", dtype=torch.int32)
+    out = torch.empty_like(q)
+    route = SplitKvRouteSpec(
+        "bf16", "bf16", head_dim, head_dim, 64, 64, page_size, False, False
+    )
+    workload = SplitKvWorkload(
+        total_mblocks=1,
+        num_n_blocks=kv_len // page_size,
+        main_bytes_per_kv_tile=64 * (head_dim + head_dim) * 2,
+        output_rows=q_heads * q_len,
+        head_dim_v=head_dim,
+        max_workspace_bytes=512 << 20,
+    )
+    device_key, _ = splitkv_device_identity(q.device)
+    key = SplitKvCalibrationKey(
+        device_key, splitkv_implementation_identity(), route.family
+    )
+    constants = SplitKvCalibration(
+        sm_slots=torch.cuda.get_device_properties(q.device).multi_processor_count,
+        main_inv_bandwidth_s_per_byte=6e-13,
+        main_inv_single_sm_s_per_byte=4e-11,
+        main_fixed_s=6e-6,
+        combine_inv_bandwidth_s_per_byte=1e-12,
+        combine_inv_single_sm_s_per_byte=2e-11,
+        combine_fixed_s=3e-6,
+        combine_cta_fixed_s=1e-6,
+        l2_cache_bytes=0,
+    )
+    splitkv_calibration_registry.publish(
+        key,
+        SplitKvCalibrationEntry(
+            constants,
+            {splitkv_workload_key(workload): 7},
+        ),
+    )
+
+    def run():
+        return flash_attn_with_kvcache(
+            q,
+            k,
+            v,
+            page_table=page_table,
+            cache_seqlens=cache_seqlens,
+            cu_seqlens_q=cu_seqlens_q,
+            max_seqlen_q=q_len,
+            max_seqlen_k=kv_len,
+            causal=True,
+            num_splits=0,
+            pack_gqa=True,
+            out=out,
+        )
+
+    try:
+        with splitkv_calibration_session("load"):
+            run()
+            torch.cuda.synchronize()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                run()
+            graph.replay()
+            torch.cuda.synchronize()
+        assert len(captured_plans) >= 2
+        assert all(plan.num_splits == 3 for plan in captured_plans[-2:])
+        assert all(
+            plan.split_kv_blocks_per_cta == 7 for plan in captured_plans[-2:]
+        )
+    finally:
+        sm120_forward_host.clear_launch_plans()
+        splitkv_calibration_registry.reset()
+
 
 def test_sm120_preallocated_output_contract_is_validated_before_launch():
     q = torch.empty((1, 1, 1, 32), device="cuda", dtype=torch.bfloat16)
@@ -80,6 +293,199 @@ def test_sm120_preallocated_output_contract_is_validated_before_launch():
     )[..., ::2]
     with pytest.raises(ValueError, match="must have stride 1"):
         flash_attn_with_kvcache(q, k, v, out=strided_out)
+
+
+@pytest.mark.parametrize("num_splits", [0, 1, 8])
+def test_sm120_fused_fp8_kv_matches_unfused_bf16_reference(num_splits):
+    torch.manual_seed(20260903)
+    batch_size, q_len, q_heads, kv_heads, head_dim = 1, 2, 6, 1, 128
+    page_size, kv_len = 64, 256
+    num_pages = kv_len // page_size
+    q = torch.randn(
+        batch_size * q_len,
+        q_heads,
+        head_dim,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    k_source = torch.randn(
+        num_pages,
+        page_size,
+        kv_heads,
+        head_dim,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    v_source = torch.randn_like(k_source)
+    k_scale = torch.tensor(0.5, device="cuda", dtype=torch.float32)
+    v_scale = torch.tensor(0.25, device="cuda", dtype=torch.float32)
+    k_fp8 = (k_source.float() / k_scale).to(torch.float8_e4m3fn)
+    v_fp8 = (v_source.float() / v_scale).to(torch.float8_e4m3fn)
+    k_bf16 = (k_fp8.float() * k_scale).to(torch.bfloat16)
+    v_bf16 = (v_fp8.float() * v_scale).to(torch.bfloat16)
+    page_table = torch.randperm(
+        num_pages, device="cuda", dtype=torch.int64
+    ).to(torch.int32)[None]
+    cache_seqlens = torch.full(
+        (batch_size,), kv_len, device="cuda", dtype=torch.int32
+    )
+    cu_seqlens_q = torch.arange(
+        batch_size + 1, device="cuda", dtype=torch.int32
+    ) * q_len
+    descale_shape = (batch_size, kv_heads)
+
+    reference = flash_attn_with_kvcache(
+        q=q,
+        k_cache=k_bf16,
+        v_cache=v_bf16,
+        page_table=page_table,
+        cache_seqlens=cache_seqlens,
+        cu_seqlens_q=cu_seqlens_q,
+        max_seqlen_q=q_len,
+        max_seqlen_k=kv_len,
+        causal=True,
+        num_splits=num_splits,
+        pack_gqa=True,
+    )
+    actual = flash_attn_with_kvcache(
+        q=q,
+        k_cache=k_fp8,
+        v_cache=v_fp8,
+        page_table=page_table,
+        cache_seqlens=cache_seqlens,
+        cu_seqlens_q=cu_seqlens_q,
+        max_seqlen_q=q_len,
+        max_seqlen_k=kv_len,
+        k_descale=k_scale.expand(descale_shape),
+        v_descale=v_scale.expand(descale_shape),
+        causal=True,
+        num_splits=num_splits,
+        pack_gqa=None,
+    )
+    torch.testing.assert_close(actual, reference, atol=2e-2, rtol=2e-2)
+
+    graph_out = torch.empty_like(actual)
+    flash_attn_with_kvcache(
+        q=q,
+        k_cache=k_fp8,
+        v_cache=v_fp8,
+        page_table=page_table,
+        cache_seqlens=cache_seqlens,
+        cu_seqlens_q=cu_seqlens_q,
+        max_seqlen_q=q_len,
+        max_seqlen_k=kv_len,
+        k_descale=k_scale.expand(descale_shape),
+        v_descale=v_scale.expand(descale_shape),
+        causal=True,
+        num_splits=num_splits,
+        pack_gqa=None,
+        out=graph_out,
+    )
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = flash_attn_with_kvcache(
+            q=q,
+            k_cache=k_fp8,
+            v_cache=v_fp8,
+            page_table=page_table,
+            cache_seqlens=cache_seqlens,
+            cu_seqlens_q=cu_seqlens_q,
+            max_seqlen_q=q_len,
+            max_seqlen_k=kv_len,
+            k_descale=k_scale.expand(descale_shape),
+            v_descale=v_scale.expand(descale_shape),
+            causal=True,
+            num_splits=num_splits,
+            pack_gqa=None,
+            out=graph_out,
+        )
+    graph.replay()
+    torch.cuda.synchronize()
+    assert captured.data_ptr() == graph_out.data_ptr()
+    torch.testing.assert_close(graph_out, reference, atol=2e-2, rtol=2e-2)
+
+
+def test_sm120_fused_fp8_kv_supports_ragged_batches():
+    torch.manual_seed(20260903)
+    q_lengths = (2, 5)
+    kv_lengths = (192, 256)
+    q_heads, kv_heads, head_dim, page_size = 8, 1, 128, 64
+    pages_per_batch = max(kv_lengths) // page_size
+    q = torch.randn(
+        sum(q_lengths), q_heads, head_dim, device="cuda", dtype=torch.bfloat16
+    )
+    k_source = torch.randn(
+        len(q_lengths) * pages_per_batch,
+        page_size,
+        kv_heads,
+        head_dim,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    v_source = torch.randn_like(k_source)
+    k_descale = torch.tensor([[0.5], [0.25]], device="cuda", dtype=torch.float32)
+    v_descale = torch.tensor([[0.25], [0.125]], device="cuda", dtype=torch.float32)
+    k_fp8 = torch.empty_like(k_source, dtype=torch.float8_e4m3fn)
+    v_fp8 = torch.empty_like(v_source, dtype=torch.float8_e4m3fn)
+    k_bf16 = torch.empty_like(k_source)
+    v_bf16 = torch.empty_like(v_source)
+    for batch_idx in range(len(q_lengths)):
+        page_slice = slice(
+            batch_idx * pages_per_batch, (batch_idx + 1) * pages_per_batch
+        )
+        k_fp8[page_slice] = (
+            k_source[page_slice].float() / k_descale[batch_idx]
+        ).to(torch.float8_e4m3fn)
+        v_fp8[page_slice] = (
+            v_source[page_slice].float() / v_descale[batch_idx]
+        ).to(torch.float8_e4m3fn)
+        k_bf16[page_slice] = (
+            k_fp8[page_slice].float() * k_descale[batch_idx]
+        ).to(torch.bfloat16)
+        v_bf16[page_slice] = (
+            v_fp8[page_slice].float() * v_descale[batch_idx]
+        ).to(torch.bfloat16)
+
+    page_table = torch.arange(
+        len(q_lengths) * pages_per_batch, device="cuda", dtype=torch.int32
+    ).view(len(q_lengths), pages_per_batch)
+    page_table[0] = page_table[0].flip(0)
+    page_table[1] = page_table[1].roll(1)
+    cache_seqlens = torch.tensor(kv_lengths, device="cuda", dtype=torch.int32)
+    cu_seqlens_q = torch.tensor(
+        (0, q_lengths[0], sum(q_lengths)), device="cuda", dtype=torch.int32
+    )
+
+    reference = flash_attn_with_kvcache(
+        q=q,
+        k_cache=k_bf16,
+        v_cache=v_bf16,
+        page_table=page_table,
+        cache_seqlens=cache_seqlens,
+        cu_seqlens_q=cu_seqlens_q,
+        max_seqlen_q=max(q_lengths),
+        max_seqlen_k=max(kv_lengths),
+        causal=True,
+        num_splits=1,
+        pack_gqa=True,
+    )
+    actual = flash_attn_with_kvcache(
+        q=q,
+        k_cache=k_fp8,
+        v_cache=v_fp8,
+        page_table=page_table,
+        cache_seqlens=cache_seqlens,
+        cu_seqlens_q=cu_seqlens_q,
+        max_seqlen_q=max(q_lengths),
+        max_seqlen_k=max(kv_lengths),
+        k_descale=k_descale,
+        v_descale=v_descale,
+        causal=True,
+        num_splits=1,
+        pack_gqa=True,
+    )
+    torch.testing.assert_close(actual, reference, atol=2e-2, rtol=2e-2)
 
 
 @pytest.mark.parametrize(

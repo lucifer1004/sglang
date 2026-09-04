@@ -995,6 +995,18 @@ class Envs:
     # warmup. Opt-in: the extra forward needs transient activation headroom
     # that small-VRAM or tightly-packed configs may not have.
     SGLANG_FLASHINFER_AUTOTUNE_EXTEND = EnvBool(False)
+    # SM120 FA4 SplitKV route calibration: off, load, tune, or force.  The
+    # default only consumes compatible device-local records; measurements are
+    # confined to model startup before CUDA Graph recording.
+    SGLANG_FA4_SPLITKV_CALIBRATION = EnvStr("load")
+    # Optional exact JSON path; otherwise use SGLANG_CACHE_DIR.
+    SGLANG_FA4_SPLITKV_CALIBRATION_CACHE = EnvStr("")
+    # Transient K/V pool used by DRAM-faithful family calibration and bounded
+    # exact-shape refinement.  It must remain larger than device L2.
+    SGLANG_FA4_SPLITKV_CALIBRATION_POOL_MIB = EnvInt(512)
+    # Maximum exact captured workloads refined per route family during one
+    # startup.  Family constants continue to route all remaining shapes.
+    SGLANG_FA4_SPLITKV_MAX_REFINEMENTS = EnvInt(8)
 
     # ===================================================================
     # Triton and Torch compilation
