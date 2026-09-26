@@ -1,0 +1,14 @@
+# Repository-root build entry for tools that can only build a checkout's root
+# directory (for example InferLab image assembly of a git submodule). The real
+# package definition is python/pyproject.toml; this backend delegates every
+# PEP 517 hook to it. Build-system requirements are those of python/.
+[build-system]
+requires = [
+  "setuptools>=61.0",
+  "setuptools-rust>=1.11",
+  "setuptools-scm>=8.0",
+  "torch==2.13.0",
+  "wheel",
+]
+build-backend = "root_build_backend"
+backend-path = ["scripts/inferlab"]
