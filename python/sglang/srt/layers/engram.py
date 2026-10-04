@@ -34,6 +34,7 @@ from sglang.kernels.ops.embeddings.engram_hash import (
 )
 from sglang.srt.distributed import tensor_model_parallel_all_reduce
 from sglang.srt.distributed.parallel_state import inplace_all_reduce
+from sglang.srt.utils.host_pin import cuda_host_register_chunked
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
     attn_cp_all_gather_into_tensor,
@@ -593,9 +594,7 @@ class _HostTable:
             # Every rank holds the fd before rank 0 continues; the /proc path only
             # resolves while rank 0 keeps its descriptor.
             group.barrier()
-        err = torch.cuda.cudart().cudaHostRegister(self.bytes.data_ptr(), nbytes, 0)
-        if int(err) != 0:
-            raise RuntimeError(f"cudaHostRegister({nbytes} bytes) failed: {err}")
+        cuda_host_register_chunked(self.bytes.data_ptr(), nbytes)
 
     def _open_shared_fd(self, nbytes: int, name: str) -> int:
         owner = None
