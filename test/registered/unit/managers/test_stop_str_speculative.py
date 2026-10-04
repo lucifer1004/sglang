@@ -18,9 +18,11 @@ register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 # accidental cross-matches (10-39 are lowercase letters).
 STOP_ID = 1
 EOS_ID = 2
+THINK_END_ID = 3
 ID_TO_TEXT = {
     STOP_ID: "STOP",
     EOS_ID: "",
+    THINK_END_ID: "</think>",
     **{i: chr(ord("a") + i % 26) for i in range(10, 40)},
     60: "a",
     61: ".",
@@ -145,6 +147,46 @@ class TestStopStrSpeculative(unittest.TestCase):
         req.update_finish_state(new_accepted_len=3)
         self.assertTrue(req.finished())
         self.assertIsNone(req.finished_len)
+
+
+
+def _reasoning_req(output_ids, stop=None, *, think_end_ids=(THINK_END_ID,)):
+    req = _make_req([], stop=stop)
+    req.require_reasoning = True
+    req.output_ids = array("q", output_ids)
+    if think_end_ids:
+        # As the batch result processor does for every committed token.
+        req.update_reasoning_tokens(list(output_ids), list(think_end_ids))
+    return req
+
+
+class TestStopStrAfterReasoning(unittest.TestCase):
+    """Stop strings end the answer, not the reasoning: a stop string the model
+    writes while thinking must neither finish the request nor be matched once
+    the reasoning has ended."""
+
+    def test_stop_str_inside_reasoning_does_not_finish(self):
+        req = _reasoning_req([10, STOP_ID, 11], stop=["STOP"])
+        req.update_finish_state(new_accepted_len=3)
+        self.assertFalse(req.finished())
+
+    def test_stop_str_after_reasoning_finishes_at_the_answer_stop(self):
+        out = [10, STOP_ID, 11, THINK_END_ID, 12, STOP_ID, 13]
+        req = _reasoning_req(out, stop=["STOP"])
+        req.update_finish_state(new_accepted_len=len(out))
+        self.assertTrue(req.finished())
+        self.assertEqual(req.finished_len, 6)
+
+    def test_window_does_not_reach_back_into_reasoning(self):
+        req = _reasoning_req([10, STOP_ID, THINK_END_ID, 12], stop=["STOP"])
+        req.update_finish_state(new_accepted_len=1)
+        self.assertFalse(req.finished())
+
+    def test_without_think_end_tracking_stop_str_still_finishes(self):
+        # Reasoning requested, but the model has no think-end ids to track it.
+        req = _reasoning_req([10, STOP_ID, 11], stop=["STOP"], think_end_ids=())
+        req.update_finish_state(new_accepted_len=3)
+        self.assertTrue(req.finished())
 
 
 if __name__ == "__main__":

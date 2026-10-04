@@ -198,9 +198,10 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
 
         # TODO(lmzheng): handle the case where multiple stop strs are hit
 
-        # Trim stop str.
+        # Trim stop str. The output ends at the match, so it is the last
+        # occurrence; reasoning before the answer may contain the string too.
         if isinstance(matched, str) and isinstance(output, str):
-            pos = output.find(matched)
+            pos = output.rfind(matched)
             if pos == -1:
                 return output
             end = pos + len(matched)
