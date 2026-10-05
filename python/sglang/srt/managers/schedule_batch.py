@@ -1752,9 +1752,19 @@ class Req(ReqDllmMixin):
         )
         # Cover all newly accepted tokens so an early stop string is not missed
         # when speculative decoding accepts multiple tokens per step.
-        return min(
+        tail_len = min(
             max_len_tail_str + max(new_accepted_len - 1, 0), len(self.output_ids)
         )
+        # Stop strings and regexes end the answer, so the window never reaches
+        # into tracked reasoning (the matcher exists only with think-end ids).
+        if self.require_reasoning and self._think_end_matcher is not None:
+            answer_len = (
+                len(self.output_ids) - self.reasoning_tokens
+                if self._is_reasoning_over
+                else 0
+            )
+            tail_len = min(tail_len, answer_len)
+        return tail_len
 
     def tail_str(self, new_accepted_len: int = 1) -> str:
         # Check stop strings and stop regex patterns together
@@ -1765,6 +1775,8 @@ class Req(ReqDllmMixin):
             return ""
 
         tail_len = self._stop_match_tail_len(new_accepted_len)
+        if tail_len == 0:
+            return ""
         return self.tokenizer.decode(self.output_ids[-tail_len:])
 
     def check_match_stop_str_prefix(self) -> bool:
