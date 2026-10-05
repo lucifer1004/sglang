@@ -505,6 +505,29 @@ crate-type = ["cdylib"]
             )
             self.assertFalse(wheel_build.fingerprint["include_absolute_rpath"])
 
+            # Setting RUSTFLAGS hides CARGO_BUILD_RUSTFLAGS from cargo, so it is
+            # carried over; CARGO_ENCODED_RUSTFLAGS outranks both and is extended.
+            remap = "--remap-path-prefix=/src=/opt/src"
+            for inherited, variable, expected in (
+                ({"CARGO_BUILD_RUSTFLAGS": remap}, "RUSTFLAGS", remap + " "),
+                (
+                    {"CARGO_ENCODED_RUSTFLAGS": remap},
+                    "CARGO_ENCODED_RUSTFLAGS",
+                    remap + "\x1f",
+                ),
+            ):
+                inherited_build = torch_build_configuration(
+                    compat_header=compat_header,
+                    python_module="sglang.srt.mem_cache.rust_tree_core.mem_cache",
+                    torch_module=fake_torch,
+                    base_environment=inherited,
+                    include_absolute_rpath=False,
+                )
+                flags = inherited_build.environment[variable]
+                self.assertTrue(flags.startswith(expected), msg=flags)
+                self.assertIn("$ORIGIN/../../../../torch/lib", flags)
+            self.assertNotIn("RUSTFLAGS", inherited_build.environment)
+
             # libtorch declares C++20 from 2.12 on; 2.11 is the only C++17 release.
             for version, expected in (("2.12.0+cu128", True), ("2.11.0+cu128", False)):
                 fake_torch.__version__ = version
