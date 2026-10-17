@@ -5,7 +5,8 @@ Qwen3.8-Flash-Next) out of device memory and lets the Triton gather kernel read
 rows straight from a host pointer. Two backends provide that pointer:
 
 ``pinned`` (default)
-    ``torch.empty(..., pin_memory=True)``. On a discrete GPU this frees VRAM.
+    Anonymous host memory pinned in chunks (``empty_pinned_host``). On a
+    discrete GPU this frees VRAM.
 
 ``file``
     A file-backed, shared ``mmap`` of a sparse file under
@@ -41,6 +42,7 @@ from typing import Optional, Sequence
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.utils.host_pin import empty_pinned_host
 
 logger = logging.getLogger(__name__)
 
@@ -241,7 +243,8 @@ def allocate_ple_host_table(
             f"unknown PLE offload backend {backend!r}; choose from {PLE_OFFLOAD_BACKENDS}"
         )
     if backend == "pinned":
-        return torch.empty(tuple(shape), dtype=dtype, device="cpu", pin_memory=True)
+        # Never pinned in one call: the per-rank table is tens of GiB.
+        return empty_pinned_host(tuple(int(d) for d in shape), dtype)
 
     numel = 1
     for d in shape:

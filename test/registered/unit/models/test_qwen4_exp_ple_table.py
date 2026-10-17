@@ -6,7 +6,8 @@ survive a re-open, reuses the file across calls, replaces one of the wrong size,
 and the prefetcher computes the right page set and honours its size floor. The
 resident-set trimmer measures only its own mapping, drops its pages once over
 budget without losing what was written through them, and is off when the budget
-is zero or the mapping is pinned.
+is zero or the mapping is pinned. A failed chunked pin unregisters the chunks
+already registered.
 
 GPU part (skipped unless the device reads pageable host memory through the host
 page tables, i.e. unified-memory parts such as GB10): the production Triton
@@ -31,6 +32,7 @@ from sglang.srt.models.qwen4_exp_ple_table import (
     make_ple_file_rss_trimmer,
     ple_table_file_name,
 )
+from sglang.srt.utils.host_pin import HOST_PIN_CHUNK_BYTES, cuda_host_register_chunked
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -104,6 +106,27 @@ class TestPleFileTableAllocator(CustomTestCase):
         table = allocate_ple_host_table((4, 4), torch.bfloat16, "pinned", None)
         self.assertTrue(table.is_pinned())
         self.assertIsNone(make_ple_file_prefetcher(table))
+
+    def test_pinned_backend_registers_past_the_first_chunk(self):
+        if not torch.cuda.is_available():
+            self.skipTest("pinned memory needs a CUDA runtime")
+        rows = HOST_PIN_CHUNK_BYTES // 4096 + 1
+        table = allocate_ple_host_table((rows, 2048), torch.bfloat16, "pinned", None)
+        self.assertTrue(table[:1].is_pinned())
+        self.assertTrue(table[-1:].is_pinned())
+
+    def test_chunk_registration_is_rolled_back_on_failure(self):
+        # Registers two chunks, fails the third: nothing may stay pinned.
+        cudart = mock.Mock()
+        cudart.cudaHostRegister.side_effect = [0, 0, 1]
+        cudart.cudaGetErrorString.return_value = "invalid value"
+        with mock.patch.object(torch.cuda, "cudart", return_value=cudart):
+            with self.assertRaisesRegex(RuntimeError, "offset 8192"):
+                cuda_host_register_chunked(0x10000, 3 * 4096, chunk_bytes=4096)
+        self.assertEqual(
+            [c.args[0] for c in cudart.cudaHostUnregister.call_args_list],
+            [0x11000, 0x10000],
+        )
 
 
 class TestPleFilePrefetcher(CustomTestCase):
