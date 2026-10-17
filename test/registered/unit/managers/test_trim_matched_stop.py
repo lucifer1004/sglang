@@ -40,6 +40,13 @@ class TestTrimMatchedStop(unittest.TestCase):
         # no_stop_trim=False: drop the stop string and anything after it.
         self.assertEqual(_trim("ans\n\nQuestion: A", "Question", False), "ans\n\n")
 
+    def test_str_trim_keeps_an_earlier_occurrence_in_the_reasoning(self):
+        # The match ends the answer; the same string written while reasoning stays.
+        out = "think Question: x</think>ans\n\nQuestion: A"
+        self.assertEqual(
+            _trim(out, "Question", False), "think Question: x</think>ans\n\n"
+        )
+
     def test_str_no_trim_keeps_stop_but_drops_trailing(self):
         # no_stop_trim=True: keep through the stop, drop the over-generated tail.
         self.assertEqual(
