@@ -103,11 +103,23 @@ def torch_build_configuration(
 
     package_depth = len(python_module.split(".")) - 1
     bundled_torch_lib = "$ORIGIN/" + "../" * package_depth + "torch/lib"
-    rustflags = environment.get("RUSTFLAGS", "")
-    rpath_flags = [f"-C link-arg=-Wl,-rpath,{bundled_torch_lib}"]
+    rpath_args = ["-C", f"link-arg=-Wl,-rpath,{bundled_torch_lib}"]
     if include_absolute_rpath:
-        rpath_flags.append(f"-C link-arg=-Wl,-rpath,{torch_lib}")
-    environment["RUSTFLAGS"] = " ".join(filter(None, (rustflags, *rpath_flags)))
+        rpath_args += ["-C", f"link-arg=-Wl,-rpath,{torch_lib}"]
+    # Cargo reads one rustflags source: CARGO_ENCODED_RUSTFLAGS, else RUSTFLAGS,
+    # else build.rustflags. Extend the environment source in effect, carrying
+    # CARGO_BUILD_RUSTFLAGS over into RUSTFLAGS; build.rustflags from Cargo
+    # config files is still overridden once RUSTFLAGS is set, as before.
+    if "CARGO_ENCODED_RUSTFLAGS" in environment:
+        encoded = environment["CARGO_ENCODED_RUSTFLAGS"]
+        environment["CARGO_ENCODED_RUSTFLAGS"] = "\x1f".join(
+            filter(None, (encoded, *rpath_args))
+        )
+    else:
+        rustflags = environment.get(
+            "RUSTFLAGS", environment.get("CARGO_BUILD_RUSTFLAGS", "")
+        )
+        environment["RUSTFLAGS"] = " ".join(filter(None, (rustflags, *rpath_args)))
 
     fingerprint = {
         "torch_version": version,
