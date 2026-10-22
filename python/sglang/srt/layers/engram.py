@@ -55,6 +55,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.runtime_context import get_model, get_parallel, get_serving
 from sglang.srt.utils import add_prefix, is_cuda, is_gfx95_supported, is_hip
 from sglang.srt.utils.hf_transformers.tokenizer import get_tokenizer
+from sglang.srt.utils.host_pin import cuda_host_register_chunked
 
 logger = logging.getLogger(__name__)
 
@@ -686,9 +687,14 @@ class _HostTable:
             # Every rank holds the fd before rank 0 continues; the /proc path only
             # resolves while rank 0 keeps its descriptor.
             group.barrier()
-        err = torch.cuda.cudart().cudaHostRegister(self.bytes.data_ptr(), nbytes, 0)
-        if int(err) != 0:
-            raise RuntimeError(f"cudaHostRegister({nbytes} bytes) failed: {err}")
+        if _is_hip:
+            # HIP may map separately registered chunks to non-contiguous device
+            # addresses, so the table stays one registration there.
+            err = torch.cuda.cudart().cudaHostRegister(self.bytes.data_ptr(), nbytes, 0)
+            if int(err) != 0:
+                raise RuntimeError(f"cudaHostRegister({nbytes} bytes) failed: {err}")
+        else:
+            cuda_host_register_chunked(self.bytes.data_ptr(), nbytes)
         self.device_ptr = _registered_device_ptr(self.bytes.data_ptr())
 
     def _open_shared_fd(self, nbytes: int, name: str) -> int:
