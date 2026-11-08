@@ -1573,6 +1573,7 @@ def _tp_refined_moe_block_sizes(
     moe_tp_size: int,
     hidden_size: int,
     runner_backend: MoeRunnerBackend,
+    activation: str,
 ) -> Optional[tuple[List[int], List[int]]]:
     """Finer w13 and w2 scale blocks for block-FP8 MoE whose TP shard splits blocks.
 
@@ -1604,6 +1605,9 @@ def _tp_refined_moe_block_sizes(
         if not (
             runner_backend.is_deep_gemm() and deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
         ):
+            return None
+        # The fused SiTU quant kernels take 128-wide groups only.
+        if activation == "situ":
             return None
         # Per-row UE8M0 scales take a K granularity of 32 or 128 only.
         if w2_block_k != block_k:
@@ -2106,6 +2110,9 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             and not layer.use_presharded_weights
             # A blockwise tail loads the checkpoint grid as is.
             and not self._supports_blockwise_fp8_tail(layer)
+            # apply() sends these to kernels that take the checkpoint block.
+            and not _is_cpu
+            and not (_is_xpu and not get_moe_runner_backend().is_triton())
         ):
             return unrefined
         refined = _tp_refined_moe_block_sizes(
@@ -2114,6 +2121,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             moe_tp_size=layer.moe_tp_size,
             hidden_size=hidden_size,
             runner_backend=self._resolve_moe_runner_backend(),
+            activation=layer.moe_runner_config.activation,
         )
         if refined is None:
             return unrefined
